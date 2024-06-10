@@ -39,7 +39,7 @@ namespace ngc
 
         explicit Parser(Lexer &lexer): m_lexer(lexer) { }
 
-        std::optional<std::unique_ptr<CompoundStatement>> parse() {
+        std::unique_ptr<CompoundStatement> parse() {
             auto token = m_lexer.nextToken();
 
             if(!token) {
@@ -54,19 +54,18 @@ namespace ngc
         }
 
     private:
-        std::optional<std::unique_ptr<CompoundStatement>> parseCompoundStatement() {
+        std::unique_ptr<CompoundStatement> parseCompoundStatement() {
             std::vector<std::unique_ptr<Statement>> statements;
 
             while(auto statement = parseStatement()) {
-                std::println("statement: {}", statement->text());
                 statements.emplace_back(std::move(statement));
             }
 
             if(statements.empty()) {
-                return std::nullopt;
+                return {};
             }
 
-            return std::make_optional(std::make_unique<CompoundStatement>(std::move(statements)));
+            return std::make_unique<CompoundStatement>(std::move(statements));
         }
 
         [[nodiscard]] std::unique_ptr<Statement> parseStatement() {
@@ -106,6 +105,10 @@ namespace ngc
 
             if(check(Token::Kind::RETURN)) {
                 return parseReturnStatement();
+            }
+
+            if(check(Token::Kind::ALIAS)) {
+                return parseAliasStatement();
             }
 
             std::optional<Token> blockDelete = std::nullopt;
@@ -154,9 +157,8 @@ namespace ngc
         [[nodiscard]] std::unique_ptr<IfStatement> parseIfStatement() {
             auto startToken = expect(Token::Kind::IF);
             auto condition = expect<RealExpression>(parseExpression());
-            //std::ignore = expect(Token::Kind::THEN);
             auto statements = parseCompoundStatement();
-            std::optional<std::unique_ptr<CompoundStatement>> elseStatements = std::nullopt;
+            std::unique_ptr<CompoundStatement> elseStatements;
 
             if(match(Token::Kind::ELSE)) {
                 elseStatements = parseCompoundStatement();
@@ -179,16 +181,22 @@ namespace ngc
             return std::make_unique<ReturnStatement>(startToken, expect<RealExpression>(parseExpression()));
         }
 
+        [[nodiscard]] std::unique_ptr<AliasStatement> parseAliasStatement() {
+            auto startToken = expect(Token::Kind::ALIAS);
+            auto namedVariable = expect<NamedVariableExpression>(parseExpression());
+            return std::make_unique<AliasStatement>(startToken, std::move(namedVariable), expect<RealExpression>(parseExpression()));
+        }
+
         [[nodiscard]] std::unique_ptr<Expression> parseExpression() {
             auto expression = parseAssignmentExpression();
-            std::println("expression: {}: {}", expression->name(), expression->toString());
+            //std::println("expression: {}: {}", expression->name(), expression->toString());
             return expression;
         }
 
         [[nodiscard]] std::unique_ptr<Expression> parseAssignmentExpression() {
             auto expression = parseOrXorExpression();
 
-            if(Token token; match(Token::Kind::EQUAL, token)) {
+            if(Token token; match(Token::Kind::ASSIGN, token)) {
                 auto left = expect<VariableExpression>(std::move(expression));
                 auto right = expect<RealExpression>(parseAssignmentExpression());
                 return std::make_unique<BinaryExpression>(token, std::move(left), std::move(right));
@@ -227,7 +235,7 @@ namespace ngc
             auto expression = parseAddSubExpression();
             Token token;
 
-            while(match({ Token::Kind::EQUAL_EQUAL, Token::Kind::NOT_EQUAL, Token::Kind::LESS, Token::Kind::LESS_EQUAL, Token::Kind::GREATER, Token::Kind::GREATER_EQUAL }, token)) {
+            while(match({ Token::Kind::EQ, Token::Kind::NE, Token::Kind::LT, Token::Kind::LE, Token::Kind::GT, Token::Kind::GE }, token)) {
                 auto left = expect<RealExpression>(std::move(expression));
                 auto right = expect<RealExpression>(parseAddSubExpression());
                 expression = std::make_unique<BinaryExpression>(token, std::move(left), std::move(right));
@@ -351,7 +359,7 @@ namespace ngc
         template<typename T>
         [[nodiscard]] std::unique_ptr<T> expect(std::unique_ptr<Expression> expression) {
             if(!expression->is<T>()) {
-                auto message = std::format("expected {}, but found {}: '{}'", T::staticName(), expression->name(), expression->text());
+                auto message = std::format("expected {}, but found {}: '{}'", T::staticClassName(), expression->className(), expression->text());
                 error(message, std::move(expression));
             }
 

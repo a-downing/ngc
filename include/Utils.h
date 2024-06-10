@@ -4,9 +4,18 @@
 #include <string>
 #include <iterator>
 #include <numeric>
+#include <stdexcept>
+#include <source_location>
 
 namespace ngc
 {
+    class LogicError final : public std::logic_error {
+        std::source_location m_sourceLocation;
+
+    public:
+        explicit LogicError(const std::string &message, const std::source_location &sourceLocation = std::source_location::current()) : std::logic_error(message), m_sourceLocation(sourceLocation) { }
+    };
+
     template <typename T>
     std::string join(const T &c, const std::string &sep) {
         if(c.size() == 0) {

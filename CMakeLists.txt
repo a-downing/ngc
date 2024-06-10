@@ -17,5 +17,7 @@ add_executable(ngc main.cpp
         include/Statement.h
         include/Expression.h
         include/Utils.h
+        include/Visitor.h
+        include/VisitorContext.h
 )
-target_include_directories(ngc PUBLIC "./include")
+target_include_directories(ngc PUBLIC "${CMAKE_SOURCE_DIR}/include")

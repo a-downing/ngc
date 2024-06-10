@@ -1,40 +1,21 @@
 #ifndef TOKEN_H
 #define TOKEN_H
 
+
 #include <cstddef>
+#include <cmath>
 #include <cassert>
 #include <charconv>
 
+#include <Utils.h>
 #include <CharacterSource.h>
-#include <cmath>
 
 namespace ngc {
     class Token {
     public:
         enum class Kind {
             NONE,
-            A,
-            B,
-            C,
-            D,
-            F,
-            G,
-            H,
-            I,
-            J,
-            K,
-            L,
-            M,
-            N,
-            O,
-            P,
-            Q,
-            R,
-            S,
-            T,
-            X,
-            Y,
-            Z,
+            A, B, C, D, F, G, H, I, J, K, L, M, N, O, P, Q, R, S, T, X, Y, Z,
             IDENTIFIER,
             COMMA,
             NAMED_VARIABLE,
@@ -46,35 +27,15 @@ namespace ngc {
             NEWLINE,
             LBRACKET,
             RBRACKET,
-            EQUAL,
-            EQUAL_EQUAL,
-            NOT_EQUAL,
-            LESS,
-            LESS_EQUAL,
-            GREATER,
-            GREATER_EQUAL,
-            PLUS,
-            MINUS,
-            MUL,
-            SLASH,
-            MOD,
-            POW,
-            AND,
-            OR,
-            XOR,
-            SUB,
-            ENDSUB,
-            CALL,
-            RETURN,
-            IF,
-            THEN,
-            ELSE,
-            ENDIF,
-            DO,
-            WHILE,
-            CONTINUE,
-            BREAK,
-            ENDWHILE
+            ASSIGN,
+            EQ, NE, LT, LE, GT, GE,
+            PLUS, MINUS,
+            MUL, SLASH, MOD, POW,
+            AND, OR, XOR,
+            SUB, ENDSUB, RETURN,
+            IF, ELSE, ENDIF,
+            WHILE, CONTINUE, BREAK, ENDWHILE,
+            ALIAS
         };
 
     private:
@@ -111,8 +72,11 @@ namespace ngc {
         }
 
         [[nodiscard]] std::string sourceName() const {
-            assert(m_source);
-            return m_source ? m_source->name() : "";
+            if(!m_source) {
+                throw LogicError("Token::sourceName() called on default constructed Token");
+            }
+
+            return m_source->name();
         }
 
         [[nodiscard]] int line() const {
@@ -131,6 +95,16 @@ namespace ngc {
             return m_start == m_end ? "" : m_source->text(m_start, m_end);
         }
 
+        [[nodiscard]] std::string_view value() const {
+            switch (m_kind) {
+                case Kind::NUMBER:
+                case Kind::IDENTIFIER: return text();
+                case Kind::NAMED_VARIABLE: return m_source->text(start() + 1, end());
+                case Kind::COMMENT: return m_source->text(start() + 1, end() - 1);
+                default: throw LogicError(std::format("Token::value() called on non-value type Token {} '{}'", name(), text()));
+            }
+        }
+
         [[nodiscard]] bool number() const {
             return m_kind == Kind::NUMBER;
         }
@@ -145,15 +119,25 @@ namespace ngc {
         }
 
         [[nodiscard]] double as_double() const {
-            assert(m_kind == Kind::NUMBER);
+            if(m_kind != Kind::NUMBER) {
+                throw LogicError(std::format("Token::as_double() called on Token {} '{}'", name(), text()));
+            }
+
             double d;
             auto [ptr, ec] = std::from_chars(text().begin(), text().end(), d);
-            assert(ec == std::errc());
+
+            if(ec != std::errc()) {
+                throw LogicError(std::format("Token::as_double(): std::from_chars() failed on '{}'", text()));
+            }
+
             return d;
         }
 
         [[nodiscard]] int as_integer() const {
-            assert(integer());
+            if(!integer()) {
+                throw LogicError(std::format("Token::as_integer() called on Token {} '{}'", name(), text()));
+            }
+
             return static_cast<int>(as_double());
         }
 
@@ -182,8 +166,6 @@ namespace ngc {
             case Kind::X: return "X";
             case Kind::Y: return "Y";
             case Kind::Z: return "Z";
-
-
             case Kind::IDENTIFIER: return "IDENTIFIER";
             case Kind::COMMA: return "COMMA";
             case Kind::NAMED_VARIABLE: return "NAMED_VARIABLE";
@@ -191,51 +173,39 @@ namespace ngc {
             case Kind::POUND: return "POUND";
             case Kind::AMPERSAND: return "AMPERSAND";
             case Kind::PERCENT: return "PERCENT";
-
             case Kind::COMMENT: return "COMMENT";
             case Kind::NEWLINE: return "NEWLINE";
-
             case Kind::LBRACKET: return "LBRACKET";
             case Kind::RBRACKET: return "RBRACKET";
-
-            case Kind::EQUAL: return "EQUAL";
-
-            case Kind::EQUAL_EQUAL: return "EQUAL_EQUAL";
-            case Kind::NOT_EQUAL: return "NOT_EQUAL";
-            case Kind::LESS: return "LESS";
-            case Kind::LESS_EQUAL: return "LESS_EQUAL";
-            case Kind::GREATER: return "GREATER";
-            case Kind::GREATER_EQUAL: return "GREATER_EQUAL";
-
+            case Kind::ASSIGN: return "ASSIGN";
+            case Kind::EQ: return "EQ";
+            case Kind::NE: return "NE";
+            case Kind::LT: return "LT";
+            case Kind::LE: return "LE";
+            case Kind::GT: return "GT";
+            case Kind::GE: return "GE";
             case Kind::PLUS: return "PLUS";
             case Kind::MINUS: return "MINUS";
             case Kind::MUL: return "MUL";
-            case Kind::SLASH: return "DIV";
+            case Kind::SLASH: return "SLASH";
             case Kind::MOD: return "MOD";
             case Kind::POW: return "POW";
-
             case Kind::AND: return "AND";
             case Kind::OR: return "OR";
             case Kind::XOR: return "XOR";
-
             case Kind::SUB: return "SUB";
             case Kind::ENDSUB: return "ENDSUB";
-            case Kind::CALL: return "CALL";
             case Kind::RETURN: return "RETURN";
-
             case Kind::IF: return "IF";
-            case Kind::THEN: return "THEN";
             case Kind::ELSE: return "ELSE";
             case Kind::ENDIF: return "ENDIF";
-
-            case Kind::DO: return "DO";
             case Kind::WHILE: return "WHILE";
             case Kind::CONTINUE: return "CONTINUE";
             case Kind::BREAK: return "BREAK";
             case Kind::ENDWHILE: return "ENDWHILE";
+            case Kind::ALIAS: return "ALIAS";
+            default: throw LogicError(std::format("Token::name() missing case statement for {} '{}'", std::to_underlying(m_kind), text()));
             }
-
-            assert(!"unhandled token name");
         }
 
         [[nodiscard]] std::string toString() const {

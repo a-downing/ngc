@@ -115,26 +115,26 @@ namespace ngc
             case '&': return makeToken(Token::Kind::AMPERSAND);
             case '=':
                 if(match('=')) {
-                    return makeToken(Token::Kind::EQUAL_EQUAL);
+                    return makeToken(Token::Kind::EQ);
                 }
 
-                return makeToken(Token::Kind::EQUAL);
+                return makeToken(Token::Kind::ASSIGN);
             case '!':
                 if(match('=')) {
-                    return makeToken(Token::Kind::NOT_EQUAL);
+                    return makeToken(Token::Kind::NE);
                 }
             case '<':
                 if(match('=')) {
-                    return makeToken(Token::Kind::LESS_EQUAL);
+                    return makeToken(Token::Kind::LE);
                 }
 
-                return makeToken(Token::Kind::LESS);
+                return makeToken(Token::Kind::LT);
             case '>':
                 if(match('=')) {
-                    return makeToken(Token::Kind::GREATER_EQUAL);
+                    return makeToken(Token::Kind::GE);
                 }
 
-                return makeToken(Token::Kind::GREATER);
+                return makeToken(Token::Kind::GT);
             case '*':
                 if(match('*')) {
                     return makeToken(Token::Kind::POW);
@@ -301,10 +301,6 @@ namespace ngc
                 return makeToken(Token::Kind::ENDSUB);
             }
 
-            if(iequal(name, "call")) {
-                return makeToken(Token::Kind::CALL);
-            }
-
             if(iequal(name, "return")) {
                 return makeToken(Token::Kind::RETURN);
             }
@@ -313,20 +309,12 @@ namespace ngc
                 return makeToken(Token::Kind::IF);
             }
 
-            if(iequal(name, "then")) {
-                return makeToken(Token::Kind::THEN);
-            }
-
             if(iequal(name, "else")) {
                 return makeToken(Token::Kind::ELSE);
             }
 
             if(iequal(name, "endif")) {
                 return makeToken(Token::Kind::ENDIF);
-            }
-
-            if(iequal(name, "do")) {
-                return makeToken(Token::Kind::DO);
             }
 
             if(iequal(name, "while")) {
@@ -343,6 +331,10 @@ namespace ngc
 
             if(iequal(name, "break")) {
                 return makeToken(Token::Kind::BREAK);
+            }
+
+            if(iequal(name, "alias")) {
+                return makeToken(Token::Kind::ALIAS);
             }
 
             return makeToken(Token::Kind::IDENTIFIER);
