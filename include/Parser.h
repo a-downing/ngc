@@ -39,7 +39,7 @@ namespace ngc
 
         explicit Parser(Lexer &lexer): m_lexer(lexer) { }
 
-        std::vector<std::unique_ptr<Statement>> parse() {
+        std::optional<std::unique_ptr<CompoundStatement>> parse() {
             auto token = m_lexer.nextToken();
 
             if(!token) {
@@ -54,7 +54,7 @@ namespace ngc
         }
 
     private:
-        std::vector<std::unique_ptr<Statement>> parseCompoundStatement() {
+        std::optional<std::unique_ptr<CompoundStatement>> parseCompoundStatement() {
             std::vector<std::unique_ptr<Statement>> statements;
 
             while(auto statement = parseStatement()) {
@@ -62,7 +62,11 @@ namespace ngc
                 statements.emplace_back(std::move(statement));
             }
 
-            return statements;
+            if(statements.empty()) {
+                return std::nullopt;
+            }
+
+            return std::make_optional(std::make_unique<CompoundStatement>(std::move(statements)));
         }
 
         [[nodiscard]] std::unique_ptr<Statement> parseStatement() {
@@ -74,7 +78,7 @@ namespace ngc
                 return nullptr;
             }
 
-            if(check(Token::Kind::ENDSUB) || check(Token::Kind::ENDIF) || check(Token::Kind::ENDWHILE) || check(Token::Kind::ENDREPEAT) || check(Token::Kind::ELSE)) {
+            if(check(Token::Kind::ENDSUB) || check(Token::Kind::ENDIF) || check(Token::Kind::ENDWHILE) || check(Token::Kind::ELSE)) {
                 return nullptr;
             }
 
@@ -94,6 +98,14 @@ namespace ngc
 
             if(check(Token::Kind::IF)) {
                 return parseIfStatement();
+            }
+
+            if(check(Token::Kind::WHILE)) {
+                return parseWhileStatement();
+            }
+
+            if(check(Token::Kind::RETURN)) {
+                return parseReturnStatement();
             }
 
             std::optional<Token> blockDelete = std::nullopt;
@@ -142,9 +154,9 @@ namespace ngc
         [[nodiscard]] std::unique_ptr<IfStatement> parseIfStatement() {
             auto startToken = expect(Token::Kind::IF);
             auto condition = expect<RealExpression>(parseExpression());
-            std::ignore = expect(Token::Kind::THEN);
+            //std::ignore = expect(Token::Kind::THEN);
             auto statements = parseCompoundStatement();
-            std::optional<std::vector<std::unique_ptr<Statement>>> elseStatements = std::nullopt;
+            std::optional<std::unique_ptr<CompoundStatement>> elseStatements = std::nullopt;
 
             if(match(Token::Kind::ELSE)) {
                 elseStatements = parseCompoundStatement();
@@ -154,8 +166,23 @@ namespace ngc
             return std::make_unique<IfStatement>(startToken, endToken, std::move(condition), std::move(statements), std::move(elseStatements));
         }
 
+        [[nodiscard]] std::unique_ptr<WhileStatement> parseWhileStatement() {
+            auto startToken = expect(Token::Kind::WHILE);
+            auto condition = expect<RealExpression>(parseExpression());
+            auto statements = parseCompoundStatement();
+            auto endToken = expect(Token::Kind::ENDWHILE);
+            return std::make_unique<WhileStatement>(startToken, endToken, std::move(condition), std::move(statements));
+        }
+
+        [[nodiscard]] std::unique_ptr<ReturnStatement> parseReturnStatement() {
+            auto startToken = expect(Token::Kind::RETURN);
+            return std::make_unique<ReturnStatement>(startToken, expect<RealExpression>(parseExpression()));
+        }
+
         [[nodiscard]] std::unique_ptr<Expression> parseExpression() {
-            return parseAssignmentExpression();
+            auto expression = parseAssignmentExpression();
+            std::println("expression: {}: {}", expression->name(), expression->toString());
+            return expression;
         }
 
         [[nodiscard]] std::unique_ptr<Expression> parseAssignmentExpression() {
@@ -298,6 +325,10 @@ namespace ngc
                 auto expression = expect<RealExpression>(parseExpression());
                 auto endToken = expect(Token::Kind::RBRACKET);
                 return std::make_unique<GroupingExpression>(token, endToken, std::move(expression));
+            }
+
+            if(token.is(Token::Kind::AMPERSAND)) {
+                return std::make_unique<UnaryExpression>(token, expect<VariableExpression>(parseExpression()));
             }
 
             error("unexpected token", token);

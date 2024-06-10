@@ -40,6 +40,7 @@ namespace ngc {
             NAMED_VARIABLE,
             NUMBER,
             POUND,
+            AMPERSAND,
             PERCENT,
             COMMENT,
             NEWLINE,
@@ -73,9 +74,7 @@ namespace ngc {
             WHILE,
             CONTINUE,
             BREAK,
-            ENDWHILE,
-            REPEAT,
-            ENDREPEAT
+            ENDWHILE
         };
 
     private:
@@ -190,6 +189,7 @@ namespace ngc {
             case Kind::NAMED_VARIABLE: return "NAMED_VARIABLE";
             case Kind::NUMBER: return "NUMBER";
             case Kind::POUND: return "POUND";
+            case Kind::AMPERSAND: return "AMPERSAND";
             case Kind::PERCENT: return "PERCENT";
 
             case Kind::COMMENT: return "COMMENT";
@@ -233,9 +233,6 @@ namespace ngc {
             case Kind::CONTINUE: return "CONTINUE";
             case Kind::BREAK: return "BREAK";
             case Kind::ENDWHILE: return "ENDWHILE";
-
-            case Kind::REPEAT: return "REPEAT";
-            case Kind::ENDREPEAT: return "ENDREPEAT";
             }
 
             assert(!"unhandled token name");

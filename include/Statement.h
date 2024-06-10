@@ -18,6 +18,18 @@ namespace ngc
         [[nodiscard]] std::string_view text() const { return startToken().source()->text(startToken().start(), endToken().end()); };
     };
 
+    class CompoundStatement final : public Statement {
+        std::vector<std::unique_ptr<Statement>> m_statements;
+
+    public:
+        explicit CompoundStatement(std::vector<std::unique_ptr<Statement>> statements): m_statements(std::move(statements)) { assert(!m_statements.empty()); }
+        ~CompoundStatement() override = default;
+
+        [[nodiscard]] const Token &startToken() const override { return m_statements.front()->startToken(); }
+        [[nodiscard]] const Token &endToken() const override { return m_statements.back()->endToken(); }
+        [[nodiscard]] const std::vector<std::unique_ptr<Statement>> &statements() const { return m_statements; }
+    };
+
     class LineNumber final {
         const Token m_n;
         const Token m_number;
@@ -74,10 +86,10 @@ namespace ngc
         Token m_endToken;
         Token m_identifier;
         std::vector<std::unique_ptr<NamedVariableExpression>> m_params;
-        std::vector<std::unique_ptr<Statement>> m_statements;
+        std::optional<std::unique_ptr<CompoundStatement>> m_statements;
 
     public:
-        explicit SubStatement(const Token &startToken, const Token &endToken, const Token &identifier, std::vector<std::unique_ptr<NamedVariableExpression>> params, std::vector<std::unique_ptr<Statement>> statements): m_startToken(startToken), m_endToken(endToken), m_identifier(identifier), m_params(std::move(params)), m_statements(std::move(statements)) { }
+        explicit SubStatement(const Token &startToken, const Token &endToken, const Token &identifier, std::vector<std::unique_ptr<NamedVariableExpression>> params, std::optional<std::unique_ptr<CompoundStatement>> statements): m_startToken(startToken), m_endToken(endToken), m_identifier(identifier), m_params(std::move(params)), m_statements(std::move(statements)) { }
         ~SubStatement() override = default;
         [[nodiscard]] const Token &startToken() const override { return m_startToken; }
         [[nodiscard]] const Token &endToken() const override { return m_endToken; }
@@ -87,14 +99,38 @@ namespace ngc
         Token m_startToken;
         Token m_endToken;
         std::unique_ptr<RealExpression> m_condition;
-        std::vector<std::unique_ptr<Statement>> m_statements;
-        std::optional<std::vector<std::unique_ptr<Statement>>> m_elseStatements;
+        std::optional<std::unique_ptr<CompoundStatement>> m_statements;
+        std::optional<std::unique_ptr<CompoundStatement>> m_elseStatements;
 
     public:
-        explicit IfStatement(const Token &startToken, const Token &endToken, std::unique_ptr<RealExpression> condition, std::vector<std::unique_ptr<Statement>> statements, std::optional<std::vector<std::unique_ptr<Statement>>> elseStatements): m_startToken(startToken), m_endToken(endToken), m_condition(std::move(condition)), m_statements(std::move(statements)), m_elseStatements(std::move(elseStatements)) { }
+        explicit IfStatement(const Token &startToken, const Token &endToken, std::unique_ptr<RealExpression> condition, std::optional<std::unique_ptr<CompoundStatement>> statements, std::optional<std::unique_ptr<CompoundStatement>> elseStatements): m_startToken(startToken), m_endToken(endToken), m_condition(std::move(condition)), m_statements(std::move(statements)), m_elseStatements(std::move(elseStatements)) { }
         ~IfStatement() override = default;
         [[nodiscard]] const Token &startToken() const override { return m_startToken; }
         [[nodiscard]] const Token &endToken() const override { return m_endToken; }
+    };
+
+    class WhileStatement final : public Statement {
+        Token m_startToken;
+        Token m_endToken;
+        std::unique_ptr<RealExpression> m_condition;
+        std::optional<std::unique_ptr<CompoundStatement>> m_statements;
+
+    public:
+        explicit WhileStatement(const Token &startToken, const Token &endToken, std::unique_ptr<RealExpression> condition, std::optional<std::unique_ptr<CompoundStatement>> statements): m_startToken(startToken), m_endToken(endToken), m_condition(std::move(condition)), m_statements(std::move(statements)) { }
+        ~WhileStatement() override = default;
+        [[nodiscard]] const Token &startToken() const override { return m_startToken; }
+        [[nodiscard]] const Token &endToken() const override { return m_endToken; }
+    };
+
+    class ReturnStatement final : public Statement {
+        Token m_startToken;
+        std::unique_ptr<RealExpression> m_expression;
+
+    public:
+        explicit ReturnStatement(const Token &startToken, std::unique_ptr<RealExpression> expression): m_startToken(startToken), m_expression(std::move(expression)) { }
+        ~ReturnStatement() override = default;
+        [[nodiscard]] const Token &startToken() const override { return m_startToken; }
+        [[nodiscard]] const Token &endToken() const override { return m_expression->endToken(); }
     };
 }
 

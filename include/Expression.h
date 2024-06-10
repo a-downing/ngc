@@ -25,8 +25,8 @@ namespace ngc
         [[nodiscard]] std::string_view text() const { return m_token.source()->text(startToken().start(), endToken().end()); }
 
         virtual bool is(class CommentExpression *expression) const { return false; }
-        virtual bool is(class RealExpression *expression) const { return false; }
         virtual bool is(class WordExpression *expression) const { return false; }
+        virtual bool is(class RealExpression *expression) const { return false; }
         virtual bool is(class LiteralExpression *expression) const { return false; }
         virtual bool is(class VariableExpression *expression) const { return false; }
         virtual bool is(class NumericVariableExpression *expression) const { return false; }

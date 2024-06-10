@@ -30,14 +30,12 @@ int main(int argc, char **argv) {
     auto lexer = ngc::Lexer(source);
     auto parser = ngc::Parser(lexer);
 
-    // TODO: finish adding while and repeat loops
-    // TODO: maybe add address of operator to enable pointers to named variables
-    // TODO: add basic semantic analysis to parser like use before assignment of named variables
-    // TODO: make separate g-code semantic analyzer that operates on parser output
+    // TODO: make separate semantic analyzer that operates on parser output
 
+    std::optional<std::unique_ptr<ngc::CompoundStatement>> statements;
 
     try {
-        parser.parse();
+        statements = parser.parse();
     } catch (const ngc::Parser::Error &err) {
         if(err.lexerError()) {
             std::println(stderr, "{}: {}: {}", err.lexerError()->location(), err.what(), err.lexerError()->message());
@@ -50,5 +48,13 @@ int main(int argc, char **argv) {
         }
 
         std::println(stderr, "{}:{}:{}", err.sourceLocation().file_name(), err.sourceLocation().line(), err.sourceLocation().column());
+        throw;
     }
+
+    if(!statements) {
+        std::println("empty program");
+        return 0;
+    }
+
+    std::println("program has {} statements", (*statements)->statements().size());
 }

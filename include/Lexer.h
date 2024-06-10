@@ -112,6 +112,7 @@ namespace ngc
             case '-': return makeToken(Token::Kind::MINUS);
             case '/': return makeToken(Token::Kind::SLASH);
             case ',': return makeToken(Token::Kind::COMMA);
+            case '&': return makeToken(Token::Kind::AMPERSAND);
             case '=':
                 if(match('=')) {
                     return makeToken(Token::Kind::EQUAL_EQUAL);
@@ -332,20 +333,16 @@ namespace ngc
                 return makeToken(Token::Kind::WHILE);
             }
 
+            if(iequal(name, "endwhile")) {
+                return makeToken(Token::Kind::ENDWHILE);
+            }
+
             if(iequal(name, "continue")) {
                 return makeToken(Token::Kind::CONTINUE);
             }
 
             if(iequal(name, "break")) {
                 return makeToken(Token::Kind::BREAK);
-            }
-
-            if(iequal(name, "repeat")) {
-                return makeToken(Token::Kind::REPEAT);
-            }
-
-            if(iequal(name, "endrepeat")) {
-                return makeToken(Token::Kind::ENDREPEAT);
             }
 
             return makeToken(Token::Kind::IDENTIFIER);

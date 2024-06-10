@@ -705,28 +705,39 @@ N8220 Z0.6
 N8225 M5
 N8230 G53 G0 Z0.
 
-sub add[#a, #b]
-    #hmm = #a == #b != #c < #d <= #e > #f >= #g
-    #foo = func_foo[42, 69, #blah]
-    #bar = 1 and 1 or 2 and 2
-    #aaa = 1 or 2 xor 3 and 4
-    #bbb = 1 + 1 * 2 + 2 / 3 - 3 + 10
-    #ccc = [1 + 1] * [2 + 2] / [3 - 3] + 10
+#hmm = #a == #b != #c < #d <= #e > #f >= #g
+#foo = func_foo[42, 69, #blah]
+#bar = 1 and 1 or 2 and 2
+#aaa = 1 or 2 xor 3 and 4
+#bbb = 1 + 1 * 2 + 2 / 3 - 3 + 10
+#ccc = [1 + 1] * [2 + 2] / [3 - 3] + 10
+
+sub add[#a, #b, #ptr_c]
+    ##ptr_c = #a + #b (pointer dereference)
 
     sub test[#x]
         #something = #x
     endsub
+
+    return 37
 endsub
 
-if 1 > 0 then
+#c = 0
+add[3, 5, &#c] (store the result in c)
+
+if 1 > 0
     g01 x0 y0 z0
 else
     g01 x1 y1 z1
 endif
 
-if 1 > 0 then
+if 1 > 0
     g01 x2 y2 z2
 endif
+
+while #something < #another
+    #something = #x
+endwhile
 
 N8235 M30
 %
