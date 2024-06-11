@@ -36,7 +36,8 @@ namespace ngc {
             SUB, ENDSUB, RETURN,
             IF, ELSE, ENDIF,
             WHILE, CONTINUE, BREAK, ENDWHILE,
-            ALIAS
+            ALIAS,
+            LET
         };
 
     private:
@@ -205,6 +206,7 @@ namespace ngc {
             case Kind::BREAK: return "BREAK";
             case Kind::ENDWHILE: return "ENDWHILE";
             case Kind::ALIAS: return "ALIAS";
+            case Kind::LET: return "LET";
             default: throw LogicError(std::format("Token::name() missing case statement for {} '{}'", std::to_underlying(m_kind), text()));
             }
         }

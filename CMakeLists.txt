@@ -20,5 +20,10 @@ add_executable(ngc main.cpp
         include/VisitorContext.h
         include/Memory.h
         include/Vars.h
+        include/Preamble.h
+        include/MemoryCell.h
+        include/SemanticAnalyzer.h
+        include/Program.h
+        include/Evaluator.h
 )
 target_include_directories(ngc PUBLIC "${CMAKE_SOURCE_DIR}/include")

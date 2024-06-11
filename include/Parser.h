@@ -111,6 +111,10 @@ namespace ngc
                 return parseAliasStatement();
             }
 
+            if(check(Token::Kind::LET)) {
+                return parseLetStatement();
+            }
+
             std::optional<Token> blockDelete = std::nullopt;
             std::optional<LineNumber> lineNumber = std::nullopt;
 
@@ -183,9 +187,21 @@ namespace ngc
 
         [[nodiscard]] std::unique_ptr<AliasStatement> parseAliasStatement() {
             auto startToken = expect(Token::Kind::ALIAS);
-            auto namedVariable = std::make_unique<NamedVariableExpression>(expect(Token::Kind::NAMED_VARIABLE));
+            auto namedVariable = expect<NamedVariableExpression>(parsePrimaryExpression());
             std::ignore = expect(Token::Kind::ASSIGN);
             return std::make_unique<AliasStatement>(startToken, std::move(namedVariable), expect<RealExpression>(parseExpression()));
+        }
+
+        [[nodiscard]] std::unique_ptr<LetStatement> parseLetStatement() {
+            auto startToken = expect(Token::Kind::LET);
+            auto namedVariable = expect<NamedVariableExpression>(parsePrimaryExpression());
+            std::unique_ptr<RealExpression> realExpression;
+
+            if(match(Token::Kind::ASSIGN)) {
+                realExpression = expect<RealExpression>(parseExpression());
+            }
+
+            return std::make_unique<LetStatement>(startToken, std::move(namedVariable), std::move(realExpression));
         }
 
         [[nodiscard]] std::unique_ptr<Expression> parseExpression() {

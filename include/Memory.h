@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <vector>
 #include <expected>
+#include <unordered_map>
 
 #include <Vars.h>
 

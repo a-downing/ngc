@@ -16,6 +16,7 @@ namespace ngc {
         virtual void visit(const class WhileStatement *stmt, VisitorContext *ctx) = 0;
         virtual void visit(const class ReturnStatement *stmt, VisitorContext *ctx) = 0;
         virtual void visit(const class AliasStatement *stmt, VisitorContext *ctx) = 0;
+        virtual void visit(const class LetStatement *stmt, VisitorContext *ctx) = 0;
 
         // expressions
         virtual void visit(const class CommentExpression *expr, VisitorContext *ctx) = 0;

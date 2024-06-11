@@ -337,6 +337,10 @@ namespace ngc
                 return makeToken(Token::Kind::ALIAS);
             }
 
+            if(iequal(name, "let")) {
+                return makeToken(Token::Kind::LET);
+            }
+
             return makeToken(Token::Kind::IDENTIFIER);
         }
 

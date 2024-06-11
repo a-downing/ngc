@@ -82,6 +82,7 @@ namespace ngc
 
         [[nodiscard]] const Token &startToken() const override { return token(); }
         [[nodiscard]] const Token &endToken() const override { return m_realExpression->endToken(); }
+        [[nodiscard]] const RealExpression *real() const { return m_realExpression.get(); }
         bool is(const WordExpression *expression) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "WordExpression"; }
@@ -97,6 +98,8 @@ namespace ngc
 
         [[nodiscard]] const Token &startToken() const override { return token(); }
         [[nodiscard]] const Token &endToken() const override { return token(); }
+        [[nodiscard]] double value() const { return token().as_double(); }
+
         bool is(const RealExpression *expression) const override { return true; }
         bool is(const LiteralExpression *expression) const override { return true; }
 
@@ -121,6 +124,7 @@ namespace ngc
 
         [[nodiscard]] const Token &startToken() const override { return token(); }
         [[nodiscard]] const Token &endToken() const override { return m_realExpression->endToken(); }
+        [[nodiscard]] const RealExpression *real() const { return m_realExpression.get(); }
         bool is(const RealExpression *expression) const override { return true; }
         bool is(const VariableExpression *expression) const override { return true; }
         bool is(const NumericVariableExpression *expression) const override { return true; }
@@ -154,11 +158,18 @@ namespace ngc
         std::unique_ptr<RealExpression> m_realExpression;
 
     public:
+        enum class Op {
+            ADDRESS_OF,
+            NEGATIVE,
+            POSITIVE
+        };
+
         explicit UnaryExpression(const Token &token, std::unique_ptr<RealExpression> realExpression) : RealExpression(token), m_realExpression(std::move(realExpression)) { }
         ~UnaryExpression() override = default;
 
         [[nodiscard]] const Token &startToken() const override { return token(); }
         [[nodiscard]] const Token &endToken() const override { return m_realExpression->endToken(); }
+        [[nodiscard]] const RealExpression *real() const { return m_realExpression.get(); }
         bool is(const RealExpression *expression) const override { return true; }
         bool is(const UnaryExpression *expression) const override { return true; }
 
@@ -166,6 +177,15 @@ namespace ngc
         [[nodiscard]] constexpr const char *className() const override { return staticClassName(); }
         [[nodiscard]] std::string toString() const override { return std::format("{}{}", token().text(), m_realExpression->text()); }
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
+
+        [[nodiscard]] Op op() const {
+            switch (token().kind()) {
+            case Token::Kind::AMPERSAND: return Op::ADDRESS_OF;
+            case Token::Kind::MINUS: return Op::NEGATIVE;
+            case Token::Kind::PLUS: return Op::POSITIVE;
+            default: throw LogicError(std::format("invalid token {} '{}' for UnaryExpression", token().name(), token().text()));
+            }
+        }
     };
 
     class BinaryExpression final : public RealExpression {
@@ -274,21 +294,22 @@ namespace ngc
 
     class GroupingExpression final : public RealExpression {
         Token m_endToken;
-        std::unique_ptr<RealExpression> m_expression;
+        std::unique_ptr<RealExpression> m_realExpression;
 
     public:
-        explicit GroupingExpression(const Token &token, const Token &endToken, std::unique_ptr<RealExpression> expression) : RealExpression(token), m_endToken(endToken), m_expression(std::move(expression)) { }
+        explicit GroupingExpression(const Token &token, const Token &endToken, std::unique_ptr<RealExpression> expression) : RealExpression(token), m_endToken(endToken), m_realExpression(std::move(expression)) { }
         ~GroupingExpression() override = default;
 
         [[nodiscard]] const Token &startToken() const override { return token(); }
         [[nodiscard]] const Token &endToken() const override { return m_endToken; }
+        [[nodiscard]] const RealExpression *real() const { return m_realExpression.get(); }
         bool is(const RealExpression *expression) const override { return true; }
         bool is(const GroupingExpression *expression) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "GroupingExpression"; }
 
         [[nodiscard]] constexpr const char *className() const override { return staticClassName(); }
-        [[nodiscard]] std::string toString() const override { return std::string(m_expression->text()); }
+        [[nodiscard]] std::string toString() const override { return std::string(m_realExpression->text()); }
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
     };
 }

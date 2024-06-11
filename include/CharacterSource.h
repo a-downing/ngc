@@ -3,18 +3,24 @@
 
 #include <string>
 #include <string_view>
+#include <utility>
 
 namespace ngc
 {
     class CharacterSource {
-        const std::string_view m_text;
-        const std::string m_name;
+        std::string m_text;
+        std::string m_name;
         size_t m_index = 0;
         int m_line = 1;
         int m_col = 1;
 
     public:
-        CharacterSource(const std::string_view text, std::string name) : m_text(text), m_name(std::move(name)) { }
+        CharacterSource(const CharacterSource &) = delete;
+        CharacterSource(CharacterSource &&) = default;
+        CharacterSource &operator=(const CharacterSource &) = delete;
+        CharacterSource &operator=(CharacterSource &&) = default;
+
+        CharacterSource(std::string text, std::string name) : m_text(std::move(text)), m_name(std::move(name)) { }
 
         void visit(const char c) {
             if(c == '\n') {
@@ -74,7 +80,7 @@ namespace ngc
         }
 
         [[nodiscard]] std::string_view text(const size_t start, const size_t end) const {
-            return m_text.substr(start, end - start);
+            return std::string_view(m_text).substr(start, end - start);
         }
     };
 }

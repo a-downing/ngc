@@ -160,6 +160,21 @@ namespace ngc
         [[nodiscard]] const RealExpression *address() const { return m_expression.get(); }
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
     };
+
+    class LetStatement final : public Statement {
+        Token m_startToken;
+        std::unique_ptr<NamedVariableExpression> m_namedVariable;
+        std::unique_ptr<RealExpression> m_expression;
+
+    public:
+        explicit LetStatement(const Token &startToken, std::unique_ptr<NamedVariableExpression> namedVariable, std::unique_ptr<RealExpression> expression): m_startToken(startToken), m_namedVariable(std::move(namedVariable)), m_expression(std::move(expression)) { }
+        ~LetStatement() override = default;
+        [[nodiscard]] const Token &startToken() const override { return m_startToken; }
+        [[nodiscard]] const Token &endToken() const override { return m_expression->endToken(); }
+        [[nodiscard]] const NamedVariableExpression *variable() const { return m_namedVariable.get(); }
+        [[nodiscard]] const RealExpression *value() const { return m_expression.get(); }
+        void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
+    };
 }
 
 #endif //BLOCK_H
