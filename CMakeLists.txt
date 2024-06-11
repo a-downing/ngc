@@ -5,7 +5,6 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_STANDARD_REQUIRED True)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-set(CMAKE_CXX_FLAGS "-g")
 
 message(STATUS "${CMAKE_CXX_COMPILER}")
 
@@ -19,5 +18,7 @@ add_executable(ngc main.cpp
         include/Utils.h
         include/Visitor.h
         include/VisitorContext.h
+        include/Memory.h
+        include/Vars.h
 )
 target_include_directories(ngc PUBLIC "${CMAKE_SOURCE_DIR}/include")

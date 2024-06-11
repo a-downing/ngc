@@ -20,18 +20,26 @@ endsub
 
 #bar = foo[#a, 37]
 
-alias #_current_tool 5400 (this essentially makes #_current_tool the same as #5400, these can be put in a g-code preamble or something to simplify the C++ side)
-alias #_current_tool 5401 (change it)
+alias #_current_tool = 5400 (this essentially makes #_current_tool the same as #5400, these can be put in a g-code preamble or something to simplify the c++ side)
+alias #_current_tool = 5401 (change it)
 #tool = #_current_tool
 
 sub twice[]
 endsub
 
-sub twice[]
+sub twice[] (error, redefined)
 endsub
 
-twice_typo[0]
-twice[0]
+sub twice[#x] (ok, overload)
+endsub
+
+twice[] (ok)
+twice[0] (ok, overload with 1 param defined)
+twice[0, 0] (error, overload with 2 params not defined)
+
+sin[360] (ok, added from c++)
+
+#test = #_g54_x (ok, defined in preamble)
 
 M30
 %

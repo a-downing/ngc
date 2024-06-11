@@ -7,32 +7,52 @@
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
+#include <algorithm>
 
+#include <Token.h>
 #include <Lexer.h>
 #include <Parser.h>
 #include <Visitor.h>
 #include <VisitorContext.h>
-#include <bits/ranges_algo.h>
+
+#include <Memory.h>
+
+class SubSignature {
+    std::string_view m_name;
+    size_t m_numParams;
+
+public:
+    SubSignature(const std::string_view name, const size_t numParams) : m_name(name), m_numParams(numParams) { }
+    explicit SubSignature(const ngc::SubStatement *stmt) : m_name(stmt->name()), m_numParams(stmt->params().size()) { }
+    explicit SubSignature(const ngc::CallExpression *expr) : m_name(expr->name()), m_numParams(expr->args().size()) { }
+    bool operator==(const SubSignature& s) const { return s.m_name == m_name && s.m_numParams == m_numParams; }
+    [[nodiscard]] std::string_view name() const { return m_name; }
+    [[nodiscard]] size_t numParams() const { return m_numParams; }
+};
+
+template<>
+struct std::hash<SubSignature> {
+    size_t operator()(const SubSignature &s) const noexcept {
+        const auto h1 = std::hash<std::string_view>{}(s.name());
+        const auto h2 = std::hash<size_t>{}(s.numParams());
+        return h1 ^ (h2 << 1);
+    }
+};
 
 class TestVisitor final : public ngc::Visitor {
     std::vector<std::unordered_map<std::string_view, const ngc::NamedVariableExpression *>> m_scope;
-    std::vector<std::unordered_set<std::string_view>> m_subScope;
+    std::vector<std::unordered_set<SubSignature>> m_subScope;
 
 public:
     ~TestVisitor() override = default;
 
     TestVisitor() {
-        // global scope
-        pushScope();
+        m_scope.emplace_back();
         m_subScope.emplace_back();
     }
 
-    void pushScope() {
-        m_scope.emplace_back();
-    }
-
-    void popScope() {
-        m_scope.pop_back();
+    void addGlobalSub(const SubSignature &s) {
+        m_subScope.front().emplace(s);
     }
 
     bool isDeclared(const ngc::NamedVariableExpression *expr) const {
@@ -43,7 +63,7 @@ public:
 
     bool isDeclared(const ngc::CallExpression *expr) const {
         return std::ranges::any_of(std::views::reverse(m_subScope), [&expr](const auto &scope) {
-            return scope.contains(expr->name());
+            return scope.contains(SubSignature(expr));
         });
     }
 
@@ -72,14 +92,14 @@ public:
     void visit(const ngc::SubStatement *stmt, ngc::VisitorContext *ctx) override {
         std::println("visitor: SubStatement '{}'", stmt->name());
 
-        if(m_subScope.back().contains(stmt->name())) {
+        if(m_subScope.back().contains(SubSignature(stmt))) {
             std::println("{}: ERROR: redefinition of sub '{}'", stmt->startToken().location(), stmt->name());
         } else {
-            m_subScope.back().insert(stmt->name());
+            m_subScope.back().insert(SubSignature(stmt));
         }
 
         std::unordered_map<std::string_view, const ngc::NamedVariableExpression *> paramNames;
-        pushScope();
+        m_scope.emplace_back();
 
         for(const auto &param : stmt->params()) {
             if(paramNames.contains(param->name())) {
@@ -99,7 +119,7 @@ public:
             }
         }
 
-        popScope();
+        m_scope.pop_back();
     }
 
     void visit(const ngc::AliasStatement *stmt, ngc::VisitorContext *ctx) override {
@@ -136,7 +156,7 @@ public:
 
     void visit(const ngc::CallExpression *expr, ngc::VisitorContext *ctx) override {
         if(!isDeclared(expr)) {
-            std::println("{}: ERROR: call to '{}' before definition", expr->token().location(), expr->name());
+            std::println("{}: ERROR: call to '{}' before definition", expr->token().location(), expr->toString());
         }
     }
 
@@ -177,8 +197,6 @@ int main(const int argc, const char **argv) {
     auto lexer = ngc::Lexer(source);
     auto parser = ngc::Parser(lexer);
 
-    // TODO: make separate semantic analyzer that operates on parser output
-
     std::unique_ptr<ngc::CompoundStatement> statements;
 
     try {
@@ -205,6 +223,28 @@ int main(const int argc, const char **argv) {
 
     std::println("program has {} statements", statements->statements().size());
 
+    // testing out how all this will work
+    // TODO: will global variables declared in ngc files be in data or stack
+    ngc::Memory mem;
+    auto addrs = mem.init(ngc::GLOBALS);
+    std::string preambleText = "%\n";
+
+    for(auto i = 0; auto &[var, name, flags] : ngc::GLOBALS) {
+        auto alias = std::format("alias #{} = {}", name, addrs[i]);
+        std::println("alias: {}", alias);
+        preambleText += alias + '\n';
+        i++;
+    }
+
+    preambleText += "%";
+
+    auto preambleSource = ngc::CharacterSource(preambleText, "preamble");
+    auto preambleLexer = ngc::Lexer(preambleSource);
+    auto preambleParser = ngc::Parser(preambleLexer);
+    auto preamble = preambleParser.parse();
+
     TestVisitor visitor;
+    visitor.addGlobalSub(SubSignature("sin", 1));
+    preamble->accept(visitor, nullptr);
     statements->accept(visitor, nullptr);
 }

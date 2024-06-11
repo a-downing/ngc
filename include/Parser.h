@@ -183,7 +183,8 @@ namespace ngc
 
         [[nodiscard]] std::unique_ptr<AliasStatement> parseAliasStatement() {
             auto startToken = expect(Token::Kind::ALIAS);
-            auto namedVariable = expect<NamedVariableExpression>(parseExpression());
+            auto namedVariable = std::make_unique<NamedVariableExpression>(expect(Token::Kind::NAMED_VARIABLE));
+            std::ignore = expect(Token::Kind::ASSIGN);
             return std::make_unique<AliasStatement>(startToken, std::move(namedVariable), expect<RealExpression>(parseExpression()));
         }
 

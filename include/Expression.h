@@ -257,6 +257,7 @@ namespace ngc
         [[nodiscard]] constexpr const char *className() const override { return staticClassName(); }
 
         [[nodiscard]] std::string_view name() const { return token().value(); }
+        [[nodiscard]] const std::vector<std::unique_ptr<RealExpression>> &args() const { return m_args; }
 
         [[nodiscard]] std::string toString() const override {
             std::vector<std::string> args;
