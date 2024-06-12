@@ -130,7 +130,7 @@ namespace ngc
 
             for(;;) {
                 if(match({ Token::Kind::NEWLINE, Token::Kind::NONE })) {
-                    auto block = std::make_unique<BlockStatement>(blockDelete, lineNumber, std::move(expressions));
+                    auto block = std::make_unique<BlockStatement>(std::move(blockDelete), std::move(lineNumber), std::move(expressions));
                     return block;
                 }
 

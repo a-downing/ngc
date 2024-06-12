@@ -4,6 +4,7 @@
 
 #include <print>
 #include <ranges>
+#include <stdexcept>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -12,33 +13,7 @@
 #include <Statement.h>
 #include <Expression.h>
 #include <VisitorContext.h>
-
-#include "Evaluator.h"
-
-namespace ngc
-{
-    class SubSignature {
-        std::string_view m_name;
-        size_t m_numParams;
-
-    public:
-        SubSignature(const std::string_view name, const size_t numParams) : m_name(name), m_numParams(numParams) { }
-        explicit SubSignature(const SubStatement *stmt) : m_name(stmt->name()), m_numParams(stmt->params().size()) { }
-        explicit SubSignature(const CallExpression *expr) : m_name(expr->name()), m_numParams(expr->args().size()) { }
-        bool operator==(const SubSignature& s) const { return s.m_name == m_name && s.m_numParams == m_numParams; }
-        [[nodiscard]] std::string_view name() const { return m_name; }
-        [[nodiscard]] size_t numParams() const { return m_numParams; }
-    };
-}
-
-template<>
-    struct std::hash<ngc::SubSignature> {
-    size_t operator()(const ngc::SubSignature &s) const noexcept {
-        const auto h1 = std::hash<std::string_view>{}(s.name());
-        const auto h2 = std::hash<size_t>{}(s.numParams());
-        return h1 ^ (h2 << 1);
-    }
-};
+#include <SubSignature.h>
 
 namespace ngc
 {
@@ -59,7 +34,6 @@ namespace ngc
         std::vector<std::unordered_map<std::string_view, const NamedVariableExpression *>> m_scope;
         std::vector<std::unordered_set<SubSignature>> m_subScope;
         std::vector<Error> m_errors;
-        bool m_declareVariables = false;
 
         class SemanticAnalyzerContext final : public VisitorContext {
             bool m_globalScope;
@@ -87,16 +61,14 @@ namespace ngc
         [[nodiscard]] const std::vector<Error> &errors() const { return m_errors; }
         void clearErrors() { m_errors.clear(); }
 
-        void processPreamble(const Preamble &preamble) {
-            if(preamble.statements()) {
+        void processPreamble(const CompoundStatement *stmt) {
+            if(stmt) {
                 auto ctx = SemanticAnalyzerContext(true);
-                preamble.statements()->accept(*this, &ctx);
+                stmt->accept(*this, &ctx);
             }
         }
 
-        void processProgram(const CompoundStatement *program, const bool declareVariables) {
-            m_declareVariables = declareVariables;
-
+        void processProgram(const CompoundStatement *program) {
             if(program) {
                 auto ctx = SemanticAnalyzerContext(true);
                 program->accept(*this, &ctx);
@@ -104,6 +76,7 @@ namespace ngc
         }
 
         void addGlobalSub(const SubSignature &s) {
+            std::println("INFO: added global sub: {}", s.toString());
             m_subScope.front().emplace(s);
         }
 
@@ -120,10 +93,6 @@ namespace ngc
         }
 
         void declareLocal(const NamedVariableExpression *expr) {
-            if(!m_declareVariables) {
-                return;
-            }
-
             if(!m_scope.back().contains(expr->name())) {
                 m_scope.back().emplace(expr->name(), expr);
                 std::println("{}: INFO: declared local variable '{}'", expr->startToken().location(), expr->name());
@@ -134,10 +103,6 @@ namespace ngc
         }
 
         void declareGlobal(const NamedVariableExpression *expr, const SemanticAnalyzerContext &ctx) {
-            if(!m_declareVariables) {
-                return;
-            }
-
             if(!m_scope.front().contains(expr->name())) {
                 m_scope.front().emplace(expr->name(), expr);
                 std::println("{}: INFO: declared global variable '{}'", expr->startToken().location(), expr->name());
@@ -148,17 +113,15 @@ namespace ngc
         }
 
         void declareSub(const SubStatement *stmt) {
-            if(!m_declareVariables) {
-                return;
-            }
+            auto sig = SubSignature(stmt);
 
-            if(m_subScope.back().contains(SubSignature(stmt))) {
+            std::println("INFO: added local sub: {}", sig.toString());
+
+            if(m_subScope.back().contains(sig)) {
                 m_errors.emplace_back(std::format("{}: ERROR: redefinition of sub '{}'", stmt->startToken().location(), stmt->name()), stmt);
             } else {
                 m_subScope.back().emplace(stmt);
             }
-
-            m_scope.emplace_back();
         }
 
         // statements
@@ -177,6 +140,7 @@ namespace ngc
         void visit(const SubStatement *stmt, VisitorContext *ctx) override {
             declareSub(stmt);
 
+            m_subScope.emplace_back();
             m_scope.emplace_back();
 
             for(const auto &param : stmt->params()) {
@@ -192,6 +156,7 @@ namespace ngc
             }
 
             m_scope.pop_back();
+            m_subScope.pop_back();
         }
 
         void visit(const AliasStatement *stmt, VisitorContext *ctx) override {
@@ -254,7 +219,7 @@ namespace ngc
 
         void visit(const CallExpression *expr, VisitorContext *ctx) override {
             if(!isDeclared(expr)) {
-                m_errors.emplace_back(std::format("{}: ERROR: call to '{}' before definition", expr->token().location(), expr->toString()), expr);
+                m_errors.emplace_back(std::format("{}: ERROR: call to '{}' before definition", expr->token().location(), expr->text()), expr);
             }
         }
 

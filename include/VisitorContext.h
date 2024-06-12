@@ -3,8 +3,7 @@
 
 namespace ngc {
     class VisitorContext {
-    public:
-        virtual ~VisitorContext() = default;
+    
     };
 }
 

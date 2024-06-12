@@ -1,16 +1,17 @@
 #include <print>
-#include <fstream>
 #include <filesystem>
+#include <memory>
 
 #include <Utils.h>
 #include <Token.h>
 #include <Lexer.h>
 #include <Parser.h>
 #include <Memory.h>
-#include <Preamble.h>
 #include <SemanticAnalyzer.h>
+#include <Program.h>
 
-#include "Program.h"
+#include "Evaluator.h"
+#include "Preamble.h"
 
 int main(const int argc, const char **argv) {
     if(argc < 2) {
@@ -23,11 +24,11 @@ int main(const int argc, const char **argv) {
     for(const auto &entry  : std::filesystem::directory_iterator("autoload")) {
         auto filename = entry.path().string();
         auto text = ngc::readFile(filename);
-        programs.emplace_back(ngc::CharacterSource(std::move(text), std::move(filename)));
+        programs.emplace_back(ngc::LexerSource(std::move(text), std::move(filename)));
     }
 
     const std::string filename = argv[1];
-    programs.emplace_back(ngc::CharacterSource(ngc::readFile(filename), filename));
+    programs.emplace_back(ngc::LexerSource(ngc::readFile(filename), filename));
 
     for(auto &program : programs) {
         try {
@@ -50,22 +51,15 @@ int main(const int argc, const char **argv) {
 
     ngc::Memory mem;
     const auto addrs = mem.init(ngc::VARS);
-    const auto preamble = ngc::Preamble::make(ngc::VARS, addrs);
+    const auto preamble = ngc::buildPreamble(addrs);
 
     ngc::SemanticAnalyzer sa;
     sa.addGlobalSub(ngc::SubSignature("sin", 1));
-    sa.processPreamble(preamble);
-
-    // kind of a hack, but good enough for now
-    for(auto &program : programs) {
-        sa.processProgram(program.statements(), true);
-    }
-
-    sa.clearErrors();
+    sa.processPreamble(preamble.get());
 
     for(auto &program : programs) {
         std::println("analyzing: {}", program.source().name());
-        sa.processProgram(program.statements(), false);
+        sa.processProgram(program.statements());
 
         if(!sa.errors().empty()) {
             for(const auto &error : sa.errors()) {
@@ -74,5 +68,13 @@ int main(const int argc, const char **argv) {
 
             return 1;
         }
+    }
+
+    auto eval = ngc::Evaluator(mem);
+    eval.executeProgram(preamble.get());
+
+    for(auto &program : programs) {
+        std::println("executing: {}", program.source().name());
+        eval.executeProgram(program.statements());
     }
 }

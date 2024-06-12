@@ -1,15 +1,15 @@
 #ifndef TOKEN_H
 #define TOKEN_H
 
-
-#include <cstddef>
+#include <memory>
 #include <cmath>
 #include <cassert>
 #include <charconv>
 #include <utility>
+#include <stdexcept>
 
-#include <Utils.h>
-#include <CharacterSource.h>
+#include <TokenSource.h>
+#include <StringTokenSource.h>
 
 namespace ngc {
     class Token {
@@ -26,8 +26,7 @@ namespace ngc {
             PERCENT,
             COMMENT,
             NEWLINE,
-            LBRACKET,
-            RBRACKET,
+            LBRACKET, RBRACKET,
             ASSIGN,
             EQ, NE, LT, LE, GT, GE,
             PLUS, MINUS,
@@ -36,79 +35,42 @@ namespace ngc {
             SUB, ENDSUB, RETURN,
             IF, ELSE, ENDIF,
             WHILE, CONTINUE, BREAK, ENDWHILE,
-            ALIAS,
-            LET
+            ALIAS, LET
         };
 
     private:
         Kind m_kind;
-        const CharacterSource *m_source;
-        size_t m_start;
-        size_t m_end;
-        int m_line;
-        int m_col;
+        std::unique_ptr<TokenSource> m_source;
 
     public:
-        Token(): m_kind(Kind::NONE), m_source(nullptr), m_start(0), m_end(0), m_line(0), m_col(0) { }
-        Token(const Kind kind, const CharacterSource &source, const size_t start, const size_t end, const int line, const int col): m_kind(kind), m_source(&source), m_start(start), m_end(end), m_line(line), m_col(col) { }
-        Token &operator=(const Token &token) = default;
+        Token(): m_kind(Kind::NONE), m_source(std::make_unique<StringTokenSource>("none", "none")) { }
+        Token(const Kind kind, std::unique_ptr<TokenSource> source): m_kind(kind), m_source(std::move(source)) { }
+        Token(const Token &t) : m_kind(t.m_kind), m_source(t.m_source->clone()) { }
 
-        [[nodiscard]] Kind kind() const {
-            return m_kind;
+        Token &operator=(const Token &t) {
+            m_kind = t.m_kind;
+            m_source = t.m_source->clone();
+            return *this;
         }
 
-        [[nodiscard]] const CharacterSource *source() const {
-            return m_source;
-        }
-
-        [[nodiscard]] bool is(const Kind kind) const {
-            return m_kind == kind;
-        }
-
-        [[nodiscard]] size_t start() const {
-            return m_start;
-        }
-
-        [[nodiscard]] size_t end() const {
-            return m_end;
-        }
-
-        [[nodiscard]] std::string sourceName() const {
-            if(!m_source) {
-                throw LogicError("Token::sourceName() called on default constructed Token");
-            }
-
-            return m_source->name();
-        }
-
-        [[nodiscard]] int line() const {
-            return m_line;
-        }
-
-        [[nodiscard]] int col() const {
-            return m_col;
-        }
+        [[nodiscard]] Kind kind() const { return m_kind; }
+        [[nodiscard]] const TokenSource *source() const { return m_source.get(); }
+        [[nodiscard]] std::string_view text() const { return m_source->text(); }
+        [[nodiscard]] bool number() const { return m_kind == Kind::NUMBER; }
+        [[nodiscard]] bool is(const Kind kind) const { return m_kind == kind; }
 
         [[nodiscard]] std::string location() const {
-            return std::format("{}:{}:{}", sourceName(), line(), col());
-        }
-
-        [[nodiscard]] std::string_view text() const {
-            return m_start == m_end ? "" : m_source->text(m_start, m_end);
+            return std::format("{}:{}:{}", m_source->name(), m_source->line(), m_source->col());
         }
 
         [[nodiscard]] std::string_view value() const {
             switch (m_kind) {
                 case Kind::NUMBER:
                 case Kind::IDENTIFIER: return text();
-                case Kind::NAMED_VARIABLE: return m_source->text(start() + 1, end());
-                case Kind::COMMENT: return m_source->text(start() + 1, end() - 1);
-                default: throw LogicError(std::format("Token::value() called on non-value type Token {} '{}'", name(), text()));
+                case Kind::NAMED_VARIABLE: return text().substr(1, text().size() - 1);
+                case Kind::COMMENT: return text().substr(1, text().size() - 2);
+                default: throw std::logic_error(std::format("Token::value() called on non-value type Token {} '{}'", name(), text()));
             }
-        }
-
-        [[nodiscard]] bool number() const {
-            return m_kind == Kind::NUMBER;
         }
 
         [[nodiscard]] bool integer() const {
@@ -122,14 +84,14 @@ namespace ngc {
 
         [[nodiscard]] double as_double() const {
             if(m_kind != Kind::NUMBER) {
-                throw LogicError(std::format("Token::as_double() called on Token {} '{}'", name(), text()));
+                throw std::logic_error(std::format("Token::as_double() called on Token {} '{}'", name(), text()));
             }
 
             double d;
             auto [ptr, ec] = std::from_chars(text().begin(), text().end(), d);
 
             if(ec != std::errc()) {
-                throw LogicError(std::format("Token::as_double(): std::from_chars() failed on '{}'", text()));
+                throw std::logic_error(std::format("Token::as_double(): std::from_chars() failed on '{}'", text()));
             }
 
             return d;
@@ -137,7 +99,7 @@ namespace ngc {
 
         [[nodiscard]] int as_integer() const {
             if(!integer()) {
-                throw LogicError(std::format("Token::as_integer() called on Token {} '{}'", name(), text()));
+                throw std::logic_error(std::format("Token::as_integer() called on Token {} '{}'", name(), text()));
             }
 
             return static_cast<int>(as_double());
@@ -207,12 +169,8 @@ namespace ngc {
             case Kind::ENDWHILE: return "ENDWHILE";
             case Kind::ALIAS: return "ALIAS";
             case Kind::LET: return "LET";
-            default: throw LogicError(std::format("Token::name() missing case statement for {} '{}'", std::to_underlying(m_kind), text()));
+            default: throw std::logic_error(std::format("Token::name() missing case statement for {} '{}'", std::to_underlying(m_kind), text()));
             }
-        }
-
-        [[nodiscard]] std::string toString() const {
-            return std::format("{}({})", name(), text());
         }
     };
 }

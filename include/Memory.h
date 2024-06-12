@@ -1,10 +1,21 @@
 #ifndef MEMORY_H
 #define MEMORY_H
 
+#ifdef __clang__
+    #pragma push_macro("__cpp_concepts")
+    #define __cpp_concepts 202002L
+    #include <expected>
+    #pragma pop_macro("__cpp_concepts")
+#else
+    #include <expected>
+#endif
+
 #include <cstdint>
 #include <vector>
-#include <expected>
 #include <unordered_map>
+#include <format>
+#include <utility>
+#include <stdexcept>
 
 #include <Vars.h>
 
@@ -43,13 +54,13 @@ namespace ngc
 
         double read(const Var var) const {
             if(!m_globals.contains(var)) {
-                throw LogicError(std::format("Memory::read() unknown Var::{}", std::to_underlying(var)));
+                throw std::logic_error(std::format("Memory::read() unknown Var::{}", std::to_underlying(var)));
             }
 
             const auto result = readData(m_globals.at(var), true);
 
             if(!result) {
-                throw LogicError(std::format("Memory::readData failed for Var::{}", std::to_underlying(var)));
+                throw std::logic_error(std::format("Memory::readData failed for Var::{}", std::to_underlying(var)));
             }
 
             return *result;
@@ -57,11 +68,11 @@ namespace ngc
 
         void write(const Var var, const double value) {
             if(!m_globals.contains(var)) {
-                throw LogicError(std::format("Memory::write() unknown Var::{}", std::to_underlying(var)));
+                throw std::logic_error(std::format("Memory::write() unknown Var::{}", std::to_underlying(var)));
             }
 
             if(!writeData(m_globals.at(var), value, true)) {
-                throw LogicError(std::format("Memory::writeData failed for Var::{}", std::to_underlying(var)));
+                throw std::logic_error(std::format("Memory::writeData failed for Var::{}", std::to_underlying(var)));
             }
         }
 
@@ -75,8 +86,10 @@ namespace ngc
             return m_data.size() & ADDR_STACK;
         }
 
-        void pop() {
+        double pop() {
+            double value = m_stack.back();
             m_stack.pop_back();
+            return value;
         }
 
         std::expected<double, Error> read(const uint32_t addr) const {

@@ -1,7 +1,7 @@
 #ifndef PROGRAM_H
 #define PROGRAM_H
 
-#include <CharacterSource.h>
+#include <LexerSource.h>
 #include <Lexer.h>
 #include <Parser.h>
 
@@ -10,7 +10,7 @@
 namespace ngc
 {
     class Program {
-        CharacterSource m_source;
+        LexerSource m_source;
         std::unique_ptr<CompoundStatement> m_statements;
 
     public:
@@ -19,7 +19,7 @@ namespace ngc
         Program &operator=(const Program &) = delete;
         Program &operator=(Program &&) = default;
 
-        explicit Program(CharacterSource source) : m_source(std::move(source)) { }
+        explicit Program(LexerSource source) : m_source(std::move(source)) { }
 
         void compile() {
             auto lexer = Lexer(m_source);
@@ -28,7 +28,7 @@ namespace ngc
         }
 
         [[nodiscard]] const CompoundStatement *statements() const { return m_statements.get(); }
-        [[nodiscard]] const CharacterSource &source() const { return m_source; }
+        [[nodiscard]] const LexerSource &source() const { return m_source; }
     };
 }
 

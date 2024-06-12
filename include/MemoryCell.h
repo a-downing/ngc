@@ -1,6 +1,8 @@
 #ifndef MEMORYCELL_H
 #define MEMORYCELL_H
 
+#include <utility>
+
 namespace ngc
 {
     class MemoryCell {

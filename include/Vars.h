@@ -1,6 +1,9 @@
 #ifndef VARS_H
 #define VARS_H
 
+#include <tuple>
+#include <string_view>
+
 #include <MemoryCell.h>
 
 namespace ngc {

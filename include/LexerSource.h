@@ -1,5 +1,5 @@
-#ifndef CHARACTERSOURCE_H
-#define CHARACTERSOURCE_H
+#ifndef LEXERSOURCE_H
+#define LEXERSOURCE_H
 
 #include <string>
 #include <string_view>
@@ -7,7 +7,7 @@
 
 namespace ngc
 {
-    class CharacterSource {
+    class LexerSource {
         std::string m_text;
         std::string m_name;
         size_t m_index = 0;
@@ -15,12 +15,12 @@ namespace ngc
         int m_col = 1;
 
     public:
-        CharacterSource(const CharacterSource &) = delete;
-        CharacterSource(CharacterSource &&) = default;
-        CharacterSource &operator=(const CharacterSource &) = delete;
-        CharacterSource &operator=(CharacterSource &&) = default;
+        LexerSource(const LexerSource &) = delete;
+        LexerSource(LexerSource &&) = default;
+        LexerSource &operator=(const LexerSource &) = delete;
+        LexerSource &operator=(LexerSource &&) = default;
 
-        CharacterSource(std::string text, std::string name) : m_text(std::move(text)), m_name(std::move(name)) { }
+        LexerSource(std::string text, std::string name) : m_text(std::move(text)), m_name(std::move(name)) { }
 
         void visit(const char c) {
             if(c == '\n') {
@@ -85,4 +85,4 @@ namespace ngc
     };
 }
 
-#endif //CHARACTERSOURCE_H
+#endif //LEXERSOURCE_H

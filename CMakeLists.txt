@@ -11,7 +11,7 @@ message(STATUS "${CMAKE_CXX_COMPILER}")
 add_executable(ngc main.cpp
         include/Lexer.h
         include/Token.h
-        include/CharacterSource.h
+        include/LexerSource.h
         include/Parser.h
         include/Statement.h
         include/Expression.h
@@ -20,10 +20,14 @@ add_executable(ngc main.cpp
         include/VisitorContext.h
         include/Memory.h
         include/Vars.h
-        include/Preamble.h
         include/MemoryCell.h
         include/SemanticAnalyzer.h
         include/Program.h
         include/Evaluator.h
+        include/TokenSource.h
+        include/StringViewTokenSource.h
+        include/StringTokenSource.h
+        include/Preamble.h
+        include/SubSignature.h
 )
 target_include_directories(ngc PUBLIC "${CMAKE_SOURCE_DIR}/include")

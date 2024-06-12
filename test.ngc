@@ -1,68 +1,12 @@
-%
-/N1 G01 X0 Y0 Z0 (a deleted block)
-N2 G01 X1 Y1 Z1 (normal block)
+let #a = 30
+let #b = 70
 
-#a = #b (error, #a and #b haven't been declared yet)
-let #b = 2 + 3
-let #a = #b
-
-sub foo[#x, #y, #x] (error, #x already declared)
-    #a = 1 (no error, refers to #a declared previously)
-    #b = #x (no error, #x is declared because it's a parameter)
-    #y = #c (error, #c not declared)
-
-    sub bar[#z]
-        let #blah = #z + #y (no error, refers to foo's parameter #y)
+sub mul[#a, #b, #c, #d]
+    sub add[#a, #b]
+        return #a + #b
     endsub
 
-    let #d = #blah (error, #blah is in bar's scope)
+    return add[#a, #b] * add[#c, #d]
 endsub
 
-let #bar = foo[#a, 37]
-
-alias #_current_tool = 5400 (this essentially makes #_current_tool the same as #5400, these can be put in a g-code preamble or something to simplify the c++ side)
-alias #_current_tool = 5401 (error, already declared)
-
-let #tool = #_current_tool
-
-sub twice[]
-endsub
-
-sub twice[] (error, redefined)
-endsub
-
-sub twice[#x] (ok, overload)
-endsub
-
-twice[] (ok)
-twice[0] (ok, overload with 1 param defined)
-twice[0, 0] (error, overload with 2 params not defined)
-
-sin[360] (ok, added from c++)
-
-let #test = #_g54_x (ok, defined in preamble)
-
-sub testsub[]
-    let #thisshouldbelocal
-
-    sub testsub2[]
-        let #thisshouldbelocal (ok, new scope)
-    endsub
-endsub
-
-1 + #doesntexist
-let #asdf = -[1 + #doesntexist]
-alias #fdsa = -[1 + #doesntexist]
-
-let #pointee = 0
-let #ptr = &#pointee
-##ptr = 1
-
-let #evaltest = [2 + 3] * [2 * 3]
-let #evaltest2 = sin[1] * 2
-
-let #hello2 = #hello (ok, declared in autoload/hello.ngc)
-let #world2 = #world (ok, declared in autoload/world.ngc)
-
-M30
-%
+let #c = mul[1, 2, 3, 4]

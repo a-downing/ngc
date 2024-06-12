@@ -1,13 +1,22 @@
 #ifndef LEXER_H
 #define LEXER_H
 
+#ifdef __clang__
+    #pragma push_macro("__cpp_concepts")
+    #define __cpp_concepts 202002L
+    #include <expected>
+    #pragma pop_macro("__cpp_concepts")
+#else
+    #include <expected>
+#endif
+
 #include <cctype>
 #include <format>
-#include <expected>
 #include <utility>
 
-#include <CharacterSource.h>
+#include <LexerSource.h>
 #include <Token.h>
+#include <StringViewTokenSource.h>
 
 namespace ngc
 {
@@ -19,7 +28,7 @@ namespace ngc
         };
 
         State m_state = State::BEGIN;
-        CharacterSource &m_source;
+        LexerSource &m_source;
         size_t m_index = 0;
         int m_line = 1;
         int m_col = 1;
@@ -32,7 +41,7 @@ namespace ngc
             const int m_col;
 
         public:
-            Error(std::string message, std::string  sourceName, const int line, const int col): m_message(std::move(message)), m_sourceName(std::move(sourceName)), m_line(line), m_col(col) { }
+            Error(std::string message, std::string sourceName, const int line, const int col): m_message(std::move(message)), m_sourceName(std::move(sourceName)), m_line(line), m_col(col) { }
             [[nodiscard]] const std::string &message() const { return m_message; }
             [[nodiscard]] const std::string &sourceName() const { return m_sourceName; }
             [[nodiscard]] int line() const { return m_line; }
@@ -43,7 +52,7 @@ namespace ngc
             }
         };
 
-        explicit Lexer(CharacterSource &source): m_source(source) { }
+        explicit Lexer(LexerSource &source): m_source(source) { }
 
         [[nodiscard]] std::expected<Token, Error> nextToken() {
             if(m_state == State::BEGIN) {
@@ -226,7 +235,7 @@ namespace ngc
         }
 
         [[nodiscard]] Token makeToken(const Token::Kind kind) const {
-            return { kind, m_source, m_index, index(), m_line, m_col };
+            return { kind, std::make_unique<StringViewTokenSource>(m_source.text(), m_source.name(), m_index, index(), m_line, m_col) };
         }
 
         [[nodiscard]] bool match(const char c) {

@@ -16,17 +16,36 @@ namespace ngc
         virtual ~Statement() = default;
         [[nodiscard]] virtual const Token &startToken() const = 0;
         [[nodiscard]] virtual const Token &endToken() const = 0;
+
+        virtual bool is(const class CompoundStatement *stmt) const { return false; }
+        virtual bool is(const class BlockStatement *stmt) const { return false; }
+        virtual bool is(const class SubStatement *stmt) const { return false; }
+        virtual bool is(const class IfStatement *stmt) const { return false; }
+        virtual bool is(const class WhileStatement *stmt) const { return false; }
+        virtual bool is(const class ReturnStatement *stmt) const { return false; }
+        virtual bool is(const class AliasStatement *stmt) const { return false; }
+        virtual bool is(const class LetStatement *stmt) const { return false; }
+
+        template<typename T>
+        [[nodiscard]] bool is() const {
+            return is(static_cast<const T *>(this));
+        }
+
+        template<typename T>
+        const T *as() const {
+            return is(static_cast<const T *>(this)) ? static_cast<const T *>(this) : nullptr;
+        }
+
         virtual void accept(Visitor &v, VisitorContext *ctx) const = 0;
-        [[nodiscard]] std::string_view text() const { return startToken().source()->text(startToken().start(), endToken().end()); };
     };
 
     class CompoundStatement final : public Statement {
         std::vector<std::unique_ptr<Statement>> m_statements;
 
     public:
-        explicit CompoundStatement(std::vector<std::unique_ptr<Statement>> statements): m_statements(std::move(statements)) { assert(!m_statements.empty()); }
+        explicit CompoundStatement(std::vector<std::unique_ptr<Statement>> statements): m_statements(std::move(statements)) { }
         ~CompoundStatement() override = default;
-
+        bool is(const CompoundStatement *expression) const override { return true; }
         [[nodiscard]] const Token &startToken() const override { return m_statements.front()->startToken(); }
         [[nodiscard]] const Token &endToken() const override { return m_statements.back()->endToken(); }
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
@@ -34,15 +53,14 @@ namespace ngc
     };
 
     class LineNumber final {
-        const Token m_n;
-        const Token m_number;
+        Token m_n;
+        Token m_number;
 
     public:
-        LineNumber(const Token &n, const Token &number): m_n(n), m_number(number) { }
+        LineNumber(Token n, Token number): m_n(std::move(n)), m_number(std::move(number)) { }
         [[nodiscard]] const Token &startToken() const { return m_n; }
         [[nodiscard]] const Token &endToken() const { return m_number; }
         [[nodiscard]] const Token &number() const { return m_number; }
-        [[nodiscard]] std::string_view text() const { return startToken().source()->text(startToken().start(), endToken().end()); }
     };
 
     class BlockStatement final : public Statement {
@@ -51,9 +69,9 @@ namespace ngc
         std::vector<std::unique_ptr<Expression>> m_expressions;
 
     public:
-        BlockStatement(const std::optional<Token> &blockDelete, const std::optional<LineNumber> &lineNumber, std::vector<std::unique_ptr<Expression>> expressions): m_blockDelete(blockDelete), m_lineNumber(lineNumber), m_expressions(std::move(expressions)) { }
+        BlockStatement(std::optional<Token> blockDelete, std::optional<LineNumber> lineNumber, std::vector<std::unique_ptr<Expression>> expressions): m_blockDelete(std::move(blockDelete)), m_lineNumber(std::move(lineNumber)), m_expressions(std::move(expressions)) { }
         ~BlockStatement() override = default;
-
+        bool is(const BlockStatement *expression) const override { return true; }
         [[nodiscard]] const std::vector<std::unique_ptr<Expression>> &expressions() const { return m_expressions; }
 
         [[nodiscard]] const Token &startToken() const override {
@@ -95,8 +113,9 @@ namespace ngc
         std::unique_ptr<CompoundStatement> m_statements;
 
     public:
-        explicit SubStatement(const Token &startToken, const Token &endToken, const Token &identifier, std::vector<std::unique_ptr<NamedVariableExpression>> params, std::unique_ptr<CompoundStatement> statements): m_startToken(startToken), m_endToken(endToken), m_identifier(identifier), m_params(std::move(params)), m_statements(std::move(statements)) { }
+        explicit SubStatement(Token startToken, Token endToken, Token identifier, std::vector<std::unique_ptr<NamedVariableExpression>> params, std::unique_ptr<CompoundStatement> statements): m_startToken(std::move(startToken)), m_endToken(std::move(endToken)), m_identifier(std::move(identifier)), m_params(std::move(params)), m_statements(std::move(statements)) { }
         ~SubStatement() override = default;
+        bool is(const SubStatement *expression) const override { return true; }
         [[nodiscard]] const Token &startToken() const override { return m_startToken; }
         [[nodiscard]] const Token &endToken() const override { return m_endToken; }
         [[nodiscard]] std::string_view name() const { return m_identifier.value(); }
@@ -113,8 +132,9 @@ namespace ngc
         std::unique_ptr<CompoundStatement> m_elseStatements;
 
     public:
-        explicit IfStatement(const Token &startToken, const Token &endToken, std::unique_ptr<RealExpression> condition, std::unique_ptr<CompoundStatement> statements, std::unique_ptr<CompoundStatement> elseStatements): m_startToken(startToken), m_endToken(endToken), m_condition(std::move(condition)), m_statements(std::move(statements)), m_elseStatements(std::move(elseStatements)) { }
+        explicit IfStatement(Token startToken, Token endToken, std::unique_ptr<RealExpression> condition, std::unique_ptr<CompoundStatement> statements, std::unique_ptr<CompoundStatement> elseStatements): m_startToken(std::move(startToken)), m_endToken(std::move(endToken)), m_condition(std::move(condition)), m_statements(std::move(statements)), m_elseStatements(std::move(elseStatements)) { }
         ~IfStatement() override = default;
+        bool is(const IfStatement *expression) const override { return true; }
         [[nodiscard]] const Token &startToken() const override { return m_startToken; }
         [[nodiscard]] const Token &endToken() const override { return m_endToken; }
         [[nodiscard]] const RealExpression *condition() const { return m_condition.get(); }
@@ -130,8 +150,9 @@ namespace ngc
         std::unique_ptr<CompoundStatement> m_statements;
 
     public:
-        explicit WhileStatement(const Token &startToken, const Token &endToken, std::unique_ptr<RealExpression> condition, std::unique_ptr<CompoundStatement> statements): m_startToken(startToken), m_endToken(endToken), m_condition(std::move(condition)), m_statements(std::move(statements)) { }
+        explicit WhileStatement(Token startToken, Token endToken, std::unique_ptr<RealExpression> condition, std::unique_ptr<CompoundStatement> statements): m_startToken(std::move(startToken)), m_endToken(std::move(endToken)), m_condition(std::move(condition)), m_statements(std::move(statements)) { }
         ~WhileStatement() override = default;
+        bool is(const WhileStatement *expression) const override { return true; }
         [[nodiscard]] const Token &startToken() const override { return m_startToken; }
         [[nodiscard]] const Token &endToken() const override { return m_endToken; }
         [[nodiscard]] const RealExpression *condition() const { return m_condition.get(); }
@@ -144,8 +165,9 @@ namespace ngc
         std::unique_ptr<RealExpression> m_expression;
 
     public:
-        explicit ReturnStatement(const Token &startToken, std::unique_ptr<RealExpression> expression): m_startToken(startToken), m_expression(std::move(expression)) { }
+        explicit ReturnStatement(Token startToken, std::unique_ptr<RealExpression> expression): m_startToken(std::move(startToken)), m_expression(std::move(expression)) { }
         ~ReturnStatement() override = default;
+        bool is(const ReturnStatement *expression) const override { return true; }
         [[nodiscard]] const Token &startToken() const override { return m_startToken; }
         [[nodiscard]] const Token &endToken() const override { return m_expression->endToken(); }
         [[nodiscard]] const RealExpression *real() const { return m_expression.get(); }
@@ -158,8 +180,9 @@ namespace ngc
         std::unique_ptr<RealExpression> m_expression;
 
     public:
-        explicit AliasStatement(const Token &startToken, std::unique_ptr<NamedVariableExpression> namedVariable, std::unique_ptr<RealExpression> expression): m_startToken(startToken), m_namedVariable(std::move(namedVariable)), m_expression(std::move(expression)) { }
+        explicit AliasStatement(Token startToken, std::unique_ptr<NamedVariableExpression> namedVariable, std::unique_ptr<RealExpression> expression): m_startToken(std::move(startToken)), m_namedVariable(std::move(namedVariable)), m_expression(std::move(expression)) { }
         ~AliasStatement() override = default;
+        bool is(const AliasStatement *expression) const override { return true; }
         [[nodiscard]] const Token &startToken() const override { return m_startToken; }
         [[nodiscard]] const Token &endToken() const override { return m_expression->endToken(); }
         [[nodiscard]] const NamedVariableExpression *variable() const { return m_namedVariable.get(); }
@@ -173,8 +196,9 @@ namespace ngc
         std::unique_ptr<RealExpression> m_expression;
 
     public:
-        explicit LetStatement(const Token &startToken, std::unique_ptr<NamedVariableExpression> namedVariable, std::unique_ptr<RealExpression> expression): m_startToken(startToken), m_namedVariable(std::move(namedVariable)), m_expression(std::move(expression)) { }
+        explicit LetStatement(Token startToken, std::unique_ptr<NamedVariableExpression> namedVariable, std::unique_ptr<RealExpression> expression): m_startToken(std::move(startToken)), m_namedVariable(std::move(namedVariable)), m_expression(std::move(expression)) { }
         ~LetStatement() override = default;
+        bool is(const LetStatement *expression) const override { return true; }
         [[nodiscard]] const Token &startToken() const override { return m_startToken; }
         [[nodiscard]] const Token &endToken() const override { return m_expression->endToken(); }
         [[nodiscard]] const NamedVariableExpression *variable() const { return m_namedVariable.get(); }

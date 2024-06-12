@@ -1,51 +1,30 @@
 #ifndef PREAMBLE_H
 #define PREAMBLE_H
 
-#include <cstdint>
-#include <string>
-#include <utility>
+#include <memory>
+#include <vector>
 
-#include <Vars.h>
-#include <MemoryCell.h>
-#include <CharacterSource.h>
-#include <Lexer.h>
-#include <Parser.h>
+#include <Token.h>
+#include <Expression.h>
 #include <Statement.h>
+#include <Vars.h>
 
-namespace ngc
-{
-    class Preamble {
-        CharacterSource m_source;
-        std::unique_ptr<CompoundStatement> m_statements;
+namespace ngc {
+    inline std::unique_ptr<CompoundStatement> buildPreamble(const std::vector<uint32_t> &addrs) {
+        auto statements = std::vector<std::unique_ptr<Statement>>();
 
-        explicit Preamble(CharacterSource source) : m_source(std::move(source)) {
-            auto lexer = Lexer(m_source);
-            auto parser = Parser(lexer);
-            m_statements = parser.parse();
+        for(size_t i = 0; const auto &[var, name, flags] : VARS) {
+            auto startToken = Token(Token::Kind::ALIAS, std::make_unique<StringTokenSource>("alias", ""));
+            auto variableToken = Token(Token::Kind::NAMED_VARIABLE, std::make_unique<StringTokenSource>(std::format("#{}", name), ""));
+            auto variable = std::make_unique<NamedVariableExpression>(variableToken);
+            auto literalToken = Token(Token::Kind::NUMBER, std::make_unique<StringTokenSource>(std::to_string(addrs[i]), ""));
+            auto alias = std::make_unique<AliasStatement>(startToken, std::move(variable), std::make_unique<LiteralExpression>(literalToken));
+            statements.emplace_back(std::move(alias));
+            i++;
         }
 
-    public:
-        Preamble(const Preamble &) = delete;
-        Preamble(Preamble &&) = delete;
-        Preamble &operator=(const Preamble &) = delete;
-        Preamble &operator=(Preamble &&) = delete;
-
-        [[nodiscard]] const CharacterSource &source() const { return m_source; }
-        [[nodiscard]] const CompoundStatement *statements() const { return m_statements.get(); }
-
-        static Preamble make(const std::initializer_list<std::tuple<Var, std::string_view, MemoryCell::Flags>> &vars, const std::vector<uint32_t> &addrs) {
-            std::string text = "%\n";
-
-            for(auto i = 0; auto &[var, name, flags] : vars) {
-                text += std::format("alias #{} = {}\n", name, addrs[i]);
-                i++;
-            }
-
-            text += '%';
-
-            return Preamble(CharacterSource(text, "preamble"));
-        }
-    };
+        return std::make_unique<CompoundStatement>(std::move(statements));
+    }
 }
 
 #endif //PREAMBLE_H
