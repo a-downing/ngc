@@ -117,6 +117,9 @@ namespace ngc
         ~IfStatement() override = default;
         [[nodiscard]] const Token &startToken() const override { return m_startToken; }
         [[nodiscard]] const Token &endToken() const override { return m_endToken; }
+        [[nodiscard]] const RealExpression *condition() const { return m_condition.get(); }
+        [[nodiscard]] const CompoundStatement *body() const { return m_statements.get(); }
+        [[nodiscard]] const CompoundStatement *elseBody() const { return m_elseStatements.get(); }
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
     };
 
@@ -131,6 +134,8 @@ namespace ngc
         ~WhileStatement() override = default;
         [[nodiscard]] const Token &startToken() const override { return m_startToken; }
         [[nodiscard]] const Token &endToken() const override { return m_endToken; }
+        [[nodiscard]] const RealExpression *condition() const { return m_condition.get(); }
+        [[nodiscard]] const CompoundStatement *body() const { return m_statements.get(); }
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
     };
 
@@ -143,6 +148,7 @@ namespace ngc
         ~ReturnStatement() override = default;
         [[nodiscard]] const Token &startToken() const override { return m_startToken; }
         [[nodiscard]] const Token &endToken() const override { return m_expression->endToken(); }
+        [[nodiscard]] const RealExpression *real() const { return m_expression.get(); }
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
     };
 

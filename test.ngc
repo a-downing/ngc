@@ -61,5 +61,8 @@ let #ptr = &#pointee
 let #evaltest = [2 + 3] * [2 * 3]
 let #evaltest2 = sin[1] * 2
 
+let #hello2 = #hello (ok, declared in autoload/hello.ngc)
+let #world2 = #world (ok, declared in autoload/world.ngc)
+
 M30
 %

@@ -15,9 +15,9 @@ namespace ngc
 
     public:
         Program(const Program &) = delete;
-        Program(Program &&) = delete;
+        Program(Program &&) = default;
         Program &operator=(const Program &) = delete;
-        Program &operator=(Program &&) = delete;
+        Program &operator=(Program &&) = default;
 
         explicit Program(CharacterSource source) : m_source(std::move(source)) { }
 

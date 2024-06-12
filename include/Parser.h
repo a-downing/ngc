@@ -17,6 +17,7 @@ namespace ngc
         Lexer &m_lexer;
         std::optional<Token> m_peekedToken;
         bool m_percentFirst = false;
+        bool m_finished = false;
 
     public:
         class Error final : public std::logic_error {
@@ -40,13 +41,7 @@ namespace ngc
         explicit Parser(Lexer &lexer): m_lexer(lexer) { }
 
         std::unique_ptr<CompoundStatement> parse() {
-            auto token = m_lexer.nextToken();
-
-            if(!token) {
-                error("lexer error", token.error());
-            }
-
-            if(token->kind() == Token::Kind::PERCENT) {
+            if(match(Token::Kind::PERCENT)) {
                 m_percentFirst = true;
             }
 
@@ -69,6 +64,10 @@ namespace ngc
         }
 
         [[nodiscard]] std::unique_ptr<Statement> parseStatement() {
+            if(m_finished) {
+                return nullptr;
+            }
+
             while(match(Token::Kind::NEWLINE)) {
 
             }
@@ -85,6 +84,7 @@ namespace ngc
 
             if(match(Token::Kind::PERCENT, token)) {
                 if(m_percentFirst) {
+                    m_finished = true;
                     return nullptr;
                 }
 

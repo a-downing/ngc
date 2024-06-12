@@ -59,6 +59,7 @@ namespace ngc
         std::vector<std::unordered_map<std::string_view, const NamedVariableExpression *>> m_scope;
         std::vector<std::unordered_set<SubSignature>> m_subScope;
         std::vector<Error> m_errors;
+        bool m_declareVariables = false;
 
         class SemanticAnalyzerContext final : public VisitorContext {
             bool m_globalScope;
@@ -67,8 +68,6 @@ namespace ngc
             explicit SemanticAnalyzerContext(const bool globalScope) : m_globalScope(globalScope) { }
             [[nodiscard]] bool isGlogalScope() const { return m_globalScope; }
             [[nodiscard]] bool isLocalScope() const { return !m_globalScope; }
-            static SemanticAnalyzerContext global() { return SemanticAnalyzerContext(true); }
-            static SemanticAnalyzerContext local() { return SemanticAnalyzerContext(false); }
         };
 
         static const SemanticAnalyzerContext &context(VisitorContext *ctx) { return *static_cast<SemanticAnalyzerContext *>(ctx); }
@@ -86,17 +85,20 @@ namespace ngc
         }
 
         [[nodiscard]] const std::vector<Error> &errors() const { return m_errors; }
+        void clearErrors() { m_errors.clear(); }
 
         void processPreamble(const Preamble &preamble) {
             if(preamble.statements()) {
-                auto ctx = SemanticAnalyzerContext::global();
+                auto ctx = SemanticAnalyzerContext(true);
                 preamble.statements()->accept(*this, &ctx);
             }
         }
 
-        void processProgram(const CompoundStatement *program) {
+        void processProgram(const CompoundStatement *program, const bool declareVariables) {
+            m_declareVariables = declareVariables;
+
             if(program) {
-                auto ctx = SemanticAnalyzerContext::global();
+                auto ctx = SemanticAnalyzerContext(true);
                 program->accept(*this, &ctx);
             }
         }
@@ -117,26 +119,46 @@ namespace ngc
             });
         }
 
-        bool declareLocal(const NamedVariableExpression *expr) {
+        void declareLocal(const NamedVariableExpression *expr) {
+            if(!m_declareVariables) {
+                return;
+            }
+
             if(!m_scope.back().contains(expr->name())) {
                 m_scope.back().emplace(expr->name(), expr);
                 std::println("{}: INFO: declared local variable '{}'", expr->startToken().location(), expr->name());
-                return true;
+                return;
             }
 
             m_errors.emplace_back(std::format("{}: ERROR: local variable '{}' already declared", expr->startToken().location(), expr->name()), expr);
-            return false;
         }
 
-        bool declareGlobal(const NamedVariableExpression *expr) {
+        void declareGlobal(const NamedVariableExpression *expr, const SemanticAnalyzerContext &ctx) {
+            if(!m_declareVariables) {
+                return;
+            }
+
             if(!m_scope.front().contains(expr->name())) {
                 m_scope.front().emplace(expr->name(), expr);
                 std::println("{}: INFO: declared global variable '{}'", expr->startToken().location(), expr->name());
-                return true;
+                return;
             }
 
             m_errors.emplace_back(std::format("{}: ERROR: global variable '{}' already declared", expr->startToken().location(), expr->name()), expr);
-            return false;
+        }
+
+        void declareSub(const SubStatement *stmt) {
+            if(!m_declareVariables) {
+                return;
+            }
+
+            if(m_subScope.back().contains(SubSignature(stmt))) {
+                m_errors.emplace_back(std::format("{}: ERROR: redefinition of sub '{}'", stmt->startToken().location(), stmt->name()), stmt);
+            } else {
+                m_subScope.back().emplace(stmt);
+            }
+
+            m_scope.emplace_back();
         }
 
         // statements
@@ -153,11 +175,7 @@ namespace ngc
         }
 
         void visit(const SubStatement *stmt, VisitorContext *ctx) override {
-            if(m_subScope.back().contains(SubSignature(stmt))) {
-                m_errors.emplace_back(std::format("{}: ERROR: redefinition of sub '{}'", stmt->startToken().location(), stmt->name()), stmt);
-            } else {
-                m_subScope.back().insert(SubSignature(stmt));
-            }
+            declareSub(stmt);
 
             m_scope.emplace_back();
 
@@ -166,7 +184,7 @@ namespace ngc
             }
 
             if(stmt->body()) {
-                auto localCtx = SemanticAnalyzerContext::local();
+                auto localCtx = SemanticAnalyzerContext(false);
 
                 for(const auto &s : stmt->body()->statements()) {
                     s->accept(*this, &localCtx);
@@ -178,7 +196,7 @@ namespace ngc
 
         void visit(const AliasStatement *stmt, VisitorContext *ctx) override {
             if(context(ctx).isGlogalScope()) {
-                declareGlobal(stmt->variable());
+                declareGlobal(stmt->variable(), context(ctx));
             } else {
                 declareLocal(stmt->variable());
             }
@@ -188,7 +206,7 @@ namespace ngc
 
         void visit(const LetStatement *stmt, VisitorContext *ctx) override {
             if(context(ctx).isGlogalScope()) {
-                declareGlobal(stmt->variable());
+                declareGlobal(stmt->variable(), context(ctx));
             } else {
                 declareLocal(stmt->variable());
             }
@@ -198,9 +216,29 @@ namespace ngc
             }
         }
 
-        void visit(const IfStatement *stmt, VisitorContext *ctx) override { }
-        void visit(const WhileStatement *stmt, VisitorContext *ctx) override { }
-        void visit(const ReturnStatement *stmt, VisitorContext *ctx) override { }
+        void visit(const IfStatement *stmt, VisitorContext *ctx) override {
+            stmt->condition()->accept(*this, ctx);
+
+            if(stmt->body()) {
+                stmt->body()->accept(*this, ctx);
+            }
+
+            if(stmt->elseBody()) {
+                stmt->elseBody()->accept(*this, ctx);
+            }
+        }
+
+        void visit(const WhileStatement *stmt, VisitorContext *ctx) override {
+            stmt->condition()->accept(*this, ctx);
+
+            if(stmt->body()) {
+                stmt->body()->accept(*this, ctx);
+            }
+        }
+
+        void visit(const ReturnStatement *stmt, VisitorContext *ctx) override {
+            stmt->real()->accept(*this, ctx);
+        }
 
         // expressions
         void visit(const BinaryExpression *expr, VisitorContext *ctx) override {
