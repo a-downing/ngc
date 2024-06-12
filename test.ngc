@@ -1,5 +1,5 @@
-let #a = 30
-let #b = 70
+let #a = 37
+let #b = 73
 
 sub mul[#a, #b, #c, #d]
     sub add[#a, #b]
@@ -9,4 +9,9 @@ sub mul[#a, #b, #c, #d]
     return add[#a, #b] * add[#c, #d]
 endsub
 
-let #c = mul[1, 2, 3, 4]
+let #c = mul[100, 101, 102, 103] + #a
+let #d = #c
+let #e = -#d
+let #f = +#e
+let #g = &#f
++#[12]

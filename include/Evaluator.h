@@ -1,10 +1,6 @@
 #ifndef EVALUATOR_H
 #define EVALUATOR_H
 
-#include "MemoryCell.h"
-#include "SubSignature.h"
-#include <algorithm>
-#include <alloca.h>
 #include <cmath>
 #include <cstddef>
 #include <format>
@@ -12,11 +8,11 @@
 #include <unordered_map>
 #include <ranges>
 
-#include <Utils.h>
 #include <Visitor.h>
 #include <VisitorContext.h>
 #include <Expression.h>
 #include <Statement.h>
+#include <MemoryCell.h>
 #include <Memory.h>
 #include <SubSignature.h>
 
@@ -44,6 +40,7 @@ namespace ngc
                 }
 
                 uint32_t addr = m_mem.addData(MemoryCell(MemoryCell::Flags::READ | MemoryCell::Flags::WRITE, value));
+                std::println("{}: ALLOCATE GLOBAL: {} @ data:{}", expr->token().location(), expr->text(), addr);
                 m_scope.front().emplace(expr->name(), addr);
             } else {
                 if(m_scope.back().contains(expr->name())) {
@@ -51,6 +48,7 @@ namespace ngc
                 }
 
                 uint32_t addr = m_mem.push(value);
+                std::println("{}: ALLOCATE LOCAL: {} @ stack:{}", expr->token().location(), expr->text(), addr & ~Memory::ADDR_STACK);
                 m_scope.back().emplace(expr->name(), addr);
             }
         }
@@ -65,8 +63,14 @@ namespace ngc
             m_subScope.back().emplace(sig, stmt);
         }
 
-        double eval(const RealExpression *expr) {
+        double eval(const RealExpression *expr, const bool dereference = true) {
             expr->accept(*this, nullptr);
+
+            if(dereference && expr->is<VariableExpression>()) {
+                const auto addr = static_cast<uint32_t>(m_accumulator);
+                return read(addr);
+            }
+
             return m_accumulator;
         }
 
@@ -108,21 +112,18 @@ namespace ngc
         }
 
         void visit(const BlockStatement* stmt, VisitorContext* ctx) override {
-            std::println("execute: BlockStatement");
-
             for(const auto &expr : stmt->expressions()) {
                 expr->accept(*this, ctx);
             }
         }
 
         void visit(const ReturnStatement* stmt, VisitorContext* ctx) override {
-            std::println("execute: ReturnStatement: {}", stmt->real()->text());
-            std::ignore = m_mem.push(eval(stmt->real()));
+            auto value = eval(stmt->real());
+            std::println("execute: ReturnStatement: {} -> {}", stmt->real()->text(), value);
+            std::ignore = m_mem.push(value);
         }
 
         void visit(const CallExpression* expr, VisitorContext* ctx) override {
-            std::println("execute: {}: {}", expr->className(), expr->text());
-
             const auto sig = SubSignature(expr);
             const SubStatement *stmt = nullptr;
 
@@ -147,18 +148,20 @@ namespace ngc
             m_scope.emplace_back();
             m_subScope.emplace_back();
 
+            auto newCtx = EvaluatorContext { .globalScope = false };
+
             for(size_t i = 0; i < params.size(); i++) {
-                auto addr = m_mem.push(eval(args.at(i).get()));
-                m_scope.back().emplace(params[i]->name(), addr);
+                const auto value = eval(args[i].get());
+                allocate(params[i].get(), value, newCtx);
             }
 
             if(stmt->body()) {
-                stmt->body()->accept(*this, ctx);
+                stmt->body()->accept(*this, &newCtx);
             }
 
             // return value
             m_accumulator = m_mem.pop();
-            std::println("{} -> {}", expr->text(), m_accumulator);
+            std::println("{}: execute: {}: {} -> {}", expr->token().location(), expr->className(), expr->text(), m_accumulator);
 
             for(size_t i = 0; i < m_scope.back().size() - 1; i++) {
                 std::ignore = m_mem.pop();
@@ -169,20 +172,18 @@ namespace ngc
         }
 
         void visit(const NumericVariableExpression* expr, VisitorContext* ctx) override {
-            std::println("execute: {}: {}", expr->className(), expr->text());
-
-            auto addr = static_cast<uint32_t>(eval(expr->real()));
+            const auto addr = static_cast<uint32_t>(eval(expr->real()));
             m_accumulator = addr;
+            std::println("{}: execute: {}: {} -> {}", expr->token().location(), expr->className(), expr->text(), m_accumulator);
         }
 
         void visit(const NamedVariableExpression* expr, VisitorContext* ctx) override {
-            std::println("execute: {}: {}", expr->className(), expr->text());
-
             uint32_t addr = 0;
 
             for(const auto &scope : std::views::reverse(m_scope)) {
                 if(scope.contains(expr->name())) {
                     addr = scope.at(expr->name());
+                    break;
                 }
             }
 
@@ -190,77 +191,84 @@ namespace ngc
                 throw std::runtime_error(std::format("undeclared variable '{}'", expr->name()));
             }
 
+            if(addr & Memory::ADDR_STACK) {
+                std::println("{}: execute: {}: {} -> stack:{}", expr->token().location(), expr->className(), expr->text(), addr & ~Memory::ADDR_STACK);
+            } else {
+                std::println("{}: execute: {}: {} -> data:{}", expr->token().location(), expr->className(), expr->text(), addr);
+            }
+
             m_accumulator = addr;
         }
 
         void visit(const BinaryExpression* expr, VisitorContext* ctx) override {
-            std::println("execute: {}: {}", expr->className(), expr->text());
+            double left;
+            double right;
 
-            auto left = eval(expr->left());
-            auto right = eval(expr->right());
-
-            if(expr->right()->is<VariableExpression>()) {
-                const auto addr = static_cast<uint32_t>(right);
-                right = read(addr);
-            }
-
-            if(expr->left()->is<VariableExpression>()) {
-                const auto addr = static_cast<uint32_t>(right);
-
-                if(expr->op() == BinaryExpression::Op::ASSIGN) {
-                    write(addr, right);
+            if(expr->op() == BinaryExpression::Op::ASSIGN) {
+                if(!expr->left()->is<VariableExpression>()) {
+                    throw std::runtime_error(std::format("tried to assign to {}", expr->className()));
                 }
 
-                left = read(addr);
+                left = eval(expr->left(), false);
+                right = eval(expr->right());
+                const auto addr = static_cast<uint32_t>(left);
+                write(addr, right);
+            } else {
+                left = eval(expr->left());
+                right = eval(expr->right());
             }
-
-            std::println("    left: {}", left);
-            std::println("    right: {}", right);
 
             switch (expr->op()) {
-            case BinaryExpression::Op::ASSIGN: m_accumulator = right; break;
-            case BinaryExpression::Op::AND: m_accumulator = left && right; break;
-            case BinaryExpression::Op::OR: m_accumulator = left || right; break;
-            case BinaryExpression::Op::XOR: m_accumulator = (left && !right) || (right && !left); break;
-            case BinaryExpression::Op::EQ: m_accumulator = left == right; break;
-            case BinaryExpression::Op::NE: m_accumulator = left != right; break;
-            case BinaryExpression::Op::LT: m_accumulator = left < right; break;
-            case BinaryExpression::Op::LE: m_accumulator = left <= right; break;
-            case BinaryExpression::Op::GT: m_accumulator = left > right; break;
-            case BinaryExpression::Op::GE: m_accumulator = left >= right; break;
-            case BinaryExpression::Op::ADD: m_accumulator = left + right; break;
-            case BinaryExpression::Op::SUB: m_accumulator = left - right; break;
-            case BinaryExpression::Op::MUL: m_accumulator = left * right; break;
-            case BinaryExpression::Op::DIV: m_accumulator = left / right; break;
-            case BinaryExpression::Op::MOD: m_accumulator = std::fmod(left, right); break;
+                case BinaryExpression::Op::ASSIGN: m_accumulator = right; break;
+                case BinaryExpression::Op::AND: m_accumulator = static_cast<bool>(left) && static_cast<bool>(right); break;
+                case BinaryExpression::Op::OR: m_accumulator = static_cast<bool>(left) || static_cast<bool>(right); break;
+                case BinaryExpression::Op::XOR: m_accumulator = (static_cast<bool>(left) && !static_cast<bool>(right)) || (static_cast<bool>(right) && !static_cast<bool>(left)); break;
+                case BinaryExpression::Op::EQ: m_accumulator = left == right; break;
+                case BinaryExpression::Op::NE: m_accumulator = left != right; break;
+                case BinaryExpression::Op::LT: m_accumulator = left < right; break;
+                case BinaryExpression::Op::LE: m_accumulator = left <= right; break;
+                case BinaryExpression::Op::GT: m_accumulator = left > right; break;
+                case BinaryExpression::Op::GE: m_accumulator = left >= right; break;
+                case BinaryExpression::Op::ADD: m_accumulator = left + right; break;
+                case BinaryExpression::Op::SUB: m_accumulator = left - right; break;
+                case BinaryExpression::Op::MUL: m_accumulator = left * right; break;
+                case BinaryExpression::Op::DIV: m_accumulator = left / right; break;
+                case BinaryExpression::Op::MOD: m_accumulator = std::fmod(left, right); break;
             }
+
+            std::println("{}: execute: {}: {} -> {}", expr->token().location(), expr->className(), expr->text(), m_accumulator);
         }
 
         void visit(const UnaryExpression* expr, VisitorContext* ctx) override {
-            std::println("execute: {}: {}", expr->className(), expr->text());
+            double value;
 
-            double value = eval(expr->real());
+            if(expr->op() == UnaryExpression::Op::ADDRESS_OF) {
+                if(!expr->real()->is<VariableExpression>()) {
+                    throw std::runtime_error(std::format("tried to assign to {}", expr->className()));
+                }
 
-            if(expr->real()->is<VariableExpression>() && expr->op() != UnaryExpression::Op::ADDRESS_OF) {
-                const auto addr = static_cast<uint32_t>(value);
-                value = read(addr);
+                value = static_cast<uint32_t>(eval(expr->real(), false));
+            } else {
+                value = eval(expr->real());
             }
 
             switch (expr->op()) {
-            case UnaryExpression::Op::NEGATIVE: m_accumulator = -value; break;
-            case UnaryExpression::Op::POSITIVE: m_accumulator = value; break;
-            case UnaryExpression::Op::ADDRESS_OF: m_accumulator = value; break;
+                case UnaryExpression::Op::NEGATIVE: m_accumulator = -value; break;
+                case UnaryExpression::Op::POSITIVE: m_accumulator = value; break;
+                case UnaryExpression::Op::ADDRESS_OF: m_accumulator = value; break;
             }
+
+            std::println("{}: execute: {}: {} -> {}", expr->token().location(), expr->className(), expr->text(), m_accumulator);
         }
 
         void visit(const GroupingExpression* expr, VisitorContext* ctx) override {
             m_accumulator = eval(expr->real());
+            std::println("{}: execute: {}: {} -> {}", expr->token().location(), expr->className(), expr->text(), m_accumulator);
         }
 
         void visit(const LiteralExpression* expr, VisitorContext* ctx) override {
-            std::println("execute: {}: {}", expr->className(), expr->text());
-
             m_accumulator = expr->value();
+            std::println("{}: execute: {}: {} -> {}", expr->token().location(), expr->className(), expr->text(), m_accumulator);
         }
         
         // TODO: these
