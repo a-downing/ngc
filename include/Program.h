@@ -11,7 +11,7 @@ namespace ngc
 {
     class Program {
         LexerSource m_source;
-        std::unique_ptr<CompoundStatement> m_statements;
+        std::vector<std::unique_ptr<Statement>> m_statements;
 
     public:
         Program(const Program &) = delete;
@@ -27,7 +27,7 @@ namespace ngc
             m_statements = parser.parse();
         }
 
-        [[nodiscard]] const CompoundStatement *statements() const { return m_statements.get(); }
+        [[nodiscard]] const std::vector<std::unique_ptr<Statement>> &statements() const { return m_statements; }
         [[nodiscard]] const LexerSource &source() const { return m_source; }
     };
 }

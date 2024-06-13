@@ -12,6 +12,8 @@
 #include <Evaluator.h>
 #include <Preamble.h>
 
+// TODO: Evaluate if and while
+
 int main(const int argc, const char **argv) {
     if(argc < 2) {
         std::println(stderr, "usage: {} <filename>", argv[0]);
@@ -54,7 +56,7 @@ int main(const int argc, const char **argv) {
 
     ngc::SemanticAnalyzer sa;
     sa.addGlobalSub(ngc::SubSignature("sin", 1));
-    sa.processPreamble(preamble.get());
+    sa.processProgram(preamble);
 
     for(auto &program : programs) {
         std::println("analyzing: {}", program.source().name());
@@ -70,7 +72,7 @@ int main(const int argc, const char **argv) {
     }
 
     auto eval = ngc::Evaluator(mem);
-    eval.executeProgram(preamble.get());
+    eval.executeProgram(preamble);
 
     for(auto &program : programs) {
         std::println("executing: {}", program.source().name());

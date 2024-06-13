@@ -4,31 +4,38 @@
 #include <string>
 #include <string_view>
 #include <utility>
+#include <stack>
 
 namespace ngc
 {
     class LexerSource {
+        struct state_t {
+            size_t index;
+            int line;
+            int col;
+        };
+
         std::string m_text;
         std::string m_name;
-        size_t m_index = 0;
-        int m_line = 1;
-        int m_col = 1;
+        std::stack<state_t> m_state;
+
+        [[nodiscard]] const state_t &state() const { return m_state.top(); }
+        state_t &state() { return m_state.top(); }
 
     public:
         LexerSource(const LexerSource &) = delete;
-        LexerSource(LexerSource &&) = default;
+        LexerSource(LexerSource &&)  noexcept = default;
         LexerSource &operator=(const LexerSource &) = delete;
         LexerSource &operator=(LexerSource &&) = default;
 
-        LexerSource(std::string text, std::string name) : m_text(std::move(text)), m_name(std::move(name)) { }
+        LexerSource(std::string text, std::string name) : m_text(std::move(text)), m_name(std::move(name)), m_state(std::initializer_list<state_t> {{ 0 , 1, 1 }}) { }
 
-        void visit(const char c) {
-            if(c == '\n') {
-                m_line++;
-                m_col = 0;
-            }
+        void pushState() {
+            m_state.push(m_state.top());
+        }
 
-            m_col++;
+        void popState() {
+            m_state.pop();
         }
 
         [[nodiscard]] const std::string &name() const {
@@ -36,24 +43,24 @@ namespace ngc
         }
 
         [[nodiscard]] size_t index() const {
-            return m_index;
+            return state().index;
         }
 
         [[nodiscard]] int line() const {
-            return m_line;
+            return state().line;
         }
 
         [[nodiscard]] int col() const {
-            return m_col;
+            return state().col;
         }
 
         [[nodiscard]] char peek() const {
-            return m_index < m_text.size() ? m_text[m_index] : '\0';
+            return state().index < m_text.size() ? m_text[state().index] : '\0';
         }
 
         [[nodiscard]] char next() {
-            if(m_index < m_text.size()) {
-                const char c  = m_text[m_index++];
+            if(state().index < m_text.size()) {
+                const char c  = m_text[state().index++];
                 visit(c);
                 return c;
             }
@@ -62,17 +69,17 @@ namespace ngc
         }
 
         [[nodiscard]] char prev() const {
-            return m_index > 0 ? m_text[m_index - 1] : '\0';
+            return state().index > 0 ? m_text[state().index - 1] : '\0';
         }
 
         void advance() {
-            if(m_index < m_text.size()) {
-                visit(m_text[m_index++]);
+            if(state().index < m_text.size()) {
+                visit(m_text[state().index++]);
             }
         }
 
         [[nodiscard]] bool end() const {
-            return m_index >= m_text.size();
+            return state().index >= m_text.size();
         }
 
         [[nodiscard]] std::string_view text() const {
@@ -81,6 +88,16 @@ namespace ngc
 
         [[nodiscard]] std::string_view text(const size_t start, const size_t end) const {
             return std::string_view(m_text).substr(start, end - start);
+        }
+
+    private:
+        void visit(const char c) {
+            if(c == '\n') {
+                state().line++;
+                state().col = 0;
+            }
+
+            state().col++;
         }
     };
 }

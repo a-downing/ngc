@@ -1,6 +1,7 @@
 #ifndef PARSER_H
 #define PARSER_H
 
+#include <print>
 #include <source_location>
 #include <stdexcept>
 #include <vector>
@@ -15,7 +16,6 @@ namespace ngc
 {
     class Parser final {
         Lexer &m_lexer;
-        std::optional<Token> m_peekedToken;
         bool m_percentFirst = false;
         bool m_finished = false;
 
@@ -40,43 +40,39 @@ namespace ngc
 
         explicit Parser(Lexer &lexer): m_lexer(lexer) { }
 
-        std::unique_ptr<CompoundStatement> parse() {
+        std::vector<std::unique_ptr<Statement>> parse() {
+            std::vector<std::unique_ptr<Statement>> statements;
+
             if(match(Token::Kind::PERCENT)) {
                 m_percentFirst = true;
             }
 
-            return parseCompoundStatement();
+            while(auto statement = parseStatement()) {
+                statements.emplace_back(std::move(statement));
+            }
+
+            return statements;
         }
 
     private:
         std::unique_ptr<CompoundStatement> parseCompoundStatement() {
+            auto startToken = expect(Token::Kind::LBRACE);
             std::vector<std::unique_ptr<Statement>> statements;
 
             while(auto statement = parseStatement()) {
                 statements.emplace_back(std::move(statement));
             }
 
-            if(statements.empty()) {
-                return {};
-            }
-
-            return std::make_unique<CompoundStatement>(std::move(statements));
+            Token endToken = expect(Token::Kind::RBRACE);
+            return std::make_unique<CompoundStatement>(std::move(startToken), std::move(endToken), std::move(statements));
         }
 
         [[nodiscard]] std::unique_ptr<Statement> parseStatement() {
-            if(m_finished) {
+            if(m_finished || match(Token::Kind::NONE)) {
                 return nullptr;
             }
 
-            while(match(Token::Kind::NEWLINE)) {
-
-            }
-
-            if(match(Token::Kind::NONE)) {
-                return nullptr;
-            }
-
-            if(check(Token::Kind::ENDSUB) || check(Token::Kind::ENDIF) || check(Token::Kind::ENDWHILE) || check(Token::Kind::ELSE)) {
+            if(check(Token::Kind::RBRACE)) {
                 return nullptr;
             }
 
@@ -103,8 +99,16 @@ namespace ngc
                 return parseWhileStatement();
             }
 
-            if(check(Token::Kind::RETURN)) {
-                return parseReturnStatement();
+            if(match(Token::Kind::BREAK, token)) {
+                return std::make_unique<BreakStatement>(token);
+            }
+
+            if(match(Token::Kind::CONTINUE, token)) {
+                return std::make_unique<ContinueStatement>(token);
+            }
+
+            if(match(Token::Kind::RETURN, token)) {
+                return std::make_unique<ReturnStatement>(token, expect<RealExpression>(parseExpression()));
             }
 
             if(check(Token::Kind::ALIAS)) {
@@ -115,6 +119,17 @@ namespace ngc
                 return parseLetStatement();
             }
 
+            token = peekToken();
+
+            if(token.kind() == Token::Kind::SLASH || token.isLetter()) {
+                return parseBlockStatement();
+            }
+
+            return std::make_unique<ExpressionStatement>(parseExpression());
+        }
+
+        [[nodiscard]] std::unique_ptr<BlockStatement> parseBlockStatement() {
+            Token token;
             std::optional<Token> blockDelete = std::nullopt;
             std::optional<LineNumber> lineNumber = std::nullopt;
 
@@ -126,15 +141,17 @@ namespace ngc
                 lineNumber.emplace(LineNumber(token, expectInteger()));
             }
 
-            std::vector<std::unique_ptr<Expression>> expressions;
+            std::vector<std::unique_ptr<WordExpression>> expressions;
 
             for(;;) {
-                if(match({ Token::Kind::NEWLINE, Token::Kind::NONE })) {
+                auto t = peekToken(false);
+
+                if(match({ Token::Kind::NEWLINE, Token::Kind::NONE }, false)) {
                     auto block = std::make_unique<BlockStatement>(std::move(blockDelete), std::move(lineNumber), std::move(expressions));
                     return block;
                 }
 
-                expressions.emplace_back(parseExpression());
+                expressions.emplace_back(expect<WordExpression>(parsePrimaryExpression()));
             }
         }
 
@@ -152,37 +169,37 @@ namespace ngc
             }
 
             std::ignore = expect(Token::Kind::RBRACKET);
-            auto statements = parseCompoundStatement();
-            auto endToken = expect(Token::Kind::ENDSUB);
+            auto stmt = parseCompoundStatement();
 
-            return std::make_unique<SubStatement>(startToken, endToken, identifier, std::move(params), std::move(statements));
+            // add a return statement if the last statement is not a return statement
+            if(stmt->statements().empty() || !stmt->statements().back()->is<ReturnStatement>()) {
+                auto returnToken = Token(Token::Kind::RETURN, std::make_unique<StringTokenSource>("return", ""));
+                auto exprToken = Token(Token::Kind::NUMBER, std::make_unique<StringTokenSource>("0", ""));
+                stmt->statements().emplace_back(std::make_unique<ReturnStatement>(returnToken, std::make_unique<LiteralExpression>(exprToken)));
+            }
+
+            return std::make_unique<SubStatement>(startToken, identifier, std::move(params), std::move(stmt));
         }
 
         [[nodiscard]] std::unique_ptr<IfStatement> parseIfStatement() {
             auto startToken = expect(Token::Kind::IF);
             auto condition = expect<RealExpression>(parseExpression());
             auto statements = parseCompoundStatement();
+
             std::unique_ptr<CompoundStatement> elseStatements;
 
             if(match(Token::Kind::ELSE)) {
                 elseStatements = parseCompoundStatement();
             }
 
-            auto endToken = expect(Token::Kind::ENDIF);
-            return std::make_unique<IfStatement>(startToken, endToken, std::move(condition), std::move(statements), std::move(elseStatements));
+            return std::make_unique<IfStatement>(startToken, std::move(condition), std::move(statements), std::move(elseStatements));
         }
 
         [[nodiscard]] std::unique_ptr<WhileStatement> parseWhileStatement() {
             auto startToken = expect(Token::Kind::WHILE);
             auto condition = expect<RealExpression>(parseExpression());
             auto statements = parseCompoundStatement();
-            auto endToken = expect(Token::Kind::ENDWHILE);
-            return std::make_unique<WhileStatement>(startToken, endToken, std::move(condition), std::move(statements));
-        }
-
-        [[nodiscard]] std::unique_ptr<ReturnStatement> parseReturnStatement() {
-            auto startToken = expect(Token::Kind::RETURN);
-            return std::make_unique<ReturnStatement>(startToken, expect<RealExpression>(parseExpression()));
+            return std::make_unique<WhileStatement>(startToken, std::move(condition), std::move(statements));
         }
 
         [[nodiscard]] std::unique_ptr<AliasStatement> parseAliasStatement() {
@@ -205,9 +222,7 @@ namespace ngc
         }
 
         [[nodiscard]] std::unique_ptr<Expression> parseExpression() {
-            auto expression = parseAssignmentExpression();
-            //std::println("expression: {}: {}", expression->name(), expression->toString());
-            return expression;
+            return parseAssignmentExpression();
         }
 
         [[nodiscard]] std::unique_ptr<Expression> parseAssignmentExpression() {
@@ -302,11 +317,8 @@ namespace ngc
                 return std::make_unique<CommentExpression>(token);
             }
 
-            switch(token.kind()) {
-                using enum Token::Kind;
-                case A: case B: case C: case D: case F: case G: case H: case I: case J: case K: case L:
-                case M: case N: case O: case P: case Q: case R: case S: case T: case X: case Y: case Z:
-                    return std::make_unique<WordExpression>(token, expect<RealExpression>(parseExpression()));
+            if(token.isLetter()) {
+                return std::make_unique<WordExpression>(token, expect<RealExpression>(parsePrimaryExpression()));
             }
 
             if(token.is(Token::Kind::NUMBER)) {
@@ -360,7 +372,7 @@ namespace ngc
 
         template<typename T>
         [[nodiscard]] std::unique_ptr<T> expect(std::unique_ptr<Expression> expression) {
-            if(!is<T>(expression.get())) {
+            if(!expression->is<T>()) {
                 auto message = std::format("expected {}, but found {}: '{}'", T::staticClassName(), expression->className(), expression->text());
                 error(message, std::move(expression));
             }
@@ -372,7 +384,7 @@ namespace ngc
             Token token;
 
             if(!match(kind, token)) {
-                error("unexpected token", peekToken());
+                error(std::format("expected {}, but found '{}'", name(kind), peekToken().text()), peekToken());
             }
 
             return token;
@@ -389,9 +401,9 @@ namespace ngc
         }
 
         template<size_t N>
-        [[nodiscard]] bool match(const Token::Kind (&kinds)[N], Token &outToken) {
+        [[nodiscard]] bool match(const Token::Kind (&kinds)[N], Token &outToken, const bool skipNewlines = true) {
             for(const auto kind : kinds) {
-                if(match(kind, outToken)) {
+                if(match(kind, outToken, skipNewlines)) {
                     return true;
                 }
             }
@@ -399,9 +411,9 @@ namespace ngc
             return false;
         }
 
-        [[nodiscard]] bool match(const Token::Kind kind, Token &outToken) {
-            if(check(kind)) {
-                outToken = nextToken();
+        [[nodiscard]] bool match(const Token::Kind kind, Token &outToken, const bool skipNewlines = true) {
+            if(check(kind, skipNewlines)) {
+                outToken = nextToken(skipNewlines);
                 return true;
             }
 
@@ -409,9 +421,9 @@ namespace ngc
         }
 
         template<size_t N>
-        [[nodiscard]] bool match(const Token::Kind (&kinds)[N]) {
+        [[nodiscard]] bool match(const Token::Kind (&kinds)[N], const bool skipNewlines = true) {
             for(const auto kind : kinds) {
-                if(match(kind)) {
+                if(match(kind, skipNewlines)) {
                     return true;
                 }
             }
@@ -419,42 +431,50 @@ namespace ngc
             return false;
         }
 
-        [[nodiscard]] bool match(const Token::Kind kind) {
-            if(check(kind)) {
-                std::ignore = nextToken();
+        [[nodiscard]] bool match(const Token::Kind kind, const bool skipNewlines = true) {
+            if(check(kind, skipNewlines)) {
+                std::ignore = nextToken(skipNewlines);
                 return true;
             }
 
             return false;
         }
 
-        [[nodiscard]] bool check(const Token::Kind kind) {
-            return peekToken().is(kind);
+        [[nodiscard]] bool check(const Token::Kind kind, const bool skipNewlines = true) {
+            return peekToken(skipNewlines).is(kind);
         }
 
-        [[nodiscard]] const Token &peekToken() {
-            if(m_peekedToken) {
-                return *m_peekedToken;
-            }
+        [[nodiscard]] Token peekToken(const bool skipNewlines = true) const {
+            for(;;) {
+                const auto token = m_lexer.peekToken();
 
-            m_peekedToken = nextToken();
-            return *m_peekedToken;
+                if(!token) {
+                    error("lexer error", token.error());
+                }
+
+                if(token->is(Token::Kind::NEWLINE) && skipNewlines) {
+                    std::ignore = m_lexer.nextToken();
+                    continue;
+                }
+
+                return *token;
+            }
         }
 
-        [[nodiscard]] Token nextToken() {
-            if(m_peekedToken) {
-                const auto token = *m_peekedToken;
-                m_peekedToken = std::nullopt;
-                return token;
+        [[nodiscard]] Token nextToken(const bool skipNewlines = true) const {
+            for(;;) {
+                const auto token = m_lexer.nextToken();
+
+                if(!token) {
+                    error("lexer error", token.error());
+                }
+
+                if(token->is(Token::Kind::NEWLINE) && skipNewlines) {
+                    continue;
+                }
+
+                return *token;
             }
-
-            const auto token = m_lexer.nextToken();
-
-            if(!token) {
-                error("lexer error", token.error());
-            }
-
-            return *token;
         }
 
         [[noreturn]] static void error(const std::string &message, const std::source_location location = std::source_location::current()) {

@@ -54,6 +54,13 @@ namespace ngc
 
         explicit Lexer(LexerSource &source): m_source(source) { }
 
+        [[nodiscard]] std::expected<Token, Error> peekToken() {
+            m_source.pushState();
+            auto token = nextToken();
+            m_source.popState();
+            return token;
+        }
+
         [[nodiscard]] std::expected<Token, Error> nextToken() {
             if(m_state == State::BEGIN) {
                 while(!end()) {
@@ -116,6 +123,8 @@ namespace ngc
             case '\n': return makeToken(Token::Kind::NEWLINE);
             case '[': return makeToken(Token::Kind::LBRACKET);
             case ']': return makeToken(Token::Kind::RBRACKET);
+            case '{': return makeToken(Token::Kind::LBRACE);
+            case '}': return makeToken(Token::Kind::RBRACE);
             case '(': return comment();
             case '+': return makeToken(Token::Kind::PLUS);
             case '-': return makeToken(Token::Kind::MINUS);
@@ -324,10 +333,6 @@ namespace ngc
                 return makeToken(Token::Kind::SUB);
             }
 
-            if(iequal(name, "endsub")) {
-                return makeToken(Token::Kind::ENDSUB);
-            }
-
             if(iequal(name, "return")) {
                 return makeToken(Token::Kind::RETURN);
             }
@@ -340,16 +345,8 @@ namespace ngc
                 return makeToken(Token::Kind::ELSE);
             }
 
-            if(iequal(name, "endif")) {
-                return makeToken(Token::Kind::ENDIF);
-            }
-
             if(iequal(name, "while")) {
                 return makeToken(Token::Kind::WHILE);
-            }
-
-            if(iequal(name, "endwhile")) {
-                return makeToken(Token::Kind::ENDWHILE);
             }
 
             if(iequal(name, "continue")) {

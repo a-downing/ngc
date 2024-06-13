@@ -1,13 +1,15 @@
+G01 X0 Y0 Z0
+
 let #a = 37
 let #b = 73
 
-sub mul[#a, #b, #c, #d]
-    sub add[#a, #b]
+sub mul[#a, #b, #c, #d] {
+    sub add[#a, #b] {
         return #a + #b
-    endsub
+    }
 
     return add[#a, #b] * add[#c, #d]
-endsub
+}
 
 let #c = mul[100, 101, 102, 103] + #a
 print["#c: ", #c]
@@ -25,3 +27,40 @@ print["&#ten: ", &#ten]
 ##ten = 321
 print["#d: ", #d]
 print["##ten: ", ##ten]
+
+let #j = 0.0
+
+if #j == 0.0 {
+    print["#j == 0.1"]
+}
+
+if #j == 0.0 {
+    print["#j == 0.1"]
+} else {
+    print["#j != 0.1"]
+}
+
+let #i = 0
+
+while #i < 100 {
+    print["#i: ", #i]
+
+    if #i == 10 {
+        break
+    }
+
+    #i = #i + 1
+}
+
+sub noreturn[#x] {
+    (if a return statement is not the last statement, return 0 is added automatically)
+}
+
+sub hasreturn[#x] {
+    return #x + 1
+}
+
+print["noreturn: ", noreturn[42]]
+print["hasreturn: ", hasreturn[36]]
+
+G01 X0 Y0

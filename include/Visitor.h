@@ -9,12 +9,15 @@ namespace ngc {
         virtual ~Visitor() = default;
 
         // statements
+        virtual void visit(const class ExpressionStatement *stmt, VisitorContext *ctx) = 0;
         virtual void visit(const class CompoundStatement *stmt, VisitorContext *ctx) = 0;
         virtual void visit(const class BlockStatement *stmt, VisitorContext *ctx) = 0;
         virtual void visit(const class SubStatement *stmt, VisitorContext *ctx) = 0;
         virtual void visit(const class IfStatement *stmt, VisitorContext *ctx) = 0;
         virtual void visit(const class WhileStatement *stmt, VisitorContext *ctx) = 0;
         virtual void visit(const class ReturnStatement *stmt, VisitorContext *ctx) = 0;
+        virtual void visit(const class BreakStatement *stmt, VisitorContext *ctx) = 0;
+        virtual void visit(const class ContinueStatement *stmt, VisitorContext *ctx) = 0;
         virtual void visit(const class AliasStatement *stmt, VisitorContext *ctx) = 0;
         virtual void visit(const class LetStatement *stmt, VisitorContext *ctx) = 0;
 

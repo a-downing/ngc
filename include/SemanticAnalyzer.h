@@ -60,17 +60,11 @@ namespace ngc
         [[nodiscard]] const std::vector<Error> &errors() const { return m_errors; }
         void clearErrors() { m_errors.clear(); }
 
-        void processPreamble(const CompoundStatement *stmt) {
-            if(stmt) {
-                auto ctx = SemanticAnalyzerContext(true);
-                stmt->accept(*this, &ctx);
-            }
-        }
+        void processProgram(const std::vector<std::unique_ptr<Statement>> &program) {
+            auto ctx = SemanticAnalyzerContext(true);
 
-        void processProgram(const CompoundStatement *program) {
-            if(program) {
-                auto ctx = SemanticAnalyzerContext(true);
-                program->accept(*this, &ctx);
+            for(const auto &stmt : program) {
+                stmt->accept(*this, &ctx);
             }
         }
 
@@ -124,6 +118,10 @@ namespace ngc
         }
 
         // statements
+        void visit(const ExpressionStatement *stmt, VisitorContext *ctx) override {
+            stmt->expression()->accept(*this, ctx);
+        }
+
         void visit(const CompoundStatement *stmt, VisitorContext *ctx) override {
             for(const auto &s : stmt->statements()) {
                 s->accept(*this, ctx);
@@ -203,6 +201,10 @@ namespace ngc
         void visit(const ReturnStatement *stmt, VisitorContext *ctx) override {
             stmt->real()->accept(*this, ctx);
         }
+
+        // TODO: these
+        void visit(const BreakStatement *stmt, VisitorContext *ctx) override { }
+        void visit(const ContinueStatement *stmt, VisitorContext *ctx) override { }
 
         // expressions
         void visit(const BinaryExpression *expr, VisitorContext *ctx) override {

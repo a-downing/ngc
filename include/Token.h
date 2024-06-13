@@ -28,14 +28,13 @@ namespace ngc {
             COMMENT,
             NEWLINE,
             LBRACKET, RBRACKET,
+            LBRACE, RBRACE,
             ASSIGN,
             EQ, NE, LT, LE, GT, GE,
             PLUS, MINUS,
             MUL, SLASH, MOD, POW,
             AND, OR, XOR,
-            SUB, ENDSUB, RETURN,
-            IF, ELSE, ENDIF,
-            WHILE, CONTINUE, BREAK, ENDWHILE,
+            SUB, RETURN, IF, THEN, ELSE, WHILE, CONTINUE, BREAK,
             ALIAS, LET
         };
 
@@ -60,6 +59,16 @@ namespace ngc {
         [[nodiscard]] std::string_view text() const { return m_source->text(); }
         [[nodiscard]] bool number() const { return m_kind == Kind::NUMBER; }
         [[nodiscard]] bool is(const Kind kind) const { return m_kind == kind; }
+
+        [[nodiscard]] bool isLetter() const {
+            switch(m_kind) {
+                using enum Kind;
+                case A: case B: case C: case D: case F: case G: case H: case I: case J: case K: case L: case M: case N: case O: case P: case Q: case R: case S: case T: case X: case Y: case Z:
+                    return true;
+                default:
+                    return false;
+            }
+        }
 
         [[nodiscard]] std::string location() const {
             return std::format("{}:{}:{}", m_source->name(), m_source->line(), m_source->col());
@@ -108,75 +117,80 @@ namespace ngc {
             return static_cast<int>(as_double());
         }
 
-        [[nodiscard]] const char *name() const {
-            switch (m_kind) {
-            case Kind::NONE: return "NONE";
-            case Kind::A: return "A";
-            case Kind::B: return "B";
-            case Kind::C: return "C";
-            case Kind::D: return "D";
-            case Kind::F: return "F";
-            case Kind::G: return "G";
-            case Kind::H: return "H";
-            case Kind::I: return "I";
-            case Kind::J: return "J";
-            case Kind::K: return "K";
-            case Kind::L: return "L";
-            case Kind::M: return "M";
-            case Kind::N: return "N";
-            case Kind::O: return "O";
-            case Kind::P: return "P";
-            case Kind::Q: return "Q";
-            case Kind::R: return "R";
-            case Kind::S: return "S";
-            case Kind::T: return "T";
-            case Kind::X: return "X";
-            case Kind::Y: return "Y";
-            case Kind::Z: return "Z";
-            case Kind::IDENTIFIER: return "IDENTIFIER";
-            case Kind::COMMA: return "COMMA";
-            case Kind::NAMED_VARIABLE: return "NAMED_VARIABLE";
-            case Kind::NUMBER: return "NUMBER";
-            case Kind::STRING: return "STRING";
-            case Kind::POUND: return "POUND";
-            case Kind::AMPERSAND: return "AMPERSAND";
-            case Kind::PERCENT: return "PERCENT";
-            case Kind::COMMENT: return "COMMENT";
-            case Kind::NEWLINE: return "NEWLINE";
-            case Kind::LBRACKET: return "LBRACKET";
-            case Kind::RBRACKET: return "RBRACKET";
-            case Kind::ASSIGN: return "ASSIGN";
-            case Kind::EQ: return "EQ";
-            case Kind::NE: return "NE";
-            case Kind::LT: return "LT";
-            case Kind::LE: return "LE";
-            case Kind::GT: return "GT";
-            case Kind::GE: return "GE";
-            case Kind::PLUS: return "PLUS";
-            case Kind::MINUS: return "MINUS";
-            case Kind::MUL: return "MUL";
-            case Kind::SLASH: return "SLASH";
-            case Kind::MOD: return "MOD";
-            case Kind::POW: return "POW";
-            case Kind::AND: return "AND";
-            case Kind::OR: return "OR";
-            case Kind::XOR: return "XOR";
-            case Kind::SUB: return "SUB";
-            case Kind::ENDSUB: return "ENDSUB";
-            case Kind::RETURN: return "RETURN";
-            case Kind::IF: return "IF";
-            case Kind::ELSE: return "ELSE";
-            case Kind::ENDIF: return "ENDIF";
-            case Kind::WHILE: return "WHILE";
-            case Kind::CONTINUE: return "CONTINUE";
-            case Kind::BREAK: return "BREAK";
-            case Kind::ENDWHILE: return "ENDWHILE";
-            case Kind::ALIAS: return "ALIAS";
-            case Kind::LET: return "LET";
-            default: throw std::logic_error(std::format("Token::name() missing case statement for {} '{}'", std::to_underlying(m_kind), text()));
-            }
-        }
+        [[nodiscard]] const char *name() const;
     };
+
+    inline const char *name(const Token::Kind kind) {
+        switch (kind) {
+            case Token::Kind::NONE: return "NONE";
+            case Token::Kind::A: return "A";
+            case Token::Kind::B: return "B";
+            case Token::Kind::C: return "C";
+            case Token::Kind::D: return "D";
+            case Token::Kind::F: return "F";
+            case Token::Kind::G: return "G";
+            case Token::Kind::H: return "H";
+            case Token::Kind::I: return "I";
+            case Token::Kind::J: return "J";
+            case Token::Kind::K: return "K";
+            case Token::Kind::L: return "L";
+            case Token::Kind::M: return "M";
+            case Token::Kind::N: return "N";
+            case Token::Kind::O: return "O";
+            case Token::Kind::P: return "P";
+            case Token::Kind::Q: return "Q";
+            case Token::Kind::R: return "R";
+            case Token::Kind::S: return "S";
+            case Token::Kind::T: return "T";
+            case Token::Kind::X: return "X";
+            case Token::Kind::Y: return "Y";
+            case Token::Kind::Z: return "Z";
+            case Token::Kind::IDENTIFIER: return "IDENTIFIER";
+            case Token::Kind::COMMA: return "COMMA";
+            case Token::Kind::NAMED_VARIABLE: return "NAMED_VARIABLE";
+            case Token::Kind::NUMBER: return "NUMBER";
+            case Token::Kind::STRING: return "STRING";
+            case Token::Kind::POUND: return "POUND";
+            case Token::Kind::AMPERSAND: return "AMPERSAND";
+            case Token::Kind::PERCENT: return "PERCENT";
+            case Token::Kind::COMMENT: return "COMMENT";
+            case Token::Kind::NEWLINE: return "NEWLINE";
+            case Token::Kind::LBRACKET: return "LBRACKET";
+            case Token::Kind::RBRACKET: return "RBRACKET";
+            case Token::Kind::LBRACE: return "LBRACE";
+            case Token::Kind::RBRACE: return "RBRACE";
+            case Token::Kind::ASSIGN: return "ASSIGN";
+            case Token::Kind::EQ: return "EQ";
+            case Token::Kind::NE: return "NE";
+            case Token::Kind::LT: return "LT";
+            case Token::Kind::LE: return "LE";
+            case Token::Kind::GT: return "GT";
+            case Token::Kind::GE: return "GE";
+            case Token::Kind::PLUS: return "PLUS";
+            case Token::Kind::MINUS: return "MINUS";
+            case Token::Kind::MUL: return "MUL";
+            case Token::Kind::SLASH: return "SLASH";
+            case Token::Kind::MOD: return "MOD";
+            case Token::Kind::POW: return "POW";
+            case Token::Kind::AND: return "AND";
+            case Token::Kind::OR: return "OR";
+            case Token::Kind::XOR: return "XOR";
+            case Token::Kind::SUB: return "SUB";
+            case Token::Kind::RETURN: return "RETURN";
+            case Token::Kind::IF: return "IF";
+            case Token::Kind::ELSE: return "ELSE";
+            case Token::Kind::WHILE: return "WHILE";
+            case Token::Kind::CONTINUE: return "CONTINUE";
+            case Token::Kind::BREAK: return "BREAK";
+            case Token::Kind::ALIAS: return "ALIAS";
+            case Token::Kind::LET: return "LET";
+            default: throw std::logic_error(std::format("Token::name() missing case statement for {}", std::to_underlying(kind)));
+        }
+    }
+
+    inline const char *Token::name() const {
+        return ngc::name(m_kind);
+    }
 }
 
 #endif //TOKEN_H

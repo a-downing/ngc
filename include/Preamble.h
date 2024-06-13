@@ -10,7 +10,7 @@
 #include <Vars.h>
 
 namespace ngc {
-    inline std::unique_ptr<CompoundStatement> buildPreamble(const std::vector<uint32_t> &addrs) {
+    inline std::vector<std::unique_ptr<Statement>> buildPreamble(const std::vector<uint32_t> &addrs) {
         auto statements = std::vector<std::unique_ptr<Statement>>();
 
         for(size_t i = 0; const auto &[var, name, flags] : VARS) {
@@ -23,7 +23,7 @@ namespace ngc {
             i++;
         }
 
-        return std::make_unique<CompoundStatement>(std::move(statements));
+        return statements;
     }
 }
 

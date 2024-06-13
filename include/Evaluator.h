@@ -1,6 +1,7 @@
 #ifndef EVALUATOR_H
 #define EVALUATOR_H
 
+#include <print>
 #include <cmath>
 #include <cstddef>
 #include <format>
@@ -68,7 +69,7 @@ namespace ngc
         double eval(const RealExpression *expr, const bool dereference = true) {
             expr->accept(*this, nullptr);
 
-            if(dereference && is<VariableExpression>(expr)) {
+            if(dereference && expr->is<VariableExpression>()) {
                 const auto addr = static_cast<uint32_t>(m_accumulator);
                 return read(addr);
             }
@@ -76,11 +77,16 @@ namespace ngc
             return m_accumulator;
         }
 
-        void executeProgram(const CompoundStatement *stmt) {
-            if(stmt) {
-                auto ctx = EvaluatorContext { .globalScope = true };
+        void executeProgram(const std::vector<std::unique_ptr<Statement>> &program) {
+            auto ctx = EvaluatorContext { .globalScope = true };
+
+            for(const auto &stmt : program) {
                 stmt->accept(*this, &ctx);
             }
+        }
+
+        void visit(const ExpressionStatement* stmt, VisitorContext* ctx) override {
+            stmt->expression()->accept(*this, ctx);
         }
 
         void visit(const CompoundStatement* stmt, VisitorContext* ctx) override { 
@@ -119,10 +125,40 @@ namespace ngc
             }
         }
 
+        // TODO: return. break, and continue need to use VisitorContext to actually have the action performed
         void visit(const ReturnStatement* stmt, VisitorContext* ctx) override {
+            std::println("<BREAK>");
             auto value = eval(stmt->real());
             std::println("execute: ReturnStatement: {} -> {}", stmt->real()->text(), value);
             std::ignore = m_mem.push(value);
+        }
+
+        void visit(const BreakStatement* stmt, VisitorContext* ctx) override {
+            std::println("<BREAK>");
+        }
+
+        void visit(const ContinueStatement* stmt, VisitorContext* ctx) override {
+            std::println("<CONTINUE>");
+        }
+
+        void visit(const IfStatement* stmt, VisitorContext* ctx) override {
+            if(eval(stmt->condition()) != 0.0) {
+                if(stmt->body()) {
+                    stmt->body()->accept(*this, ctx);
+                }
+            } else {
+                if(stmt->elseBody()) {
+                    stmt->elseBody()->accept(*this, ctx);
+                }
+            }
+        }
+
+        void visit(const WhileStatement* stmt, VisitorContext* ctx) override {
+            while(eval(stmt->condition()) != 0.0) {
+                if(stmt->body()) {
+                    stmt->body()->accept(*this, ctx);
+                }
+            }
         }
 
         void visit(const CallExpression* expr, VisitorContext* ctx) override {
@@ -131,10 +167,10 @@ namespace ngc
                 std::string text;
 
                 for(const auto &arg : expr->args()) {
-                    if(is<RealExpression>(arg.get())) {
-                        text += std::format("{}", eval(as<RealExpression>(arg.get())));
-                    } else if(is<StringExpression>(arg.get())) {
-                        text += as<StringExpression>(arg.get())->value();
+                    if(const auto real = arg->as<RealExpression>()) {
+                        text += std::format("{}", eval(real));
+                    } else if(const auto str = arg->as<StringExpression>()) {
+                        text += str->value();
                     }
                 }
 
@@ -226,7 +262,7 @@ namespace ngc
             double right;
 
             if(expr->op() == BinaryExpression::Op::ASSIGN) {
-                if(!is<VariableExpression>(expr->left())) {
+                if(!expr->left()->is<VariableExpression>()) {
                     throw std::runtime_error(std::format("tried to assign to {}", expr->className()));
                 }
 
@@ -265,7 +301,7 @@ namespace ngc
             double value;
 
             if(expr->op() == UnaryExpression::Op::ADDRESS_OF) {
-                if(!is<VariableExpression>(expr->real())) {
+                if(!expr->real()->is<VariableExpression>()) {
                     throw std::runtime_error(std::format("tried to assign to {}", expr->className()));
                 }
 
@@ -292,10 +328,6 @@ namespace ngc
             m_accumulator = expr->value();
             std::println("{}: execute: {}: {} -> {}", expr->token().location(), expr->className(), expr->text(), m_accumulator);
         }
-        
-        // TODO: these
-        void visit(const IfStatement* stmt, VisitorContext* ctx) override { throw std::logic_error(std::format("tried to evaluate IfStatement")); }
-        void visit(const WhileStatement* stmt, VisitorContext* ctx) override { throw std::logic_error(std::format("tried to evaluate WhileStatement")); }
         
         // not implemented for now
         void visit(const CommentExpression* expr, VisitorContext* ctx) override { }
@@ -332,7 +364,7 @@ namespace ngc
 
         template<typename T>
         const T *expect(const Expression *expr) {
-            auto t = as<T>(expr);
+            auto t = expr->as<T>();
 
             if(!t) {
                 throw std::logic_error(std::format("expected {}, but found {}", T::staticClassName(), expr->className()));

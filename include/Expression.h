@@ -41,27 +41,29 @@ namespace ngc
         virtual bool is(const class CallExpression *) const { return false; }
         virtual bool is(const class GroupingExpression *) const { return false; }
 
+        template<typename T>
+        [[nodiscard]] bool is() const {
+            return this->is(static_cast<const T *>(this));
+        }
+
+        template<typename T>
+        const T *as() const {
+            return this->is(static_cast<const T *>(this)) ? static_cast<const T *>(this) : nullptr;
+        }
+
         virtual void accept(Visitor &v, VisitorContext *ctx) const = 0;
     };
 
-    template<typename T>
-    [[nodiscard]] bool is(const Expression *expr) {
-        return expr->is(static_cast<const T *>(expr));
-    }
-
-    template<typename T>
-    const T *as(const Expression *expr) {
-        return expr->is(static_cast<const T *>(expr)) ? static_cast<const T *>(expr) : nullptr;
-    }
-
     class CommentExpression final : public Expression {
     public:
+        using Expression::is;
         explicit CommentExpression(Token token) : Expression(std::move(token)) { }
         ~CommentExpression() override = default;
 
         [[nodiscard]] const Token &startToken() const override { return token(); }
         [[nodiscard]] const Token &endToken() const override { return token(); }
         [[nodiscard]] std::string text() const override { return std::string(token().text()); }
+
         bool is(const CommentExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "CommentExpression"; }
@@ -71,6 +73,7 @@ namespace ngc
 
     class ScalarExpression : public Expression {
     public:
+        using Expression::is;
         explicit ScalarExpression(Token token) : Expression(std::move(token)) { }
         bool is(const ScalarExpression *) const final { return true; }
         [[nodiscard]] static constexpr const char *staticClassName() { return "ScalarExpression"; }
@@ -78,6 +81,7 @@ namespace ngc
 
     class RealExpression : public ScalarExpression {
     public:
+        using Expression::is;
         explicit RealExpression(Token token) : ScalarExpression(std::move(token)) { }
         bool is(const RealExpression *) const final { return true; }
         [[nodiscard]] static constexpr const char *staticClassName() { return "RealExpression"; }
@@ -87,6 +91,7 @@ namespace ngc
         std::unique_ptr<RealExpression> m_realExpression;
 
     public:
+        using Expression::is;
         WordExpression(Token token, std::unique_ptr<RealExpression> real): Expression(std::move(token)), m_realExpression(std::move(real)) { }
         ~WordExpression() override = default;
 
@@ -104,6 +109,7 @@ namespace ngc
 
     class LiteralExpression final : public RealExpression {
     public:
+        using Expression::is;
         explicit LiteralExpression(Token token) : RealExpression(std::move(token)) { }
         ~LiteralExpression() override = default;
 
@@ -121,6 +127,7 @@ namespace ngc
 
     class StringExpression final : public ScalarExpression {
     public:
+        using Expression::is;
         explicit StringExpression(Token token) : ScalarExpression(std::move(token)) { }
         ~StringExpression() override = default;
 
@@ -138,6 +145,7 @@ namespace ngc
 
     class VariableExpression : public RealExpression {
     public:
+        using Expression::is;
         explicit VariableExpression(Token token) : RealExpression(std::move(token)) { }
         [[nodiscard]] static constexpr const char *staticClassName() { return "VariableExpression"; }
 
@@ -148,6 +156,7 @@ namespace ngc
         std::unique_ptr<RealExpression> m_realExpression;
 
     public:
+        using Expression::is;
         explicit NumericVariableExpression(Token token, std::unique_ptr<RealExpression> realExpression) : VariableExpression(std::move(token)), m_realExpression(std::move(realExpression)) { }
         ~NumericVariableExpression() override = default;
 
@@ -165,6 +174,7 @@ namespace ngc
 
     class NamedVariableExpression final : public VariableExpression {
     public:
+        using Expression::is;
         explicit NamedVariableExpression(Token token) : VariableExpression(std::move(token)) { }
         ~NamedVariableExpression() override = default;
 
@@ -185,6 +195,8 @@ namespace ngc
         std::unique_ptr<RealExpression> m_realExpression;
 
     public:
+        using Expression::is;
+
         enum class Op {
             ADDRESS_OF,
             NEGATIVE,
@@ -220,6 +232,8 @@ namespace ngc
         std::unique_ptr<RealExpression> m_right;
 
     public:
+        using Expression::is;
+
         enum class Op {
             ASSIGN,
             AND, OR, XOR,
@@ -271,6 +285,7 @@ namespace ngc
         std::vector<std::unique_ptr<ScalarExpression>> m_args;
 
     public:
+        using Expression::is;
         explicit CallExpression(Token token, Token endToken, std::vector<std::unique_ptr<ScalarExpression>> args) : RealExpression(std::move(token)), m_endToken(std::move(endToken)), m_args(std::move(args)) { }
         ~CallExpression() override = default;
 
@@ -294,6 +309,7 @@ namespace ngc
         std::unique_ptr<RealExpression> m_realExpression;
 
     public:
+        using Expression::is;
         explicit GroupingExpression(Token token, Token endToken, std::unique_ptr<RealExpression> expression) : RealExpression(std::move(token)), m_endToken(std::move(endToken)), m_realExpression(std::move(expression)) { }
         ~GroupingExpression() override = default;
 
