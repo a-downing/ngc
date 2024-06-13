@@ -2,6 +2,7 @@
 #ifndef EXPRESSION_H
 #define EXPRESSION_H
 
+#include <utility>
 #include <vector>
 #include <memory>
 #include <utility>
@@ -16,7 +17,7 @@ namespace ngc
         Token m_token;
 
     public:
-        explicit Expression(Token token) : m_token(std::move(token)) { }
+        explicit Expression(Token  token) : m_token(std::move(token)) { }
         virtual ~Expression() = default;
 
         [[nodiscard]] const Token &token() const { return m_token; }
@@ -26,30 +27,32 @@ namespace ngc
         [[nodiscard]] virtual constexpr const char *className() const = 0;
         [[nodiscard]] virtual std::string text() const = 0;
 
-        virtual bool is(const class CommentExpression *expression) const { return false; }
-        virtual bool is(const class WordExpression *expression) const { return false; }
-        virtual bool is(const class RealExpression *expression) const { return false; }
-        virtual bool is(const class LiteralExpression *expression) const { return false; }
-        virtual bool is(const class VariableExpression *expression) const { return false; }
-        virtual bool is(const class NumericVariableExpression *expression) const { return false; }
-        virtual bool is(const class NamedVariableExpression *expression) const { return false; }
-        virtual bool is(const class UnaryExpression *expression) const { return false; }
-        virtual bool is(const class BinaryExpression *expression) const { return false; }
-        virtual bool is(const class CallExpression *expression) const { return false; }
-        virtual bool is(const class GroupingExpression *expression) const { return false; }
-
-        template<typename T>
-        [[nodiscard]] bool is() const {
-            return is(static_cast<const T *>(this));
-        }
-
-        template<typename T>
-        const T *as() const {
-            return is(static_cast<const T *>(this)) ? static_cast<const T *>(this) : nullptr;
-        }
+        virtual bool is(const class CommentExpression *) const { return false; }
+        virtual bool is(const class WordExpression *) const { return false; }
+        virtual bool is(const class ScalarExpression *) const { return false; }
+        virtual bool is(const class RealExpression *) const { return false; }
+        virtual bool is(const class LiteralExpression *) const { return false; }
+        virtual bool is(const class StringExpression *) const { return false; }
+        virtual bool is(const class VariableExpression *) const { return false; }
+        virtual bool is(const class NumericVariableExpression *) const { return false; }
+        virtual bool is(const class NamedVariableExpression *) const { return false; }
+        virtual bool is(const class UnaryExpression *) const { return false; }
+        virtual bool is(const class BinaryExpression *) const { return false; }
+        virtual bool is(const class CallExpression *) const { return false; }
+        virtual bool is(const class GroupingExpression *) const { return false; }
 
         virtual void accept(Visitor &v, VisitorContext *ctx) const = 0;
     };
+
+    template<typename T>
+    [[nodiscard]] bool is(const Expression *expr) {
+        return expr->is(static_cast<const T *>(expr));
+    }
+
+    template<typename T>
+    const T *as(const Expression *expr) {
+        return expr->is(static_cast<const T *>(expr)) ? static_cast<const T *>(expr) : nullptr;
+    }
 
     class CommentExpression final : public Expression {
     public:
@@ -59,16 +62,24 @@ namespace ngc
         [[nodiscard]] const Token &startToken() const override { return token(); }
         [[nodiscard]] const Token &endToken() const override { return token(); }
         [[nodiscard]] std::string text() const override { return std::string(token().text()); }
-        bool is(const CommentExpression *expression) const override { return true; }
+        bool is(const CommentExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "CommentExpression"; }
         [[nodiscard]] constexpr const char *className() const override { return staticClassName(); }
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
     };
 
-    class RealExpression : public Expression {
+    class ScalarExpression : public Expression {
     public:
-        explicit RealExpression(Token token) : Expression(std::move(token)) { }
+        explicit ScalarExpression(Token token) : Expression(std::move(token)) { }
+        bool is(const ScalarExpression *) const final { return true; }
+        [[nodiscard]] static constexpr const char *staticClassName() { return "ScalarExpression"; }
+    };
+
+    class RealExpression : public ScalarExpression {
+    public:
+        explicit RealExpression(Token token) : ScalarExpression(std::move(token)) { }
+        bool is(const RealExpression *) const final { return true; }
         [[nodiscard]] static constexpr const char *staticClassName() { return "RealExpression"; }
     };
 
@@ -83,7 +94,8 @@ namespace ngc
         [[nodiscard]] const Token &endToken() const override { return m_realExpression->endToken(); }
         [[nodiscard]] std::string text() const override { return std::format("{}{}", token().text(), m_realExpression->text()); }
         [[nodiscard]] const RealExpression *real() const { return m_realExpression.get(); }
-        bool is(const WordExpression *expression) const override { return true; }
+
+        bool is(const WordExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "WordExpression"; }
         [[nodiscard]] constexpr const char *className() const override { return staticClassName(); }
@@ -100,10 +112,26 @@ namespace ngc
         [[nodiscard]] std::string text() const override { return std::string(token().text()); }
         [[nodiscard]] double value() const { return token().as_double(); }
 
-        bool is(const RealExpression *expression) const override { return true; }
-        bool is(const LiteralExpression *expression) const override { return true; }
+        bool is(const LiteralExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "LiteralExpression"; }
+        [[nodiscard]] constexpr const char *className() const override { return staticClassName(); }
+        void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
+    };
+
+    class StringExpression final : public ScalarExpression {
+    public:
+        explicit StringExpression(Token token) : ScalarExpression(std::move(token)) { }
+        ~StringExpression() override = default;
+
+        [[nodiscard]] const Token &startToken() const override { return token(); }
+        [[nodiscard]] const Token &endToken() const override { return token(); }
+        [[nodiscard]] std::string text() const override { return std::string(token().text()); }
+        [[nodiscard]] std::string_view value() const { return token().value(); }
+
+        bool is(const StringExpression *) const override { return true; }
+
+        [[nodiscard]] static constexpr const char *staticClassName() { return "StringExpression"; }
         [[nodiscard]] constexpr const char *className() const override { return staticClassName(); }
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
     };
@@ -112,6 +140,8 @@ namespace ngc
     public:
         explicit VariableExpression(Token token) : RealExpression(std::move(token)) { }
         [[nodiscard]] static constexpr const char *staticClassName() { return "VariableExpression"; }
+
+        bool is(const VariableExpression *) const final { return true; }
     };
 
     class NumericVariableExpression final : public VariableExpression {
@@ -125,9 +155,8 @@ namespace ngc
         [[nodiscard]] const Token &endToken() const override { return m_realExpression->endToken(); }
         [[nodiscard]] std::string text() const override { return std::format("{}{}", token().text(), m_realExpression->text()); }
         [[nodiscard]] const RealExpression *real() const { return m_realExpression.get(); }
-        bool is(const RealExpression *expression) const override { return true; }
-        bool is(const VariableExpression *expression) const override { return true; }
-        bool is(const NumericVariableExpression *expression) const override { return true; }
+
+        bool is(const NumericVariableExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "NumericVariableExpression"; }
         [[nodiscard]] constexpr const char *className() const override { return staticClassName(); }
@@ -142,9 +171,8 @@ namespace ngc
         [[nodiscard]] const Token &startToken() const override { return token(); }
         [[nodiscard]] const Token &endToken() const override { return token(); }
         [[nodiscard]] std::string text() const override { return std::string(token().text()); }
-        bool is(const RealExpression *expression) const override { return true; }
-        bool is(const VariableExpression *expression) const override { return true; }
-        bool is(const NamedVariableExpression *expression) const override { return true; }
+
+        bool is(const NamedVariableExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "NamedVariableExpression"; }
         [[nodiscard]] constexpr const char *className() const override { return staticClassName(); }
@@ -170,8 +198,8 @@ namespace ngc
         [[nodiscard]] const Token &endToken() const override { return m_realExpression->endToken(); }
         [[nodiscard]] std::string text() const override { return std::format("{}{}", token().text(), m_realExpression->text()); }
         [[nodiscard]] const RealExpression *real() const { return m_realExpression.get(); }
-        bool is(const RealExpression *expression) const override { return true; }
-        bool is(const UnaryExpression *expression) const override { return true; }
+
+        bool is(const UnaryExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "UnaryExpression"; }
         [[nodiscard]] constexpr const char *className() const override { return staticClassName(); }
@@ -206,8 +234,8 @@ namespace ngc
         [[nodiscard]] const Token &startToken() const override { return m_left->startToken(); }
         [[nodiscard]] const Token &endToken() const override { return m_right->endToken(); }
         [[nodiscard]] std::string text() const override { return std::format("[{} {} {}]", m_left->text(), token().text(), m_right->text()); }
-        bool is(const RealExpression *expression) const override { return true; }
-        bool is(const BinaryExpression *expression) const override { return true; }
+
+        bool is(const BinaryExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "BinaryExpression"; }
         [[nodiscard]] constexpr const char *className() const override { return staticClassName(); }
@@ -236,48 +264,27 @@ namespace ngc
                 default: throw std::logic_error(std::format("invalid token {} '{}' for BinaryExpression", token().name(), token().text()));
             }
         }
-
-        [[nodiscard]] std::string_view opName() const {
-            switch (token().kind()) {
-                case Token::Kind::ASSIGN: return "ASSIGN";
-                case Token::Kind::EQ: return "EQ";
-                case Token::Kind::NE: return "NE";
-                case Token::Kind::LT: return "LT";
-                case Token::Kind::LE: return "LE";
-                case Token::Kind::GT: return "GT";
-                case Token::Kind::GE: return "GE";
-                case Token::Kind::PLUS: return "ADD";
-                case Token::Kind::MINUS: return "SUB";
-                case Token::Kind::MUL: return "MUL";
-                case Token::Kind::SLASH: return "DIV";
-                case Token::Kind::MOD: return "MOD";
-                case Token::Kind::AND: return "AND";
-                case Token::Kind::OR: return "OR";
-                case Token::Kind::XOR: return "XOR";
-                default: throw std::logic_error(std::format("invalid token {} '{}' for BinaryExpression", token().name(), token().text()));
-            }
-        }
     };
 
     class CallExpression final : public RealExpression {
         Token m_endToken;
-        std::vector<std::unique_ptr<RealExpression>> m_args;
+        std::vector<std::unique_ptr<ScalarExpression>> m_args;
 
     public:
-        explicit CallExpression(Token token, Token endToken, std::vector<std::unique_ptr<RealExpression>> args) : RealExpression(std::move(token)), m_endToken(std::move(endToken)), m_args(std::move(args)) { }
+        explicit CallExpression(Token token, Token endToken, std::vector<std::unique_ptr<ScalarExpression>> args) : RealExpression(std::move(token)), m_endToken(std::move(endToken)), m_args(std::move(args)) { }
         ~CallExpression() override = default;
 
         [[nodiscard]] const Token &startToken() const override { return token(); }
         [[nodiscard]] const Token &endToken() const override { return m_endToken; }
         [[nodiscard]] std::string text() const override { return std::format("{}[...]", token().text()); } // TODO: this
-        bool is(const RealExpression *expression) const override { return true; }
-        bool is(const CallExpression *expression) const override { return true; }
+
+        bool is(const CallExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "CallExpression"; }
         [[nodiscard]] constexpr const char *className() const override { return staticClassName(); }
 
         [[nodiscard]] std::string_view name() const { return token().value(); }
-        [[nodiscard]] const std::vector<std::unique_ptr<RealExpression>> &args() const { return m_args; }
+        [[nodiscard]] const std::vector<std::unique_ptr<ScalarExpression>> &args() const { return m_args; }
 
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
     };
@@ -294,8 +301,8 @@ namespace ngc
         [[nodiscard]] const Token &endToken() const override { return m_endToken; }
         [[nodiscard]] std::string text() const override { return std::format("[{}]", m_realExpression->text()); }
         [[nodiscard]] const RealExpression *real() const { return m_realExpression.get(); }
-        bool is(const RealExpression *expression) const override { return true; }
-        bool is(const GroupingExpression *expression) const override { return true; }
+
+        bool is(const GroupingExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "GroupingExpression"; }
 

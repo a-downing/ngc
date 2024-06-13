@@ -9,9 +9,8 @@
 #include <Memory.h>
 #include <SemanticAnalyzer.h>
 #include <Program.h>
-
-#include "Evaluator.h"
-#include "Preamble.h"
+#include <Evaluator.h>
+#include <Preamble.h>
 
 int main(const int argc, const char **argv) {
     if(argc < 2) {

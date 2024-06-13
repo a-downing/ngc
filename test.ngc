@@ -10,8 +10,18 @@ sub mul[#a, #b, #c, #d]
 endsub
 
 let #c = mul[100, 101, 102, 103] + #a
-let #d = #c
-let #e = -#d
-let #f = +#e
-let #g = &#f
-+#[12]
+print["#c: ", #c]
+
+let #d = 123
+let #e = &#d
+let #ten = 10
+
+print["#d: ", #d]
+print["&#d: ", &#d]
+print["#e: ", #e]
+print["#ten: ", #ten]
+print["&#ten: ", &#ten]
+
+##ten = 321
+print["#d: ", #d]
+print["##ten: ", ##ten]

@@ -122,6 +122,7 @@ namespace ngc
             case '/': return makeToken(Token::Kind::SLASH);
             case ',': return makeToken(Token::Kind::COMMA);
             case '&': return makeToken(Token::Kind::AMPERSAND);
+            case '"': return string();
             case '=':
                 if(match('=')) {
                     return makeToken(Token::Kind::EQ);
@@ -174,6 +175,23 @@ namespace ngc
         }
 
     private:
+        [[nodiscard]] std::expected<Token, Error> string() {
+            while(!match('"') && !end()) {
+                if(match('\'')) {
+                    advance();
+                }
+
+                advance();
+            }
+
+            if(prev() != '"') {
+                return std::unexpected(Error("unterminated string", m_source.name(), line(), col()));
+            }
+
+
+            return makeToken(Token::Kind::STRING);
+        }
+
         [[nodiscard]] std::expected<Token, Error> name(const Token::Kind kind) {
             while(!match('>') && !end()) {
                 advance();

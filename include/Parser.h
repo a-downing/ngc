@@ -303,29 +303,10 @@ namespace ngc
             }
 
             switch(token.kind()) {
-            case Token::Kind::A:
-            case Token::Kind::B:
-            case Token::Kind::C:
-            case Token::Kind::D:
-            case Token::Kind::F:
-            case Token::Kind::G:
-            case Token::Kind::H:
-            case Token::Kind::I:
-            case Token::Kind::J:
-            case Token::Kind::K:
-            case Token::Kind::L:
-            case Token::Kind::M:
-            case Token::Kind::N:
-            case Token::Kind::O:
-            case Token::Kind::P:
-            case Token::Kind::Q:
-            case Token::Kind::R:
-            case Token::Kind::S:
-            case Token::Kind::T:
-            case Token::Kind::X:
-            case Token::Kind::Y:
-            case Token::Kind::Z:
-                return std::make_unique<WordExpression>(token, expect<RealExpression>(parseExpression()));
+                using enum Token::Kind;
+                case A: case B: case C: case D: case F: case G: case H: case I: case J: case K: case L:
+                case M: case N: case O: case P: case Q: case R: case S: case T: case X: case Y: case Z:
+                    return std::make_unique<WordExpression>(token, expect<RealExpression>(parseExpression()));
             }
 
             if(token.is(Token::Kind::NUMBER)) {
@@ -356,16 +337,20 @@ namespace ngc
                 return std::make_unique<UnaryExpression>(token, expect<VariableExpression>(parseExpression()));
             }
 
+            if(token.is(Token::Kind::STRING)) {
+                return std::make_unique<StringExpression>(token);
+            }
+
             error("unexpected token", token);
         }
 
         [[nodiscard]] std::unique_ptr<CallExpression> parseCallExpression(const Token &token) {
             std::ignore = expect(Token::Kind::LBRACKET);
-            auto args = std::vector<std::unique_ptr<RealExpression>>();
+            auto args = std::vector<std::unique_ptr<ScalarExpression>>();
 
             if(!check(Token::Kind::RBRACKET)) {
                 do {
-                    args.emplace_back(expect<RealExpression>(parseExpression()));
+                    args.emplace_back(expect<ScalarExpression>(parseExpression()));
                 } while(match(Token::Kind::COMMA));
             }
 
@@ -375,7 +360,7 @@ namespace ngc
 
         template<typename T>
         [[nodiscard]] std::unique_ptr<T> expect(std::unique_ptr<Expression> expression) {
-            if(!expression->is<T>()) {
+            if(!is<T>(expression.get())) {
                 auto message = std::format("expected {}, but found {}: '{}'", T::staticClassName(), expression->className(), expression->text());
                 error(message, std::move(expression));
             }

@@ -22,6 +22,7 @@ namespace ngc {
         virtual void visit(const class CommentExpression *expr, VisitorContext *ctx) = 0;
         virtual void visit(const class WordExpression *expr, VisitorContext *ctx) = 0;
         virtual void visit(const class LiteralExpression *expr, VisitorContext *ctx) = 0;
+        virtual void visit(const class StringExpression *expr, VisitorContext *ctx) = 0;
         virtual void visit(const class NumericVariableExpression *expr, VisitorContext *ctx) = 0;
         virtual void visit(const class NamedVariableExpression *expr, VisitorContext *ctx) = 0;
         virtual void visit(const class UnaryExpression *expr, VisitorContext *ctx) = 0;

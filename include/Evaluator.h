@@ -34,6 +34,8 @@ namespace ngc
         explicit Evaluator(Memory &mem) : m_mem(mem), m_scope(1), m_subScope(1) { }
 
         void allocate(const NamedVariableExpression *expr, double value, const EvaluatorContext &ctx) {
+            std::println("{}: allocate: {} {}", expr->token().location(), expr->text(), value);
+
             if(ctx.globalScope) {
                 if(m_scope.front().contains(expr->name())) {
                     throw std::logic_error(std::format("redeclared global variable '{}'", expr->name()));
@@ -66,7 +68,7 @@ namespace ngc
         double eval(const RealExpression *expr, const bool dereference = true) {
             expr->accept(*this, nullptr);
 
-            if(dereference && expr->is<VariableExpression>()) {
+            if(dereference && is<VariableExpression>(expr)) {
                 const auto addr = static_cast<uint32_t>(m_accumulator);
                 return read(addr);
             }
@@ -124,6 +126,24 @@ namespace ngc
         }
 
         void visit(const CallExpression* expr, VisitorContext* ctx) override {
+            // TODO: more extensible way to evaluate built in functions
+            if(expr->name() == "print") {
+                std::string text;
+
+                for(const auto &arg : expr->args()) {
+                    if(is<RealExpression>(arg.get())) {
+                        text += std::format("{}", eval(as<RealExpression>(arg.get())));
+                    } else if(is<StringExpression>(arg.get())) {
+                        text += as<StringExpression>(arg.get())->value();
+                    }
+                }
+
+                std::println("<PRINT>: {}", text);
+
+                m_accumulator = 0.0;
+                return;
+            }
+
             const auto sig = SubSignature(expr);
             const SubStatement *stmt = nullptr;
 
@@ -151,7 +171,8 @@ namespace ngc
             auto newCtx = EvaluatorContext { .globalScope = false };
 
             for(size_t i = 0; i < params.size(); i++) {
-                const auto value = eval(args[i].get());
+                auto arg = expect<RealExpression>(args[i].get());
+                const auto value = eval(arg);
                 allocate(params[i].get(), value, newCtx);
             }
 
@@ -205,7 +226,7 @@ namespace ngc
             double right;
 
             if(expr->op() == BinaryExpression::Op::ASSIGN) {
-                if(!expr->left()->is<VariableExpression>()) {
+                if(!is<VariableExpression>(expr->left())) {
                     throw std::runtime_error(std::format("tried to assign to {}", expr->className()));
                 }
 
@@ -219,21 +240,22 @@ namespace ngc
             }
 
             switch (expr->op()) {
-                case BinaryExpression::Op::ASSIGN: m_accumulator = right; break;
-                case BinaryExpression::Op::AND: m_accumulator = static_cast<bool>(left) && static_cast<bool>(right); break;
-                case BinaryExpression::Op::OR: m_accumulator = static_cast<bool>(left) || static_cast<bool>(right); break;
-                case BinaryExpression::Op::XOR: m_accumulator = (static_cast<bool>(left) && !static_cast<bool>(right)) || (static_cast<bool>(right) && !static_cast<bool>(left)); break;
-                case BinaryExpression::Op::EQ: m_accumulator = left == right; break;
-                case BinaryExpression::Op::NE: m_accumulator = left != right; break;
-                case BinaryExpression::Op::LT: m_accumulator = left < right; break;
-                case BinaryExpression::Op::LE: m_accumulator = left <= right; break;
-                case BinaryExpression::Op::GT: m_accumulator = left > right; break;
-                case BinaryExpression::Op::GE: m_accumulator = left >= right; break;
-                case BinaryExpression::Op::ADD: m_accumulator = left + right; break;
-                case BinaryExpression::Op::SUB: m_accumulator = left - right; break;
-                case BinaryExpression::Op::MUL: m_accumulator = left * right; break;
-                case BinaryExpression::Op::DIV: m_accumulator = left / right; break;
-                case BinaryExpression::Op::MOD: m_accumulator = std::fmod(left, right); break;
+                using enum BinaryExpression::Op;
+                case ASSIGN: m_accumulator = right; break;
+                case AND: m_accumulator = static_cast<bool>(left) && static_cast<bool>(right); break;
+                case OR: m_accumulator = static_cast<bool>(left) || static_cast<bool>(right); break;
+                case XOR: m_accumulator = (static_cast<bool>(left) && !static_cast<bool>(right)) || (static_cast<bool>(right) && !static_cast<bool>(left)); break;
+                case EQ: m_accumulator = left == right; break;
+                case NE: m_accumulator = left != right; break;
+                case LT: m_accumulator = left < right; break;
+                case LE: m_accumulator = left <= right; break;
+                case GT: m_accumulator = left > right; break;
+                case GE: m_accumulator = left >= right; break;
+                case ADD: m_accumulator = left + right; break;
+                case SUB: m_accumulator = left - right; break;
+                case MUL: m_accumulator = left * right; break;
+                case DIV: m_accumulator = left / right; break;
+                case MOD: m_accumulator = std::fmod(left, right); break;
             }
 
             std::println("{}: execute: {}: {} -> {}", expr->token().location(), expr->className(), expr->text(), m_accumulator);
@@ -243,7 +265,7 @@ namespace ngc
             double value;
 
             if(expr->op() == UnaryExpression::Op::ADDRESS_OF) {
-                if(!expr->real()->is<VariableExpression>()) {
+                if(!is<VariableExpression>(expr->real())) {
                     throw std::runtime_error(std::format("tried to assign to {}", expr->className()));
                 }
 
@@ -278,8 +300,9 @@ namespace ngc
         // not implemented for now
         void visit(const CommentExpression* expr, VisitorContext* ctx) override { }
         void visit(const WordExpression* expr, VisitorContext* ctx) override { }
+        void visit(const StringExpression* expr, VisitorContext* ctx) override { }
 
-        double read(const uint32_t addr) {
+        [[nodiscard]] double read(const uint32_t addr) const {
             auto result = m_mem.read(addr);
 
             if(!result) {
@@ -305,6 +328,17 @@ namespace ngc
                 case Memory::Error::WRITE: throw std::logic_error("WRITE");
                 }
             }
+        }
+
+        template<typename T>
+        const T *expect(const Expression *expr) {
+            auto t = as<T>(expr);
+
+            if(!t) {
+                throw std::logic_error(std::format("expected {}, but found {}", T::staticClassName(), expr->className()));
+            }
+
+            return t;
         }
     };
 }

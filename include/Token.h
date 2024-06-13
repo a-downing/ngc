@@ -21,6 +21,7 @@ namespace ngc {
             COMMA,
             NAMED_VARIABLE,
             NUMBER,
+            STRING,
             POUND,
             AMPERSAND,
             PERCENT,
@@ -46,6 +47,7 @@ namespace ngc {
         Token(): m_kind(Kind::NONE), m_source(std::make_unique<StringTokenSource>("none", "none")) { }
         Token(const Kind kind, std::unique_ptr<TokenSource> source): m_kind(kind), m_source(std::move(source)) { }
         Token(const Token &t) : m_kind(t.m_kind), m_source(t.m_source->clone()) { }
+        Token(Token &&) = default;
 
         Token &operator=(const Token &t) {
             m_kind = t.m_kind;
@@ -68,7 +70,8 @@ namespace ngc {
                 case Kind::NUMBER:
                 case Kind::IDENTIFIER: return text();
                 case Kind::NAMED_VARIABLE: return text().substr(1, text().size() - 1);
-                case Kind::COMMENT: return text().substr(1, text().size() - 2);
+                case Kind::COMMENT:
+                case Kind::STRING: return text().substr(1, text().size() - 2);
                 default: throw std::logic_error(std::format("Token::value() called on non-value type Token {} '{}'", name(), text()));
             }
         }
@@ -134,6 +137,7 @@ namespace ngc {
             case Kind::COMMA: return "COMMA";
             case Kind::NAMED_VARIABLE: return "NAMED_VARIABLE";
             case Kind::NUMBER: return "NUMBER";
+            case Kind::STRING: return "STRING";
             case Kind::POUND: return "POUND";
             case Kind::AMPERSAND: return "AMPERSAND";
             case Kind::PERCENT: return "PERCENT";

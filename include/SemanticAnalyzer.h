@@ -4,7 +4,6 @@
 
 #include <print>
 #include <ranges>
-#include <stdexcept>
 #include <vector>
 #include <unordered_map>
 #include <unordered_set>
@@ -113,7 +112,7 @@ namespace ngc
         }
 
         void declareSub(const SubStatement *stmt) {
-            auto sig = SubSignature(stmt);
+            const auto sig = SubSignature(stmt);
 
             std::println("INFO: added local sub: {}", sig.toString());
 
@@ -218,8 +217,15 @@ namespace ngc
         }
 
         void visit(const CallExpression *expr, VisitorContext *ctx) override {
-            if(!isDeclared(expr)) {
-                m_errors.emplace_back(std::format("{}: ERROR: call to '{}' before definition", expr->token().location(), expr->text()), expr);
+            // TODO: more extensible way to analyze built in functions
+            if(expr->name() != "print") {
+                if(!isDeclared(expr)) {
+                    m_errors.emplace_back(std::format("{}: ERROR: call to '{}' before definition", expr->token().location(), expr->text()), expr);
+                }
+            }
+
+            for(const auto &arg : expr->args()) {
+                arg->accept(*this, ctx);
             }
         }
 
@@ -242,6 +248,7 @@ namespace ngc
         // not needed
         void visit(const CommentExpression *expr, VisitorContext *ctx) override { }
         void visit(const LiteralExpression *expr, VisitorContext *ctx) override { }
+        void visit(const StringExpression *expr, VisitorContext *ctx) override { }
     };
 }
 
