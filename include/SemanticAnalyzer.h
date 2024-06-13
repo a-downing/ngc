@@ -144,13 +144,8 @@ namespace ngc
                 declareLocal(param.get());
             }
 
-            if(stmt->body()) {
-                auto localCtx = SemanticAnalyzerContext(false);
-
-                for(const auto &s : stmt->body()->statements()) {
-                    s->accept(*this, &localCtx);
-                }
-            }
+            auto localCtx = SemanticAnalyzerContext(false);
+            stmt->body()->accept(*this, &localCtx);
 
             m_scope.pop_back();
             m_subScope.pop_back();

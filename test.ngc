@@ -56,9 +56,7 @@ sub noreturn[#x] {
     (if a return statement is not the last statement, return 0 is added automatically)
 }
 
-sub hasreturn[#x] {
-    return #x + 1
-}
+sub hasreturn[#x] return #x + 1
 
 print["noreturn: ", noreturn[42]]
 print["hasreturn: ", hasreturn[36]]

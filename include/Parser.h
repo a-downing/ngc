@@ -72,10 +72,6 @@ namespace ngc
                 return nullptr;
             }
 
-            if(check(Token::Kind::RBRACE)) {
-                return nullptr;
-            }
-
             Token token;
 
             if(match(Token::Kind::PERCENT, token)) {
@@ -85,6 +81,14 @@ namespace ngc
                 }
 
                 error("unexpected token", token);
+            }
+
+            if(check(Token::Kind::LBRACE)) {
+                return parseCompoundStatement();
+            }
+
+            if(check(Token::Kind::RBRACE)) {
+                return nullptr;
             }
 
             if(check(Token::Kind::SUB)) {
@@ -169,16 +173,25 @@ namespace ngc
             }
 
             std::ignore = expect(Token::Kind::RBRACKET);
-            auto stmt = parseCompoundStatement();
 
-            // add a return statement if the last statement is not a return statement
-            if(stmt->statements().empty() || !stmt->statements().back()->is<ReturnStatement>()) {
-                auto returnToken = Token(Token::Kind::RETURN, std::make_unique<StringTokenSource>("return", ""));
-                auto exprToken = Token(Token::Kind::NUMBER, std::make_unique<StringTokenSource>("0", ""));
-                stmt->statements().emplace_back(std::make_unique<ReturnStatement>(returnToken, std::make_unique<LiteralExpression>(exprToken)));
+            auto stmt = parseStatement();
+
+            if(stmt->is<ReturnStatement>()) {
+                return std::make_unique<SubStatement>(startToken, identifier, std::move(params), std::move(stmt));
             }
 
-            return std::make_unique<SubStatement>(startToken, identifier, std::move(params), std::move(stmt));
+            if(const auto compound = stmt->as<CompoundStatement>(); compound) {
+                //add a return statement if the last statement is not a return statement
+                if(compound->statements().empty() || !compound->statements().back()->is<ReturnStatement>()) {
+                    auto returnToken = Token(Token::Kind::RETURN, std::make_unique<StringTokenSource>("return", ""));
+                    auto exprToken = Token(Token::Kind::NUMBER, std::make_unique<StringTokenSource>("0", ""));
+                    compound->statements().emplace_back(std::make_unique<ReturnStatement>(returnToken, std::make_unique<LiteralExpression>(exprToken)));
+                }
+
+                return std::make_unique<SubStatement>(startToken, identifier, std::move(params), std::move(stmt));
+            }
+
+            error("expected a return statement or a compound statement", stmt->startToken());
         }
 
         [[nodiscard]] std::unique_ptr<IfStatement> parseIfStatement() {
