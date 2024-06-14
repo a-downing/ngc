@@ -54,22 +54,22 @@ int main(const int argc, const char **argv) {
     const auto addrs = mem.init(ngc::VARS);
     const auto preamble = ngc::buildPreamble(addrs);
 
-    ngc::SemanticAnalyzer sa;
-    sa.addGlobalSub(ngc::SubSignature("sin", 1));
-    sa.processProgram(preamble);
-
-    for(auto &program : programs) {
-        std::println("analyzing: {}", program.source().name());
-        sa.processProgram(program.statements());
-
-        if(!sa.errors().empty()) {
-            for(const auto &error : sa.errors()) {
-                std::println(stderr, "{}", error.message());
-            }
-
-            return 1;
-        }
-    }
+    // ngc::SemanticAnalyzer sa;
+    // sa.addGlobalSub(ngc::SubSignature("sin", 1));
+    // sa.processProgram(preamble);
+    //
+    // for(auto &program : programs) {
+    //     std::println("analyzing: {}", program.source().name());
+    //     sa.processProgram(program.statements());
+    //
+    //     if(!sa.errors().empty()) {
+    //         for(const auto &error : sa.errors()) {
+    //             std::println(stderr, "{}", error.message());
+    //         }
+    //
+    //         return 1;
+    //     }
+    // }
 
     auto eval = ngc::Evaluator(mem);
     eval.executeProgram(preamble);

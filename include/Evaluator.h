@@ -25,36 +25,78 @@ namespace ngc
         double m_accumulator = 0.0;
         Memory &m_mem;
 
-        struct EvaluatorContext : public VisitorContext {
-            bool globalScope;
+        class Scope {
+            Evaluator *m_evaluator = nullptr;
+            bool m_opened = false;
+            bool m_global = false;
+
+        public:
+            explicit Scope(Evaluator &evaluator, const bool global) : m_evaluator(&evaluator), m_global(global) { }
+            Scope() = default;
+
+            ~Scope() {
+                if(m_opened) {
+                    for(auto _ : m_evaluator->m_scope.back()) {
+                        m_evaluator->m_mem.pop();
+                    }
+
+                    m_evaluator->m_scope.pop_back();
+                    m_evaluator->m_subScope.pop_back();
+                }
+            }
+
+            void allocate(const NamedVariableExpression *expr, double value) {
+                std::println("{}: allocate: {} {}", expr->token().location(), expr->text(), value);
+
+                if(!m_global && !m_opened) {
+                    openScope();
+                }
+
+                if(m_evaluator->m_scope.size() == 1) {
+                    if(m_evaluator->m_scope.front().contains(expr->name())) {
+                        throw std::logic_error(std::format("redeclared global variable '{}'", expr->name()));
+                    }
+
+                    uint32_t addr = m_evaluator->m_mem.addData(MemoryCell(MemoryCell::Flags::READ | MemoryCell::Flags::WRITE, value));
+                    std::println("{}: ALLOCATE GLOBAL: {} @ data:{}", expr->token().location(), expr->text(), addr);
+                    m_evaluator->m_scope.front().emplace(expr->name(), addr);
+                } else {
+                    if(m_evaluator->m_scope.back().contains(expr->name())) {
+                        throw std::logic_error(std::format("redeclared local variable '{}'", expr->name()));
+                    }
+
+                    uint32_t addr = m_evaluator->m_mem.push(value);
+                    std::println("{}: ALLOCATE LOCAL: {} @ stack:{}", expr->token().location(), expr->text(), addr & ~Memory::ADDR_STACK);
+                    m_evaluator->m_scope.back().emplace(expr->name(), addr);
+                }
+            }
+
+        private:
+            void openScope() {
+                m_evaluator->m_scope.emplace_back();
+                m_evaluator->m_subScope.emplace_back();
+                m_opened = true;
+            }
         };
 
-        static const EvaluatorContext &context(VisitorContext *ctx) { return *static_cast<EvaluatorContext *>(ctx); }
+        struct Context final : VisitorContext {
+            enum Action {
+                NONE,
+                RETURN,
+                BREAK,
+                CONTINUE
+            };
+
+            Scope scope;
+            Action action = NONE;
+        };
+
+        static Context *context(VisitorContext *ctx) { return static_cast<Context *>(ctx); }
 
     public:
-        explicit Evaluator(Memory &mem) : m_mem(mem), m_scope(1), m_subScope(1) { }
+        explicit Evaluator(Memory &mem) : m_scope(1), m_subScope(1), m_mem(mem) { }
 
-        void allocate(const NamedVariableExpression *expr, double value, const EvaluatorContext &ctx) {
-            std::println("{}: allocate: {} {}", expr->token().location(), expr->text(), value);
-
-            if(ctx.globalScope) {
-                if(m_scope.front().contains(expr->name())) {
-                    throw std::logic_error(std::format("redeclared global variable '{}'", expr->name()));
-                }
-
-                uint32_t addr = m_mem.addData(MemoryCell(MemoryCell::Flags::READ | MemoryCell::Flags::WRITE, value));
-                std::println("{}: ALLOCATE GLOBAL: {} @ data:{}", expr->token().location(), expr->text(), addr);
-                m_scope.front().emplace(expr->name(), addr);
-            } else {
-                if(m_scope.back().contains(expr->name())) {
-                    throw std::logic_error(std::format("redeclared local variable '{}'", expr->name()));
-                }
-
-                uint32_t addr = m_mem.push(value);
-                std::println("{}: ALLOCATE LOCAL: {} @ stack:{}", expr->token().location(), expr->text(), addr & ~Memory::ADDR_STACK);
-                m_scope.back().emplace(expr->name(), addr);
-            }
-        }
+        Context createScopeContext(bool global = false) { return Context { .scope = Scope(*this, global) }; }
 
         void declareSub(const SubStatement *stmt) {
             auto sig = SubSignature(stmt);
@@ -78,7 +120,7 @@ namespace ngc
         }
 
         void executeProgram(const std::vector<std::unique_ptr<Statement>> &program) {
-            auto ctx = EvaluatorContext { .globalScope = true };
+            auto ctx = createScopeContext(true);
 
             for(const auto &stmt : program) {
                 stmt->accept(*this, &ctx);
@@ -89,7 +131,14 @@ namespace ngc
             stmt->expression()->accept(*this, ctx);
         }
 
-        void visit(const CompoundStatement* stmt, VisitorContext* ctx) override { 
+        void visit(const CompoundStatement* stmt, VisitorContext* ctx) override {
+            Context newCtx;
+
+            if(!ctx) {
+                newCtx = createScopeContext();
+                ctx = &newCtx;
+            }
+
             for(const auto &s : stmt->statements()) {
                 s->accept(*this, ctx);
             }
@@ -97,12 +146,7 @@ namespace ngc
 
         void visit(const AliasStatement *stmt, VisitorContext *ctx) override {
             auto addr = static_cast<uint32_t>(eval(stmt->address()));
-
-            if(context(ctx).globalScope) {
-                m_scope.front().emplace(stmt->variable()->name(), addr);
-            } else {
-                m_scope.back().emplace(stmt->variable()->name(), addr);
-            }
+            m_scope.back().emplace(stmt->variable()->name(), addr);
         }
 
         void visit(const LetStatement* stmt, VisitorContext* ctx) override {
@@ -112,7 +156,7 @@ namespace ngc
                 value = eval(stmt->value());
             }
 
-            allocate(stmt->variable(), value, context(ctx));
+            context(ctx)->scope.allocate(stmt->variable(), value);
         }
 
         void visit(const SubStatement* stmt, VisitorContext* ctx) override { 
@@ -125,43 +169,67 @@ namespace ngc
             }
         }
 
-        // TODO: return. break, and continue need to use VisitorContext to actually have the action performed
         void visit(const ReturnStatement* stmt, VisitorContext* ctx) override {
-            std::println("<BREAK>");
-            auto value = eval(stmt->real());
-            std::println("execute: ReturnStatement: {} -> {}", stmt->real()->text(), value);
-            std::ignore = m_mem.push(value);
+            m_accumulator = eval(stmt->real());
+            context(ctx)->action = Context::RETURN;
         }
 
         void visit(const BreakStatement* stmt, VisitorContext* ctx) override {
-            std::println("<BREAK>");
+            context(ctx)->action = Context::BREAK;
         }
 
         void visit(const ContinueStatement* stmt, VisitorContext* ctx) override {
-            std::println("<CONTINUE>");
+            context(ctx)->action = Context::CONTINUE;
         }
 
         void visit(const IfStatement* stmt, VisitorContext* ctx) override {
             if(eval(stmt->condition()) != 0.0) {
-                if(stmt->body()) {
-                    stmt->body()->accept(*this, ctx);
-                }
+                std::println("<IF TRUE>");
+                auto newCtx = createScopeContext();
+                stmt->body()->accept(*this, &newCtx);
+                context(ctx)->action = newCtx.action;
             } else {
+                std::println("<IF FALSE>");
                 if(stmt->elseBody()) {
-                    stmt->elseBody()->accept(*this, ctx);
+                    auto newCtx = createScopeContext();
+                    stmt->elseBody()->accept(*this, &newCtx);
+                    context(ctx)->action = newCtx.action;
                 }
             }
         }
 
         void visit(const WhileStatement* stmt, VisitorContext* ctx) override {
+            Context newCtx = createScopeContext();
+
             while(eval(stmt->condition()) != 0.0) {
-                if(stmt->body()) {
-                    stmt->body()->accept(*this, ctx);
+                newCtx.action = Context::NONE;
+                bool doBreak = false;
+
+                for(const auto &s : stmt->body()->statements()) {
+                    s->accept(*this, &newCtx);
+
+                    if(newCtx.action == Context::CONTINUE) {
+                        std::println("<CONTINUE>");
+                        break;
+                    }
+
+                    if(newCtx.action == Context::BREAK) {
+                        std::println("<BREAK>");
+                        doBreak = true;
+                        break;
+                    }
+                }
+
+                if(doBreak) {
+                    break;
                 }
             }
         }
 
         void visit(const CallExpression* expr, VisitorContext* ctx) override {
+            // functions implicitly return 0 if they dont return explicitly
+            m_accumulator = 0.0;
+
             // TODO: more extensible way to evaluate built in functions
             if(expr->name() == "print") {
                 std::string text;
@@ -175,8 +243,6 @@ namespace ngc
                 }
 
                 std::println("<PRINT>: {}", text);
-
-                m_accumulator = 0.0;
                 return;
             }
 
@@ -201,31 +267,24 @@ namespace ngc
                 throw std::runtime_error("params.size() != args.size()");
             }
 
-            m_scope.emplace_back();
-            m_subScope.emplace_back();
-
-            auto newCtx = EvaluatorContext { .globalScope = false };
+            Context newCtx = createScopeContext();
 
             for(size_t i = 0; i < params.size(); i++) {
-                auto arg = expect<RealExpression>(args[i].get());
+                const auto arg = expect<RealExpression>(args[i].get());
                 const auto value = eval(arg);
-                allocate(params[i].get(), value, newCtx);
+                newCtx.scope.allocate(params[i].get(), value);
             }
 
-            if(stmt->body()) {
+            for(const auto &s : stmt->body()->statements()) {
                 stmt->body()->accept(*this, &newCtx);
+
+                if(newCtx.action == Context::RETURN) {
+                    break;
+                }
             }
 
-            // return value
-            m_accumulator = m_mem.pop();
+
             std::println("{}: execute: {}: {} -> {}", expr->token().location(), expr->className(), expr->text(), m_accumulator);
-
-            for(size_t i = 0; i < m_scope.back().size() - 1; i++) {
-                std::ignore = m_mem.pop();
-            }
-
-            m_scope.pop_back();
-            m_subScope.pop_back();
         }
 
         void visit(const NumericVariableExpression* expr, VisitorContext* ctx) override {

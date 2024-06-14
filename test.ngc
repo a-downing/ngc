@@ -56,9 +56,50 @@ sub noreturn[#x] {
     (if a return statement is not the last statement, return 0 is added automatically)
 }
 
-sub hasreturn[#x] return #x + 1
+sub hasreturn[#x] { return #x + 1 }
 
 print["noreturn: ", noreturn[42]]
 print["hasreturn: ", hasreturn[36]]
 
 G01 X0 Y0
+
+#i = 0
+
+while #i < 1000 {
+    let #j = 0
+
+    while #j < 1000 {
+        print["j: ", #j]
+        print["j > 3: ", #j > 3]
+
+        if #j > 3 {
+            print["BBBBBBREAK"]
+            break
+        }
+
+        #j = #j + 1
+        continue
+        #j = #j + 1
+    }
+
+    print["i: ", #i]
+
+    if #i > 10 {
+        break
+    }
+
+    #i = #i + 1
+    continue
+    #i = #i + 1
+}
+
+sub tworeturns[#a, #b] {
+    let #t
+    #b = 777
+    break
+    return #a + #b
+    return #a * #b
+}
+
+print["tworeturns: ", tworeturns[3, 5]]
+print["tworeturns: ", tworeturns[3, 5]]

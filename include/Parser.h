@@ -173,25 +173,7 @@ namespace ngc
             }
 
             std::ignore = expect(Token::Kind::RBRACKET);
-
-            auto stmt = parseStatement();
-
-            if(stmt->is<ReturnStatement>()) {
-                return std::make_unique<SubStatement>(startToken, identifier, std::move(params), std::move(stmt));
-            }
-
-            if(const auto compound = stmt->as<CompoundStatement>(); compound) {
-                //add a return statement if the last statement is not a return statement
-                if(compound->statements().empty() || !compound->statements().back()->is<ReturnStatement>()) {
-                    auto returnToken = Token(Token::Kind::RETURN, std::make_unique<StringTokenSource>("return", ""));
-                    auto exprToken = Token(Token::Kind::NUMBER, std::make_unique<StringTokenSource>("0", ""));
-                    compound->statements().emplace_back(std::make_unique<ReturnStatement>(returnToken, std::make_unique<LiteralExpression>(exprToken)));
-                }
-
-                return std::make_unique<SubStatement>(startToken, identifier, std::move(params), std::move(stmt));
-            }
-
-            error("expected a return statement or a compound statement", stmt->startToken());
+            return std::make_unique<SubStatement>(startToken, identifier, std::move(params), parseCompoundStatement());
         }
 
         [[nodiscard]] std::unique_ptr<IfStatement> parseIfStatement() {

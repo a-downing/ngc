@@ -133,17 +133,17 @@ namespace ngc
         Token m_startToken;
         Token m_identifier;
         std::vector<std::unique_ptr<NamedVariableExpression>> m_params;
-        std::unique_ptr<Statement> m_statement;
+        std::unique_ptr<CompoundStatement> m_statement;
 
     public:
-        explicit SubStatement(Token startToken, Token identifier, std::vector<std::unique_ptr<NamedVariableExpression>> params, std::unique_ptr<Statement> statements): m_startToken(std::move(startToken)), m_identifier(std::move(identifier)), m_params(std::move(params)), m_statement(std::move(statements)) { }
+        explicit SubStatement(Token startToken, Token identifier, std::vector<std::unique_ptr<NamedVariableExpression>> params, std::unique_ptr<CompoundStatement> statements): m_startToken(std::move(startToken)), m_identifier(std::move(identifier)), m_params(std::move(params)), m_statement(std::move(statements)) { }
         ~SubStatement() override = default;
         bool is(const SubStatement *) const override { return true; }
         [[nodiscard]] const Token &startToken() const override { return m_startToken; }
         [[nodiscard]] const Token &endToken() const override { return m_statement->endToken(); }
         [[nodiscard]] std::string_view name() const { return m_identifier.value(); }
         [[nodiscard]] const std::vector<std::unique_ptr<NamedVariableExpression>> &params() const { return m_params; } // TODO: maybe this should return a std::vector<NamedVariableExpression *>
-        [[nodiscard]] const Statement *body() const { return m_statement.get(); }
+        [[nodiscard]] const CompoundStatement *body() const { return m_statement.get(); }
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
     };
 
