@@ -29,5 +29,6 @@ add_executable(ngc main.cpp
         include/StringTokenSource.h
         include/Preamble.h
         include/SubSignature.h
+        include/GCode.h
 )
 target_include_directories(ngc PUBLIC "${CMAKE_SOURCE_DIR}/include")

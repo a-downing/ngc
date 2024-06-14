@@ -1,7 +1,9 @@
+G00 X-1.0
+
 let #a = 37
 let #b = 73
 
-sub mul[#a, #b, #c, #d] {p
+sub mul[#a, #b, #c, #d] {
     sub add[#a, #b] {
         return #a + #b
     }

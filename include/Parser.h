@@ -217,7 +217,9 @@ namespace ngc
         }
 
         [[nodiscard]] std::unique_ptr<Expression> parseExpression() {
-            return parseAssignmentExpression();
+            auto expr = parseAssignmentExpression();
+            //std::println("expr: {} {}", expr->className(), expr->text());
+            return expr;
         }
 
         [[nodiscard]] std::unique_ptr<Expression> parseAssignmentExpression() {
@@ -313,7 +315,7 @@ namespace ngc
             }
 
             if(token.isLetter()) {
-                return std::make_unique<WordExpression>(token, expect<RealExpression>(parsePrimaryExpression()));
+                return std::make_unique<WordExpression>(token, expect<RealExpression>(parseExpression()));
             }
 
             if(token.is(Token::Kind::NUMBER)) {
@@ -439,19 +441,22 @@ namespace ngc
             return peekToken(skipNewlines).is(kind);
         }
 
-        [[nodiscard]] Token peekToken(const bool skipNewlines = true) const {
+        [[nodiscard]] Token peekToken(const bool skipNewlines = true) {
+            m_lexer.pushState();
+
             for(;;) {
-                const auto token = m_lexer.peekToken();
+                const auto token = m_lexer.nextToken();
 
                 if(!token) {
+                    m_lexer.popState();
                     error("lexer error", token.error());
                 }
 
                 if(token->is(Token::Kind::NEWLINE) && skipNewlines) {
-                    std::ignore = m_lexer.nextToken();
                     continue;
                 }
 
+                m_lexer.popState();
                 return *token;
             }
         }
@@ -459,6 +464,7 @@ namespace ngc
         [[nodiscard]] Token nextToken(const bool skipNewlines = true) const {
             for(;;) {
                 const auto token = m_lexer.nextToken();
+                //std::println("TOKEN: {} '{}'", token->name(), token->text());
 
                 if(!token) {
                     error("lexer error", token.error());

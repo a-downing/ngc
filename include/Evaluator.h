@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <format>
+#include <vector>
 #include <queue>
 #include <stdexcept>
 #include <unordered_map>
@@ -18,7 +19,7 @@
 #include <MemoryCell.h>
 #include <Memory.h>
 #include <SubSignature.h>
-#include <vector>
+#include <GCode.h>
 
 namespace ngc
 {
@@ -150,6 +151,7 @@ namespace ngc
         }
 
         void visit(const BlockStatement* stmt, VisitorContext* ctx) override {
+            // TODO: convert these into a vector of Word structs and add to m_blocks
             for(const auto &expr : stmt->expressions()) {
                 expr->accept(*this, ctx);
             }

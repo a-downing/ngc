@@ -1,3 +1,4 @@
+#include "GCode.h"
 #include <print>
 #include <filesystem>
 
@@ -70,8 +71,15 @@ int main(const int argc, const char **argv) {
     // }
 
     auto callback = [&] (std::queue<const ngc::BlockStatement *> &blocks) {
+        ngc::MachineState machineState;
+
         std::println("CALLBACK: {} blocks", blocks.size());
-        blocks = {};
+
+
+        while(!blocks.empty()) {
+            auto block = blocks.front();
+            blocks.pop();
+        }
     };
 
     auto eval = ngc::Evaluator(mem, callback);

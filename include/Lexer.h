@@ -54,11 +54,12 @@ namespace ngc
 
         explicit Lexer(LexerSource &source): m_source(source) { }
 
-        [[nodiscard]] std::expected<Token, Error> peekToken() {
+        void pushState() {
             m_source.pushState();
-            auto token = nextToken();
+        }
+
+        void popState() {
             m_source.popState();
-            return token;
         }
 
         [[nodiscard]] std::expected<Token, Error> nextToken() {
