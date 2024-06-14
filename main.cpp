@@ -1,6 +1,5 @@
 #include <print>
 #include <filesystem>
-#include <memory>
 
 #include <Utils.h>
 #include <Token.h>
@@ -11,8 +10,7 @@
 #include <Program.h>
 #include <Evaluator.h>
 #include <Preamble.h>
-
-// TODO: Evaluate if and while
+#include <Statement.h>
 
 int main(const int argc, const char **argv) {
     if(argc < 2) {
@@ -71,7 +69,13 @@ int main(const int argc, const char **argv) {
     //     }
     // }
 
-    auto eval = ngc::Evaluator(mem);
+    auto callback = [&] (std::queue<const ngc::BlockStatement *> &blocks) {
+        std::println("CALLBACK: {} blocks", blocks.size());
+        blocks = {};
+    };
+
+    auto eval = ngc::Evaluator(mem, callback);
+    std::println("executing: preamble");
     eval.executeProgram(preamble);
 
     for(auto &program : programs) {

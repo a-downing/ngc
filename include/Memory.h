@@ -122,7 +122,7 @@ namespace ngc
             }
 
             if(addr & ADDR_STACK) {
-                return isVolatileStack((addr & ~ADDR_STACK) - 1);
+                return false;
             }
 
             return isVolatileData(addr - 1);
@@ -181,14 +181,6 @@ namespace ngc
 
             m_stack[index] = value;
             return {};
-        }
-
-        std::expected<bool, Error> isVolatileStack(const size_t index) const {
-            if(index >= m_stack.size()) {
-                return std::unexpected(Error::INVALID_STACK_ADDRESS);
-            }
-
-            return false;
         }
     };
 }
