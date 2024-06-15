@@ -2,6 +2,7 @@
 #define BLOCK_H
 
 #include <optional>
+#include <stdexcept>
 #include <utility>
 #include <vector>
 
@@ -16,6 +17,8 @@ namespace ngc
         virtual ~Statement() = default;
         [[nodiscard]] virtual const Token &startToken() const = 0;
         [[nodiscard]] virtual const Token &endToken() const = 0;
+
+        virtual std::string text() const = 0;
 
         virtual bool is(const class ExpressionStatement *) const { return false; }
         virtual bool is(const class CompoundStatement *) const { return false; }
@@ -56,6 +59,7 @@ namespace ngc
         bool is(const ExpressionStatement *) const override { return true; }
         [[nodiscard]] const Token &startToken() const override { return m_expression->startToken(); }
         [[nodiscard]] const Token &endToken() const override { return m_expression->endToken(); }
+        [[nodiscard]] std::string text() const override { return m_expression->text(); }
         const Expression *expression() const { return m_expression.get(); }
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
     };
@@ -71,29 +75,18 @@ namespace ngc
         bool is(const CompoundStatement *) const override { return true; }
         [[nodiscard]] const Token &startToken() const override { return m_startToken; }
         [[nodiscard]] const Token &endToken() const override { return m_endToken; }
+        [[nodiscard]] std::string text() const override { return std::format("{{ {} }}", join(m_statements, " ")); }
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
         [[nodiscard]] const std::vector<std::unique_ptr<Statement>> &statements() const { return m_statements; }
         [[nodiscard]] std::vector<std::unique_ptr<Statement>> &statements() { return m_statements; }
     };
 
-    class LineNumber final {
-        Token m_n;
-        Token m_number;
-
-    public:
-        LineNumber(Token n, Token number): m_n(std::move(n)), m_number(std::move(number)) { }
-        [[nodiscard]] const Token &startToken() const { return m_n; }
-        [[nodiscard]] const Token &endToken() const { return m_number; }
-        [[nodiscard]] const Token &number() const { return m_number; }
-    };
-
     class BlockStatement final : public Statement {
         std::optional<Token> m_blockDelete;
-        std::optional<LineNumber> m_lineNumber;
         std::vector<std::unique_ptr<WordExpression>> m_expressions;
 
     public:
-        BlockStatement(std::optional<Token> blockDelete, std::optional<LineNumber> lineNumber, std::vector<std::unique_ptr<WordExpression>> expressions): m_blockDelete(std::move(blockDelete)), m_lineNumber(std::move(lineNumber)), m_expressions(std::move(expressions)) { }
+        BlockStatement(std::optional<Token> blockDelete, std::vector<std::unique_ptr<WordExpression>> expressions): m_blockDelete(std::move(blockDelete)), m_expressions(std::move(expressions)) { }
         ~BlockStatement() override = default;
         bool is(const BlockStatement *) const override { return true; }
         [[nodiscard]] const std::vector<std::unique_ptr<WordExpression>> &expressions() const { return m_expressions; }
@@ -103,11 +96,10 @@ namespace ngc
                 return *m_blockDelete;
             }
 
-            if(m_lineNumber) {
-                return m_lineNumber->startToken();
+            if(m_expressions.empty()) {
+                throw std::runtime_error("empty BlockStatement");
             }
-
-            assert(!m_expressions.empty());
+            
             return m_expressions.front()->startToken();
         }
 
@@ -116,17 +108,17 @@ namespace ngc
                 return m_expressions.back()->endToken();
             }
 
-            if(m_lineNumber) {
-                return m_lineNumber->endToken();
+            if(!m_blockDelete) {
+                throw std::runtime_error("empty BlockStatement");
             }
 
-            assert(m_blockDelete);
             return *m_blockDelete;
         }
 
+        [[nodiscard]] std::string text() const override { return std::format("{}{}", m_blockDelete ? m_blockDelete->text() : "", join(m_expressions, " ")); }
+
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
         [[nodiscard]] const std::optional<Token> &blockDelete() const { return m_blockDelete; }
-        [[nodiscard]] const std::optional<LineNumber> &lineNumber() const { return m_lineNumber; }
     };
 
     class SubStatement final : public Statement {
@@ -141,6 +133,7 @@ namespace ngc
         bool is(const SubStatement *) const override { return true; }
         [[nodiscard]] const Token &startToken() const override { return m_startToken; }
         [[nodiscard]] const Token &endToken() const override { return m_statement->endToken(); }
+        [[nodiscard]] std::string text() const override { return std::format("{}[{}] {}", name(), join(m_params, ", "), m_statement->text()); }
         [[nodiscard]] std::string_view name() const { return m_identifier.value(); }
         [[nodiscard]] const std::vector<std::unique_ptr<NamedVariableExpression>> &params() const { return m_params; } // TODO: maybe this should return a std::vector<NamedVariableExpression *>
         [[nodiscard]] const CompoundStatement *body() const { return m_statement.get(); }
@@ -159,6 +152,16 @@ namespace ngc
         bool is(const IfStatement *) const override { return true; }
         [[nodiscard]] const Token &startToken() const override { return m_startToken; }
         [[nodiscard]] const Token &endToken() const override { return m_elseStatements ? m_elseStatements->endToken() : m_statements->endToken(); }
+
+        [[nodiscard]] std::string text() const override { 
+            if(m_elseStatements) {
+                return std::format("{} {} {} else {}", m_startToken.text(), m_condition->text(), m_statements->text(), m_elseStatements->text());
+            }
+
+            return std::format("{} {} {}", m_startToken.text(), m_condition->text(), m_statements->text());
+        }
+            
+
         [[nodiscard]] const RealExpression *condition() const { return m_condition.get(); }
         [[nodiscard]] const CompoundStatement *body() const { return m_statements.get(); }
         [[nodiscard]] const CompoundStatement *elseBody() const { return m_elseStatements.get(); }
@@ -176,6 +179,7 @@ namespace ngc
         bool is(const WhileStatement *) const override { return true; }
         [[nodiscard]] const Token &startToken() const override { return m_startToken; }
         [[nodiscard]] const Token &endToken() const override { return m_statements->endToken(); }
+        [[nodiscard]] std::string text() const override { return std::format("{} {} {}", m_startToken.text(), m_condition->text(), m_statements->text()); }
         [[nodiscard]] const RealExpression *condition() const { return m_condition.get(); }
         [[nodiscard]] const CompoundStatement *body() const { return m_statements.get(); }
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
@@ -191,6 +195,7 @@ namespace ngc
         bool is(const ReturnStatement *) const override { return true; }
         [[nodiscard]] const Token &startToken() const override { return m_startToken; }
         [[nodiscard]] const Token &endToken() const override { return m_expression->endToken(); }
+        [[nodiscard]] std::string text() const override { return std::format("{} {}", m_startToken.text(), m_expression->text()); }
         [[nodiscard]] const RealExpression *real() const { return m_expression.get(); }
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
     };
@@ -204,6 +209,7 @@ namespace ngc
         bool is(const BreakStatement *) const override { return true; }
         [[nodiscard]] const Token &startToken() const override { return m_startToken; }
         [[nodiscard]] const Token &endToken() const override { return m_startToken; }
+        [[nodiscard]] std::string text() const override { return std::string(m_startToken.text()); }
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
     };
 
@@ -216,6 +222,7 @@ namespace ngc
         bool is(const ContinueStatement *) const override { return true; }
         [[nodiscard]] const Token &startToken() const override { return m_startToken; }
         [[nodiscard]] const Token &endToken() const override { return m_startToken; }
+        [[nodiscard]] std::string text() const override { return std::string(m_startToken.text()); }
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
     };
 
@@ -230,6 +237,7 @@ namespace ngc
         bool is(const AliasStatement *) const override { return true; }
         [[nodiscard]] const Token &startToken() const override { return m_startToken; }
         [[nodiscard]] const Token &endToken() const override { return m_expression->endToken(); }
+        [[nodiscard]] std::string text() const override { return std::format("{} {} = {}", m_startToken.text(), m_namedVariable->text(), m_expression->text()); }
         [[nodiscard]] const NamedVariableExpression *variable() const { return m_namedVariable.get(); }
         [[nodiscard]] const RealExpression *address() const { return m_expression.get(); }
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
@@ -246,6 +254,15 @@ namespace ngc
         bool is(const LetStatement *) const override { return true; }
         [[nodiscard]] const Token &startToken() const override { return m_startToken; }
         [[nodiscard]] const Token &endToken() const override { return m_expression->endToken(); }
+
+        [[nodiscard]] std::string text() const override { 
+            if(m_expression) {
+                return std::format("{} {} = {}", m_startToken.text(), m_namedVariable->text(), m_expression->text());
+            }
+
+            return std::format("{} {}", m_startToken.text(), m_namedVariable->text());
+        }
+
         [[nodiscard]] const NamedVariableExpression *variable() const { return m_namedVariable.get(); }
         [[nodiscard]] const RealExpression *value() const { return m_expression.get(); }
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }

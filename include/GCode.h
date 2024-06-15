@@ -1,10 +1,13 @@
 #ifndef GCODE_H
 #define GCODE_H
 
+#include <optional>
 #include <stdexcept>
 #include <format>
 
 #include <Token.h>
+#include <Expression.h>
+#include <Statement.h>
 
 namespace ngc {
     enum class GCode {
@@ -122,111 +125,27 @@ namespace ngc {
         }
     }
 
-    struct Word {
-        Letter letter;
-        double real;
-    };
-
-    class MachineState {
-        GCode m_modeMotion;
-        GCode m_modePlane;
-        GCode m_modeDistance;
-        GCode m_modeFeedrate;
-        GCode m_modeUnits;
-        GCode m_modeToolLengthOffset;
-        GCode m_modeCoordSys;
-        GCode m_modePath;
-
-        MCode m_modeStop;
-        MCode m_modeToolChange;
-        MCode m_modeSpindle;
-
-        std::optional<GCode> m_nonModal;
+    class Word {
+        const WordExpression *m_expression;
+        Letter m_letter;
+        double m_real;
 
     public:
-        GCode modeMotion() const { return m_modeMotion; }
-        GCode modePlane() const { return m_modePlane; }
-        GCode modeDistance() const { return m_modeDistance; }
-        GCode modeFeedrate() const { return m_modeFeedrate; }
-        GCode modeUnits() const { return m_modeUnits; }
-        GCode modeToolLengthOffset() const { return m_modeToolLengthOffset; }
-        GCode modeCoordSys() const { return m_modeCoordSys; }
-        GCode modePath() const { return m_modePath; }
+        Word(const WordExpression *expression, const Letter letter, const double real) : m_expression(expression), m_letter(letter), m_real(real) { }
+        const WordExpression *expression() const { return m_expression; }
+        Letter letter() const { return m_letter; }
+        double real() const { return m_real; }
+        std::string text() const { return std::format("{}{}", name(m_letter), m_real); }
+    };
 
-        MCode modeStop() const { return m_modeStop; }
-        MCode modeSpindle() const { return m_modeSpindle; }
-
-        std::optional<GCode> nonModal() const { return m_nonModal; }
-
-        void affectState(const GCode code) {
-            switch(code) {
-                case GCode::G0:
-                case GCode::G1:
-                case GCode::G2:
-                case GCode::G3:
-                    m_modeMotion = code;
-                    break;
-                case GCode::G17:
-                case GCode::G18:
-                case GCode::G19:
-                    m_modePlane = code;
-                    break;
-                case GCode::G90:
-                case GCode::G91:
-                    m_modeDistance = code;
-                    break;
-                case GCode::G93:
-                case GCode::G94:
-                    m_modeFeedrate = code;
-                    break;
-                case GCode::G20:
-                case GCode::G21:
-                    m_modeUnits = code;
-                    break;
-                case GCode::G43:
-                case GCode::G49:
-                    m_modeToolLengthOffset = code;
-                    break;
-                case GCode::G54:
-                case GCode::G55:
-                case GCode::G56:
-                case GCode::G57:
-                case GCode::G58:
-                case GCode::G59:
-                case GCode::G59_1:
-                case GCode::G59_2:
-                case GCode::G59_3:
-                    m_modeCoordSys = code;
-                    break;
-                case GCode::G61_1:
-                    m_modePath = code;
-                    break;
-                case GCode::G53:
-                    m_nonModal = code;
-                    break;
-                throw std::logic_error(std::format("invalid g-code {}", name(code)));
-            }
-        }
-
-        void affectState(const MCode code) {
-            switch(code) {
-                case MCode::M0:
-                case MCode::M1:
-                case MCode::M2:
-                case MCode::M30:
-                    m_modeStop = code;
-                    break;
-                case MCode::M3:
-                case MCode::M4:
-                case MCode::M5:
-                    m_modeSpindle = code;
-                    break;
-                case MCode::M6:
-                    m_modeToolChange = code;
-                    break;
-                throw std::logic_error(std::format("invalid m-code {}", name(code)));
-            }
-        }
+    class Block {
+        const BlockStatement *m_statement;
+        std::vector<Word> m_words;
+    public:
+        Block(const BlockStatement *statement, std::vector<Word> words) : m_statement(statement), m_words(std::move(words)) { }
+        const BlockStatement *statement() { return m_statement; };
+        const std::vector<Word> &words() { return m_words; }
+        bool blockDelete() const { return m_statement->blockDelete() != std::nullopt; }
     };
 
     constexpr GCode convertGCode(double real) {
@@ -316,6 +235,144 @@ namespace ngc {
             default: throw std::logic_error(std::format("can't convert token {} to Letter", name(kind)));
         }
     }
+
+    class MachineState {
+        GCode m_modeMotion;
+        GCode m_modePlane;
+        GCode m_modeDistance;
+        GCode m_modeFeedrate;
+        GCode m_modeUnits;
+        GCode m_modeToolLengthOffset;
+        GCode m_modeCoordSys;
+        GCode m_modePath;
+
+        MCode m_modeStop;
+        MCode m_modeToolChange;
+        MCode m_modeSpindle;
+
+        double m_A, m_B, m_C, m_D, m_F, m_H, m_I, m_J, m_K, m_L, m_M, m_N, m_O, m_P, m_Q, m_R, m_S, m_T, m_X, m_Y, m_Z;
+
+        std::optional<GCode> m_nonModal;
+
+    public:
+        GCode modeMotion() const { return m_modeMotion; }
+        GCode modePlane() const { return m_modePlane; }
+        GCode modeDistance() const { return m_modeDistance; }
+        GCode modeFeedrate() const { return m_modeFeedrate; }
+        GCode modeUnits() const { return m_modeUnits; }
+        GCode modeToolLengthOffset() const { return m_modeToolLengthOffset; }
+        GCode modeCoordSys() const { return m_modeCoordSys; }
+        GCode modePath() const { return m_modePath; }
+
+        MCode modeStop() const { return m_modeStop; }
+        MCode modeSpindle() const { return m_modeSpindle; }
+
+        std::optional<GCode> nonModal() const { return m_nonModal; }
+
+        void affectState(const Word &word) {
+            if(word.letter() == Letter::G) {
+                return affectState(convertGCode(word.real()));
+            }
+
+            if(word.letter() == Letter::M) {
+                return affectState(convertMCode(word.real()));
+            }
+
+            switch (word.letter()) {
+                case Letter::A: m_A = word.real(); break;
+                case Letter::B: m_B = word.real(); break;
+                case Letter::C: m_C = word.real(); break;
+                case Letter::D: m_D = word.real(); break;
+                case Letter::F: m_F = word.real(); break;
+                case Letter::H: m_H = word.real(); break;
+                case Letter::I: m_I = word.real(); break;
+                case Letter::J: m_J = word.real(); break;
+                case Letter::K: m_K = word.real(); break;
+                case Letter::L: m_L = word.real(); break;
+                case Letter::N: m_N = word.real(); break;
+                case Letter::O: m_O = word.real(); break;
+                case Letter::P: m_P = word.real(); break;
+                case Letter::Q: m_Q = word.real(); break;
+                case Letter::R: m_R = word.real(); break;
+                case Letter::S: m_S = word.real(); break;
+                case Letter::T: m_T = word.real(); break;
+                case Letter::X: m_X = word.real(); break;
+                case Letter::Y: m_Y = word.real(); break;
+                case Letter::Z: m_Z = word.real(); break;
+                default: std::logic_error(std::format("invalid word {}", word.text()));
+            }
+        }
+
+        void affectState(const GCode code) {
+            switch(code) {
+                case GCode::G0:
+                case GCode::G1:
+                case GCode::G2:
+                case GCode::G3:
+                    m_modeMotion = code;
+                    break;
+                case GCode::G17:
+                case GCode::G18:
+                case GCode::G19:
+                    m_modePlane = code;
+                    break;
+                case GCode::G90:
+                case GCode::G91:
+                    m_modeDistance = code;
+                    break;
+                case GCode::G93:
+                case GCode::G94:
+                    m_modeFeedrate = code;
+                    break;
+                case GCode::G20:
+                case GCode::G21:
+                    m_modeUnits = code;
+                    break;
+                case GCode::G43:
+                case GCode::G49:
+                    m_modeToolLengthOffset = code;
+                    break;
+                case GCode::G54:
+                case GCode::G55:
+                case GCode::G56:
+                case GCode::G57:
+                case GCode::G58:
+                case GCode::G59:
+                case GCode::G59_1:
+                case GCode::G59_2:
+                case GCode::G59_3:
+                    m_modeCoordSys = code;
+                    break;
+                case GCode::G61_1:
+                    m_modePath = code;
+                    break;
+                case GCode::G53:
+                    m_nonModal = code;
+                    break;
+                default: throw std::logic_error(std::format("invalid g-code {}", name(code)));
+            }
+        }
+
+        void affectState(const MCode code) {
+            switch(code) {
+                case MCode::M0:
+                case MCode::M1:
+                case MCode::M2:
+                case MCode::M30:
+                    m_modeStop = code;
+                    break;
+                case MCode::M3:
+                case MCode::M4:
+                case MCode::M5:
+                    m_modeSpindle = code;
+                    break;
+                case MCode::M6:
+                    m_modeToolChange = code;
+                    break;
+                default: throw std::logic_error(std::format("invalid m-code {}", name(code)));
+            }
+        }
+    };
 }
 
 #endif //GCODE_H

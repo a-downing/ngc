@@ -18,8 +18,21 @@ namespace ngc
         Lexer &m_lexer;
         bool m_percentFirst = false;
         bool m_finished = false;
+        std::stack<bool> m_skipNewlines;
+
+        bool skipNewlines() const { return m_skipNewlines.top(); }
+
+        class ScopedSkipNewlines {
+            Parser &m_parser;
+
+        public:
+            ScopedSkipNewlines(Parser &p, const bool skipNewlines) : m_parser(p) { m_parser.m_skipNewlines.push(skipNewlines); }
+            ~ScopedSkipNewlines() { m_parser.m_skipNewlines.pop(); }
+        };
 
     public:
+        explicit Parser(Lexer &lexer): m_lexer(lexer), m_skipNewlines({true}) { }
+
         class Error final : public std::logic_error {
             const std::source_location m_location;
             const std::optional<Token> m_token;
@@ -37,8 +50,6 @@ namespace ngc
             [[nodiscard]] const std::optional<Lexer::Error> &lexerError() const { return m_lexerError; }
             [[nodiscard]] Expression *expression() const { return m_expression.get(); }
         };
-
-        explicit Parser(Lexer &lexer): m_lexer(lexer) { }
 
         std::vector<std::unique_ptr<Statement>> parse() {
             std::vector<std::unique_ptr<Statement>> statements;
@@ -135,23 +146,23 @@ namespace ngc
         [[nodiscard]] std::unique_ptr<BlockStatement> parseBlockStatement() {
             Token token;
             std::optional<Token> blockDelete = std::nullopt;
-            std::optional<LineNumber> lineNumber = std::nullopt;
+
+            ScopedSkipNewlines skip(*this, false);
+
+            // eat up any leading newlines
+            while(match(Token::Kind::NEWLINE)) {
+
+            }
 
             if(match(Token::Kind::SLASH, token)) {
                 blockDelete.emplace(token);
             }
 
-            if(match(Token::Kind::N, token)) {
-                lineNumber.emplace(LineNumber(token, expectInteger()));
-            }
-
             std::vector<std::unique_ptr<WordExpression>> expressions;
 
             for(;;) {
-                auto t = peekToken(false);
-
-                if(match({ Token::Kind::NEWLINE, Token::Kind::NONE }, false)) {
-                    auto block = std::make_unique<BlockStatement>(std::move(blockDelete), std::move(lineNumber), std::move(expressions));
+                if(match({ Token::Kind::NEWLINE, Token::Kind::NONE })) {
+                    auto block = std::make_unique<BlockStatement>(std::move(blockDelete), std::move(expressions));
                     return block;
                 }
 
@@ -398,9 +409,9 @@ namespace ngc
         }
 
         template<size_t N>
-        [[nodiscard]] bool match(const Token::Kind (&kinds)[N], Token &outToken, const bool skipNewlines = true) {
+        [[nodiscard]] bool match(const Token::Kind (&kinds)[N], Token &outToken) {
             for(const auto kind : kinds) {
-                if(match(kind, outToken, skipNewlines)) {
+                if(match(kind, outToken)) {
                     return true;
                 }
             }
@@ -408,9 +419,9 @@ namespace ngc
             return false;
         }
 
-        [[nodiscard]] bool match(const Token::Kind kind, Token &outToken, const bool skipNewlines = true) {
-            if(check(kind, skipNewlines)) {
-                outToken = nextToken(skipNewlines);
+        [[nodiscard]] bool match(const Token::Kind kind, Token &outToken) {
+            if(check(kind)) {
+                outToken = nextToken();
                 return true;
             }
 
@@ -418,9 +429,9 @@ namespace ngc
         }
 
         template<size_t N>
-        [[nodiscard]] bool match(const Token::Kind (&kinds)[N], const bool skipNewlines = true) {
+        [[nodiscard]] bool match(const Token::Kind (&kinds)[N]) {
             for(const auto kind : kinds) {
-                if(match(kind, skipNewlines)) {
+                if(match(kind)) {
                     return true;
                 }
             }
@@ -428,20 +439,20 @@ namespace ngc
             return false;
         }
 
-        [[nodiscard]] bool match(const Token::Kind kind, const bool skipNewlines = true) {
-            if(check(kind, skipNewlines)) {
-                std::ignore = nextToken(skipNewlines);
+        [[nodiscard]] bool match(const Token::Kind kind) {
+            if(check(kind)) {
+                std::ignore = nextToken();
                 return true;
             }
 
             return false;
         }
 
-        [[nodiscard]] bool check(const Token::Kind kind, const bool skipNewlines = true) {
-            return peekToken(skipNewlines).is(kind);
+        [[nodiscard]] bool check(const Token::Kind kind) {
+            return peekToken().is(kind);
         }
 
-        [[nodiscard]] Token peekToken(const bool skipNewlines = true) {
+        [[nodiscard]] Token peekToken() {
             m_lexer.pushState();
 
             for(;;) {
@@ -452,7 +463,7 @@ namespace ngc
                     error("lexer error", token.error());
                 }
 
-                if(token->is(Token::Kind::NEWLINE) && skipNewlines) {
+                if(token->is(Token::Kind::NEWLINE) && skipNewlines()) {
                     continue;
                 }
 
@@ -461,7 +472,7 @@ namespace ngc
             }
         }
 
-        [[nodiscard]] Token nextToken(const bool skipNewlines = true) const {
+        [[nodiscard]] Token nextToken() const {
             for(;;) {
                 const auto token = m_lexer.nextToken();
                 //std::println("TOKEN: {} '{}'", token->name(), token->text());
@@ -470,7 +481,7 @@ namespace ngc
                     error("lexer error", token.error());
                 }
 
-                if(token->is(Token::Kind::NEWLINE) && skipNewlines) {
+                if(token->is(Token::Kind::NEWLINE) && skipNewlines()) {
                     continue;
                 }
 

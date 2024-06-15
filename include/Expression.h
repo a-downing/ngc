@@ -54,6 +54,21 @@ namespace ngc
         virtual void accept(Visitor &v, VisitorContext *ctx) const = 0;
     };
 
+    template<typename Expr>
+    inline std::string join(const std::vector<std::unique_ptr<Expr>> &expressions, const std::string_view sep) {
+        std::string result;
+
+        for(const auto &expr : expressions) {
+            result += expr->text();
+
+            if(expr != expressions.back()) {
+                result += sep;
+            }
+        }
+
+        return result;
+    }
+
     class CommentExpression final : public Expression {
     public:
         using Expression::is;
@@ -291,7 +306,7 @@ namespace ngc
 
         [[nodiscard]] const Token &startToken() const override { return token(); }
         [[nodiscard]] const Token &endToken() const override { return m_endToken; }
-        [[nodiscard]] std::string text() const override { return std::format("{}[...]", token().text()); } // TODO: this
+        [[nodiscard]] std::string text() const override { return std::format("{}[{}]", token().text(), join(m_args, ", ")); }
 
         bool is(const CallExpression *) const override { return true; }
 

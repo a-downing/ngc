@@ -27,8 +27,8 @@ namespace ngc
         std::vector<std::unordered_map<std::string_view, uint32_t>> m_scope;
         std::vector<std::unordered_map<SubSignature, const SubStatement *>> m_subScope;
         Memory &m_mem;
-        const std::function<void(std::queue<const BlockStatement *> &)> &m_callback;
-        std::queue<const BlockStatement *> m_blocks;
+        const std::function<void(std::queue<Block> &)> &m_callback;
+        std::queue<Block> m_blocks;
 
         class Scope {
             Evaluator *m_evaluator = nullptr;
@@ -100,7 +100,7 @@ namespace ngc
         static Context *context(VisitorContext *ctx) { return static_cast<Context *>(ctx); }
 
     public:
-        explicit Evaluator(Memory &mem, const std::function<void(std::queue<const BlockStatement *> &)> &callback) : m_scope(1), m_subScope(1), m_mem(mem), m_callback(callback) { }
+        explicit Evaluator(Memory &mem, const std::function<void(std::queue<Block> &)> &callback) : m_scope(1), m_subScope(1), m_mem(mem), m_callback(callback) { }
 
         void executeProgram(const std::vector<std::unique_ptr<Statement>> &program) {
             auto ctx = createScopeContext(true);
@@ -151,12 +151,15 @@ namespace ngc
         }
 
         void visit(const BlockStatement* stmt, VisitorContext* ctx) override {
-            // TODO: convert these into a vector of Word structs and add to m_blocks
+            std::vector<Word> words;
+
             for(const auto &expr : stmt->expressions()) {
-                expr->accept(*this, ctx);
+                Letter letter = convertLetter(expr->token().kind());
+                double real = eval(expr->real(), ctx);
+                words.emplace_back(Word(expr.get(), letter, real));
             }
 
-            m_blocks.emplace(stmt);
+            m_blocks.emplace(Block(stmt, std::move(words)));
         }
 
         void visit(const ReturnStatement* stmt, VisitorContext* ctx) override {

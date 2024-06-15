@@ -1,4 +1,3 @@
-#include "GCode.h"
 #include <print>
 #include <filesystem>
 
@@ -12,6 +11,7 @@
 #include <Evaluator.h>
 #include <Preamble.h>
 #include <Statement.h>
+#include <GCode.h>
 
 int main(const int argc, const char **argv) {
     if(argc < 2) {
@@ -33,6 +33,10 @@ int main(const int argc, const char **argv) {
     for(auto &program : programs) {
         try {
             program.compile();
+        
+            for(const auto &stmt : program.statements()) {
+                //std::println("{}", stmt->text());
+            }
         } catch (const ngc::Parser::Error &err) {
             if(err.lexerError()) {
                 std::println(stderr, "{}: {}: {}", err.lexerError()->location(), err.what(), err.lexerError()->message());
@@ -43,7 +47,7 @@ int main(const int argc, const char **argv) {
             } else {
                 std::println(stderr, "{}", err.what());
             }
-
+        
             std::println(stderr, "{}:{}:{}", err.sourceLocation().file_name(), err.sourceLocation().line(), err.sourceLocation().column());
             throw;
         }
@@ -70,7 +74,7 @@ int main(const int argc, const char **argv) {
     //     }
     // }
 
-    auto callback = [&] (std::queue<const ngc::BlockStatement *> &blocks) {
+    auto callback = [] (std::queue<ngc::Block> &blocks) {
         ngc::MachineState machineState;
 
         std::println("CALLBACK: {} blocks", blocks.size());
@@ -79,6 +83,16 @@ int main(const int argc, const char **argv) {
         while(!blocks.empty()) {
             auto block = blocks.front();
             blocks.pop();
+
+            if(block.blockDelete()) {
+                std::println("DELETED BLOCK: {}", block.statement()->text());
+            } else{
+                std::println("BLOCK: {}", block.statement()->text());
+            }
+
+            for(const auto &word : block.words()) {
+                machineState.affectState(word);
+            }
         }
     };
 
