@@ -1,0 +1,7 @@
+alias #userdata_1 = 1
+#userdata_1 = 333
+
+sub _tool_change[#tool_number] {
+    print["tool_change: ", #tool_number]
+    return #tool_number
+}

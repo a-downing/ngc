@@ -48,6 +48,9 @@ namespace ngc {
         Token(const Token &t) : m_kind(t.m_kind), m_source(t.m_source->clone()) { }
         Token(Token &&) = default;
 
+        static Token fromDouble(const double d, std::string name = "double") { return { Kind::NUMBER, std::make_unique<StringTokenSource>(d, std::move(name)) }; }
+        static Token fromString(const Kind kind, std::string text, std::string name = "string") { return { kind, std::make_unique<StringTokenSource>(std::move(text), std::move(name)) }; }
+
         Token &operator=(const Token &t) {
             m_kind = t.m_kind;
             m_source = t.m_source->clone();
@@ -71,7 +74,7 @@ namespace ngc {
         }
 
         [[nodiscard]] std::string location() const {
-            return std::format("{}:{}:{}", m_source->name(), m_source->line(), m_source->col());
+            return m_source->location();
         }
 
         [[nodiscard]] std::string_view value() const {
@@ -103,7 +106,7 @@ namespace ngc {
             auto [ptr, ec] = std::from_chars(text().begin(), text().end(), d);
 
             if(ec != std::errc()) {
-                throw std::logic_error(std::format("Token::as_double(): std::from_chars() failed on '{}'", text()));
+                throw std::logic_error(std::format("StringTokenSource::{}(): std::from_chars() failed on '{}'", __func__, text()));
             }
 
             return d;

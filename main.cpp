@@ -74,7 +74,7 @@ int main(const int argc, const char **argv) {
     //     }
     // }
 
-    auto callback = [] (std::queue<ngc::Block> &blocks) {
+    auto callback = [] (std::queue<ngc::Block> &blocks, ngc::Evaluator &eval) {
         ngc::MachineState machineState;
 
         std::println("CALLBACK: {} blocks", blocks.size());
@@ -92,6 +92,12 @@ int main(const int argc, const char **argv) {
 
             for(const auto &word : block.words()) {
                 machineState.affectState(word);
+
+                //testing tool change
+                if(word.letter() == ngc::Letter::T) {
+                    const double toolNumber = eval.call("_tool_change", word.real());
+                    std::println("_tool_change[{}] returned: {}", word.real(), toolNumber);
+                }
             }
         }
     };

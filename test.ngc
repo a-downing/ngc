@@ -103,10 +103,11 @@ G01 Z3
 
 let #time = #_time
 
-
-
-
-
 G01 X4
-G01 Y5
+/G01 Y5
 G01 Z6
+
+print["_time: ", #_time]
+print["_userdata_1: ", #userdata_1]
+
+M6 T2

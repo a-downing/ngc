@@ -36,17 +36,22 @@ namespace ngc
             WRITE
         };
 
-        std::vector<uint32_t> init(std::initializer_list<std::tuple<Var, std::string_view, MemoryCell::Flags>> specs) {
+        std::vector<uint32_t> init(const std::initializer_list<std::tuple<Var, std::string_view, size_t, MemoryCell::Flags>> specs) {
             m_data.clear();
             m_globals.clear();
             m_stack.clear();
 
             std::vector<uint32_t> addrs;
 
-            for(const auto &[var, name, flags] : specs) {
-                const auto addr = addData(MemoryCell(flags));
-                m_globals.emplace(var, addr);
-                addrs.emplace_back(addr);
+            for(const auto &[var, name, addr, flags] : specs) {
+                while(m_data.size() < addr) {
+                    addData(MemoryCell(MemoryCell::Flags::READ | MemoryCell::Flags::WRITE));
+                }
+
+                auto _addr = addData(MemoryCell(flags));
+
+                m_globals.emplace(var, _addr);
+                addrs.emplace_back(_addr);
             }
 
             return addrs;
@@ -77,13 +82,15 @@ namespace ngc
         }
 
         uint32_t addData(const MemoryCell mc) {
+            const auto addr = m_data.size();
             m_data.emplace_back(mc);
-            return m_data.size();
+            return addr;
         }
 
         uint32_t push(double value) {
+            const auto addr = m_stack.size() | ADDR_STACK;
             m_stack.emplace_back(value);
-            return m_stack.size() | ADDR_STACK;
+            return addr;
         }
 
         double pop() {
@@ -98,10 +105,10 @@ namespace ngc
             }
 
             if(addr & ADDR_STACK) {
-                return readStack((addr & ~ADDR_STACK) - 1);
+                return readStack(addr & ~ADDR_STACK);
             }
 
-            return readData(addr - 1, false);
+            return readData(addr, false);
         }
 
         std::expected<void, Error> write(const uint32_t addr, const double value) {
@@ -110,10 +117,10 @@ namespace ngc
             }
 
             if(addr & ADDR_STACK) {
-                return writeStack((addr & ~ADDR_STACK) - 1, value);
+                return writeStack(addr & ~ADDR_STACK, value);
             }
 
-            return writeData(addr - 1, value, false);
+            return writeData(addr, value, false);
         }
 
         std::expected<bool, Error> isVolatile(const uint32_t addr) const {
@@ -125,7 +132,7 @@ namespace ngc
                 return false;
             }
 
-            return isVolatileData(addr - 1);
+            return isVolatileData(addr);
         }
 
     private:

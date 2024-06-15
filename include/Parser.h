@@ -85,7 +85,7 @@ namespace ngc
 
             Token token;
 
-            if(match(Token::Kind::PERCENT, token)) {
+            if(match(token, Token::Kind::PERCENT)) {
                 if(m_percentFirst) {
                     m_finished = true;
                     return nullptr;
@@ -114,15 +114,15 @@ namespace ngc
                 return parseWhileStatement();
             }
 
-            if(match(Token::Kind::BREAK, token)) {
+            if(match(token, Token::Kind::BREAK)) {
                 return std::make_unique<BreakStatement>(token);
             }
 
-            if(match(Token::Kind::CONTINUE, token)) {
+            if(match(token, Token::Kind::CONTINUE)) {
                 return std::make_unique<ContinueStatement>(token);
             }
 
-            if(match(Token::Kind::RETURN, token)) {
+            if(match(token, Token::Kind::RETURN)) {
                 return std::make_unique<ReturnStatement>(token, expect<RealExpression>(parseExpression()));
             }
 
@@ -154,14 +154,14 @@ namespace ngc
 
             }
 
-            if(match(Token::Kind::SLASH, token)) {
+            if(match(token, Token::Kind::SLASH)) {
                 blockDelete.emplace(token);
             }
 
             std::vector<std::unique_ptr<WordExpression>> expressions;
 
             for(;;) {
-                if(match({ Token::Kind::NEWLINE, Token::Kind::NONE })) {
+                if(match(Token::Kind::NEWLINE, Token::Kind::NONE)) {
                     auto block = std::make_unique<BlockStatement>(std::move(blockDelete), std::move(expressions));
                     return block;
                 }
@@ -236,7 +236,7 @@ namespace ngc
         [[nodiscard]] std::unique_ptr<Expression> parseAssignmentExpression() {
             auto expression = parseOrXorExpression();
 
-            if(Token token; match(Token::Kind::ASSIGN, token)) {
+            if(Token token; match(token, Token::Kind::ASSIGN)) {
                 auto left = expect<VariableExpression>(std::move(expression));
                 auto right = expect<RealExpression>(parseAssignmentExpression());
                 return std::make_unique<BinaryExpression>(token, std::move(left), std::move(right));
@@ -249,7 +249,7 @@ namespace ngc
             auto expression = parseAndExpression();
             Token token;
 
-            while(match({ Token::Kind::OR, Token::Kind::XOR }, token)) {
+            while(match(token, Token::Kind::OR, Token::Kind::XOR)) {
                 auto left = expect<RealExpression>(std::move(expression));
                 auto right = expect<RealExpression>(parseAndExpression());
                 expression = std::make_unique<BinaryExpression>(token, std::move(left), std::move(right));
@@ -262,7 +262,7 @@ namespace ngc
             auto expression = parseComparisonExpression();
             Token token;
 
-            while(match(Token::Kind::AND, token)) {
+            while(match(token, Token::Kind::AND)) {
                 auto left = expect<RealExpression>(std::move(expression));
                 auto right = expect<RealExpression>(parseComparisonExpression());
                 expression = std::make_unique<BinaryExpression>(token, std::move(left), std::move(right));
@@ -275,7 +275,7 @@ namespace ngc
             auto expression = parseAddSubExpression();
             Token token;
 
-            while(match({ Token::Kind::EQ, Token::Kind::NE, Token::Kind::LT, Token::Kind::LE, Token::Kind::GT, Token::Kind::GE }, token)) {
+            while(match(token, Token::Kind::EQ, Token::Kind::NE, Token::Kind::LT, Token::Kind::LE, Token::Kind::GT, Token::Kind::GE)) {
                 auto left = expect<RealExpression>(std::move(expression));
                 auto right = expect<RealExpression>(parseAddSubExpression());
                 expression = std::make_unique<BinaryExpression>(token, std::move(left), std::move(right));
@@ -288,7 +288,7 @@ namespace ngc
             auto expression = parseMulDivModExpression();
             Token token;
 
-            while(match({ Token::Kind::PLUS, Token::Kind::MINUS }, token)) {
+            while(match(token, Token::Kind::PLUS, Token::Kind::MINUS)) {
                 auto left = expect<RealExpression>(std::move(expression));
                 auto right = expect<RealExpression>(parseMulDivModExpression());
                 expression = std::make_unique<BinaryExpression>(token, std::move(left), std::move(right));
@@ -301,7 +301,7 @@ namespace ngc
             auto expression = parseUnaryExpression();
             Token token;
 
-            while(match({ Token::Kind::MUL, Token::Kind::SLASH, Token::Kind::MOD }, token)) {
+            while(match(token, Token::Kind::MUL, Token::Kind::SLASH, Token::Kind::MOD)) {
                 auto left = expect<RealExpression>(std::move(expression));
                 auto right = expect<RealExpression>(parseUnaryExpression());
                 expression = std::make_unique<BinaryExpression>(token, std::move(left), std::move(right));
@@ -311,7 +311,7 @@ namespace ngc
         }
 
         [[nodiscard]] std::unique_ptr<Expression> parseUnaryExpression() {
-            if(Token token; match({ Token::Kind::PLUS, Token::Kind::MINUS }, token)) {
+            if(Token token; match(token, Token::Kind::PLUS, Token::Kind::MINUS)) {
                 return std::make_unique<UnaryExpression>(token, expect<RealExpression>(parseUnaryExpression()));
             }
 
@@ -391,7 +391,7 @@ namespace ngc
         [[nodiscard]] Token expect(const Token::Kind kind) {
             Token token;
 
-            if(!match(kind, token)) {
+            if(!match(token, kind)) {
                 error(std::format("expected {}, but found '{}'", name(kind), peekToken().text()), peekToken());
             }
 
@@ -405,42 +405,16 @@ namespace ngc
                 error(std::format("expected integer, but found: '{}'", token.text()), token);
             }
 
+            if(match(Token::Kind::A, Token::Kind::B)) {
+
+            }
+
             return token;
         }
 
-        template<size_t N>
-        [[nodiscard]] bool match(const Token::Kind (&kinds)[N], Token &outToken) {
-            for(const auto kind : kinds) {
-                if(match(kind, outToken)) {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        [[nodiscard]] bool match(const Token::Kind kind, Token &outToken) {
-            if(check(kind)) {
-                outToken = nextToken();
-                return true;
-            }
-
-            return false;
-        }
-
-        template<size_t N>
-        [[nodiscard]] bool match(const Token::Kind (&kinds)[N]) {
-            for(const auto kind : kinds) {
-                if(match(kind)) {
-                    return true;
-                }
-            }
-
-            return false;
-        }
-
-        [[nodiscard]] bool match(const Token::Kind kind) {
-            if(check(kind)) {
+        template<typename ...Args>
+        [[nodiscard]] bool match(Args... args) requires (std::same_as<Args, Token::Kind> && ...) {
+            if((check(args) || ...)) {
                 std::ignore = nextToken();
                 return true;
             }
@@ -448,8 +422,23 @@ namespace ngc
             return false;
         }
 
-        [[nodiscard]] bool check(const Token::Kind kind) {
-            return peekToken().is(kind);
+        template<typename ...Args>
+        [[nodiscard]] bool match(Token &token, Args... args) requires (std::same_as<Args, Token::Kind> && ...) {
+            if((check(args) || ...)) {
+                token = nextToken();
+                return true;
+            }
+
+            return false;
+        }
+
+        template<typename ...Args>
+        [[nodiscard]] bool check(Args... args) requires (std::same_as<Args, Token::Kind> && ...) {
+            if((peekToken().is(args) || ...)) {
+                return true;
+            }
+
+            return false;
         }
 
         [[nodiscard]] Token peekToken() {

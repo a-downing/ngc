@@ -128,6 +128,8 @@ namespace ngc
         explicit LiteralExpression(Token token) : RealExpression(std::move(token)) { }
         ~LiteralExpression() override = default;
 
+        static std::unique_ptr<LiteralExpression> fromDouble(const double d) { return std::make_unique<LiteralExpression>(Token::fromDouble(d)); }
+
         [[nodiscard]] const Token &startToken() const override { return token(); }
         [[nodiscard]] const Token &endToken() const override { return token(); }
         [[nodiscard]] std::string text() const override { return std::string(token().text()); }
@@ -192,6 +194,10 @@ namespace ngc
         using Expression::is;
         explicit NamedVariableExpression(Token token) : VariableExpression(std::move(token)) { }
         ~NamedVariableExpression() override = default;
+
+        static std::unique_ptr<NamedVariableExpression> fromName(std::string name) {
+            return std::make_unique<NamedVariableExpression>(Token::fromString(Token::Kind::NAMED_VARIABLE, std::format("#{}", name)));
+        }
 
         [[nodiscard]] const Token &startToken() const override { return token(); }
         [[nodiscard]] const Token &endToken() const override { return token(); }

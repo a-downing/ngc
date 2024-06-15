@@ -1,6 +1,7 @@
 #ifndef EVALUATOR_H
 #define EVALUATOR_H
 
+#include <concepts>
 #include <functional>
 #include <print>
 #include <cmath>
@@ -27,7 +28,7 @@ namespace ngc
         std::vector<std::unordered_map<std::string_view, uint32_t>> m_scope;
         std::vector<std::unordered_map<SubSignature, const SubStatement *>> m_subScope;
         Memory &m_mem;
-        const std::function<void(std::queue<Block> &)> &m_callback;
+        const std::function<void(std::queue<Block> &, Evaluator &)> &m_callback;
         std::queue<Block> m_blocks;
 
         class Scope {
@@ -50,7 +51,7 @@ namespace ngc
                 }
             }
 
-            void allocate(const NamedVariableExpression *expr, double value) {
+            void allocate(const NamedVariableExpression *expr, const double value) {
                 if(!m_evaluator) {
                     throw std::logic_error("Scope::allocate called on default constructed Scope");
                 }
@@ -100,7 +101,14 @@ namespace ngc
         static Context *context(VisitorContext *ctx) { return static_cast<Context *>(ctx); }
 
     public:
-        explicit Evaluator(Memory &mem, const std::function<void(std::queue<Block> &)> &callback) : m_scope(1), m_subScope(1), m_mem(mem), m_callback(callback) { }
+        explicit Evaluator(Memory &mem, const std::function<void(std::queue<Block> &, Evaluator &)> &callback) : m_scope(1), m_subScope(1), m_mem(mem), m_callback(callback) { }
+
+        template<typename ...Args>
+        double call(std::string name, Args... args) requires (std::convertible_to<Args, double> && ...) {
+            std::vector<std::unique_ptr<ScalarExpression>> args2;
+            (args2.emplace_back(LiteralExpression::fromDouble(args)), ...);
+            return callImpl(std::move(name), std::move(args2));
+        }
 
         void executeProgram(const std::vector<std::unique_ptr<Statement>> &program) {
             auto ctx = createScopeContext(true);
@@ -110,7 +118,7 @@ namespace ngc
             }
 
             while(!m_blocks.empty()) {
-                m_callback(m_blocks);
+                m_callback(m_blocks, *this);
             }
         }
 
@@ -154,12 +162,12 @@ namespace ngc
             std::vector<Word> words;
 
             for(const auto &expr : stmt->expressions()) {
-                Letter letter = convertLetter(expr->token().kind());
-                double real = eval(expr->real(), ctx);
-                words.emplace_back(Word(expr.get(), letter, real));
+                const Letter letter = convertLetter(expr->token().kind());
+                const double real = eval(expr->real(), ctx);
+                words.emplace_back(expr.get(), letter, real);
             }
 
-            m_blocks.emplace(Block(stmt, std::move(words)));
+            m_blocks.emplace(stmt, std::move(words));
         }
 
         void visit(const ReturnStatement* stmt, VisitorContext* ctx) override {
@@ -331,6 +339,7 @@ namespace ngc
                 case MUL: result = left * right; break;
                 case DIV: result = left / right; break;
                 case MOD: result = std::fmod(left, right); break;
+                default: throw std::logic_error("missing ");
             }
 
             context(ctx)->result = result;
@@ -353,7 +362,7 @@ namespace ngc
 
             switch (expr->op()) {
                 case UnaryExpression::Op::NEGATIVE: result = -value; break;
-                case UnaryExpression::Op::POSITIVE: result = value; break;
+                case UnaryExpression::Op::POSITIVE:
                 case UnaryExpression::Op::ADDRESS_OF: result = value; break;
             }
 
@@ -374,7 +383,15 @@ namespace ngc
         void visit(const StringExpression* expr, VisitorContext* ctx) override { }
 
     private:
-    Context createScopeContext(bool global = false) { return Context { .scope = Scope(*this, global) }; }
+        Context createScopeContext(const bool global = false) { return Context { .scope = Scope(*this, global) }; }
+
+        double callImpl(std::string name, std::vector<std::unique_ptr<ScalarExpression>> args) {
+            const auto startToken = Token::fromString(Token::Kind::IDENTIFIER, std::move(name));
+            const auto endToken = Token::fromString(Token::Kind::RBRACKET, "]");
+            const auto call = std::make_unique<CallExpression>(startToken, endToken, std::move(args));
+            auto ctx = createScopeContext(true);
+            return eval(call.get(), &ctx);
+        }
 
         void declareSub(const SubStatement *stmt) {
             auto sig = SubSignature(stmt);
@@ -397,19 +414,33 @@ namespace ngc
             return context(ctx)->result;
         }
 
+        bool isVolatile(const uint32_t addr) {
+            const auto result = m_mem.isVolatile(addr);
+
+            if(!result) {
+                switch (result.error()) {
+                    case Memory::Error::INVALID_DATA_ADDRESS: throw std::logic_error("INVALID_DATA_ADDRESS");
+                    case Memory::Error::INVALID_STACK_ADDRESS: throw std::logic_error("INVALID_STACK_ADDRESS");
+                    case Memory::Error::READ: throw std::logic_error("READ");
+                    case Memory::Error::WRITE: throw std::logic_error("WRITE");
+                }
+            }
+            return *result;
+        }
+
         [[nodiscard]] double read(const uint32_t addr) {
-            while(m_mem.isVolatile(addr) && !m_blocks.empty()) {
-                m_callback(m_blocks);
+            while(isVolatile(addr) && !m_blocks.empty()) {
+                m_callback(m_blocks, *this);
             }
 
             auto result = m_mem.read(addr);
 
             if(!result) {
                 switch (result.error()) {
-                case Memory::Error::INVALID_DATA_ADDRESS: throw std::logic_error("INVALID_DATA_ADDRESS");
-                case Memory::Error::INVALID_STACK_ADDRESS: throw std::logic_error("INVALID_STACK_ADDRESS");
-                case Memory::Error::READ: throw std::logic_error("READ");
-                case Memory::Error::WRITE: throw std::logic_error("WRITE");
+                    case Memory::Error::INVALID_DATA_ADDRESS: throw std::logic_error("INVALID_DATA_ADDRESS");
+                    case Memory::Error::INVALID_STACK_ADDRESS: throw std::logic_error("INVALID_STACK_ADDRESS");
+                    case Memory::Error::READ: throw std::logic_error("READ");
+                    case Memory::Error::WRITE: throw std::logic_error("WRITE");
                 }
             }
 
@@ -417,9 +448,7 @@ namespace ngc
         }
 
         void write(const uint32_t addr, const double value) {
-            auto result = m_mem.write(addr, value);
-
-            if(!result) {
+            if(auto result = m_mem.write(addr, value); !result) {
                 switch (result.error()) {
                 case Memory::Error::INVALID_DATA_ADDRESS: throw std::logic_error("INVALID_DATA_ADDRESS");
                 case Memory::Error::INVALID_STACK_ADDRESS: throw std::logic_error("INVALID_STACK_ADDRESS");
