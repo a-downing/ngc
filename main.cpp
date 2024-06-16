@@ -19,6 +19,8 @@ int main(const int argc, const char **argv) {
         return 0;
     }
 
+    std::println("__cpp_concepts: {}", __cpp_concepts);
+
     std::vector<ngc::Program> programs;
 
     for(const auto &entry  : std::filesystem::directory_iterator("autoload")) {
@@ -93,6 +95,8 @@ int main(const int argc, const char **argv) {
             for(const auto &word : block.words()) {
                 machineState.affectState(word);
 
+                std::println("    {}{}", name(word.letter()), word.real());
+
                 //testing tool change
                 if(word.letter() == ngc::Letter::T) {
                     const double toolNumber = eval.call("_tool_change", word.real());
@@ -103,11 +107,17 @@ int main(const int argc, const char **argv) {
     };
 
     auto eval = ngc::Evaluator(mem, callback);
-    std::println("executing: preamble");
-    eval.executeProgram(preamble);
+
+    std::println("first pass: preamble");
+    eval.executeFirstPass(preamble);
+
+    for(auto &program : programs) {
+        std::println("first pass: {}", program.source().name());
+        eval.executeFirstPass(program.statements());
+    }
 
     for(auto &program : programs) {
         std::println("executing: {}", program.source().name());
-        eval.executeProgram(program.statements());
+        eval.executeSecondPass(program.statements());
     }
 }

@@ -111,3 +111,15 @@ print["_time: ", #_time]
 print["_userdata_1: ", #userdata_1]
 
 M6 T2
+
+calledfirst[33]
+
+sub calledfirst[#x] {
+    print["calledfirst: ", #x]
+}
+
+print["after: ", #after]
+let #after = 777
+
+let #_a = 0
+let #_b = #_a

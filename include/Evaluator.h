@@ -51,6 +51,8 @@ namespace ngc
                 }
             }
 
+            [[nodiscard]] bool global() const { return m_global; }
+
             void allocate(const NamedVariableExpression *expr, const double value) {
                 if(!m_evaluator) {
                     throw std::logic_error("Scope::allocate called on default constructed Scope");
@@ -110,7 +112,46 @@ namespace ngc
             return callImpl(std::move(name), std::move(args2));
         }
 
-        void executeProgram(const std::vector<std::unique_ptr<Statement>> &program) {
+        void declareGlobal(const NamedVariableExpression *expr, uint32_t addr, const std::optional<double> value = std::nullopt) {
+            if(m_scope.back().contains(expr->name())) {
+                throw std::logic_error(std::format("already declared global variable '{}'", expr->name()));
+            }
+
+            if(addr == 0) {
+                const auto _value = value ? *value : 0.0;
+                addr = m_mem.addData(MemoryCell(MemoryCell::Flags::READ | MemoryCell::Flags::WRITE, _value));
+            } else {
+                if(value) {
+                    write(addr, *value);
+                }
+            }
+
+            m_scope.back().emplace(expr->name(), addr);
+        }
+
+        void executeFirstPass(const std::vector<std::unique_ptr<Statement>> &program) {
+            auto ctx = createScopeContext(true);
+
+            for(const auto &stmt : program) {
+                if(const auto s = stmt->as<AliasStatement>(); s) {
+                    const auto addr = static_cast<uint32_t>(eval(s->address(), &ctx));
+                    declareGlobal(s->variable(), addr);
+                    continue;
+                }
+
+                if(const auto s = stmt->as<LetStatement>(); s) {
+                    const auto value = s->value() ? eval(s->value(), &ctx) : 0.0;
+                    declareGlobal(s->variable(), 0, value);
+                    continue;
+                }
+
+                if(const auto s = stmt->as<SubStatement>(); s) {
+                    declareSub(s);
+                }
+            }
+        }
+
+        void executeSecondPass(const std::vector<std::unique_ptr<Statement>> &program) {
             auto ctx = createScopeContext(true);
 
             for(const auto &stmt : program) {
@@ -120,6 +161,14 @@ namespace ngc
             while(!m_blocks.empty()) {
                 m_callback(m_blocks, *this);
             }
+        }
+
+        void visit(const SubStatement* stmt, VisitorContext* ctx) override {
+            if(context(ctx)->scope.global()) {
+                return;
+            }
+
+            declareSub(stmt);
         }
 
         void visit(const ExpressionStatement* stmt, VisitorContext* ctx) override {
@@ -140,11 +189,19 @@ namespace ngc
         }
 
         void visit(const AliasStatement *stmt, VisitorContext *ctx) override {
+            if(context(ctx)->scope.global()) {
+                return;
+            }
+
             auto addr = static_cast<uint32_t>(eval(stmt->address(), ctx));
             m_scope.back().emplace(stmt->variable()->name(), addr);
         }
 
         void visit(const LetStatement* stmt, VisitorContext* ctx) override {
+            if(context(ctx)->scope.global()) {
+                return;
+            }
+
             double value = 0.0;
 
             if(stmt->value()) {
@@ -152,10 +209,6 @@ namespace ngc
             }
 
             context(ctx)->scope.allocate(stmt->variable(), value);
-        }
-
-        void visit(const SubStatement* stmt, VisitorContext* ctx) override { 
-            declareSub(stmt);
         }
 
         void visit(const BlockStatement* stmt, VisitorContext* ctx) override {
@@ -376,11 +429,11 @@ namespace ngc
         void visit(const LiteralExpression* expr, VisitorContext* ctx) override {
             context(ctx)->result = expr->value();
         }
-        
-        // not implemented for now
+
+        // not needed
+        void visit(const StringExpression* expr, VisitorContext* ctx) override { }
         void visit(const CommentExpression* expr, VisitorContext* ctx) override { }
         void visit(const WordExpression* expr, VisitorContext* ctx) override { }
-        void visit(const StringExpression* expr, VisitorContext* ctx) override { }
 
     private:
         Context createScopeContext(const bool global = false) { return Context { .scope = Scope(*this, global) }; }
