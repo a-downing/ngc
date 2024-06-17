@@ -1,13 +1,12 @@
-#ifndef PROGRAM_H
-#define PROGRAM_H
+module;
 
-#include <LexerSource.h>
-#include <Lexer.h>
-#include <Parser.h>
-
+#include <memory>
 #include <utility>
 
-namespace ngc
+export module evaluator:Program;
+import parser;
+
+export namespace ngc
 {
     class Program {
         LexerSource m_source;
@@ -31,5 +30,3 @@ namespace ngc
         [[nodiscard]] const LexerSource &source() const { return m_source; }
     };
 }
-
-#endif //PROGRAM_H

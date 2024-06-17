@@ -1,16 +1,17 @@
-#ifndef BLOCK_H
-#define BLOCK_H
+module;
 
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <utility>
 #include <vector>
 
-#include <Token.h>
-#include <Expression.h>
-#include <Visitor.h>
+export module parser:Statement;
+import :Token;
+import :Expression;
+import :Visitor;
 
-namespace ngc
+export namespace ngc
 {
     class Statement {
     public:
@@ -268,5 +269,3 @@ namespace ngc
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
     };
 }
-
-#endif //BLOCK_H

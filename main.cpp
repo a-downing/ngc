@@ -1,25 +1,20 @@
 #include <print>
+#include <vector>
+#include <queue>
 #include <filesystem>
 
-#include <Utils.h>
-#include <Token.h>
-#include <Lexer.h>
-#include <Parser.h>
-#include <Memory.h>
-#include <SemanticAnalyzer.h>
-#include <Program.h>
-#include <Evaluator.h>
-#include <Preamble.h>
-#include <Statement.h>
-#include <GCode.h>
+import utils;
+import parser;
+import memory;
+import gcode;
+import evaluator;
+import machine;
 
 int main(const int argc, const char **argv) {
     if(argc < 2) {
         std::println(stderr, "usage: {} <filename>", argv[0]);
         return 0;
     }
-
-    std::println("__cpp_concepts: {}", __cpp_concepts);
 
     std::vector<ngc::Program> programs;
 
@@ -35,7 +30,7 @@ int main(const int argc, const char **argv) {
     for(auto &program : programs) {
         try {
             program.compile();
-        
+
             for(const auto &stmt : program.statements()) {
                 //std::println("{}", stmt->text());
             }
@@ -49,7 +44,7 @@ int main(const int argc, const char **argv) {
             } else {
                 std::println(stderr, "{}", err.what());
             }
-        
+
             std::println(stderr, "{}:{}:{}", err.sourceLocation().file_name(), err.sourceLocation().line(), err.sourceLocation().column());
             throw;
         }
@@ -57,30 +52,11 @@ int main(const int argc, const char **argv) {
 
     ngc::Memory mem;
     const auto addrs = mem.init(ngc::VARS);
+    auto machine = ngc::Machine(mem);
     const auto preamble = ngc::buildPreamble(addrs);
 
-    // ngc::SemanticAnalyzer sa;
-    // sa.addGlobalSub(ngc::SubSignature("sin", 1));
-    // sa.processProgram(preamble);
-    //
-    // for(auto &program : programs) {
-    //     std::println("analyzing: {}", program.source().name());
-    //     sa.processProgram(program.statements());
-    //
-    //     if(!sa.errors().empty()) {
-    //         for(const auto &error : sa.errors()) {
-    //             std::println(stderr, "{}", error.message());
-    //         }
-    //
-    //         return 1;
-    //     }
-    // }
-
-    auto callback = [] (std::queue<ngc::Block> &blocks, ngc::Evaluator &eval) {
-        ngc::MachineState machineState;
-
+    auto callback = [&machine] (std::queue<ngc::Block> &blocks, ngc::Evaluator &eval) {
         std::println("CALLBACK: {} blocks", blocks.size());
-
 
         while(!blocks.empty()) {
             auto block = blocks.front();
@@ -92,17 +68,7 @@ int main(const int argc, const char **argv) {
                 std::println("BLOCK: {}", block.statement()->text());
             }
 
-            for(const auto &word : block.words()) {
-                machineState.affectState(word);
-
-                std::println("    {}{}", name(word.letter()), word.real());
-
-                //testing tool change
-                if(word.letter() == ngc::Letter::T) {
-                    const double toolNumber = eval.call("_tool_change", word.real());
-                    std::println("_tool_change[{}] returned: {}", word.real(), toolNumber);
-                }
-            }
+            machine.executeBlock(block);
         }
     };
 

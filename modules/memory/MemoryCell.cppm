@@ -1,9 +1,10 @@
-#ifndef MEMORYCELL_H
-#define MEMORYCELL_H
+module;
 
 #include <utility>
 
-namespace ngc
+export module memory:MemoryCell;
+
+export namespace ngc
 {
     class MemoryCell {
     public:
@@ -31,5 +32,3 @@ namespace ngc
         return static_cast<MemoryCell::Flags>(std::to_underlying(a) | std::to_underlying(b));
     }
 }
-
-#endif //MEMORYCELL_H

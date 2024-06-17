@@ -1,13 +1,16 @@
-#ifndef UTILS_H
-#define UTILS_H
+module;
 
+#include <format>
 #include <string>
 #include <iterator>
 #include <filesystem>
 #include <fstream>
 #include <charconv>
+#include <array>
 
-namespace ngc
+export module utils;
+
+export namespace ngc
 {
     inline std::string toChars(const double d) {
         std::array<char, 32> chars;
@@ -37,5 +40,3 @@ namespace ngc
         return fileContent;
     }
 }
-
-#endif //UTILS_H

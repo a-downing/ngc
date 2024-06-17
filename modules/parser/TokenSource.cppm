@@ -1,10 +1,11 @@
-#ifndef TOKENSOURCE_H
-#define TOKENSOURCE_H
+module;
 
 #include <memory>
 #include <string_view>
 
-namespace ngc {
+export module parser:TokenSource;
+
+export namespace ngc {
     class TokenSource {
     public:
         [[nodiscard]] virtual std::unique_ptr<TokenSource> clone() const = 0;
@@ -16,5 +17,3 @@ namespace ngc {
         [[nodiscard]] virtual std::string location() const = 0;
     };
 }
-
-#endif //TOKENSOURCE_H

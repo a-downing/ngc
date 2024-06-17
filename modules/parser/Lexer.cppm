@@ -1,5 +1,4 @@
-#ifndef LEXER_H
-#define LEXER_H
+module;
 
 #ifdef __clang__
     #pragma push_macro("__cpp_concepts")
@@ -10,15 +9,17 @@
     #include <expected>
 #endif
 
+#include <memory>
 #include <cctype>
 #include <format>
 #include <utility>
 
-#include <LexerSource.h>
-#include <Token.h>
-#include <StringViewTokenSource.h>
+export module parser:Lexer;
+import :LexerSource;
+import :StringViewTokenSource;
+import :Token;
 
-namespace ngc
+export namespace ngc
 {
     class Lexer final {
         enum class State {
@@ -376,5 +377,3 @@ namespace ngc
         }
     };
 }
-
-#endif //LEXER_H

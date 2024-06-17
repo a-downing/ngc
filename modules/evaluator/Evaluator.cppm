@@ -1,6 +1,6 @@
-#ifndef EVALUATOR_H
-#define EVALUATOR_H
+module;
 
+#include <memory>
 #include <concepts>
 #include <functional>
 #include <print>
@@ -13,16 +13,14 @@
 #include <unordered_map>
 #include <ranges>
 
-#include <Visitor.h>
-#include <VisitorContext.h>
-#include <Expression.h>
-#include <Statement.h>
-#include <MemoryCell.h>
-#include <Memory.h>
-#include <SubSignature.h>
-#include <GCode.h>
+export module evaluator;
+export import :Preamble;
+export import :Program;
+import parser;
+import memory;
+import gcode;
 
-namespace ngc
+export namespace ngc
 {
     class Evaluator final : public Visitor {
         std::vector<std::unordered_map<std::string_view, uint32_t>> m_scope;
@@ -523,5 +521,3 @@ namespace ngc
         }
     };
 }
-
-#endif //EVALUATOR_H

@@ -1,72 +1,47 @@
-#ifndef GCODE_H
-#define GCODE_H
+module;
 
+#include <utility>
+#include <vector>
 #include <optional>
 #include <stdexcept>
 #include <format>
+#include <print>
 
-#include <Token.h>
-#include <Expression.h>
-#include <Statement.h>
+export module gcode;
+import parser;
 
-namespace ngc {
-    enum class GCode {
-        G0,
-        G1,
-        G17,
-        G18,
-        G19,
-        G2,
-        G20,
-        G21,
-        G3,
-        G43,
-        G49,
-        G53,
-        G54,
-        G55,
-        G56,
-        G57,
-        G58,
-        G59,
-        G59_1,
-        G59_2,
-        G59_3,
-        G61_1,
-        G90,
-        G91,
-        G93,
-        G94,
-    };
+export namespace ngc {
+#include "gcode.gen.h"
+}
 
-    inline const char *name(const GCode code) {
+export namespace ngc {
+    inline GCode coordsys(const int i) {
+        switch(i) {
+        case 1: return GCode::G54;
+        case 2: return GCode::G55;
+        case 3: return GCode::G56;
+        case 4: return GCode::G57;
+        case 5: return GCode::G58;
+        case 6: return GCode::G59;
+        case 7: return GCode::G59_1;
+        case 8: return GCode::G59_2;
+        case 9: return GCode::G59_3;
+        default: throw std::logic_error(std::format("invalid coordinate system number: {}", i));
+        }
+    }
+
+    inline int coordsys(const GCode code) {
         switch(code) {
-            case GCode::G0: return "G0";
-            case GCode::G1: return "G1";
-            case GCode::G17: return "G17";
-            case GCode::G18: return "G18";
-            case GCode::G19: return "G19";
-            case GCode::G2: return "G2";
-            case GCode::G20: return "G20";
-            case GCode::G21: return "G21";
-            case GCode::G3: return "G3";
-            case GCode::G43: return "G43";
-            case GCode::G49: return "G49";
-            case GCode::G53: return "G53";
-            case GCode::G54: return "G54";
-            case GCode::G55: return "G55";
-            case GCode::G56: return "G56";
-            case GCode::G57: return "G57";
-            case GCode::G58: return "G58";
-            case GCode::G59: return "G59";
-            case GCode::G59_1: return "G59.1";
-            case GCode::G59_2: return "G59.2";
-            case GCode::G59_3: return "G59.3";
-            case GCode::G61_1: return "G61.1";
-            case GCode::G90: return "G90";
-            case GCode::G91: return "G91";
-            case GCode::G93: return "G93";
-            case GCode::G94: return "G94";
+        case GCode::G54: return 1;
+        case GCode::G55: return 2;
+        case GCode::G56: return 3;
+        case GCode::G57: return 4;
+        case GCode::G58: return 5;
+        case GCode::G59: return 6;
+        case GCode::G59_1: return 7;
+        case GCode::G59_2: return 8;
+        case GCode::G59_3: return 9;
+        default: throw std::logic_error(std::format("invalid coordinate system: {}", name(code)));
         }
     }
 
@@ -91,6 +66,7 @@ namespace ngc {
             case MCode::M30: return "M30";
             case MCode::M5: return "M5";
             case MCode::M6: return "M6";
+            default: throw std::runtime_error(std::format("{}() missing case statement for MCode::{}", __func__, std::to_underlying(code)));
         }
     }
 
@@ -122,6 +98,7 @@ namespace ngc {
             case Letter::X: return "X";
             case Letter::Y: return "Y";
             case Letter::Z: return "Z";
+            default: throw std::runtime_error(std::format("{}() missing case statement for Letter::{}", __func__, std::to_underlying(letter)));
         }
     }
 
@@ -132,10 +109,10 @@ namespace ngc {
 
     public:
         Word(const WordExpression *expression, const Letter letter, const double real) : m_expression(expression), m_letter(letter), m_real(real) { }
-        const WordExpression *expression() const { return m_expression; }
-        Letter letter() const { return m_letter; }
-        double real() const { return m_real; }
-        std::string text() const { return std::format("{}{}", name(m_letter), m_real); }
+        [[nodiscard]] const WordExpression *expression() const { return m_expression; }
+        [[nodiscard]] Letter letter() const { return m_letter; }
+        [[nodiscard]] double real() const { return m_real; }
+        [[nodiscard]] std::string text() const { return std::format("{}{}", name(m_letter), m_real); }
     };
 
     class Block {
@@ -143,14 +120,14 @@ namespace ngc {
         std::vector<Word> m_words;
     public:
         Block(const BlockStatement *statement, std::vector<Word> words) : m_statement(statement), m_words(std::move(words)) { }
-        const BlockStatement *statement() { return m_statement; };
-        const std::vector<Word> &words() { return m_words; }
-        bool blockDelete() const { return m_statement->blockDelete() != std::nullopt; }
+        [[nodiscard]] const BlockStatement *statement() const { return m_statement; };
+        [[nodiscard]] const std::vector<Word> &words() const { return m_words; }
+        [[nodiscard]] bool blockDelete() const { return m_statement->blockDelete() != std::nullopt; }
     };
 
     constexpr GCode convertGCode(double real) {
-        int whole = static_cast<int>(real);
-        int fract = static_cast<int>((real - whole) * 10 + 0.5);
+        const int whole = static_cast<int>(real);
+        const int fract = static_cast<int>((real - whole) * 10 + 0.5);
 
         switch(whole) {
             case 0: return GCode::G0;
@@ -191,11 +168,8 @@ namespace ngc {
         }
     }
 
-    constexpr MCode convertMCode(double real) {
-        int whole = static_cast<int>(real);
-        int fract = static_cast<int>((real - whole) * 10 + 0.5);
-
-        switch(whole) {
+    constexpr MCode convertMCode(const double real) {
+        switch(static_cast<int>(real)) {
             case 0: return MCode::M0;
             case 1: return MCode::M1;
             case 2: return MCode::M2;
@@ -208,7 +182,7 @@ namespace ngc {
         }
     }
 
-    constexpr Letter convertLetter(Token::Kind kind) {
+    constexpr Letter convertLetter(const Token::Kind kind) {
         switch(kind) {
             case Token::Kind::A: return Letter::A;
             case Token::Kind::B: return Letter::B;
@@ -236,38 +210,83 @@ namespace ngc {
         }
     }
 
-    class MachineState {
-        GCode m_modeMotion;
-        GCode m_modePlane;
-        GCode m_modeDistance;
-        GCode m_modeFeedrate;
-        GCode m_modeUnits;
-        GCode m_modeToolLengthOffset;
-        GCode m_modeCoordSys;
-        GCode m_modePath;
+    class GCodeState {
+        GCMotion m_modeMotion{};
+        GCPlane m_modePlane{};
+        GCDist m_modeDistance{};
+        GCFeed m_modeFeedrate{};
+        GCUnits m_modeUnits{};
+        GCTLen m_modeToolLengthOffset{};
+        GCCoord m_modeCoordSys{};
+        GCPath m_modePath{};
 
-        MCode m_modeStop;
-        MCode m_modeToolChange;
-        MCode m_modeSpindle;
+        std::optional<GCNonModal> m_nonModal{};
 
-        double m_A, m_B, m_C, m_D, m_F, m_H, m_I, m_J, m_K, m_L, m_M, m_N, m_O, m_P, m_Q, m_R, m_S, m_T, m_X, m_Y, m_Z;
+        std::optional<MCode> m_modeStop{};
+        std::optional<MCode> m_modeToolChange{};
+        std::optional<MCode> m_modeSpindle{};
 
-        std::optional<GCode> m_nonModal;
+        double m_F = 1;
+        std::optional<double> m_A, m_B, m_C, m_D, m_H, m_I, m_J, m_K, m_L, m_P, m_Q, m_R, m_S, m_T, m_X, m_Y, m_Z;
 
     public:
-        GCode modeMotion() const { return m_modeMotion; }
-        GCode modePlane() const { return m_modePlane; }
-        GCode modeDistance() const { return m_modeDistance; }
-        GCode modeFeedrate() const { return m_modeFeedrate; }
-        GCode modeUnits() const { return m_modeUnits; }
-        GCode modeToolLengthOffset() const { return m_modeToolLengthOffset; }
-        GCode modeCoordSys() const { return m_modeCoordSys; }
-        GCode modePath() const { return m_modePath; }
+        GCodeState() {
+            affectState(GCode::G0);
+            affectState(GCode::G17);
+            affectState(GCode::G90);
+            affectState(GCode::G94);
+            affectState(GCode::G20);
+            affectState(GCode::G49);
+            affectState(GCode::G54);
+            affectState(GCode::G61_1);
+        }
 
-        MCode modeStop() const { return m_modeStop; }
-        MCode modeSpindle() const { return m_modeSpindle; }
+        [[nodiscard]] GCodeState modalCopy() const {
+            auto copy = GCodeState();
+            copy.m_modeMotion = m_modeMotion;
+            copy.m_modePlane = m_modePlane;
+            copy.m_modeDistance = m_modeDistance;
+            copy.m_modeFeedrate = m_modeFeedrate;
+            copy.m_modeUnits = m_modeUnits;
+            copy.m_modeToolLengthOffset = m_modeToolLengthOffset;
+            copy.m_modeCoordSys = m_modeCoordSys;
+            copy.m_modePath = m_modePath;
+            copy.m_F = m_F;
+            return copy;
+        }
 
-        std::optional<GCode> nonModal() const { return m_nonModal; }
+        [[nodiscard]] GCMotion modeMotion() const { return m_modeMotion; }
+        [[nodiscard]] GCPlane modePlane() const { return m_modePlane; }
+        [[nodiscard]] GCDist modeDistance() const { return m_modeDistance; }
+        [[nodiscard]] GCFeed modeFeedrate() const { return m_modeFeedrate; }
+        [[nodiscard]] GCUnits modeUnits() const { return m_modeUnits; }
+        [[nodiscard]] GCTLen modeToolLengthOffset() const { return m_modeToolLengthOffset; }
+        [[nodiscard]] GCCoord modeCoordSys() const { return m_modeCoordSys; }
+        [[nodiscard]] GCPath modePath() const { return m_modePath; }
+
+        [[nodiscard]] std::optional<double> A() const { return m_A; }
+        [[nodiscard]] std::optional<double> B() const { return m_B; }
+        [[nodiscard]] std::optional<double> C() const { return m_C; }
+        [[nodiscard]] std::optional<double> D() const { return m_D; }
+        [[nodiscard]] double F() const { return m_F; }
+        [[nodiscard]] std::optional<double> H() const { return m_H; }
+        [[nodiscard]] std::optional<double> I() const { return m_I; }
+        [[nodiscard]] std::optional<double> J() const { return m_J; }
+        [[nodiscard]] std::optional<double> K() const { return m_K; }
+        [[nodiscard]] std::optional<double> L() const { return m_L; }
+        [[nodiscard]] std::optional<double> P() const { return m_P; }
+        [[nodiscard]] std::optional<double> Q() const { return m_Q; }
+        [[nodiscard]] std::optional<double> R() const { return m_R; }
+        [[nodiscard]] std::optional<double> S() const { return m_S; }
+        [[nodiscard]] std::optional<double> T() const { return m_T; }
+        [[nodiscard]] std::optional<double> X() const { return m_X; }
+        [[nodiscard]] std::optional<double> Y() const { return m_Y; }
+        [[nodiscard]] std::optional<double> Z() const { return m_Z; }
+
+        [[nodiscard]] std::optional<MCode> modeStop() const { return m_modeStop; }
+        [[nodiscard]] std::optional<MCode> modeSpindle() const { return m_modeSpindle; }
+
+        [[nodiscard]] std::optional<GCNonModal> nonModal() const { return m_nonModal; }
 
         void affectState(const Word &word) {
             if(word.letter() == Letter::G) {
@@ -289,8 +308,7 @@ namespace ngc {
                 case Letter::J: m_J = word.real(); break;
                 case Letter::K: m_K = word.real(); break;
                 case Letter::L: m_L = word.real(); break;
-                case Letter::N: m_N = word.real(); break;
-                case Letter::O: m_O = word.real(); break;
+                case Letter::N: break;
                 case Letter::P: m_P = word.real(); break;
                 case Letter::Q: m_Q = word.real(); break;
                 case Letter::R: m_R = word.real(); break;
@@ -299,7 +317,7 @@ namespace ngc {
                 case Letter::X: m_X = word.real(); break;
                 case Letter::Y: m_Y = word.real(); break;
                 case Letter::Z: m_Z = word.real(); break;
-                default: std::logic_error(std::format("invalid word {}", word.text()));
+                default: throw std::logic_error(std::format("invalid word {}", word.text()));
             }
         }
 
@@ -309,28 +327,28 @@ namespace ngc {
                 case GCode::G1:
                 case GCode::G2:
                 case GCode::G3:
-                    m_modeMotion = code;
+                    m_modeMotion = static_cast<GCMotion>(code);
                     break;
                 case GCode::G17:
                 case GCode::G18:
                 case GCode::G19:
-                    m_modePlane = code;
+                    m_modePlane = static_cast<GCPlane>(code);
                     break;
                 case GCode::G90:
                 case GCode::G91:
-                    m_modeDistance = code;
+                    m_modeDistance = static_cast<GCDist>(code);
                     break;
                 case GCode::G93:
                 case GCode::G94:
-                    m_modeFeedrate = code;
+                    m_modeFeedrate = static_cast<GCFeed>(code);
                     break;
                 case GCode::G20:
                 case GCode::G21:
-                    m_modeUnits = code;
+                    m_modeUnits = static_cast<GCUnits>(code);
                     break;
                 case GCode::G43:
                 case GCode::G49:
-                    m_modeToolLengthOffset = code;
+                    m_modeToolLengthOffset = static_cast<GCTLen>(code);
                     break;
                 case GCode::G54:
                 case GCode::G55:
@@ -341,13 +359,13 @@ namespace ngc {
                 case GCode::G59_1:
                 case GCode::G59_2:
                 case GCode::G59_3:
-                    m_modeCoordSys = code;
+                    m_modeCoordSys = static_cast<GCCoord>(code);
                     break;
                 case GCode::G61_1:
-                    m_modePath = code;
+                    m_modePath = static_cast<GCPath>(code);
                     break;
                 case GCode::G53:
-                    m_nonModal = code;
+                    m_nonModal = static_cast<GCNonModal>(code);
                     break;
                 default: throw std::logic_error(std::format("invalid g-code {}", name(code)));
             }
@@ -374,5 +392,3 @@ namespace ngc {
         }
     };
 }
-
-#endif //GCODE_H

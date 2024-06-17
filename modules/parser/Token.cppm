@@ -1,5 +1,4 @@
-#ifndef TOKEN_H
-#define TOKEN_H
+module;
 
 #include <memory>
 #include <cmath>
@@ -8,10 +7,11 @@
 #include <utility>
 #include <stdexcept>
 
-#include <TokenSource.h>
-#include <StringTokenSource.h>
+export module parser:Token;
+import :TokenSource;
+import :StringTokenSource;
 
-namespace ngc {
+export namespace ngc {
     class Token {
     public:
         enum class Kind {
@@ -195,5 +195,3 @@ namespace ngc {
         return ngc::name(m_kind);
     }
 }
-
-#endif //TOKEN_H

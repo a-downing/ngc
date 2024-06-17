@@ -1,19 +1,17 @@
-#ifndef PREAMBLE_H
-#define PREAMBLE_H
+module;
 
 #include <memory>
 #include <vector>
 
-#include <Token.h>
-#include <Expression.h>
-#include <Statement.h>
-#include <Vars.h>
+export module evaluator:Preamble;
+import parser;
+import memory;
 
-namespace ngc {
+export namespace ngc {
     inline std::vector<std::unique_ptr<Statement>> buildPreamble(const std::vector<uint32_t> &addrs) {
         auto statements = std::vector<std::unique_ptr<Statement>>();
 
-        for(size_t i = 0; const auto &[var, name, addr, flags] : VARS) {
+        for(size_t i = 0; const auto &[var, name, addr, flags, value] : VARS) {
             auto startToken = Token::fromString(Token::Kind::ALIAS, "alias");
             auto variable = NamedVariableExpression::fromName(std::string(name));
             auto alias = std::make_unique<AliasStatement>(startToken, std::move(variable), LiteralExpression::fromDouble(addrs[i]));
@@ -24,5 +22,3 @@ namespace ngc {
         return statements;
     }
 }
-
-#endif //PREAMBLE_H

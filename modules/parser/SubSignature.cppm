@@ -1,12 +1,14 @@
-#ifndef SUBSIGNATURE_H
-#define SUBSIGNATURE_H
+module;
 
+#include <string>
 #include <string_view>
+#include <format>
 
-#include <Statement.h>
-#include <Expression.h>
+export module parser:SubSignature;
+import :Expression;
+import :Statement;
 
-namespace ngc {
+export namespace ngc {
     class SubSignature {
         std::string_view m_name;
         size_t m_numParams;
@@ -30,5 +32,3 @@ struct std::hash<ngc::SubSignature> {
         return h1 ^ (h2 << 1);
     }
 };
-
-#endif //SUBSIGNATURE_H

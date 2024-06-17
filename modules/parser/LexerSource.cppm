@@ -1,12 +1,13 @@
-#ifndef LEXERSOURCE_H
-#define LEXERSOURCE_H
+module;
 
 #include <string>
 #include <string_view>
 #include <utility>
 #include <stack>
 
-namespace ngc
+export module parser:LexerSource;
+
+export namespace ngc
 {
     class LexerSource {
         struct state_t {
@@ -101,5 +102,3 @@ namespace ngc
         }
     };
 }
-
-#endif //LEXERSOURCE_H

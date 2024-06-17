@@ -1,18 +1,22 @@
-#ifndef PARSER_H
-#define PARSER_H
+module;
 
-#include <print>
 #include <source_location>
 #include <stdexcept>
 #include <vector>
 #include <memory>
 #include <tuple>
+#include <stack>
 
-#include <Lexer.h>
-#include <Statement.h>
-#include <Expression.h>
+export module parser;
+export import :Token;
+export import :LexerSource;
+export import :Lexer;
+export import :Visitor;
+export import :Expression;
+export import :Statement;
+export import :SubSignature;
 
-namespace ngc
+export namespace ngc
 {
     class Parser final {
         Lexer &m_lexer;
@@ -495,5 +499,3 @@ namespace ngc
         }
     };
 }
-
-#endif //PARSER_H

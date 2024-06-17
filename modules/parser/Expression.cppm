@@ -1,6 +1,4 @@
-
-#ifndef EXPRESSION_H
-#define EXPRESSION_H
+module;
 
 #include <utility>
 #include <vector>
@@ -8,10 +6,11 @@
 #include <utility>
 #include <stdexcept>
 
-#include <Token.h>
-#include <Visitor.h>
+export module parser:Expression;
+import :Token;
+import :Visitor;
 
-namespace ngc
+export namespace ngc
 {
     class Expression {
         Token m_token;
@@ -347,5 +346,3 @@ namespace ngc
         void accept(Visitor &v, VisitorContext *ctx) const override { v.visit(this, ctx); }
     };
 }
-
-#endif //EXPRESSION_H

@@ -3,32 +3,48 @@ project(ngc)
 
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_EXTENSIONS OFF)
-set(CMAKE_CXX_STANDARD_REQUIRED True)
+set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-message(STATUS "${CMAKE_CXX_COMPILER}")
+add_library(utils)
+target_sources(utils PUBLIC FILE_SET CXX_MODULES FILES modules/Utils.cppm)
 
-add_executable(ngc main.cpp
-        include/Lexer.h
-        include/Token.h
-        include/LexerSource.h
-        include/Parser.h
-        include/Statement.h
-        include/Expression.h
-        include/Utils.h
-        include/Visitor.h
-        include/VisitorContext.h
-        include/Memory.h
-        include/Vars.h
-        include/MemoryCell.h
-        include/SemanticAnalyzer.h
-        include/Program.h
-        include/Evaluator.h
-        include/TokenSource.h
-        include/StringViewTokenSource.h
-        include/StringTokenSource.h
-        include/Preamble.h
-        include/SubSignature.h
-        include/GCode.h
-)
-target_include_directories(ngc PUBLIC "${CMAKE_SOURCE_DIR}/include")
+add_library(parser)
+target_sources(parser PUBLIC FILE_SET CXX_MODULES FILES
+        modules/parser/LexerSource.cppm
+        modules/parser/TokenSource.cppm
+        modules/parser/StringTokenSource.cppm
+        modules/parser/StringViewTokenSource.cppm
+        modules/parser/Token.cppm
+        modules/parser/Lexer.cppm
+        modules/parser/Visitor.cppm
+        modules/parser/Expression.cppm
+        modules/parser/Statement.cppm
+        modules/parser/SubSignature.cppm
+        modules/parser/Parser.cppm)
+target_link_libraries(parser utils)
+
+add_library(gcode)
+target_sources(gcode PUBLIC FILE_SET CXX_MODULES FILES modules/gcode/GCode.cppm)
+target_link_libraries(gcode parser)
+
+add_library(memory)
+target_sources(memory PUBLIC FILE_SET CXX_MODULES FILES
+        modules/memory/Vars.cppm
+        modules/memory/MemoryCell.cppm
+        modules/memory/Memory.cppm)
+target_link_libraries(memory)
+
+add_library(machine)
+target_sources(machine PUBLIC FILE_SET CXX_MODULES FILES modules/Machine.cppm)
+target_link_libraries(machine gcode memory)
+
+add_library(evaluator)
+target_sources(evaluator PUBLIC FILE_SET CXX_MODULES FILES
+        modules/evaluator/Preamble.cppm
+        modules/evaluator/Program.cppm
+        modules/evaluator/Evaluator.cppm)
+target_link_libraries(evaluator parser memory gcode)
+
+add_executable(ngc main.cpp)
+target_link_libraries(ngc utils parser memory evaluator machine)

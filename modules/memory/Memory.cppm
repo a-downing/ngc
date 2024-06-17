@@ -1,5 +1,4 @@
-#ifndef MEMORY_H
-#define MEMORY_H
+module;
 
 #ifdef __clang__
     #pragma push_macro("__cpp_concepts")
@@ -17,9 +16,11 @@
 #include <utility>
 #include <stdexcept>
 
-#include <Vars.h>
+export module memory;
+export import :Vars;
+export import :MemoryCell;
 
-namespace ngc
+export namespace ngc
 {
     class Memory {
         std::vector<MemoryCell> m_data;
@@ -36,19 +37,19 @@ namespace ngc
             WRITE
         };
 
-        std::vector<uint32_t> init(const std::initializer_list<std::tuple<Var, std::string_view, size_t, MemoryCell::Flags>> specs) {
+        std::vector<uint32_t> init(const std::initializer_list<vars_t> specs) {
             m_data.clear();
             m_globals.clear();
             m_stack.clear();
 
             std::vector<uint32_t> addrs;
 
-            for(const auto &[var, name, addr, flags] : specs) {
+            for(const auto &[var, name, addr, flags, value] : specs) {
                 while(m_data.size() < addr) {
                     addData(MemoryCell(MemoryCell::Flags::READ | MemoryCell::Flags::WRITE));
                 }
 
-                auto _addr = addData(MemoryCell(flags));
+                auto _addr = addData(MemoryCell(flags, value));
 
                 m_globals.emplace(var, _addr);
                 addrs.emplace_back(_addr);
@@ -57,12 +58,17 @@ namespace ngc
             return addrs;
         }
 
-        double read(const Var var) const {
+        size_t deref(const Var var) const {
             if(!m_globals.contains(var)) {
                 throw std::logic_error(std::format("Memory::read() unknown Var::{}", std::to_underlying(var)));
             }
 
-            const auto result = readData(m_globals.at(var), true);
+            return m_globals.at(var);
+        }
+
+        double read(const Var var) const {
+            const auto addr = deref(var);
+            const auto result = readData(addr, true);
 
             if(!result) {
                 throw std::logic_error(std::format("Memory::readData failed for Var::{}", std::to_underlying(var)));
@@ -191,5 +197,3 @@ namespace ngc
         }
     };
 }
-
-#endif //MEMORY_H

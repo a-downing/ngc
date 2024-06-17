@@ -1,10 +1,10 @@
-#ifndef STRINGVIEWTOKENSOURCE_H
-#define STRINGVIEWTOKENSOURCE_H
+module;
 
 #include <memory>
 #include <string_view>
 
-#include <TokenSource.h>
+export module parser:StringViewTokenSource;
+import :TokenSource;
 
 namespace ngc {
     class StringViewTokenSource final : public TokenSource {
@@ -28,5 +28,3 @@ namespace ngc {
         }
     };
 }
-
-#endif //STRINGVIEWTOKENSOURCE_H

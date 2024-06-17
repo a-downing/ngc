@@ -1,8 +1,7 @@
-#ifndef VISITOR_H
-#define VISITOR_H
+export module parser:Visitor;
 
-namespace ngc {
-    class VisitorContext;
+export namespace ngc {
+    class VisitorContext {};
 
     class Visitor {
     public:
@@ -34,5 +33,3 @@ namespace ngc {
         virtual void visit(const class GroupingExpression *expr, VisitorContext *ctx) = 0;
     };
 }
-
-#endif //VISITOR_H
