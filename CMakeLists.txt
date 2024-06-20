@@ -5,6 +5,7 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_CXX_FLAGS "-O2")
 
 add_library(utils)
 target_sources(utils PUBLIC FILE_SET CXX_MODULES FILES modules/Utils.cppm)
@@ -35,9 +36,10 @@ target_sources(memory PUBLIC FILE_SET CXX_MODULES FILES
         modules/memory/Memory.cppm)
 target_link_libraries(memory)
 
-add_library(machine)
-target_sources(machine PUBLIC FILE_SET CXX_MODULES FILES modules/Machine.cppm)
-target_link_libraries(machine gcode memory)
+add_library(machine
+        modules/machine/ToolTable.cppm)
+target_sources(machine PUBLIC FILE_SET CXX_MODULES FILES modules/machine/Machine.cppm modules/machine/MachineCommand.cppm modules/machine/ToolTable.cppm)
+target_link_libraries(machine utils gcode memory)
 
 add_library(evaluator)
 target_sources(evaluator PUBLIC FILE_SET CXX_MODULES FILES

@@ -3,5 +3,6 @@ alias #userdata_1 = 1
 
 sub _tool_change[#tool_number] {
     print["tool_change: ", #tool_number]
+    G01 X33 Y42 Z37
     return #tool_number
 }

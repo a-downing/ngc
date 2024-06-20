@@ -1,3 +1,10 @@
+#ifndef GCODE_GEN_H
+#define GCODE_GEN_H
+
+#include <utility>
+#include <format>
+#include <stdexcept>
+
 enum class GCode {
     G0 = 0,
     G1 = 1,
@@ -191,3 +198,6 @@ inline const char *name(const GCNonModal code) {
         default: throw std::runtime_error(std::format("{}() invalid code GCNonModal::{}", __func__, std::to_underlying(code)));
     }
 }
+
+
+#endif

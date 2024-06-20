@@ -12,6 +12,7 @@ module;
 #include <stdexcept>
 #include <unordered_map>
 #include <ranges>
+#include <utility>
 
 export module evaluator;
 export import :Preamble;
@@ -26,8 +27,8 @@ export namespace ngc
         std::vector<std::unordered_map<std::string_view, uint32_t>> m_scope;
         std::vector<std::unordered_map<SubSignature, const SubStatement *>> m_subScope;
         Memory &m_mem;
-        const std::function<void(std::queue<Block> &, Evaluator &)> &m_callback;
-        std::queue<Block> m_blocks;
+        const std::function<void(const Block &, Evaluator &)> &m_callback;
+        //std::queue<Block> m_blocks;
 
         class Scope {
             Evaluator *m_evaluator = nullptr;
@@ -101,7 +102,7 @@ export namespace ngc
         static Context *context(VisitorContext *ctx) { return static_cast<Context *>(ctx); }
 
     public:
-        explicit Evaluator(Memory &mem, const std::function<void(std::queue<Block> &, Evaluator &)> &callback) : m_scope(1), m_subScope(1), m_mem(mem), m_callback(callback) { }
+        explicit Evaluator(Memory &mem, const std::function<void(const Block &, Evaluator &)> &callback) : m_scope(1), m_subScope(1), m_mem(mem), m_callback(callback) { }
 
         template<typename ...Args>
         double call(std::string name, Args... args) requires (std::convertible_to<Args, double> && ...) {
@@ -154,10 +155,6 @@ export namespace ngc
 
             for(const auto &stmt : program) {
                 stmt->accept(*this, &ctx);
-            }
-
-            while(!m_blocks.empty()) {
-                m_callback(m_blocks, *this);
             }
         }
 
@@ -218,7 +215,7 @@ export namespace ngc
                 words.emplace_back(expr.get(), letter, real);
             }
 
-            m_blocks.emplace(stmt, std::move(words));
+            m_callback(Block(stmt, std::move(words)), *this);
         }
 
         void visit(const ReturnStatement* stmt, VisitorContext* ctx) override {
@@ -415,6 +412,7 @@ export namespace ngc
                 case UnaryExpression::Op::NEGATIVE: result = -value; break;
                 case UnaryExpression::Op::POSITIVE:
                 case UnaryExpression::Op::ADDRESS_OF: result = value; break;
+                default: throw std::runtime_error(std::format("invalid unary operator UnaryExpression::Op{}", std::to_underlying(expr->op())));
             }
 
             context(ctx)->result = result;
@@ -480,10 +478,6 @@ export namespace ngc
         }
 
         [[nodiscard]] double read(const uint32_t addr) {
-            while(isVolatile(addr) && !m_blocks.empty()) {
-                m_callback(m_blocks, *this);
-            }
-
             auto result = m_mem.read(addr);
 
             if(!result) {

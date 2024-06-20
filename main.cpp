@@ -20,12 +20,23 @@ int main(const int argc, const char **argv) {
 
     for(const auto &entry  : std::filesystem::directory_iterator("autoload")) {
         auto filename = entry.path().string();
-        auto text = ngc::readFile(filename);
-        programs.emplace_back(ngc::LexerSource(std::move(text), std::move(filename)));
+        auto result = ngc::readFile(filename);
+
+        if(!result) {
+            throw result.error();
+        }
+
+        programs.emplace_back(ngc::LexerSource(std::move(*result), std::move(filename)));
     }
 
     const std::string filename = argv[1];
-    programs.emplace_back(ngc::LexerSource(ngc::readFile(filename), filename));
+    auto result = ngc::readFile(filename);
+
+    if(!result) {
+        throw result.error();
+    }
+
+    programs.emplace_back(ngc::LexerSource(std::move(*result), filename));
 
     for(auto &program : programs) {
         try {
@@ -55,21 +66,24 @@ int main(const int argc, const char **argv) {
     auto machine = ngc::Machine(mem);
     const auto preamble = ngc::buildPreamble(addrs);
 
-    auto callback = [&machine] (std::queue<ngc::Block> &blocks, ngc::Evaluator &eval) {
-        std::println("CALLBACK: {} blocks", blocks.size());
-
-        while(!blocks.empty()) {
-            auto block = blocks.front();
-            blocks.pop();
-
-            if(block.blockDelete()) {
-                std::println("DELETED BLOCK: {}", block.statement()->text());
-            } else{
-                std::println("BLOCK: {}", block.statement()->text());
-            }
-
-            machine.executeBlock(block);
+    auto callback = [&machine] (const ngc::Block &block, ngc::Evaluator &eval) {
+        if(block.blockDelete()) {
+            //std::println("DELETED BLOCK: {}", block.statement()->text());
+        } else{
+            //std::println("BLOCK: {}", block.statement()->text());
         }
+
+        ngc::GCodeState state;
+
+        for(const auto &word : block.words()) {
+            state.affectState(word);
+        }
+
+        if(state.modeToolChange()) {
+            eval.call("_tool_change", state.T());
+        }
+
+        machine.executeBlock(block);
     };
 
     auto eval = ngc::Evaluator(mem, callback);
@@ -85,5 +99,9 @@ int main(const int argc, const char **argv) {
     for(auto &program : programs) {
         std::println("executing: {}", program.source().name());
         eval.executeSecondPass(program.statements());
+    }
+
+    for(const auto &cmd : machine.commands()) {
+        std::println("command: {}", cmd->text());
     }
 }

@@ -97,7 +97,8 @@ export namespace ngc {
 
     using vars_t = std::tuple<Var, std::string_view, size_t, MemoryCell::Flags, double>;
 
-    constexpr std::initializer_list<vars_t> VARS = {
+    // const and constexpr result in linker error with -O2, not sure if bug or I'm overlooking something
+    constinit std::initializer_list<vars_t> VARS = {
         { Var::G28_X, "_g28_x", 5161, MemoryCell::Flags::READ, 0 },
         { Var::G28_Y, "_g28_y", 0, MemoryCell::Flags::READ, 0 },
         { Var::G28_Z, "_g28_z", 0, MemoryCell::Flags::READ, 0 },

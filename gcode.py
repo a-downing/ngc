@@ -44,10 +44,6 @@ def decl_name(name, codes):
 print("#ifndef GCODE_GEN_H")
 print("#define GCODE_GEN_H\n")
 
-print("#include <utility>")
-print("#include <format>")
-print("#include <stdexcept>\n")
-
 decl_enum("GCode", all)
 decl_name("GCode", all)
 

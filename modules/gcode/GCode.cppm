@@ -12,6 +12,7 @@ import parser;
 
 export namespace ngc {
 #include "gcode.gen.h"
+#include "mcode.gen.h"
 }
 
 export namespace ngc {
@@ -42,31 +43,6 @@ export namespace ngc {
         case GCode::G59_2: return 8;
         case GCode::G59_3: return 9;
         default: throw std::logic_error(std::format("invalid coordinate system: {}", name(code)));
-        }
-    }
-
-    enum class MCode {
-        M0,
-        M1,
-        M2,
-        M3,
-        M30,
-        M4,
-        M5,
-        M6,
-    };
-
-    inline const char *name(const MCode code) {
-        switch(code) {
-            case MCode::M0: return "M0";
-            case MCode::M1: return "M1";
-            case MCode::M2: return "M2";
-            case MCode::M3: return "M3";
-            case MCode::M4: return "M4";
-            case MCode::M30: return "M30";
-            case MCode::M5: return "M5";
-            case MCode::M6: return "M6";
-            default: throw std::runtime_error(std::format("{}() missing case statement for MCode::{}", __func__, std::to_underlying(code)));
         }
     }
 
@@ -210,6 +186,25 @@ export namespace ngc {
         }
     }
 
+    struct GCodeStateDifference {
+        std::optional<GCMotion> modeMotion;
+        std::optional<GCPlane> modePlane;
+        std::optional<GCDist> modeDistance;
+        std::optional<GCFeed> modeFeedrate;
+        std::optional<GCUnits> modeUnits;
+        std::optional<GCTLen> modeToolLengthOffset;
+        std::optional<GCCoord> modeCoordSys;
+        std::optional<GCPath> modePath;
+
+        std::optional<GCNonModal> nonModal;
+
+        std::optional<MCSpindle> modeSpindle;
+        std::optional<MCStop> modeStop;
+        std::optional<MCToolChange> modeToolChange;
+
+        std::optional<double> A, B, C, D, F, H, I, J, K, L, P, Q, R, S, T, X, Y, Z;
+    };
+
     class GCodeState {
         GCMotion m_modeMotion{};
         GCPlane m_modePlane{};
@@ -222,12 +217,14 @@ export namespace ngc {
 
         std::optional<GCNonModal> m_nonModal{};
 
-        std::optional<MCode> m_modeStop{};
-        std::optional<MCode> m_modeToolChange{};
-        std::optional<MCode> m_modeSpindle{};
+        MCSpindle m_modeSpindle{};
+        std::optional<MCStop> m_modeStop{};
+        std::optional<MCToolChange> m_modeToolChange{};
 
-        double m_F = 1;
-        std::optional<double> m_A, m_B, m_C, m_D, m_H, m_I, m_J, m_K, m_L, m_P, m_Q, m_R, m_S, m_T, m_X, m_Y, m_Z;
+        double m_F = 0;
+        double m_T = 0;
+        double m_S = 0;
+        std::optional<double> m_A, m_B, m_C, m_D, m_H, m_I, m_J, m_K, m_L, m_P, m_Q, m_R, m_X, m_Y, m_Z;
 
     public:
         GCodeState() {
@@ -239,20 +236,54 @@ export namespace ngc {
             affectState(GCode::G49);
             affectState(GCode::G54);
             affectState(GCode::G61_1);
+            affectState(MCode::M5);
         }
 
-        [[nodiscard]] GCodeState modalCopy() const {
-            auto copy = GCodeState();
-            copy.m_modeMotion = m_modeMotion;
-            copy.m_modePlane = m_modePlane;
-            copy.m_modeDistance = m_modeDistance;
-            copy.m_modeFeedrate = m_modeFeedrate;
-            copy.m_modeUnits = m_modeUnits;
-            copy.m_modeToolLengthOffset = m_modeToolLengthOffset;
-            copy.m_modeCoordSys = m_modeCoordSys;
-            copy.m_modePath = m_modePath;
-            copy.m_F = m_F;
-            return copy;
+        GCodeStateDifference calculateDifference(const GCodeState &s) const {
+            GCodeStateDifference diff = {};
+
+            if(s.m_modeMotion != m_modeMotion) { diff.modeMotion = s.m_modeMotion; }
+            if(s.m_modePlane != m_modePlane) { diff.modePlane = s.m_modePlane; }
+            if(s.m_modeDistance != m_modeDistance) { diff.modeDistance = s.m_modeDistance; }
+            if(s.m_modeFeedrate != m_modeFeedrate) { diff.modeFeedrate = s.m_modeFeedrate; }
+            if(s.m_modeUnits != m_modeUnits) { diff.modeUnits = s.m_modeUnits; }
+            if(s.m_modeToolLengthOffset != m_modeToolLengthOffset) { diff.modeToolLengthOffset = s.m_modeToolLengthOffset; }
+            if(s.m_modeCoordSys != m_modeCoordSys) { diff.modeCoordSys = s.m_modeCoordSys; }
+            if(s.m_modePath != m_modePath) { diff.modePath = s.m_modePath; }
+
+            if(s.m_nonModal != m_nonModal) { diff.nonModal = s.m_nonModal; }
+
+            if(s.m_modeSpindle != m_modeSpindle) { diff.modeSpindle = s.m_modeSpindle; }
+            if(s.m_modeStop != m_modeStop) { diff.modeStop = s.m_modeStop; }
+            if(s.m_modeToolChange != m_modeToolChange) { diff.modeToolChange = s.m_modeToolChange; }
+
+            if(s.m_A != m_A) { diff.A = s.m_A; }
+            if(s.m_B != m_B) { diff.B = s.m_B; }
+            if(s.m_C != m_C) { diff.C = s.m_C; }
+            if(s.m_D != m_D) { diff.D = s.m_D; }
+            if(s.m_F != m_F) { diff.F = s.m_F; }
+            if(s.m_H != m_H) { diff.H = s.m_H; }
+            if(s.m_I != m_I) { diff.I = s.m_I; }
+            if(s.m_J != m_J) { diff.J = s.m_J; }
+            if(s.m_K != m_K) { diff.K = s.m_K; }
+            if(s.m_L != m_L) { diff.L = s.m_L; }
+            if(s.m_P != m_P) { diff.P = s.m_P; }
+            if(s.m_Q != m_Q) { diff.Q = s.m_Q; }
+            if(s.m_R != m_R) { diff.R = s.m_R; }
+            if(s.m_S != m_S) { diff.S = s.m_S; }
+            if(s.m_T != m_T) { diff.T = s.m_T; }
+            if(s.m_X != m_X) { diff.X = s.m_X; }
+            if(s.m_Y != m_Y) { diff.Y = s.m_Y; }
+            if(s.m_Z != m_Z) { diff.Z = s.m_Z; }
+
+            return diff;
+        }
+
+        void resetModal() {
+            m_nonModal = std::nullopt;
+            m_modeStop = std::nullopt;
+            m_modeToolChange = std::nullopt;
+            m_A = m_B = m_C = m_D = m_H = m_I = m_J = m_K = m_L = m_P = m_Q = m_R = m_X = m_Y = m_Z = std::nullopt;
         }
 
         [[nodiscard]] GCMotion modeMotion() const { return m_modeMotion; }
@@ -277,14 +308,15 @@ export namespace ngc {
         [[nodiscard]] std::optional<double> P() const { return m_P; }
         [[nodiscard]] std::optional<double> Q() const { return m_Q; }
         [[nodiscard]] std::optional<double> R() const { return m_R; }
-        [[nodiscard]] std::optional<double> S() const { return m_S; }
-        [[nodiscard]] std::optional<double> T() const { return m_T; }
+        [[nodiscard]] double S() const { return m_S; }
+        [[nodiscard]] double T() const { return m_T; }
         [[nodiscard]] std::optional<double> X() const { return m_X; }
         [[nodiscard]] std::optional<double> Y() const { return m_Y; }
         [[nodiscard]] std::optional<double> Z() const { return m_Z; }
 
-        [[nodiscard]] std::optional<MCode> modeStop() const { return m_modeStop; }
-        [[nodiscard]] std::optional<MCode> modeSpindle() const { return m_modeSpindle; }
+        [[nodiscard]] MCSpindle modeSpindle() const { return m_modeSpindle; }
+        [[nodiscard]] std::optional<MCStop> modeStop() const { return m_modeStop; }
+        [[nodiscard]] std::optional<MCToolChange> modeToolChange() const { return m_modeToolChange; }
 
         [[nodiscard]] std::optional<GCNonModal> nonModal() const { return m_nonModal; }
 
@@ -377,15 +409,15 @@ export namespace ngc {
                 case MCode::M1:
                 case MCode::M2:
                 case MCode::M30:
-                    m_modeStop = code;
+                    m_modeStop = static_cast<MCStop>(code);
                     break;
                 case MCode::M3:
                 case MCode::M4:
                 case MCode::M5:
-                    m_modeSpindle = code;
+                    m_modeSpindle = static_cast<MCSpindle>(code);
                     break;
                 case MCode::M6:
-                    m_modeToolChange = code;
+                    m_modeToolChange = static_cast<MCToolChange>(code);
                     break;
                 default: throw std::logic_error(std::format("invalid m-code {}", name(code)));
             }

@@ -3,10 +3,14 @@ module;
 #include <print>
 #include <vector>
 #include <format>
+#include <memory>
 #include <stdexcept>
 #include <utility>
 
 export module machine;
+export import :ToolTable;
+export import :MachineCommand;
+import utils;
 import memory;
 import gcode;
 
@@ -22,31 +26,42 @@ export namespace ngc {
     class Machine {
         position_t m_pos = {};
         Memory &m_mem;
-        GCodeState m_gcodeState{};
+        GCodeState m_state{};
+        std::vector<std::unique_ptr<MachineCommand>> m_commands;
 
     public:
         explicit Machine(Memory &mem) : m_mem(mem) {
             const auto num = static_cast<int>(mem.read(Var::COORDSYS));
-            m_gcodeState.affectState(coordsys(num));
+            m_state.affectState(coordsys(num));
         }
 
+        const GCodeState &state() const { return m_state; }
+        const std::vector<std::unique_ptr<MachineCommand>> &commands() const { return m_commands; }
+
         void executeBlock(const Block &block) {
-            auto nextState = m_gcodeState.modalCopy();
+            auto state = m_state;
+            state.resetModal();
 
             if(block.blockDelete()) {
                 return;
             }
 
             for(const auto &word : block.words()) {
-                nextState.affectState(word);
+                state.affectState(word);
             }
 
-            const auto off = offset(nextState.modeCoordSys());
-            const auto pos = position(nextState);
+            const auto diff = m_state.calculateDifference(state);
 
-            std::println("POS: {} {} {}", pos.x, pos.y, pos.z);
+            if(diff.modeSpindle) {
+                if(*diff.modeSpindle == MCSpindle::M5) {
+                    m_commands.emplace_back(std::make_unique<SpindleStop>());
+                } else if(state.S() > 0 && (*diff.modeSpindle == MCSpindle::M3 || *diff.modeSpindle == MCSpindle::M4)) {
+                    const auto dir = *diff.modeSpindle == MCSpindle::M3 ? SpindleStart::Dir::CW : SpindleStart::Dir::CCW;
+                    m_commands.emplace_back(std::make_unique<SpindleStart>(dir, state.S()));
+                }
+            }
 
-            m_pos = pos;
+            m_state = state;
         }
 
     private:
@@ -59,7 +74,7 @@ export namespace ngc {
         }
 
         [[nodiscard]] position_t positionAbsolute(const GCodeState &state) const {
-            auto pos = m_pos;
+            auto pos = position_t();
 
             if(state.X()) {
                 pos.x = *state.X();
@@ -77,7 +92,7 @@ export namespace ngc {
         }
 
         [[nodiscard]] position_t positionRelative(const GCodeState &state) const {
-            auto pos = position_t();
+            auto pos = m_pos;
 
             if(state.X()) {
                 pos.x = *state.X();
