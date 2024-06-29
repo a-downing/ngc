@@ -5,7 +5,12 @@ set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-set(CMAKE_CXX_FLAGS "-O2")
+
+set(IMGUI_DIR imgui)
+
+set(OpenGL_GL_PREFERENCE GLVND)
+find_package(OpenGL REQUIRED)
+find_package(glfw3 REQUIRED)
 
 add_library(utils)
 target_sources(utils PUBLIC FILE_SET CXX_MODULES FILES modules/Utils.cppm)
@@ -50,3 +55,23 @@ target_link_libraries(evaluator parser memory gcode)
 
 add_executable(ngc main.cpp)
 target_link_libraries(ngc utils parser memory evaluator machine)
+
+add_executable(imgui_main
+        imgui_main.cpp
+        ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp
+        ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
+        ${IMGUI_DIR}/misc/cpp/imgui_stdlib.cpp
+        ${IMGUI_DIR}/imgui.cpp
+        ${IMGUI_DIR}/imgui_draw.cpp
+        ${IMGUI_DIR}/imgui_demo.cpp
+        ${IMGUI_DIR}/imgui_tables.cpp
+        ${IMGUI_DIR}/imgui_widgets.cpp)
+
+target_include_directories(imgui_main PUBLIC 
+        ${IMGUI_DIR}
+        ${IMGUI_DIR}/backends
+        ${IMGUI_DIR}/misc/cpp)
+
+target_link_libraries(imgui_main OpenGL::GL glfw)
+
+add_executable(binary_to_compressed_c ${IMGUI_DIR}/misc/fonts/binary_to_compressed_c.cpp)
