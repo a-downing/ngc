@@ -1,5 +1,6 @@
-module;
+#pragma once
 
+#include <print>
 #include <source_location>
 #include <stdexcept>
 #include <vector>
@@ -7,16 +8,11 @@ module;
 #include <tuple>
 #include <stack>
 
-export module parser;
-export import :Token;
-export import :LexerSource;
-export import :Lexer;
-export import :Visitor;
-export import :Expression;
-export import :Statement;
-export import :SubSignature;
+#include "parser/Lexer.h"
+#include "parser/Expression.h"
+#include "parser/Statement.h"
 
-export namespace ngc
+namespace ngc
 {
     class Parser final {
         Lexer &m_lexer;
@@ -38,12 +34,13 @@ export namespace ngc
         explicit Parser(Lexer &lexer): m_lexer(lexer), m_skipNewlines({true}) { }
 
         class Error final : public std::logic_error {
-            const std::source_location m_location;
-            const std::optional<Token> m_token;
-            const std::optional<Lexer::Error> m_lexerError;
-            const std::unique_ptr<Expression> m_expression;
+            std::source_location m_location;
+            std::optional<Token> m_token;
+            std::optional<Lexer::Error> m_lexerError;
+            std::unique_ptr<Expression> m_expression;
 
         public:
+            Error(Error &&err) = default;
             Error(const std::string &message, const std::source_location location): std::logic_error(message), m_location(location) { }
             Error(const std::string &message, const std::source_location location, const Token &token): std::logic_error(message), m_location(location), m_token(token) { }
             Error(const std::string &message, const std::source_location location, const Lexer::Error &lexerError): std::logic_error(message), m_location(location), m_lexerError(lexerError) { }
@@ -53,20 +50,28 @@ export namespace ngc
             [[nodiscard]] const std::optional<Token> &token() const { return m_token; }
             [[nodiscard]] const std::optional<Lexer::Error> &lexerError() const { return m_lexerError; }
             [[nodiscard]] Expression *expression() const { return m_expression.get(); }
+
+            std::string text() const {
+                return what();
+            }
         };
 
-        std::vector<std::unique_ptr<Statement>> parse() {
+        std::expected<std::vector<std::unique_ptr<Statement>>, Error> parse() {
             std::vector<std::unique_ptr<Statement>> statements;
 
-            if(match(Token::Kind::PERCENT)) {
-                m_percentFirst = true;
+            try {
+                if(match(Token::Kind::PERCENT)) {
+                    m_percentFirst = true;
+                }
+
+                while(auto statement = parseStatement()) {
+                    statements.emplace_back(std::move(statement));
+                }
+            } catch(Error &err) {
+                return std::unexpected(std::move(err));
             }
 
-            while(auto statement = parseStatement()) {
-                statements.emplace_back(std::move(statement));
-            }
-
-            return statements;
+            return { std::move(statements) };
         }
 
     private:

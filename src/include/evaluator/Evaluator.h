@@ -1,4 +1,4 @@
-module;
+#pragma once
 
 #include <memory>
 #include <concepts>
@@ -8,27 +8,22 @@ module;
 #include <cstddef>
 #include <format>
 #include <vector>
-#include <queue>
 #include <stdexcept>
 #include <unordered_map>
 #include <ranges>
 #include <utility>
 
-export module evaluator;
-export import :Preamble;
-export import :Program;
-import parser;
-import memory;
-import gcode;
+#include "parser/SubSignature.h"
+#include "memory/Memory.h"
+#include "gcode/GCode.h"
 
-export namespace ngc
+namespace ngc
 {
     class Evaluator final : public Visitor {
         std::vector<std::unordered_map<std::string_view, uint32_t>> m_scope;
         std::vector<std::unordered_map<SubSignature, const SubStatement *>> m_subScope;
         Memory &m_mem;
         const std::function<void(const Block &, Evaluator &)> &m_callback;
-        //std::queue<Block> m_blocks;
 
         class Scope {
             Evaluator *m_evaluator = nullptr;
@@ -128,7 +123,7 @@ export namespace ngc
             m_scope.back().emplace(expr->name(), addr);
         }
 
-        void executeFirstPass(const std::vector<std::unique_ptr<Statement>> &program) {
+        void executeFirstPass(const std::span<const Statement * const> program) {
             auto ctx = createScopeContext(true);
 
             for(const auto &stmt : program) {
@@ -150,7 +145,7 @@ export namespace ngc
             }
         }
 
-        void executeSecondPass(const std::vector<std::unique_ptr<Statement>> &program) {
+        void executeSecondPass(const std::span<const Statement * const> program) {
             auto ctx = createScopeContext(true);
 
             for(const auto &stmt : program) {

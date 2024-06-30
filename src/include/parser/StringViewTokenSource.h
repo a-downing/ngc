@@ -1,10 +1,10 @@
-module;
+#pragma once
 
+#include <format>
 #include <memory>
 #include <string_view>
 
-export module parser:StringViewTokenSource;
-import :TokenSource;
+#include "parser/TokenSource.h"
 
 namespace ngc {
     class StringViewTokenSource final : public TokenSource {

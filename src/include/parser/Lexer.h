@@ -1,4 +1,4 @@
-module;
+#pragma once
 
 #ifdef __clang__
     #pragma push_macro("__cpp_concepts")
@@ -14,12 +14,11 @@ module;
 #include <format>
 #include <utility>
 
-export module parser:Lexer;
-import :LexerSource;
-import :StringViewTokenSource;
-import :Token;
+#include "parser/LexerSource.h"
+#include "parser/StringViewTokenSource.h"
+#include "parser/Token.h"
 
-export namespace ngc
+namespace ngc
 {
     class Lexer final {
         enum class State {

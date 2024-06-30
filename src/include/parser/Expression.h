@@ -1,16 +1,14 @@
-module;
+#pragma once
 
 #include <utility>
 #include <vector>
 #include <memory>
 #include <utility>
-#include <stdexcept>
 
-export module parser:Expression;
-import :Token;
-import :Visitor;
+#include "parser/Token.h"
+#include "parser/Visitor.h"
 
-export namespace ngc
+namespace ngc
 {
     class Expression {
         Token m_token;
@@ -26,28 +24,28 @@ export namespace ngc
         [[nodiscard]] virtual constexpr const char *className() const = 0;
         [[nodiscard]] virtual std::string text() const = 0;
 
-        virtual bool is(const class CommentExpression *) const { return false; }
-        virtual bool is(const class WordExpression *) const { return false; }
-        virtual bool is(const class ScalarExpression *) const { return false; }
-        virtual bool is(const class RealExpression *) const { return false; }
-        virtual bool is(const class LiteralExpression *) const { return false; }
-        virtual bool is(const class StringExpression *) const { return false; }
-        virtual bool is(const class VariableExpression *) const { return false; }
-        virtual bool is(const class NumericVariableExpression *) const { return false; }
-        virtual bool is(const class NamedVariableExpression *) const { return false; }
-        virtual bool is(const class UnaryExpression *) const { return false; }
-        virtual bool is(const class BinaryExpression *) const { return false; }
-        virtual bool is(const class CallExpression *) const { return false; }
-        virtual bool is(const class GroupingExpression *) const { return false; }
+        virtual bool isImpl(const class CommentExpression *) const { return false; }
+        virtual bool isImpl(const class WordExpression *) const { return false; }
+        virtual bool isImpl(const class ScalarExpression *) const { return false; }
+        virtual bool isImpl(const class RealExpression *) const { return false; }
+        virtual bool isImpl(const class LiteralExpression *) const { return false; }
+        virtual bool isImpl(const class StringExpression *) const { return false; }
+        virtual bool isImpl(const class VariableExpression *) const { return false; }
+        virtual bool isImpl(const class NumericVariableExpression *) const { return false; }
+        virtual bool isImpl(const class NamedVariableExpression *) const { return false; }
+        virtual bool isImpl(const class UnaryExpression *) const { return false; }
+        virtual bool isImpl(const class BinaryExpression *) const { return false; }
+        virtual bool isImpl(const class CallExpression *) const { return false; }
+        virtual bool isImpl(const class GroupingExpression *) const { return false; }
 
         template<typename T>
         [[nodiscard]] bool is() const {
-            return this->is(static_cast<const T *>(this));
+            return this->isImpl(static_cast<const T *>(nullptr));
         }
 
         template<typename T>
         const T *as() const {
-            return this->is(static_cast<const T *>(this)) ? static_cast<const T *>(this) : nullptr;
+            return this->isImpl(static_cast<const T *>(nullptr)) ? static_cast<const T *>(this) : nullptr;
         }
 
         virtual void accept(Visitor &v, VisitorContext *ctx) const = 0;
@@ -78,7 +76,7 @@ export namespace ngc
         [[nodiscard]] const Token &endToken() const override { return token(); }
         [[nodiscard]] std::string text() const override { return std::string(token().text()); }
 
-        bool is(const CommentExpression *) const override { return true; }
+        bool isImpl(const CommentExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "CommentExpression"; }
         [[nodiscard]] constexpr const char *className() const override { return staticClassName(); }
@@ -87,17 +85,15 @@ export namespace ngc
 
     class ScalarExpression : public Expression {
     public:
-        using Expression::is;
         explicit ScalarExpression(Token token) : Expression(std::move(token)) { }
-        bool is(const ScalarExpression *) const final { return true; }
+        bool isImpl(const ScalarExpression *) const final { return true; }
         [[nodiscard]] static constexpr const char *staticClassName() { return "ScalarExpression"; }
     };
 
     class RealExpression : public ScalarExpression {
     public:
-        using Expression::is;
         explicit RealExpression(Token token) : ScalarExpression(std::move(token)) { }
-        bool is(const RealExpression *) const final { return true; }
+        bool isImpl(const RealExpression *) const final { return true; }
         [[nodiscard]] static constexpr const char *staticClassName() { return "RealExpression"; }
     };
 
@@ -105,7 +101,6 @@ export namespace ngc
         std::unique_ptr<RealExpression> m_realExpression;
 
     public:
-        using Expression::is;
         WordExpression(Token token, std::unique_ptr<RealExpression> real): Expression(std::move(token)), m_realExpression(std::move(real)) { }
         ~WordExpression() override = default;
 
@@ -114,7 +109,7 @@ export namespace ngc
         [[nodiscard]] std::string text() const override { return std::format("{}{}", token().text(), m_realExpression->text()); }
         [[nodiscard]] const RealExpression *real() const { return m_realExpression.get(); }
 
-        bool is(const WordExpression *) const override { return true; }
+        bool isImpl(const WordExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "WordExpression"; }
         [[nodiscard]] constexpr const char *className() const override { return staticClassName(); }
@@ -123,7 +118,6 @@ export namespace ngc
 
     class LiteralExpression final : public RealExpression {
     public:
-        using Expression::is;
         explicit LiteralExpression(Token token) : RealExpression(std::move(token)) { }
         ~LiteralExpression() override = default;
 
@@ -134,7 +128,7 @@ export namespace ngc
         [[nodiscard]] std::string text() const override { return std::string(token().text()); }
         [[nodiscard]] double value() const { return token().as_double(); }
 
-        bool is(const LiteralExpression *) const override { return true; }
+        bool isImpl(const LiteralExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "LiteralExpression"; }
         [[nodiscard]] constexpr const char *className() const override { return staticClassName(); }
@@ -143,7 +137,6 @@ export namespace ngc
 
     class StringExpression final : public ScalarExpression {
     public:
-        using Expression::is;
         explicit StringExpression(Token token) : ScalarExpression(std::move(token)) { }
         ~StringExpression() override = default;
 
@@ -152,7 +145,7 @@ export namespace ngc
         [[nodiscard]] std::string text() const override { return std::string(token().text()); }
         [[nodiscard]] std::string_view value() const { return token().value(); }
 
-        bool is(const StringExpression *) const override { return true; }
+        bool isImpl(const StringExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "StringExpression"; }
         [[nodiscard]] constexpr const char *className() const override { return staticClassName(); }
@@ -161,18 +154,15 @@ export namespace ngc
 
     class VariableExpression : public RealExpression {
     public:
-        using Expression::is;
         explicit VariableExpression(Token token) : RealExpression(std::move(token)) { }
         [[nodiscard]] static constexpr const char *staticClassName() { return "VariableExpression"; }
-
-        bool is(const VariableExpression *) const final { return true; }
+        bool isImpl(const VariableExpression *) const final { return true; }
     };
 
     class NumericVariableExpression final : public VariableExpression {
         std::unique_ptr<RealExpression> m_realExpression;
 
     public:
-        using Expression::is;
         explicit NumericVariableExpression(Token token, std::unique_ptr<RealExpression> realExpression) : VariableExpression(std::move(token)), m_realExpression(std::move(realExpression)) { }
         ~NumericVariableExpression() override = default;
 
@@ -181,7 +171,7 @@ export namespace ngc
         [[nodiscard]] std::string text() const override { return std::format("{}{}", token().text(), m_realExpression->text()); }
         [[nodiscard]] const RealExpression *real() const { return m_realExpression.get(); }
 
-        bool is(const NumericVariableExpression *) const override { return true; }
+        bool isImpl(const NumericVariableExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "NumericVariableExpression"; }
         [[nodiscard]] constexpr const char *className() const override { return staticClassName(); }
@@ -190,7 +180,6 @@ export namespace ngc
 
     class NamedVariableExpression final : public VariableExpression {
     public:
-        using Expression::is;
         explicit NamedVariableExpression(Token token) : VariableExpression(std::move(token)) { }
         ~NamedVariableExpression() override = default;
 
@@ -202,7 +191,7 @@ export namespace ngc
         [[nodiscard]] const Token &endToken() const override { return token(); }
         [[nodiscard]] std::string text() const override { return std::string(token().text()); }
 
-        bool is(const NamedVariableExpression *) const override { return true; }
+        bool isImpl(const NamedVariableExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "NamedVariableExpression"; }
         [[nodiscard]] constexpr const char *className() const override { return staticClassName(); }
@@ -215,8 +204,6 @@ export namespace ngc
         std::unique_ptr<RealExpression> m_realExpression;
 
     public:
-        using Expression::is;
-
         enum class Op {
             ADDRESS_OF,
             NEGATIVE,
@@ -231,7 +218,7 @@ export namespace ngc
         [[nodiscard]] std::string text() const override { return std::format("{}{}", token().text(), m_realExpression->text()); }
         [[nodiscard]] const RealExpression *real() const { return m_realExpression.get(); }
 
-        bool is(const UnaryExpression *) const override { return true; }
+        bool isImpl(const UnaryExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "UnaryExpression"; }
         [[nodiscard]] constexpr const char *className() const override { return staticClassName(); }
@@ -252,8 +239,6 @@ export namespace ngc
         std::unique_ptr<RealExpression> m_right;
 
     public:
-        using Expression::is;
-
         enum class Op {
             ASSIGN,
             AND, OR, XOR,
@@ -269,7 +254,7 @@ export namespace ngc
         [[nodiscard]] const Token &endToken() const override { return m_right->endToken(); }
         [[nodiscard]] std::string text() const override { return std::format("[{} {} {}]", m_left->text(), token().text(), m_right->text()); }
 
-        bool is(const BinaryExpression *) const override { return true; }
+        bool isImpl(const BinaryExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "BinaryExpression"; }
         [[nodiscard]] constexpr const char *className() const override { return staticClassName(); }
@@ -305,7 +290,6 @@ export namespace ngc
         std::vector<std::unique_ptr<ScalarExpression>> m_args;
 
     public:
-        using Expression::is;
         explicit CallExpression(Token token, Token endToken, std::vector<std::unique_ptr<ScalarExpression>> args) : RealExpression(std::move(token)), m_endToken(std::move(endToken)), m_args(std::move(args)) { }
         ~CallExpression() override = default;
 
@@ -313,7 +297,7 @@ export namespace ngc
         [[nodiscard]] const Token &endToken() const override { return m_endToken; }
         [[nodiscard]] std::string text() const override { return std::format("{}[{}]", token().text(), join(m_args, ", ")); }
 
-        bool is(const CallExpression *) const override { return true; }
+        bool isImpl(const CallExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "CallExpression"; }
         [[nodiscard]] constexpr const char *className() const override { return staticClassName(); }
@@ -329,7 +313,6 @@ export namespace ngc
         std::unique_ptr<RealExpression> m_realExpression;
 
     public:
-        using Expression::is;
         explicit GroupingExpression(Token token, Token endToken, std::unique_ptr<RealExpression> expression) : RealExpression(std::move(token)), m_endToken(std::move(endToken)), m_realExpression(std::move(expression)) { }
         ~GroupingExpression() override = default;
 
@@ -338,7 +321,7 @@ export namespace ngc
         [[nodiscard]] std::string text() const override { return std::format("[{}]", m_realExpression->text()); }
         [[nodiscard]] const RealExpression *real() const { return m_realExpression.get(); }
 
-        bool is(const GroupingExpression *) const override { return true; }
+        bool isImpl(const GroupingExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "GroupingExpression"; }
 

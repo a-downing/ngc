@@ -1,13 +1,12 @@
-module;
+#pragma once
 
 #include <memory>
 #include <string>
 #include <string_view>
 #include <utility>
 
-export module parser:StringTokenSource;
-import utils;
-import :TokenSource;
+#include "utils.h"
+#include "parser/TokenSource.h"
 
 namespace ngc {
     class StringTokenSource final : public TokenSource {

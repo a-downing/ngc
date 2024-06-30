@@ -1,4 +1,4 @@
-module;
+#pragma once
 
 #include <print>
 #include <vector>
@@ -7,19 +7,18 @@ module;
 #include <stdexcept>
 #include <utility>
 
-export module machine;
-export import :ToolTable;
-export import :MachineCommand;
-import utils;
-import memory;
-import gcode;
+#include "gcode/GCode.h"
+#include "memory/Memory.h"
+#include "machine/MachineCommand.h"
+#include "memory/Vars.h"
 
-export namespace ngc {
+
+namespace ngc {
     struct position_t {
         double x{}, y{}, z{}, a{}, b{}, c{};
     };
 
-    position_t operator+(const position_t &a, const position_t &b) {
+    inline position_t operator+(const position_t &a, const position_t &b) {
         return { a.x+b.x, a.y+b.y, a.z+b.z, a.a+b.a, a.b+b.b, a.c+b.c };
     }
 
@@ -31,6 +30,7 @@ export namespace ngc {
 
     public:
         explicit Machine(Memory &mem) : m_mem(mem) {
+            m_mem.init(gVars);
             const auto num = static_cast<int>(mem.read(Var::COORDSYS));
             m_state.affectState(coordsys(num));
         }

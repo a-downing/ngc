@@ -1,4 +1,4 @@
-module;
+#pragma once
 
 #include <memory>
 #include <cmath>
@@ -7,11 +7,10 @@ module;
 #include <utility>
 #include <stdexcept>
 
-export module parser:Token;
-import :TokenSource;
-import :StringTokenSource;
+#include "parser/TokenSource.h"
+#include "parser/StringTokenSource.h"
 
-export namespace ngc {
+namespace ngc {
     class Token {
     public:
         enum class Kind {

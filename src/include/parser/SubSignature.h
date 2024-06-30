@@ -1,14 +1,13 @@
-module;
+#pragma once
 
 #include <string>
 #include <string_view>
 #include <format>
 
-export module parser:SubSignature;
-import :Expression;
-import :Statement;
+#include "parser/Expression.h"
+#include "parser/Statement.h"
 
-export namespace ngc {
+namespace ngc {
     class SubSignature {
         std::string_view m_name;
         size_t m_numParams;

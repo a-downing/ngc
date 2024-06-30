@@ -1,10 +1,8 @@
-module;
+#pragma once
 
 #include <utility>
 
-export module memory:MemoryCell;
-
-export namespace ngc
+namespace ngc
 {
     class MemoryCell {
     public:

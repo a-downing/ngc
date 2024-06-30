@@ -1,4 +1,4 @@
-module;
+#pragma once
 
 #include <utility>
 #include <vector>
@@ -7,15 +7,88 @@ module;
 #include <format>
 #include <print>
 
-export module gcode;
-import parser;
+// #define GC_MOTION(DO) \
+//     DO(G0, GCMotion) \
+//     DO(G1, GCMotion) \
+//     DO(G2, GCMotion) \
+//     DO(G3, GCMotion) \
 
-export namespace ngc {
-#include "gcode.gen.h"
-#include "mcode.gen.h"
+// #define GC_PLANE(DO) \
+//     DO(G17, GCPlane) \
+//     DO(G18, GCPlane) \
+//     DO(G19, GCPlane) \
+
+// #define GC_DISTANCE(DO) \
+//     DO(G90, GCDistance) \
+//     DO(G91, GCDistance) \
+
+// #define GC_FEED(DO) \
+//     DO(G93, GCFeed) \
+//     DO(G94, GCFeed) \
+
+// #define GC_UNITS(DO) \
+//     DO(G20, GCUnits) \
+//     DO(G21, GCUnits) \
+
+// #define GC_TOOL_LEN(DO) \
+//     DO(G43, GCToolLen) \
+//     DO(G49, GCToolLen) \
+
+// #define GC_COORD_SYS(DO) \
+//     DO(G54, GCCoordSys) \
+//     DO(G55, GCCoordSys) \
+//     DO(G56, GCCoordSys) \
+//     DO(G57, GCCoordSys) \
+//     DO(G58, GCCoordSys) \
+//     DO(G59, GCCoordSys) \
+//     DO(G59_1, GCCoordSys) \
+//     DO(G59_2, GCCoordSys) \
+//     DO(G59_3, GCCoordSys) \
+
+// #define GC_PATH(DO) \
+//     DO(G61_1, GCPath) \
+
+// #define GC_NON_MODAL(DO) \
+//     DO(G53, GCNonModal)
+
+// #define GCODES(DO) \
+//     GC_MOTION(DO) \
+//     GC_PLANE(DO) \
+//     GC_DISTANCE(DO) \
+//     GC_FEED(DO) \
+//     GC_UNITS(DO) \
+//     GC_TOOL_LEN(DO) \
+//     GC_COORD_SYS(DO) \
+//     GC_PATH(DO) \
+//     GC_NON_MODAL(DO) \
+
+#include "parser/Token.h"
+#include "parser/Expression.h"
+#include "parser/Statement.h"
+
+namespace ngc {
+#include "gcode/gcode.gen.h"
+#include "gcode/mcode.gen.h"
 }
 
-export namespace ngc {
+namespace ngc {
+
+    // enum class GCode {
+    //     #define ENUM_VALUE(name, ...) name,
+    //     GCODES(ENUM_VALUE)
+    //     #undef ENUM_VALUE
+    // };
+
+    // inline constexpr std::string_view name(const GCode code) {
+    //     switch(code) {
+    //         #define CASE(name, ...) case GCode::name: return #name;
+    //         GCODES(CASE)
+    //         #undef CASE
+
+    //         default: UNREACHABLE();
+    //     }
+    // }
+
     inline GCode coordsys(const int i) {
         switch(i) {
         case 1: return GCode::G54;

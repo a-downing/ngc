@@ -1,4 +1,4 @@
-module;
+#pragma once
 
 #include <memory>
 #include <optional>
@@ -6,12 +6,11 @@ module;
 #include <utility>
 #include <vector>
 
-export module parser:Statement;
-import :Token;
-import :Expression;
-import :Visitor;
+#include "parser/Token.h"
+#include "parser/Expression.h"
+#include "parser/Visitor.h"
 
-export namespace ngc
+namespace ngc
 {
     class Statement {
     public:
@@ -35,12 +34,12 @@ export namespace ngc
 
         template<typename T>
         [[nodiscard]] bool is() const {
-            return this->is(static_cast<const T *>(this));
+            return this->is(static_cast<const T *>(nullptr));
         }
 
         template<typename T>
         const T *as() const {
-            return this->is(static_cast<const T *>(this)) ? static_cast<const T *>(this) : nullptr;
+            return this->is(static_cast<const T *>(nullptr)) ? static_cast<const T *>(this) : nullptr;
         }
 
         template<typename T>

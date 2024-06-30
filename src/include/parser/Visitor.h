@@ -1,6 +1,6 @@
-export module parser:Visitor;
+#pragma once
 
-export namespace ngc {
+namespace ngc {
     class VisitorContext {};
 
     class Visitor {

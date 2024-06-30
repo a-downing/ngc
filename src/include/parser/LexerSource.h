@@ -1,13 +1,11 @@
-module;
+#pragma once
 
 #include <string>
 #include <string_view>
 #include <utility>
 #include <stack>
 
-export module parser:LexerSource;
-
-export namespace ngc
+namespace ngc
 {
     class LexerSource {
         struct state_t {
@@ -29,7 +27,15 @@ export namespace ngc
         LexerSource &operator=(const LexerSource &) = delete;
         LexerSource &operator=(LexerSource &&) = default;
 
-        LexerSource(std::string text, std::string name) : m_text(std::move(text)), m_name(std::move(name)), m_state(std::initializer_list<state_t> {{ 0 , 1, 1 }}) { }
+        LexerSource(std::string text, std::string name) : m_text(std::move(text)), m_name(std::move(name)), m_state(std::initializer_list<state_t> {{ 0, 1, 1 }}) { }
+
+        void reset() {
+            while(!m_state.empty()) {
+                m_state.pop();
+            }
+
+            m_state.emplace(state_t { 0, 1, 1 });
+        }
 
         void pushState() {
             m_state.push(m_state.top());

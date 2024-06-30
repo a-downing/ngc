@@ -1,4 +1,4 @@
-module;
+#pragma once
 
 #ifdef __clang__
     #pragma push_macro("__cpp_concepts")
@@ -16,16 +16,16 @@ module;
 #include <utility>
 #include <stdexcept>
 
-export module memory;
-export import :Vars;
-export import :MemoryCell;
+#include "memory/Vars.h"
+#include "memory/MemoryCell.h"
 
-export namespace ngc
+namespace ngc
 {
     class Memory {
         std::vector<MemoryCell> m_data;
         std::vector<double> m_stack;
         std::unordered_map<Var, uint32_t> m_globals;
+        std::vector<uint32_t> m_addrs;
 
     public:
         static constexpr uint32_t ADDR_STACK = 0x80000000;
@@ -37,12 +37,13 @@ export namespace ngc
             WRITE
         };
 
-        std::vector<uint32_t> init(const std::initializer_list<vars_t> specs) {
+        const std::vector<uint32_t> &addrs() const { return m_addrs; }
+
+        void init(const std::span<const vars_t> specs) {
             m_data.clear();
             m_globals.clear();
             m_stack.clear();
-
-            std::vector<uint32_t> addrs;
+            m_addrs.clear();
 
             for(const auto &[var, name, addr, flags, value] : specs) {
                 while(m_data.size() < addr) {
@@ -52,10 +53,8 @@ export namespace ngc
                 auto _addr = addData(MemoryCell(flags, value));
 
                 m_globals.emplace(var, _addr);
-                addrs.emplace_back(_addr);
+                m_addrs.emplace_back(_addr);
             }
-
-            return addrs;
         }
 
         size_t deref(const Var var) const {

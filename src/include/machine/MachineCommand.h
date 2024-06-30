@@ -1,13 +1,11 @@
-module;
+#pragma once
 
 #include <utility>
 #include <string>
 #include <format>
 #include <stdexcept>
 
-export module machine:MachineCommand;
-
-export namespace ngc {
+namespace ngc {
     class MachineCommand {
     public:
         virtual ~MachineCommand() = default;

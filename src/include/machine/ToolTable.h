@@ -1,4 +1,4 @@
-module;
+#pragma once
 
 #ifdef __clang__
     #pragma push_macro("__cpp_concepts")
@@ -15,10 +15,9 @@ module;
 #include <utility>
 #include <cctype>
 
-export module machine:ToolTable;
-import utils;
+#include "utils.h"
 
-export namespace ngc {
+namespace ngc {
     class ToolTable {
     public:
         static constexpr std::string_view FILENAME = "tool_table.txt";
@@ -29,13 +28,20 @@ export namespace ngc {
             double diameter;
             std::string comment;
 
-            std::string text() { return std::format("T{} X{} Y{} Z{} A{} B{} C{} DIAMETER: {} COMMENT: \"{}\"", number, x, y, z, a, b, c, diameter, comment); }
+            std::string text() const { return std::format("T{} X{} Y{} Z{} A{} B{} C{} DIAMETER: {} COMMENT: \"{}\"", number, x, y, z, a, b, c, diameter, comment); }
         };
 
     private:
-        std::map<int, const tool_entry_t> m_tools;
+        std::map<int, tool_entry_t> m_tools;
 
     public:
+        auto begin() const { return m_tools.begin(); }
+        auto end() const { return m_tools.end(); }
+
+        void set(int num, const tool_entry_t &tool) {
+            m_tools.insert_or_assign(num, tool);
+        }
+
         std::expected<void, std::string> load() {
             m_tools.clear();
             const auto result = readFile(FILENAME);
@@ -90,7 +96,7 @@ export namespace ngc {
                     }
 
                     tool.comment = std::move(token);
-
+                    
                     m_tools.emplace(tool.number, tool);
                     col = 0;
                     token.clear();

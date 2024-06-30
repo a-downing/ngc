@@ -1,11 +1,9 @@
-module;
+#pragma once
 
 #include <memory>
 #include <string_view>
 
-export module parser:TokenSource;
-
-export namespace ngc {
+namespace ngc {
     class TokenSource {
     public:
         [[nodiscard]] virtual std::unique_ptr<TokenSource> clone() const = 0;
