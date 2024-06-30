@@ -1,6 +1,5 @@
 #pragma once
 
-#include <syncstream>
 #ifdef __clang__
     #pragma push_macro("__cpp_concepts")
     #define __cpp_concepts 202002L
