@@ -101,14 +101,13 @@ namespace ngc {
                 throw std::logic_error(std::format("Token::as_double() called on Token {} '{}'", name(), text()));
             }
 
-            double d;
-            auto [ptr, ec] = std::from_chars(text().begin(), text().end(), d);
+            auto result = fromChars(text());
 
-            if(ec != std::errc()) {
+            if(!result) {
                 throw std::logic_error(std::format("StringTokenSource::{}(): std::from_chars() failed on '{}'", __func__, text()));
             }
 
-            return d;
+            return *result;
         }
 
         [[nodiscard]] int as_integer() const {

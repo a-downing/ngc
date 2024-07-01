@@ -52,7 +52,7 @@ namespace ngc
 
     inline std::expected<double, std::errc> fromChars(const std::string_view text) {
         double d;
-        auto [ptr, ec] = std::from_chars(text.begin(), text.end(), d);
+        auto [ptr, ec] = std::from_chars(text.data(), text.data() + text.size(), d);
 
         if(ec != std::errc()) {
             return std::unexpected(ec);

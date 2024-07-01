@@ -6,7 +6,7 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_compile_options(-g -O2 -Wall -Wextra)
+#add_compile_options(-g -O2 -Wall -Wextra)
 #add_compile_options(-g -O2 -fsanitize=address -fsanitize=undefined -Wall -Wextra)
 #add_link_options(-fsanitize=address -fsanitize=undefined)
 
@@ -15,6 +15,7 @@ set(IMGUI_DIR imgui)
 set(OpenGL_GL_PREFERENCE GLVND)
 find_package(OpenGL REQUIRED)
 find_package(glfw3 REQUIRED)
+#add_subdirectory(glfw)
 
 # add_library(utils)
 # target_sources(utils PUBLIC FILE_SET CXX_MODULES FILES src/modules/Utils.cppm)
