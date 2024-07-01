@@ -11,28 +11,28 @@
 //     DO(G0, GCMotion) \
 //     DO(G1, GCMotion) \
 //     DO(G2, GCMotion) \
-//     DO(G3, GCMotion) \
+//     DO(G3, GCMotion)
 
 // #define GC_PLANE(DO) \
 //     DO(G17, GCPlane) \
 //     DO(G18, GCPlane) \
-//     DO(G19, GCPlane) \
+//     DO(G19, GCPlane)
 
 // #define GC_DISTANCE(DO) \
 //     DO(G90, GCDistance) \
-//     DO(G91, GCDistance) \
+//     DO(G91, GCDistance)
 
 // #define GC_FEED(DO) \
 //     DO(G93, GCFeed) \
-//     DO(G94, GCFeed) \
+//     DO(G94, GCFeed)
 
 // #define GC_UNITS(DO) \
 //     DO(G20, GCUnits) \
-//     DO(G21, GCUnits) \
+//     DO(G21, GCUnits)
 
 // #define GC_TOOL_LEN(DO) \
 //     DO(G43, GCToolLen) \
-//     DO(G49, GCToolLen) \
+//     DO(G49, GCToolLen)
 
 // #define GC_COORD_SYS(DO) \
 //     DO(G54, GCCoordSys) \
@@ -43,10 +43,10 @@
 //     DO(G59, GCCoordSys) \
 //     DO(G59_1, GCCoordSys) \
 //     DO(G59_2, GCCoordSys) \
-//     DO(G59_3, GCCoordSys) \
+//     DO(G59_3, GCCoordSys)
 
 // #define GC_PATH(DO) \
-//     DO(G61_1, GCPath) \
+//     DO(G61_1, GCPath)
 
 // #define GC_NON_MODAL(DO) \
 //     DO(G53, GCNonModal)
@@ -60,7 +60,7 @@
 //     GC_TOOL_LEN(DO) \
 //     GC_COORD_SYS(DO) \
 //     GC_PATH(DO) \
-//     GC_NON_MODAL(DO) \
+//     GC_NON_MODAL(DO)
 
 #include "parser/Token.h"
 #include "parser/Expression.h"

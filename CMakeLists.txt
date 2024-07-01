@@ -1,13 +1,14 @@
 cmake_minimum_required(VERSION 3.28)
 project(ngc)
 
-set(CMAKE_CXX_STANDARD 26)
+set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_compile_options(-g -O2 -fsanitize=undefined)
-add_link_options(-fsanitize=undefined)
+add_compile_options(-g -O2 -Wall -Wextra)
+#add_compile_options(-g -O2 -fsanitize=address -fsanitize=undefined -Wall -Wextra)
+#add_link_options(-fsanitize=address -fsanitize=undefined)
 
 set(IMGUI_DIR imgui)
 

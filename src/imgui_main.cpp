@@ -77,7 +77,7 @@ int main(int, char**) {
 
     auto font = io.Fonts->AddFontFromFileTTF("fonts/main_font.ttf", 20);
 
-    Application app;
+    Application app(window);
     app.init();
 
     while (!glfwWindowShouldClose(window)) {
@@ -106,6 +106,8 @@ int main(int, char**) {
 
         glfwSwapBuffers(window);
     }
+
+    app.terminate();
 
     // Cleanup
     ImGui_ImplOpenGL3_Shutdown();

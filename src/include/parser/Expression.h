@@ -10,7 +10,7 @@
 
 namespace ngc
 {
-    class Expression {
+    class Expression { 
         Token m_token;
 
     public:
@@ -92,6 +92,7 @@ namespace ngc
 
     class RealExpression : public ScalarExpression {
     public:
+    using ScalarExpression::isImpl;
         explicit RealExpression(Token token) : ScalarExpression(std::move(token)) { }
         bool isImpl(const RealExpression *) const final { return true; }
         [[nodiscard]] static constexpr const char *staticClassName() { return "RealExpression"; }
@@ -128,6 +129,7 @@ namespace ngc
         [[nodiscard]] std::string text() const override { return std::string(token().text()); }
         [[nodiscard]] double value() const { return token().as_double(); }
 
+        using RealExpression::isImpl;
         bool isImpl(const LiteralExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "LiteralExpression"; }
@@ -145,6 +147,7 @@ namespace ngc
         [[nodiscard]] std::string text() const override { return std::string(token().text()); }
         [[nodiscard]] std::string_view value() const { return token().value(); }
 
+        using ScalarExpression::isImpl;
         bool isImpl(const StringExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "StringExpression"; }
@@ -156,6 +159,7 @@ namespace ngc
     public:
         explicit VariableExpression(Token token) : RealExpression(std::move(token)) { }
         [[nodiscard]] static constexpr const char *staticClassName() { return "VariableExpression"; }
+        using RealExpression::isImpl;
         bool isImpl(const VariableExpression *) const final { return true; }
     };
 
@@ -171,6 +175,7 @@ namespace ngc
         [[nodiscard]] std::string text() const override { return std::format("{}{}", token().text(), m_realExpression->text()); }
         [[nodiscard]] const RealExpression *real() const { return m_realExpression.get(); }
 
+        using VariableExpression::isImpl;
         bool isImpl(const NumericVariableExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "NumericVariableExpression"; }
@@ -191,6 +196,7 @@ namespace ngc
         [[nodiscard]] const Token &endToken() const override { return token(); }
         [[nodiscard]] std::string text() const override { return std::string(token().text()); }
 
+        using VariableExpression::isImpl;
         bool isImpl(const NamedVariableExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "NamedVariableExpression"; }
@@ -218,6 +224,7 @@ namespace ngc
         [[nodiscard]] std::string text() const override { return std::format("{}{}", token().text(), m_realExpression->text()); }
         [[nodiscard]] const RealExpression *real() const { return m_realExpression.get(); }
 
+        using RealExpression::isImpl;
         bool isImpl(const UnaryExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "UnaryExpression"; }
@@ -254,6 +261,7 @@ namespace ngc
         [[nodiscard]] const Token &endToken() const override { return m_right->endToken(); }
         [[nodiscard]] std::string text() const override { return std::format("[{} {} {}]", m_left->text(), token().text(), m_right->text()); }
 
+        using RealExpression::isImpl;
         bool isImpl(const BinaryExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "BinaryExpression"; }
@@ -297,6 +305,7 @@ namespace ngc
         [[nodiscard]] const Token &endToken() const override { return m_endToken; }
         [[nodiscard]] std::string text() const override { return std::format("{}[{}]", token().text(), join(m_args, ", ")); }
 
+        using RealExpression::isImpl;
         bool isImpl(const CallExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "CallExpression"; }
@@ -321,6 +330,7 @@ namespace ngc
         [[nodiscard]] std::string text() const override { return std::format("[{}]", m_realExpression->text()); }
         [[nodiscard]] const RealExpression *real() const { return m_realExpression.get(); }
 
+        using RealExpression::isImpl;
         bool isImpl(const GroupingExpression *) const override { return true; }
 
         [[nodiscard]] static constexpr const char *staticClassName() { return "GroupingExpression"; }

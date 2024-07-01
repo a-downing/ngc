@@ -17,13 +17,56 @@
 #include "memory/Memory.h"
 #include "gcode/GCode.h"
 
-namespace ngc
-{
+namespace ngc {
+    class EvaluatorMessageVisitor {
+    public:
+        virtual void visit(const class BlockMessage &) = 0;
+        virtual void visit(const class PrintMessage &) = 0;
+    };
+
+    class EvaluatorMessage {
+    public:
+        virtual ~EvaluatorMessage() = default;
+        virtual bool isImpl(const BlockMessage *) const { return false; }
+        virtual bool isImpl(const PrintMessage *) const { return false; }
+        virtual void accept(EvaluatorMessageVisitor &) const = 0;
+
+        template<typename T>
+        [[nodiscard]] bool is() const {
+            return this->isImpl(static_cast<const T *>(nullptr));
+        }
+
+        template<typename T>
+        const T *as() const {
+            return this->isImpl(static_cast<const T *>(nullptr)) ? static_cast<const T *>(this) : nullptr;
+        }
+    };
+
+    class BlockMessage final : public EvaluatorMessage {
+        Block m_block;
+    public:
+        virtual ~BlockMessage() override = default;
+        explicit BlockMessage(Block block) : m_block(std::move(block)) { }
+        const Block &block() const { return m_block; }
+        virtual bool isImpl(const BlockMessage *) const override { return true; }
+        void accept(EvaluatorMessageVisitor &visitor) const override { visitor.visit(*this); }
+    };
+
+    class PrintMessage final : public EvaluatorMessage {
+        std::string m_text;
+    public:
+        virtual ~PrintMessage() override = default;
+        explicit PrintMessage(std::string text) : m_text(std::move(text)) { }
+        const std::string &text() const { return m_text; }
+        virtual bool isImpl(const PrintMessage *) const override { return true; }
+        void accept(EvaluatorMessageVisitor &visitor) const override { visitor.visit(*this); }
+    };
+
     class Evaluator final : public Visitor {
         std::vector<std::unordered_map<std::string_view, uint32_t>> m_scope;
         std::vector<std::unordered_map<SubSignature, const SubStatement *>> m_subScope;
         Memory &m_mem;
-        const std::function<void(const Block &, Evaluator &)> &m_callback;
+        const std::function<void(std::unique_ptr<const EvaluatorMessage>, Evaluator &)> &m_callback;
 
         class Scope {
             Evaluator *m_evaluator = nullptr;
@@ -97,7 +140,7 @@ namespace ngc
         static Context *context(VisitorContext *ctx) { return static_cast<Context *>(ctx); }
 
     public:
-        explicit Evaluator(Memory &mem, const std::function<void(const Block &, Evaluator &)> &callback) : m_scope(1), m_subScope(1), m_mem(mem), m_callback(callback) { }
+        explicit Evaluator(Memory &mem, const std::function<void(std::unique_ptr<const EvaluatorMessage>, Evaluator &)> &callback) : m_scope(1), m_subScope(1), m_mem(mem), m_callback(callback) { }
 
         template<typename ...Args>
         double call(std::string name, Args... args) requires (std::convertible_to<Args, double> && ...) {
@@ -210,7 +253,7 @@ namespace ngc
                 words.emplace_back(expr.get(), letter, real);
             }
 
-            m_callback(Block(stmt, std::move(words)), *this);
+            m_callback(std::make_unique<BlockMessage>(Block(stmt, std::move(words))), *this);
         }
 
         void visit(const ReturnStatement* stmt, VisitorContext* ctx) override {
@@ -218,11 +261,11 @@ namespace ngc
             context(ctx)->action = Context::RETURN;
         }
 
-        void visit(const BreakStatement* stmt, VisitorContext* ctx) override {
+        void visit(const BreakStatement *, VisitorContext* ctx) override {
             context(ctx)->action = Context::BREAK;
         }
 
-        void visit(const ContinueStatement* stmt, VisitorContext* ctx) override {
+        void visit(const ContinueStatement *, VisitorContext* ctx) override {
             context(ctx)->action = Context::CONTINUE;
         }
 
@@ -281,6 +324,7 @@ namespace ngc
                 }
 
                 std::println("<PRINT>: {}", text);
+                m_callback(std::make_unique<PrintMessage>(text), *this);
                 return;
             }
 
@@ -422,9 +466,9 @@ namespace ngc
         }
 
         // not needed
-        void visit(const StringExpression* expr, VisitorContext* ctx) override { }
-        void visit(const CommentExpression* expr, VisitorContext* ctx) override { }
-        void visit(const WordExpression* expr, VisitorContext* ctx) override { }
+        void visit(const StringExpression*, VisitorContext*) override { }
+        void visit(const CommentExpression*, VisitorContext*) override { }
+        void visit(const WordExpression*, VisitorContext*) override { }
 
     private:
         Context createScopeContext(const bool global = false) { return Context { .scope = Scope(*this, global) }; }

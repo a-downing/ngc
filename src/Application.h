@@ -1,5 +1,8 @@
 #pragma once
 
+#include "parser/Statement.h"
+#include <cstdint>
+
 #ifdef __clang__
     #pragma push_macro("__cpp_concepts")
     #define __cpp_concepts 202002L
@@ -9,84 +12,38 @@
     #include <expected>
 #endif
 
-#include <optional>
 #include <filesystem>
 #include <print>
 #include <string>
+
+#include <GL/gl.h>
+#include <GLFW/glfw3.h>
 
 #include "imgui.h"
 #include "imgui_stdlib.h"
 
 #include "utils.h"
+#include "Worker.h"
+
 #include "parser/LexerSource.h"
 #include "parser/Program.h"
-
 #include "memory/Vars.h"
 #include "memory/Memory.h"
 #include "machine/Machine.h"
 #include "machine/ToolTable.h"
 #include "evaluator/Preamble.h"
 #include "evaluator/Evaluator.h"
+#include "gcode/GCode.h"
 
-struct tool_table_strings_t {
-    std::string number;
-    std::string x, y, z, a, b, c;
-    std::string diameter;
-    std::string comment;
+#include "gui/tool_table_strings_t.h"
 
-    static tool_table_strings_t from(const ngc::ToolTable::tool_entry_t &tool) {
-        return {
-            ngc::toChars(tool.number),
-            ngc::toChars(tool.x),
-            ngc::toChars(tool.y),
-            ngc::toChars(tool.z),
-            ngc::toChars(tool.a),
-            ngc::toChars(tool.b),
-            ngc::toChars(tool.c),
-            ngc::toChars(tool.diameter),
-            tool.comment
-        };
-    }
-
-    std::expected<ngc::ToolTable::tool_entry_t, std::string> to() const {
-        auto _number = ngc::fromChars(number);
-        if(!_number) {  return std::unexpected(std::format("failed to convert '{}' to number", number)); }
-
-        auto _x = ngc::fromChars(x);
-        if(!_x) {  return std::unexpected(std::format("failed to convert '{}' to number", x)); }
-
-        auto _y = ngc::fromChars(y);
-        if(!_y) {  return std::unexpected(std::format("failed to convert '{}' to number", y)); }
-
-        auto _z = ngc::fromChars(z);
-        if(!_z) {  return std::unexpected(std::format("failed to convert '{}' to number", z)); }
-
-        auto _a = ngc::fromChars(a);
-        if(!_a) {  return std::unexpected(std::format("failed to convert '{}' to number", a)); }
-
-        auto _b = ngc::fromChars(b);
-        if(!_b) {  return std::unexpected(std::format("failed to convert '{}' to number", b)); }
-
-        auto _c = ngc::fromChars(c);
-        if(!_c) {  return std::unexpected(std::format("failed to convert '{}' to number", c)); }
-
-        auto _diameter = ngc::fromChars(diameter);
-        if(!_diameter) {  return std::unexpected(std::format("failed to convert '{}' to number", diameter)); }
-        
-        return ngc::ToolTable::tool_entry_t { static_cast<int>(*_number), *_x, *_y, *_z, *_a, *_b, *_c, *_diameter, comment };
-    }
-};
-
-class Application {
+class Application final : public ngc::EvaluatorMessageVisitor {
+    GLFWwindow *m_window;
     std::filesystem::path m_path = std::filesystem::absolute(".").lexically_normal();
     ngc::Memory m_mem;
     ngc::Machine m_machine;
     ngc::ToolTable m_tools;
     std::vector<tool_table_strings_t> m_toolStrings;
-
-    std::optional<ngc::Preamble> m_preamble;
-    std::vector<ngc::Program> m_programs;
-    bool m_compiled = false;
 
     // windows
     bool m_enableOpenDialog = false;
@@ -94,11 +51,15 @@ class Application {
     bool m_enableMemoryWindow = false;
     bool m_enableToolWindow = false;
     bool m_enableErrorWindow = false;
+    bool m_enableMessagesWindow = false;
 
     std::string m_errorMessage;
 
+    Worker m_worker;
+    std::vector<std::unique_ptr<const ngc::EvaluatorMessage>> m_evaluatorMessages;
+
 public:
-    Application() : m_machine(m_mem) { }
+    Application(GLFWwindow *window) : m_window(window), m_machine(m_mem), m_worker(m_mem) { }
 
     void init() {
         auto result = m_tools.load();
@@ -107,6 +68,10 @@ public:
             m_errorMessage = "failed to load tool table";
             m_enableErrorWindow = true;
         }
+    }
+
+    void terminate() {
+        m_worker.join();
     }
 
     void initToolTableStrings() {
@@ -161,8 +126,10 @@ public:
                 if(ImGui::MenuItem("Tool Table", nullptr, &m_enableToolWindow)) {
                     initToolTableStrings();
                 }
+
+                ImGui::MenuItem("Messages", nullptr, &m_enableMessagesWindow);
                 
-                if(ImGui::MenuItem("Exit")) { std::exit(0); }
+                if(ImGui::MenuItem("Exit")) { glfwSetWindowShouldClose(m_window, GL_TRUE); }
                 
                 ImGui::EndMenu();
             }
@@ -170,11 +137,51 @@ public:
             ImGui::EndMainMenuBar();
         }
 
+        auto messages = m_worker.moveEvaluatorMessages();
+
+        if(!messages.empty()) {
+            m_evaluatorMessages.reserve(m_evaluatorMessages.size() + messages.size());
+            std::move(std::begin(messages), std::end(messages), std::back_inserter(m_evaluatorMessages));
+            m_enableMessagesWindow = true;
+        }
+
         if(m_enableOpenDialog) { renderOpenDialog(); }
         if(m_enableProgramWindow) { renderProgramWindow(); }
         if(m_enableMemoryWindow) { renderMemoryWindow(); }
         if(m_enableToolWindow) { renderToolWindow(); }
         if(m_enableErrorWindow) { renderErrorWindow(); }
+        if(m_enableMessagesWindow) { renderMessagesWindow(); }
+    }
+
+    void renderMessagesWindow() {
+        if(ImGui::Begin("Messages", &m_enableMessagesWindow)) {
+            for(const auto &msg : m_evaluatorMessages) {
+                //msg->accept(*this);
+
+                if(auto blockMsg = msg->as<ngc::BlockMessage>()) {
+                    ImGui::TextUnformatted(blockMsg->block().statement()->text().c_str());
+                    continue;
+                }
+
+                if(auto printMsg = msg->as<ngc::PrintMessage>()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, { 0.4, 0.4, 1.0, 1.0 });
+                    ImGui::TextUnformatted(std::format("PRINT: {}", printMsg->text()).c_str());
+                    ImGui::PopStyleColor();
+                }
+            }
+
+            ImGui::End();
+        }
+    }
+
+    void visit(const ngc::BlockMessage &msg) override {
+        //std::println("BlockMessage: {}", msg.block().statement()->text());
+        //ImGui::TextUnformatted(msg.block().statement()->text().c_str());
+    }
+
+    void visit(const ngc::PrintMessage &msg) override {
+        //std::println("PrintMessage: {}", msg.text());
+        //ImGui::TextUnformatted(std::format("PRINT: {}", msg.text()).c_str());
     }
 
     void renderToolWindow() {
@@ -268,7 +275,7 @@ public:
 
                 uint32_t address = 0;
 
-                for(const auto &[var, name, addr, _, _] : ngc::gVars) {
+                for(const auto &[var, name, addr, _flags, _value] : ngc::gVars) {
                     if(addr != 0) {
                         address = addr;
                     }
@@ -299,74 +306,22 @@ public:
     }
 
     void renderProgramWindow() {
-        if(m_programs.empty()) {
-            m_enableProgramWindow = false;
-            return;
-        }
-
         if(ImGui::Begin("Program", &m_enableProgramWindow)) {
-            if(!m_programs.empty() && !m_compiled) {
-                if(ImGui::Button("Compile Programs")) {
-                    for(auto &program : m_programs) {
-                        auto result = program.compile();
-
-                        if(!result) {
-                            m_compiled = false;
-                            m_errorMessage = result.error().text();
-                            m_enableErrorWindow = true;
-                            break;
-                        }
-                    }
-
-                    m_compiled = true;
-                }
+            if(ImGui::Button("Compile Programs")) {
+                m_worker.compile();
             }
 
-            if(m_compiled) {
-                //TODO: this stuff
+            if(m_worker.compiled()) {
                 if(ImGui::Button("Execute")) {
-                    auto callback = [this] (const ngc::Block &block, ngc::Evaluator &eval) {
-                        // if(block.blockDelete()) {
-                        //     std::println("DELETED BLOCK: {}", block.statement()->text());
-                        // } else{
-                        //     std::println("BLOCK: {}", block.statement()->text());
-                        // }
-
-                        ngc::GCodeState state;
-
-                        for(const auto &word : block.words()) {
-                            state.affectState(word);
-                        }
-
-                        if(state.modeToolChange()) {
-                            eval.call("_tool_change", state.T());
-                        }
-
-                        //m_machine.executeBlock(block);
-                    };
-
-                    auto eval = ngc::Evaluator(m_mem, callback);
-
-                    std::println("first pass: preamble");
-                    eval.executeFirstPass(m_preamble->statements());
-
-                    for(const auto &program : m_programs) {
-                        std::println("first pass: {}", program.source().name());
-                        eval.executeFirstPass(program.statements());
-                    }
-
-                    for(const auto &program : m_programs) {
-                        std::println("executing: {}", program.source().name());
-                        eval.executeSecondPass(program.statements());
-                    }
+                    m_worker.execute();
                 }
             }
 
             if(ImGui::BeginTabBar("programs")) {
-                m_preamble = ngc::Preamble(m_mem);
+                auto preamble = ngc::Preamble(m_mem);
                 std::string preambleText;
 
-                for(const auto &stmt : m_preamble->statements()) {
+                for(const auto &stmt : preamble.statements()) {
                     preambleText += stmt->text() + '\n';
                 }
 
@@ -375,10 +330,22 @@ public:
                     ImGui::EndTabItem();
                 }
 
-                for(const auto &program : m_programs) {
-                    if(ImGui::BeginTabItem(program.source().name().c_str())) {
-                        ImGui::InputTextMultiline("##source", const_cast<char *>(program.source().text().data()), program.source().text().size(), { -1, -1 }, ImGuiInputTextFlags_ReadOnly);
-                        ImGui::EndTabItem();
+                if(m_worker.compiled()) {
+                    for(const auto &program : m_worker.programs()) {
+                        if(ImGui::BeginTabItem(program.source().name().c_str())) {
+                            for(const auto &stmt : program.statements()) {
+                                ImGui::Selectable(stmt->text().c_str());
+                            }
+
+                            ImGui::EndTabItem();
+                        }
+                    }
+                } else {
+                    for(const auto &program : m_worker.programs()) {
+                        if(ImGui::BeginTabItem(program.source().name().c_str())) {
+                            ImGui::InputTextMultiline("##source", const_cast<char *>(program.source().text().data()), program.source().text().size(), { -1, -1 }, ImGuiInputTextFlags_ReadOnly);
+                            ImGui::EndTabItem();
+                        }
                     }
                 }
 
@@ -400,7 +367,7 @@ public:
                 m_path = std::filesystem::absolute(m_path.append("..")).lexically_normal();
             }
 
-            for(const auto entry : std::filesystem::directory_iterator(m_path)) {
+            for(const auto &entry : std::filesystem::directory_iterator(m_path)) {
                 if(ImGui::Selectable(std::format("{}", entry.path().filename().string()).c_str())) {
                     if(entry.is_directory()) {
                         m_path = std::filesystem::absolute(entry.path()).lexically_normal();
@@ -410,15 +377,15 @@ public:
                         auto result = ngc::readFile(entry.path().string());
 
                         if(result) {
+                            std::vector<ngc::Program> programs;
                             auto program = ngc::Program(ngc::LexerSource(*result, entry.path().string()));
-                            m_programs.clear();
-                            m_compiled = false;
 
-                            for(const auto entry : std::filesystem::directory_iterator("autoload")) {
-                                m_programs.emplace_back(ngc::LexerSource(*ngc::readFile(entry.path().string()), entry.path().string()));
+                            for(const auto &entry : std::filesystem::directory_iterator("autoload")) {
+                                programs.emplace_back(ngc::LexerSource(*ngc::readFile(entry.path().string()), entry.path().string()));
                             }
 
-                            m_programs.emplace_back(std::move(program));
+                            programs.emplace_back(std::move(program));
+                            m_worker.setPrograms(std::move(programs));
                             m_enableOpenDialog = false;
                             m_enableProgramWindow = true;
                         }

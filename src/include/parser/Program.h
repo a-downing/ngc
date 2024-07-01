@@ -38,6 +38,7 @@ namespace ngc {
             }
 
             m_statements = std::move(*result);
+            m_ptrStatements.clear();
 
             for(const auto &statement : m_statements) {
                 m_ptrStatements.emplace_back(statement.get());

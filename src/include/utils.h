@@ -18,8 +18,8 @@
 #include <array>
 #include <source_location>
 
-#define PANIC(...) panic(std::source_location::current(), "PANIC" __VA_OPT__(,) __VA_ARGS__)
-#define UNREACHABLE(...) panic(std::source_location::current(), "UNREACHABLE" __VA_OPT__(,) __VA_ARGS__)
+#define PANIC(...) ngc::panic(std::source_location::current(), "PANIC" __VA_OPT__(,) __VA_ARGS__)
+#define UNREACHABLE(...) ngc::panic(std::source_location::current(), "UNREACHABLE" __VA_OPT__(,) __VA_ARGS__)
 
 namespace ngc
 {
