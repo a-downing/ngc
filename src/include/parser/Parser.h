@@ -37,19 +37,15 @@ namespace ngc
             std::source_location m_location;
             std::optional<Token> m_token;
             std::optional<Lexer::Error> m_lexerError;
-            std::unique_ptr<Expression> m_expression;
 
         public:
-            Error(Error &&err) = default;
             Error(const std::string &message, const std::source_location location): std::logic_error(message), m_location(location) { }
             Error(const std::string &message, const std::source_location location, const Token &token): std::logic_error(message), m_location(location), m_token(token) { }
             Error(const std::string &message, const std::source_location location, const Lexer::Error &lexerError): std::logic_error(message), m_location(location), m_lexerError(lexerError) { }
-            Error(const std::string &message, const std::source_location location, std::unique_ptr<Expression> expression): std::logic_error(message), m_location(location), m_expression(std::move(expression)) { }
 
             [[nodiscard]] const std::source_location &sourceLocation() const { return m_location; }
             [[nodiscard]] const std::optional<Token> &token() const { return m_token; }
             [[nodiscard]] const std::optional<Lexer::Error> &lexerError() const { return m_lexerError; }
-            [[nodiscard]] Expression *expression() const { return m_expression.get(); }
 
             std::string text() const {
                 if(m_lexerError) {
@@ -398,8 +394,8 @@ namespace ngc
         template<typename T>
         [[nodiscard]] std::unique_ptr<T> expect(std::unique_ptr<Expression> expression) {
             if(!expression->is<T>()) {
-                auto message = std::format("expected {}, but found {}: '{}'", T::staticClassName(), expression->className(), expression->text());
-                error(message, std::move(expression));
+                auto message = std::format("expected {}, but found '{}'", T::staticClassName(), expression->text());
+                error(message, std::move(expression->token()));
             }
 
             return std::unique_ptr<T>(static_cast<T *>(expression.release()));
@@ -505,10 +501,6 @@ namespace ngc
 
         [[noreturn]] static void error(const std::string &message, const Lexer::Error &lexerError, const std::source_location location = std::source_location::current()) {
             throw Error(message, location, lexerError);
-        }
-
-        [[noreturn]] static void error(const std::string &message, std::unique_ptr<Expression> expression, const std::source_location location = std::source_location::current()) {
-            throw Error(message, location, std::move(expression));
         }
     };
 }

@@ -6,9 +6,9 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_compile_options(-g -O0 -Wall -Wextra)
-#add_compile_options(-g -O2 -fsanitize=undefined -Wall -Wextra)
-#add_link_options(-fsanitize=undefined)
+#add_compile_options(-g -O0 -Wall -Wextra)
+add_compile_options(-g -O2 -fsanitize=undefined -fsanitize=address -Wall -Wextra)
+add_link_options(-fsanitize=undefined -fsanitize=address)
 
 set(IMGUI_DIR imgui)
 

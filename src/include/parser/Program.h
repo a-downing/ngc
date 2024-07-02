@@ -22,7 +22,8 @@ namespace ngc {
         Program &operator=(const Program &) = delete;
         Program &operator=(Program &&) = default;
 
-        explicit Program(LexerSource source) : m_source(std::move(source)) { }
+        //explicit Program(LexerSource source) : m_source(std::move(source)) { }
+        Program(std::string text, std::string name) : m_source(std::move(text), std::move(name)) { }
 
         bool compiled() const { return m_compiled; }
 

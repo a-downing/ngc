@@ -23,6 +23,7 @@ class Worker {
     bool m_doCompile = false;
     bool m_doExecute = false;
     bool m_compiled = false;
+    bool m_busy = false;
 
     std::vector<ngc::Program> m_programs;
     std::vector<ngc::Parser::Error> m_parserErrors;
@@ -31,14 +32,40 @@ class Worker {
 public:
     Worker(ngc::Memory &mem) : m_mem(mem), m_thread(std::thread(&Worker::work, this)) { }
 
-    std::span<const ngc::Program> programs() const {
+    bool compiled() const {
         std::scoped_lock lock(m_mutex);
-        return m_programs;
+        return m_compiled;
     }
 
-    std::vector<std::unique_ptr<const ngc::EvaluatorMessage>> moveEvaluatorMessages() {
+    bool busy() const {
         std::scoped_lock lock(m_mutex);
-        return std::move(m_evaluatorMessages);
+        return m_busy;
+    }
+
+    std::vector<ngc::Parser::Error> parserErrors() const {
+        std::scoped_lock lock(m_mutex);
+        return m_parserErrors;
+    }
+
+    bool compile(const std::vector<std::tuple<std::string, std::string>> &programs) {
+        std::scoped_lock lock(m_mutex);
+
+        if(m_busy) {
+            return false;
+        }
+
+        m_programs.clear();
+        m_parserErrors.clear();
+        m_evaluatorMessages.clear();
+        
+        for(auto &[source, name] : programs) {
+            m_programs.emplace_back(source, name);
+        }
+
+        m_compiled = false;
+        m_doCompile = true;
+        m_cv.notify_one();
+        return true;
     }
 
     void join() {
@@ -49,28 +76,16 @@ public:
         m_thread.join();
     }
 
-    void setPrograms(std::vector<ngc::Program> programs) {
+    bool execute() {
         std::scoped_lock lock(m_mutex);
-        m_programs = std::move(programs);
-        m_compiled = false;
-    }
+        
+        if(m_busy) {
+            return false;
+        }
 
-    bool compiled() const {
-        std::scoped_lock lock(m_mutex);
-        return m_compiled;
-    }
-
-    void compile() {
-        std::scoped_lock lock(m_mutex);
-        m_compiled = false;
-        m_doCompile = true;
-        m_cv.notify_one();
-    }
-
-    void execute() {
-        std::scoped_lock lock(m_mutex);
         m_doExecute = true;
         m_cv.notify_one();
+        return true;
     }
 
 private:
@@ -78,6 +93,8 @@ private:
         for(;;) {
             std::unique_lock lock(m_mutex);
             m_cv.wait(lock, [&] { return m_doJoin || m_doCompile || m_doExecute; });
+
+            m_busy = true;
 
             if(m_doJoin) {
                 m_doJoin = false;
@@ -105,7 +122,7 @@ private:
             auto result = program.compile();
 
             if(!result) {
-                std::println("error: {}", result.error().text());
+                std::scoped_lock lock(m_mutex);
                 m_parserErrors.emplace_back(std::move(result.error()));
             }
         }
@@ -115,6 +132,8 @@ private:
         if(m_parserErrors.empty() && !m_programs.empty()) {
             m_compiled = true;
         }
+
+        m_busy = false;
     }
 
     void doExecute() {
@@ -139,6 +158,7 @@ private:
                 std::println("PRINT: {}", printMsg->text());
             }
 
+            std::scoped_lock lock(m_mutex);
             m_evaluatorMessages.emplace_back(std::move(msg));
         };
 
@@ -157,5 +177,8 @@ private:
             std::println("executing: {}", program.source().name());
             eval.executeSecondPass(program.statements());
         }
+
+        std::scoped_lock lock(m_mutex);
+        m_busy = false;
     }
 };

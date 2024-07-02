@@ -75,7 +75,7 @@ int main(int, char**) {
 
     ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
 
-    auto font = io.Fonts->AddFontFromFileTTF("fonts/main_font.ttf", 20);
+    //auto font = io.Fonts->AddFontFromFileTTF("fonts/main_font.ttf", 20);
 
     Application app(window);
     app.init();
