@@ -24,15 +24,12 @@
 #include "utils.h"
 #include "Worker.h"
 
-#include "parser/LexerSource.h"
-#include "parser/Program.h"
+#include "gui/imgui_custom.h"
 #include "memory/Vars.h"
 #include "memory/Memory.h"
 #include "machine/Machine.h"
 #include "machine/ToolTable.h"
-#include "evaluator/Preamble.h"
 #include "evaluator/Evaluator.h"
-#include "gcode/GCode.h"
 
 #include "gui/tool_table_strings_t.h"
 
@@ -43,6 +40,7 @@ class Application final : public ngc::EvaluatorMessageVisitor {
     ngc::Machine m_machine;
     ngc::ToolTable m_tools;
     std::vector<tool_table_strings_t> m_toolStrings;
+    std::vector<std::tuple<std::string, std::string>> m_programSource;
 
     // windows
     bool m_enableOpenDialog = false;
@@ -55,7 +53,6 @@ class Application final : public ngc::EvaluatorMessageVisitor {
     std::string m_errorMessage;
 
     Worker m_worker;
-    std::vector<std::unique_ptr<const ngc::EvaluatorMessage>> m_evaluatorMessages;
 
 public:
     Application(GLFWwindow *window) : m_window(window), m_machine(m_mem), m_worker(m_mem) { }
@@ -109,7 +106,7 @@ public:
         ImGui::OpenPopup("Error");
 
         if(ImGui::BeginPopupModal("Error", &m_enableErrorWindow, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::PushStyleColor(ImGuiCol_Text, { 1.0f, 0.4f, 0.4f, 1.0f });
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4_Redish);
             ImGui::TextUnformatted(m_errorMessage.c_str());
             ImGui::PopStyleColor();
             ImGui::EndPopup();
@@ -136,14 +133,6 @@ public:
             ImGui::EndMainMenuBar();
         }
 
-        auto messages = m_worker.moveEvaluatorMessages();
-
-        if(!messages.empty()) {
-            m_evaluatorMessages.reserve(m_evaluatorMessages.size() + messages.size());
-            std::move(std::begin(messages), std::end(messages), std::back_inserter(m_evaluatorMessages));
-            m_enableMessagesWindow = true;
-        }
-
         if(m_enableOpenDialog) { renderOpenDialog(); }
         if(m_enableProgramWindow) { renderProgramWindow(); }
         if(m_enableMemoryWindow) { renderMemoryWindow(); }
@@ -154,20 +143,18 @@ public:
 
     void renderMessagesWindow() {
         if(ImGui::Begin("Messages", &m_enableMessagesWindow)) {
-            for(const auto &msg : m_evaluatorMessages) {
-                //msg->accept(*this);
+            // m_worker.foreachEvaluatorMessage([](const ngc::EvaluatorMessage *msg) {
+            //     if(auto blockMsg = msg->as<ngc::BlockMessage>()) {
+            //         ImGui::TextUnformatted(blockMsg->block().statement()->text().c_str());
+            //         return;
+            //     }
 
-                if(auto blockMsg = msg->as<ngc::BlockMessage>()) {
-                    ImGui::TextUnformatted(blockMsg->block().statement()->text().c_str());
-                    continue;
-                }
-
-                if(auto printMsg = msg->as<ngc::PrintMessage>()) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, { 0.4, 0.4, 1.0, 1.0 });
-                    ImGui::TextUnformatted(std::format("PRINT: {}", printMsg->text()).c_str());
-                    ImGui::PopStyleColor();
-                }
-            }
+            //     if(auto printMsg = msg->as<ngc::PrintMessage>()) {
+            //         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4_Blueish);
+            //         ImGui::TextUnformatted(std::format("PRINT: {}", printMsg->text()).c_str());
+            //         ImGui::PopStyleColor();
+            //     }
+            // });
 
             ImGui::End();
         }
@@ -306,49 +293,41 @@ public:
 
     void renderProgramWindow() {
         if(ImGui::Begin("Program", &m_enableProgramWindow)) {
-            if(ImGui::Button("Compile Programs")) {
-                m_worker.compile();
-            }
+            auto size = ImGui::GetWindowSize();
 
-            if(m_worker.compiled()) {
-                if(ImGui::Button("Execute")) {
-                    m_worker.execute();
-                }
-            }
-
-            if(ImGui::BeginTabBar("programs")) {
-                auto preamble = ngc::Preamble(m_mem);
-                std::string preambleText;
-
-                for(const auto &stmt : preamble.statements()) {
-                    preambleText += stmt->text() + '\n';
-                }
-
-                if(ImGui::BeginTabItem("preamble")) {
-                    ImGui::InputTextMultiline("##source", &preambleText, { -1, -1 }, ImGuiInputTextFlags_ReadOnly);
-                    ImGui::EndTabItem();
+            if(ImGui::BeginChild("top", { 0, 0 }, ImGuiChildFlags_Border | ImGuiChildFlags_ResizeY)) {
+                if(ImGui::Button("Compile Programs", {0,0}, m_worker.busy())) {
+                    m_worker.compile(m_programSource);
                 }
 
                 if(m_worker.compiled()) {
-                    for(const auto &program : m_worker.programs()) {
-                        if(ImGui::BeginTabItem(program.source().name().c_str())) {
-                            for(const auto &stmt : program.statements()) {
-                                ImGui::Selectable(stmt->text().c_str());
-                            }
-
-                            ImGui::EndTabItem();
-                        }
-                    }
-                } else {
-                    for(const auto &program : m_worker.programs()) {
-                        if(ImGui::BeginTabItem(program.source().name().c_str())) {
-                            ImGui::InputTextMultiline("##source", const_cast<char *>(program.source().text().data()), program.source().text().size(), { -1, -1 }, ImGuiInputTextFlags_ReadOnly);
-                            ImGui::EndTabItem();
-                        }
+                    if(ImGui::Button("Execute")) {
+                        m_worker.execute();
                     }
                 }
 
-                ImGui::EndTabBar();
+                if(ImGui::BeginTabBar("programs")) {
+                    for(auto &[source, name] : m_programSource) {
+                        if(ImGui::BeginTabItem(name.c_str())) {
+                            ImGui::InputTextMultiline("##source", &source, { -1, -1 });
+                            ImGui::EndTabItem();
+                        }
+                    }
+
+                    ImGui::EndTabBar();
+                }
+
+                ImGui::EndChild();
+            }
+
+            if(ImGui::BeginChild("bottom", {0, 0 }, ImGuiChildFlags_Border)) {
+                for(const auto &error : m_worker.parserErrors()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4_Redish);
+                    ImGui::Selectable(error.text().c_str());
+                    ImGui::PopStyleColor();
+                }
+
+                ImGui::EndChild();
             }
 
             ImGui::End();
@@ -375,19 +354,32 @@ public:
                     if(entry.is_regular_file()) {
                         auto result = ngc::readFile(entry.path().string());
 
-                        if(result) {
-                            std::vector<ngc::Program> programs;
-                            auto program = ngc::Program(ngc::LexerSource(*result, entry.path().string()));
+                        if(!result) {
+                            m_programSource.clear();
+                            m_errorMessage = result.error().what();
+                            m_enableErrorWindow = true;
+                            break;
+                        }
 
-                            for(const auto &entry : std::filesystem::directory_iterator("autoload")) {
-                                programs.emplace_back(ngc::LexerSource(*ngc::readFile(entry.path().string()), entry.path().string()));
+                        m_programSource.clear();
+
+                        for(const auto &entry : std::filesystem::directory_iterator("autoload")) {
+                            auto result = ngc::readFile(entry.path().string());
+
+                            if(!result) {
+                                m_programSource.clear();
+                                m_errorMessage = result.error().what();
+                                m_enableErrorWindow = true;
+                                break;
                             }
 
-                            programs.emplace_back(std::move(program));
-                            m_worker.setPrograms(std::move(programs));
-                            m_enableOpenDialog = false;
-                            m_enableProgramWindow = true;
+                            m_programSource.emplace_back(*result, entry.path().string());
                         }
+
+                        m_programSource.emplace_back(*result, entry.path().string());
+                        //m_worker.reset(std::move(programs));
+                        m_enableOpenDialog = false;
+                        m_enableProgramWindow = true;
                     }
                 }
             }
