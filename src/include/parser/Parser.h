@@ -52,6 +52,14 @@ namespace ngc
             [[nodiscard]] Expression *expression() const { return m_expression.get(); }
 
             std::string text() const {
+                if(m_lexerError) {
+                    return std::format("{}: {}", m_lexerError->location(), m_lexerError->message());
+                }
+
+                if(m_token) {
+                    return std::format("{}: {}", m_token->location(), what());
+                }
+
                 return what();
             }
         };

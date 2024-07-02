@@ -62,7 +62,7 @@ namespace ngc
     }
 
     inline std::expected<std::string, std::ios_base::failure> readFile(const std::filesystem::path& filePath) {
-        std::ifstream file(filePath);
+        std::ifstream file(filePath, std::ios::binary);
 
         if (!file) {
             return std::unexpected(std::ios_base::failure("Failed to open file"));
@@ -71,6 +71,8 @@ namespace ngc
         file.seekg(0, std::ios::end);
         const auto fileSize = file.tellg();
         file.seekg(0, std::ios::beg);
+
+        std::println("readFile({}) fileSize: {}", filePath.string(), (size_t)fileSize);
 
         std::string fileContent(fileSize, '\0');
         file.read(&fileContent[0], fileSize);

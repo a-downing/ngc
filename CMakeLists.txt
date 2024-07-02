@@ -6,16 +6,16 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-#add_compile_options(-g -O2 -Wall -Wextra)
-#add_compile_options(-g -O2 -fsanitize=address -fsanitize=undefined -Wall -Wextra)
-#add_link_options(-fsanitize=address -fsanitize=undefined)
+add_compile_options(-g -O0 -Wall -Wextra)
+#add_compile_options(-g -O2 -fsanitize=undefined -Wall -Wextra)
+#add_link_options(-fsanitize=undefined)
 
 set(IMGUI_DIR imgui)
 
 set(OpenGL_GL_PREFERENCE GLVND)
 find_package(OpenGL REQUIRED)
-find_package(glfw3 REQUIRED)
-#add_subdirectory(glfw)
+#find_package(glfw3 REQUIRED)
+add_subdirectory(glfw)
 
 # add_library(utils)
 # target_sources(utils PUBLIC FILE_SET CXX_MODULES FILES src/modules/Utils.cppm)
@@ -83,3 +83,6 @@ target_include_directories(imgui_main PUBLIC
 target_link_libraries(imgui_main OpenGL::GL glfw)
 
 add_executable(binary_to_compressed_c ${IMGUI_DIR}/misc/fonts/binary_to_compressed_c.cpp)
+
+add_executable(test src/test.cpp)
+target_include_directories(test PUBLIC src/ src/include)

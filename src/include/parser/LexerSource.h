@@ -4,6 +4,7 @@
 #include <string_view>
 #include <utility>
 #include <stack>
+#include <print>
 
 namespace ngc
 {

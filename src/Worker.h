@@ -105,6 +105,7 @@ private:
             auto result = program.compile();
 
             if(!result) {
+                std::println("error: {}", result.error().text());
                 m_parserErrors.emplace_back(std::move(result.error()));
             }
         }
