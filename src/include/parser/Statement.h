@@ -33,12 +33,12 @@ namespace ngc
         virtual bool is(const class LetStatement *) const { return false; }
 
         template<typename T>
-        [[nodiscard]] bool is() const {
+        [[nodiscard]] bool is() const requires std::derived_from<T, Statement> {
             return this->is(static_cast<const T *>(nullptr));
         }
 
         template<typename T>
-        const T *as() const {
+        const T *as() const requires std::derived_from<T, Statement> {
             return this->is(static_cast<const T *>(nullptr)) ? static_cast<const T *>(this) : nullptr;
         }
 
