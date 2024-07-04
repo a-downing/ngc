@@ -1,4 +1,5 @@
 1 0 0 1.234 0 0 0 0.25 1/4" end mill
 2 0 0 3.321 0 0 0 0.5 1/2" ball end mill
 3 0 0 1.69 0 0 0 0.125 1/8" end mill
-4 0 0 1 0 0 0 0.25 1/4" ball end mill
+4 0 0 1 0 0 0 0.25 1/4" ball end mil
+7 0 0 1.234 0 0 0 0.25 1/4" end mill

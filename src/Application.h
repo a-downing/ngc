@@ -2,6 +2,7 @@
 
 #include "parser/Statement.h"
 #include <cstdint>
+#include <ranges>
 
 #ifdef __clang__
     #pragma push_macro("__cpp_concepts")
@@ -25,19 +26,13 @@
 #include "Worker.h"
 
 #include "gui/imgui_custom.h"
-#include "memory/Vars.h"
-#include "memory/Memory.h"
-#include "machine/Machine.h"
 #include "machine/ToolTable.h"
-#include "evaluator/Evaluator.h"
 
 #include "gui/tool_table_strings_t.h"
 
 class Application final : public ngc::EvaluatorMessageVisitor {
     GLFWwindow *m_window;
     std::filesystem::path m_path = std::filesystem::absolute(".").lexically_normal();
-    ngc::Memory m_mem;
-    ngc::Machine m_machine;
     ngc::ToolTable m_tools;
     std::vector<tool_table_strings_t> m_toolStrings;
     std::vector<std::tuple<std::string, std::string>> m_programSource;
@@ -52,10 +47,10 @@ class Application final : public ngc::EvaluatorMessageVisitor {
 
     std::string m_errorMessage;
 
-    Worker m_worker;
+    Worker m_worker{};
 
 public:
-    Application(GLFWwindow *window) : m_window(window), m_machine(m_mem), m_worker(m_mem) { }
+    Application(GLFWwindow *window) : m_window(window) { }
 
     void init() {
         auto result = m_tools.load();
@@ -143,18 +138,11 @@ public:
 
     void renderMessagesWindow() {
         if(ImGui::Begin("Messages", &m_enableMessagesWindow)) {
-            // m_worker.foreachEvaluatorMessage([](const ngc::EvaluatorMessage *msg) {
-            //     if(auto blockMsg = msg->as<ngc::BlockMessage>()) {
-            //         ImGui::TextUnformatted(blockMsg->block().statement()->text().c_str());
-            //         return;
-            //     }
-
-            //     if(auto printMsg = msg->as<ngc::PrintMessage>()) {
-            //         ImGui::PushStyleColor(ImGuiCol_Text, ImVec4_Blueish);
-            //         ImGui::TextUnformatted(std::format("PRINT: {}", printMsg->text()).c_str());
-            //         ImGui::PopStyleColor();
-            //     }
-            // });
+            for(const auto &msg : m_worker.printMessages()) {
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4_Blueish);
+                ImGui::TextUnformatted(std::format("PRINT: {}", msg).c_str());
+                ImGui::PopStyleColor();
+            }
 
             ImGui::End();
         }
@@ -278,7 +266,7 @@ public:
                     ImGui::TextUnformatted(std::format("{}", name).c_str());
 
                     ImGui::TableSetColumnIndex(3);
-                    auto value = m_mem.read(var);
+                    auto value = m_worker.read(var);
                     ImGui::TextUnformatted(std::format("{}", value).c_str());
 
                     address++;
@@ -320,10 +308,20 @@ public:
                 ImGui::EndChild();
             }
 
-            if(ImGui::BeginChild("bottom", {0, 0 }, ImGuiChildFlags_Border)) {
+            if(ImGui::BeginChild("middle", {0, 0 }, ImGuiChildFlags_Border | ImGuiChildFlags_ResizeY)) {
                 for(const auto &error : m_worker.parserErrors()) {
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4_Redish);
                     ImGui::Selectable(error.text().c_str());
+                    ImGui::PopStyleColor();
+                }
+
+                ImGui::EndChild();
+            }
+
+            if(ImGui::BeginChild("bottom", {0, 0 }, ImGuiChildFlags_Border)) {
+                for(const auto &block : m_worker.blockMessages()) {
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4_Greenish);
+                    ImGui::Selectable(block.c_str());
                     ImGui::PopStyleColor();
                 }
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <print>
+#include <tuple>
 #include <vector>
 #include <format>
 #include <memory>
@@ -8,6 +9,9 @@
 #include <utility>
 
 #include "gcode/GCode.h"
+#include "gcode/GCodeStateDifference.h"
+#include "gcode/gcode.gen.h"
+#include "machine/ToolTable.h"
 #include "memory/Memory.h"
 #include "machine/MachineCommand.h"
 #include "memory/Vars.h"
@@ -24,23 +28,33 @@ namespace ngc {
 
     class Machine {
         position_t m_pos = {};
-        Memory &m_mem;
+        position_t m_toolOffset = {};
+        Memory m_memory;
+        ToolTable m_toolTable;
         GCodeState m_state{};
         std::vector<std::unique_ptr<MachineCommand>> m_commands;
 
     public:
-        explicit Machine(Memory &mem) : m_mem(mem) {
-            m_mem.init(gVars);
-            const auto num = static_cast<int>(mem.read(Var::COORDSYS));
+        Machine() {
+            m_memory.init(gVars);
+            auto result = m_toolTable.load();
+
+            if(!result) {
+                PANIC("{}", result.error());
+            }
+
+            const auto num = static_cast<int>(m_memory.read(Var::COORDSYS));
             m_state.affectState(coordsys(num));
         }
 
-        const GCodeState &state() const { return m_state; }
-        const std::vector<std::unique_ptr<MachineCommand>> &commands() const { return m_commands; }
+        template<typename Self> auto &memory(this Self &&self) { return std::forward<Self>(self).m_memory; }
+        template<typename Self> auto &toolTable(this Self &&self) { return std::forward<Self>(self).m_toolTable; }
+        template<typename Self> auto &state(this Self &&self) { return std::forward<Self>(self).m_state; }
+        template<typename Self> auto &commands(this Self &&self) { return std::forward<Self>(self).m_commands; }
 
         void executeBlock(const Block &block) {
+            m_state.resetModal();
             auto state = m_state;
-            state.resetModal();
 
             if(block.blockDelete()) {
                 return;
@@ -50,21 +64,107 @@ namespace ngc {
                 state.affectState(word);
             }
 
-            const auto diff = m_state.calculateDifference(state);
+            auto diff = GCodeStateDifference(m_state, state);
 
-            if(diff.modeSpindle) {
-                if(*diff.modeSpindle == MCSpindle::M5) {
-                    m_commands.emplace_back(std::make_unique<SpindleStop>());
-                } else if(state.S() > 0 && (*diff.modeSpindle == MCSpindle::M3 || *diff.modeSpindle == MCSpindle::M4)) {
-                    const auto dir = *diff.modeSpindle == MCSpindle::M3 ? SpindleStart::Dir::CW : SpindleStart::Dir::CCW;
-                    m_commands.emplace_back(std::make_unique<SpindleStart>(dir, state.S()));
+            if(auto modeMotion = diff.takeModeMotion()) {
+                m_state.modeMotion(*modeMotion);
+            }
+
+            if(auto modeDistance = diff.takeModeDistance()) {
+                m_state.modeDistance(*modeDistance);
+            }
+
+            if(auto modeCoordSys = diff.takeModeCoordSys()) {
+                m_state.modeCoordSys(*modeCoordSys);
+            }
+
+            if(auto nonModal = diff.monModal()) {
+                if(m_state.nonModal()) {
+                    PANIC("already have non-modal: {}", name(*m_state.nonModal()));
+                }
+
+                if(*nonModal == GCNonModal::G53) {
+                    m_state.nonModal(*diff.takeNonModal());
                 }
             }
 
-            m_state = state;
+            if(auto tool = diff.takeT()) {
+                m_state.T(*tool);
+            }
+
+            if(auto speed = diff.takeS()) {
+                m_state.S(*speed);
+            }
+
+            if(auto feed = diff.takeF()) {
+                m_state.F(*feed);
+            }
+
+            if(auto modeToolChange = diff.takeModeToolChange()) {
+                m_state.modeToolChange(*modeToolChange);
+            }
+
+            if(auto modeSpindle = diff.takeModeSpindle()) {
+                m_state.modeSpindle(*modeSpindle);
+
+                if(modeSpindle == MCSpindle::M5) {
+                    m_commands.emplace_back(std::make_unique<SpindleStop>());
+                } else if(m_state.S() > 0 && (modeSpindle == MCSpindle::M3 || modeSpindle == MCSpindle::M4)) {
+                    const auto dir = modeSpindle == MCSpindle::M3 ? SpindleStart::Dir::CW : SpindleStart::Dir::CCW;
+                    m_commands.emplace_back(std::make_unique<SpindleStart>(dir, m_state.S()));
+                }
+            }
+
+            if(auto modeToolLengthOffset = diff.takeModeToolLengthOffset()) {
+                int toolNumber = static_cast<int>(m_state.T());
+
+                std::ignore = diff.takeMovement();
+                m_state.modeToolLengthOffset(*modeToolLengthOffset);
+
+                if(auto h = diff.takeH()) {
+                    toolNumber = static_cast<int>(*h);
+                }
+
+                if(auto tool = m_toolTable.get(toolNumber)) {
+                    m_toolOffset = { tool->x, tool->y, tool->z, tool->a, tool->b, tool->c };
+                } else {
+                    PANIC("{}: tool not found: {}", block.statement()->startToken().location(), toolNumber);
+                }
+            }
+
+            if(auto modePlane = diff.takeModePlane()) {
+                m_state.modePlane(*modePlane);
+            }
+
+            if(auto modeStop = diff.takeModeStop()) {
+                m_state.modeStop(*modeStop);
+            }
+
+            if(auto movement = diff.takeMovement(); !movement.empty()) {
+                if(movement.X) { m_state.X(*movement.X); }
+                if(movement.Y) { m_state.Y(*movement.Y); }
+                if(movement.Z) { m_state.Z(*movement.Z); }
+                if(movement.A) { m_state.A(*movement.A); }
+                if(movement.B) { m_state.B(*movement.B); }
+                if(movement.C) { m_state.C(*movement.C); }
+                if(movement.I) { m_state.I(*movement.I); }
+                if(movement.J) { m_state.J(*movement.J); }
+                if(movement.K) { m_state.K(*movement.K); }
+
+                handleMotion(block);
+            }
+
+            if(!diff.empty()) {
+                PANIC("{}: unhandled gcode state change: {}", block.statement()->startToken().location(), diff.text());
+            }
         }
 
     private:
+        void handleMotion(const Block &block) {
+            std::println("handleMotion: {}", block.statement()->text());
+            // TODO: handle motion
+        }
+
         [[nodiscard]] position_t position(const GCodeState &state) {
             switch(state.modeDistance()) {
                 case GCDist::G90: return positionAbsolute(state);
@@ -125,7 +225,7 @@ namespace ngc {
         }
 
         [[nodiscard]] position_t offset(const Var x, const Var y, const Var z, const Var a, const Var b, const Var c) const {
-            return { m_mem.read(x), m_mem.read(y), m_mem.read(z), m_mem.read(a), m_mem.read(b), m_mem.read(c) };
+            return { m_memory.read(x), m_memory.read(y), m_memory.read(z), m_memory.read(a), m_memory.read(b), m_memory.read(c) };
         }
     };
 }

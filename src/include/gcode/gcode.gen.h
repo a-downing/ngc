@@ -1,11 +1,12 @@
-#ifndef GCODE_GEN_H
-#define GCODE_GEN_H
+#pragma once
 
+#include <cstdint>
 #include <utility>
-#include <format>
-#include <stdexcept>
+#include <string_view>
 
-enum class GCode {
+#include "utils.h"
+
+enum class GCode : std::uint8_t {
     G0 = 0,
     G1 = 1,
     G2 = 2,
@@ -34,7 +35,7 @@ enum class GCode {
     G53 = 25,
 };
 
-inline const char *name(const GCode code) {
+inline std::string_view name(const GCode code) {
     switch(code) {
         case GCode::G0: return "G0";
         case GCode::G1: return "G1";
@@ -62,95 +63,102 @@ inline const char *name(const GCode code) {
         case GCode::G59_3: return "G59.3";
         case GCode::G61_1: return "G61.1";
         case GCode::G53: return "G53";
-        default: throw std::runtime_error(std::format("{}() invalid code GCode::{}", __func__, std::to_underlying(code)));
     }
+
+    PANIC("{}() invalid code GCode::{}", __func__, std::to_underlying(code));
 }
 
-enum class GCMotion {
+enum class GCMotion : std::uint8_t {
     G0 = 0,
     G1 = 1,
     G2 = 2,
     G3 = 3,
 };
 
-inline const char *name(const GCMotion code) {
+inline std::string_view name(const GCMotion code) {
     switch(code) {
         case GCMotion::G0: return "G0";
         case GCMotion::G1: return "G1";
         case GCMotion::G2: return "G2";
         case GCMotion::G3: return "G3";
-        default: throw std::runtime_error(std::format("{}() invalid code GCMotion::{}", __func__, std::to_underlying(code)));
     }
+
+    PANIC("{}() invalid code GCMotion::{}", __func__, std::to_underlying(code));
 }
 
-enum class GCPlane {
+enum class GCPlane : std::uint8_t {
     G17 = 4,
     G18 = 5,
     G19 = 6,
 };
 
-inline const char *name(const GCPlane code) {
+inline std::string_view name(const GCPlane code) {
     switch(code) {
         case GCPlane::G17: return "G17";
         case GCPlane::G18: return "G18";
         case GCPlane::G19: return "G19";
-        default: throw std::runtime_error(std::format("{}() invalid code GCPlane::{}", __func__, std::to_underlying(code)));
     }
+
+    PANIC("{}() invalid code GCPlane::{}", __func__, std::to_underlying(code));
 }
 
-enum class GCDist {
+enum class GCDist : std::uint8_t {
     G90 = 7,
     G91 = 8,
 };
 
-inline const char *name(const GCDist code) {
+inline std::string_view name(const GCDist code) {
     switch(code) {
         case GCDist::G90: return "G90";
         case GCDist::G91: return "G91";
-        default: throw std::runtime_error(std::format("{}() invalid code GCDist::{}", __func__, std::to_underlying(code)));
     }
+
+    PANIC("{}() invalid code GCDist::{}", __func__, std::to_underlying(code));
 }
 
-enum class GCFeed {
+enum class GCFeed : std::uint8_t {
     G93 = 9,
     G94 = 10,
 };
 
-inline const char *name(const GCFeed code) {
+inline std::string_view name(const GCFeed code) {
     switch(code) {
         case GCFeed::G93: return "G93";
         case GCFeed::G94: return "G94";
-        default: throw std::runtime_error(std::format("{}() invalid code GCFeed::{}", __func__, std::to_underlying(code)));
     }
+
+    PANIC("{}() invalid code GCFeed::{}", __func__, std::to_underlying(code));
 }
 
-enum class GCUnits {
+enum class GCUnits : std::uint8_t {
     G20 = 11,
     G21 = 12,
 };
 
-inline const char *name(const GCUnits code) {
+inline std::string_view name(const GCUnits code) {
     switch(code) {
         case GCUnits::G20: return "G20";
         case GCUnits::G21: return "G21";
-        default: throw std::runtime_error(std::format("{}() invalid code GCUnits::{}", __func__, std::to_underlying(code)));
     }
+
+    PANIC("{}() invalid code GCUnits::{}", __func__, std::to_underlying(code));
 }
 
-enum class GCTLen {
+enum class GCTLen : std::uint8_t {
     G43 = 13,
     G49 = 14,
 };
 
-inline const char *name(const GCTLen code) {
+inline std::string_view name(const GCTLen code) {
     switch(code) {
         case GCTLen::G43: return "G43";
         case GCTLen::G49: return "G49";
-        default: throw std::runtime_error(std::format("{}() invalid code GCTLen::{}", __func__, std::to_underlying(code)));
     }
+
+    PANIC("{}() invalid code GCTLen::{}", __func__, std::to_underlying(code));
 }
 
-enum class GCCoord {
+enum class GCCoord : std::uint8_t {
     G54 = 15,
     G55 = 16,
     G56 = 17,
@@ -162,7 +170,7 @@ enum class GCCoord {
     G59_3 = 23,
 };
 
-inline const char *name(const GCCoord code) {
+inline std::string_view name(const GCCoord code) {
     switch(code) {
         case GCCoord::G54: return "G54";
         case GCCoord::G55: return "G55";
@@ -173,31 +181,32 @@ inline const char *name(const GCCoord code) {
         case GCCoord::G59_1: return "G59.1";
         case GCCoord::G59_2: return "G59.2";
         case GCCoord::G59_3: return "G59.3";
-        default: throw std::runtime_error(std::format("{}() invalid code GCCoord::{}", __func__, std::to_underlying(code)));
     }
+
+    PANIC("{}() invalid code GCCoord::{}", __func__, std::to_underlying(code));
 }
 
-enum class GCPath {
+enum class GCPath : std::uint8_t {
     G61_1 = 24,
 };
 
-inline const char *name(const GCPath code) {
+inline std::string_view name(const GCPath code) {
     switch(code) {
         case GCPath::G61_1: return "G61.1";
-        default: throw std::runtime_error(std::format("{}() invalid code GCPath::{}", __func__, std::to_underlying(code)));
     }
+
+    PANIC("{}() invalid code GCPath::{}", __func__, std::to_underlying(code));
 }
 
-enum class GCNonModal {
+enum class GCNonModal : std::uint8_t {
     G53 = 25,
 };
 
-inline const char *name(const GCNonModal code) {
+inline std::string_view name(const GCNonModal code) {
     switch(code) {
         case GCNonModal::G53: return "G53";
-        default: throw std::runtime_error(std::format("{}() invalid code GCNonModal::{}", __func__, std::to_underlying(code)));
     }
+
+    PANIC("{}() invalid code GCNonModal::{}", __func__, std::to_underlying(code));
 }
 
-
-#endif
