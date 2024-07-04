@@ -1,5 +1,6 @@
 #pragma once
 
+#include <optional>
 #ifdef __clang__
     #pragma push_macro("__cpp_concepts")
     #define __cpp_concepts 202002L
@@ -37,6 +38,14 @@ namespace ngc {
     public:
         auto begin() const { return m_tools.begin(); }
         auto end() const { return m_tools.end(); }
+
+        std::optional<tool_entry_t> get(int num) {
+            if(!m_tools.contains(num)) {
+                return std::nullopt;
+            }
+
+            return m_tools.at(num);
+        }
 
         void set(int num, const tool_entry_t &tool) {
             m_tools.insert_or_assign(num, tool);

@@ -21,7 +21,7 @@ for code in all:
 
 
 def decl_enum(name, codes):
-    print(f"enum class {name} {{")
+    print(f"enum class {name} : std::uint8_t {{")
 
     for code in codes:
         print(f"    {code.replace(".", "_")} = {ids[code]},")
@@ -30,19 +30,25 @@ def decl_enum(name, codes):
 
 
 def decl_name(name, codes):
-    print(f"inline const char *name(const {name} code) {{")
+    print(f"inline std::string_view name(const {name} code) {{")
     print("    switch(code) {")
 
     for code in codes:
         print(f"        case {name}::{code.replace(".", "_")}: return \"{code}\";")
-
-    print(f"        default: throw std::runtime_error(std::format(\"{{}}() invalid code {name}::{{}}\", __func__, std::to_underlying(code)));")
     print("    }")
+    print()
+    print(f"    PANIC(\"{{}}() invalid code {name}::{{}}\", __func__, std::to_underlying(code));")
     print("}\n")
 
 
-print("#ifndef GCODE_GEN_H")
-print("#define GCODE_GEN_H\n")
+print("#pragma once")
+print()
+print("#include <cstdint>")
+print("#include <utility>")
+print("#include <string_view>")
+print()
+print("#include \"utils.h\"")
+print()
 
 decl_enum("GCode", all)
 decl_name("GCode", all)
@@ -73,5 +79,3 @@ decl_name("GCPath", path)
 
 decl_enum("GCNonModal", non_modal)
 decl_name("GCNonModal", non_modal)
-
-print("\n#endif")
