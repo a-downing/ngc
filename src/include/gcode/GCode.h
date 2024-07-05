@@ -182,23 +182,108 @@ namespace ngc {
         const int fract = static_cast<int>((real - whole) * 10 + 0.5);
 
         switch(whole) {
-            case 0: return GCode::G0;
-            case 1: return GCode::G1;
-            case 17: return GCode::G17;
-            case 18: return GCode::G18;
-            case 19: return GCode::G19;
-            case 2: return GCode::G2;
-            case 20: return GCode::G20;
-            case 21: return GCode::G21;
-            case 3: return GCode::G3;
-            case 43: return GCode::G43;
-            case 49: return GCode::G49;
-            case 53: return GCode::G53;
-            case 54: return GCode::G54;
-            case 55: return GCode::G55;
-            case 56: return GCode::G56;
-            case 57: return GCode::G57;
-            case 58: return GCode::G58;
+            case 0:
+                switch(fract) {
+                    case 0: return GCode::G0;
+                }
+
+                break;
+            case 1:
+                switch(fract) {
+                    case 0: return GCode::G1;
+                }
+
+                break;
+            case 17:
+                switch(fract) {
+                    case 0: return GCode::G17;
+                }
+
+                break;
+            case 18:
+                switch(fract) {
+                    case 0: return GCode::G18;
+                }
+
+                break;
+            case 19:
+                switch(fract) {
+                    case 0: return GCode::G19;
+                }
+
+                break;
+            case 2:
+                switch(fract) {
+                    case 0: return GCode::G2;
+                }
+
+                break;
+            case 20:
+                switch(fract) {
+                    case 0: return GCode::G20;
+                }
+
+                break;
+            case 21:
+                switch(fract) {
+                    case 0: return GCode::G21;
+                }
+
+                break;
+            case 3:
+                switch(fract) {
+                    case 0: return GCode::G3;
+                }
+
+                break;
+            case 43:
+                switch(fract) {
+                    case 0: return GCode::G43;
+                }
+
+                break;
+            case 49:
+                switch(fract) {
+                    case 0: return GCode::G49;
+                }
+
+                break;
+            case 53:
+                switch(fract) {
+                    case 0: return GCode::G53;
+                }
+
+                break;
+            case 54:
+                switch(fract) {
+                    case 0: return GCode::G54;
+                }
+
+                break;
+            case 55:
+                switch(fract) {
+                    case 0: return GCode::G55;
+                }
+
+                break;
+            case 56:
+                switch(fract) {
+                    case 0: return GCode::G56;
+                }
+
+                break;
+            case 57:
+                switch(fract) {
+                    case 0: return GCode::G57;
+                }
+
+                break;
+            case 58:
+                switch(fract) {
+                    case 0: return GCode::G58;
+                }
+
+                break;
             case 59:
                 switch(fract) {
                     case 0: return GCode::G59;
@@ -207,17 +292,37 @@ namespace ngc {
                     case 3: return GCode::G59_3;
                 }
 
-                PANIC("invalid gcode G{}", real);
+                break;
             case 61:
                 switch(fract) {
                     case 1: return GCode::G61_1;
                 }
 
-                PANIC("invalid gcode G{}", real);
-            case 90: return GCode::G90;
-            case 91: return GCode::G91;
-            case 93: return GCode::G93;
-            case 94: return GCode::G94;
+                break;
+            case 90:
+                switch(fract) {
+                    case 0: return GCode::G90;
+                }
+
+                break;
+            case 91:
+                switch(fract) {
+                    case 0: return GCode::G91;
+                }
+
+                break;
+            case 93:
+                switch(fract) {
+                    case 0: return GCode::G93;
+                }
+
+                break;
+            case 94:
+                switch(fract) {
+                    case 0: return GCode::G94;
+                }
+
+                break;
         }
 
         PANIC("invalid gcode G{}", real);
@@ -273,7 +378,7 @@ namespace ngc {
         GCDist m_modeDistance{};
         GCFeed m_modeFeedrate{};
         GCUnits m_modeUnits{};
-        GCTLen m_modeToolLengthOffset{};
+        GCTLen m_modeToolOffset{};
         GCCoord m_modeCoordSys{};
         GCPath m_modePath{};
 
@@ -313,7 +418,7 @@ namespace ngc {
         GCDist modeDistance() const { return m_modeDistance; }
         GCFeed modeFeedrate() const { return m_modeFeedrate; }
         GCUnits modeUnits() const { return m_modeUnits; }
-        GCTLen modeToolLengthOffset() const { return m_modeToolLengthOffset; }
+        GCTLen modeToolOffset() const { return m_modeToolOffset; }
         GCCoord modeCoordSys() const { return m_modeCoordSys; }
         GCPath modePath() const { return m_modePath; }
         MCSpindle modeSpindle() const { return m_modeSpindle; }
@@ -326,7 +431,7 @@ namespace ngc {
         void modeDistance(const GCDist x) { m_modeDistance = x; }
         void modeFeedrate(const GCFeed x) { m_modeFeedrate = x; }
         void modeUnits(const GCUnits x) { m_modeUnits = x; }
-        void modeToolLengthOffset(const GCTLen x) { m_modeToolLengthOffset = x; }
+        void modeToolOffset(const GCTLen x) { m_modeToolOffset = x; }
         void modeCoordSys(const GCCoord x) { m_modeCoordSys = x; }
         void modePath(const GCPath x) { m_modePath = x; }
         void modeSpindle(const MCSpindle x) { m_modeSpindle = x; }
@@ -427,7 +532,7 @@ namespace ngc {
                     return;
                 case GCode::G43:
                 case GCode::G49:
-                    m_modeToolLengthOffset = static_cast<GCTLen>(code);
+                    m_modeToolOffset = static_cast<GCTLen>(code);
                     return;
                 case GCode::G54:
                 case GCode::G55:

@@ -1,6 +1,7 @@
 #pragma once
 
-#include "parser/Statement.h"
+#include "machine/MachineCommand.h"
+#include <GL/glu.h>
 #include <cstdint>
 #include <ranges>
 
@@ -17,6 +18,8 @@
 #include <print>
 #include <string>
 
+#include <GL/gl.h>
+#include <GL/glu.h>
 #include <GLFW/glfw3.h>
 
 #include "imgui.h"
@@ -95,6 +98,52 @@ public:
         }
 
         initToolTableStrings();
+    }
+
+    void render3D() {
+        glMatrixMode(GL_PROJECTION);
+        glLoadIdentity();
+        gluPerspective(60.0, 1.0, 0.1, 1000.0);
+        gluLookAt(0, -2, 8, 2, 5, 0, 0, 0, 1);
+        
+        glMatrixMode(GL_MODELVIEW);
+        glLoadIdentity();
+
+        glTranslated(0, 0, -2);
+
+        glBegin(GL_LINES);
+        glColor3f(1.0,0.4,0.4);
+
+        glVertex3d(-10.0, -10.0, 0.0);
+        glVertex3d(-10.0, 10.0, 0.0);
+
+        glVertex3d(-10.0, 10.0, 0.0);
+        glVertex3d(10.0, 10.0, 0.0);
+
+        glVertex3d(10.0, 10.0, 0.0);
+        glVertex3d(10.0, -10.0, 0.0);
+
+        glVertex3d(10.0, -10.0, 0.0);
+        glVertex3d(-10.0, -10.0, 0.0);
+
+        m_worker.lock([&]() {
+            m_worker.machine().foreachCommand([](const ngc::MachineCommand &cmd) {
+                if(auto moveLine = cmd.as<ngc::MoveLine>()) {
+                    if(moveLine->speed() == -1.0) {
+                        glColor3f(1.0, 1.0, 0.4);
+                    } else {
+                        glColor3f(0.4, 0.4, 1.0);
+                    }
+
+                    auto &v = moveLine->from();
+                    auto &w = moveLine->to();
+                    glVertex3d(v.x, v.y, v.z);
+                    glVertex3d(w.x, w.y, w.z);
+                }
+            });
+        });
+
+        glEnd();
     }
 
     void renderErrorWindow() {
@@ -304,9 +353,9 @@ public:
 
                     ImGui::EndTabBar();
                 }
-
-                ImGui::EndChild();
             }
+
+            ImGui::EndChild();
 
             if(ImGui::BeginChild("middle", {0, 0 }, ImGuiChildFlags_Border | ImGuiChildFlags_ResizeY)) {
                 for(const auto &error : m_worker.parserErrors()) {
@@ -314,9 +363,9 @@ public:
                     ImGui::Selectable(error.text().c_str());
                     ImGui::PopStyleColor();
                 }
-
-                ImGui::EndChild();
             }
+
+            ImGui::EndChild();
 
             if(ImGui::BeginChild("bottom", {0, 0 }, ImGuiChildFlags_Border)) {
                 for(const auto &block : m_worker.blockMessages()) {
@@ -324,9 +373,9 @@ public:
                     ImGui::Selectable(block.c_str());
                     ImGui::PopStyleColor();
                 }
-
-                ImGui::EndChild();
             }
+
+            ImGui::EndChild();
 
             ImGui::End();
         }

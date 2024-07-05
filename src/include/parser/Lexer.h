@@ -236,7 +236,8 @@ namespace ngc
                 return std::unexpected(Error("unterminated comment", m_source.name(), line(), col()));
             }
 
-            return makeToken(Token::Kind::COMMENT);
+            //return makeToken(Token::Kind::COMMENT);
+            return nextToken();
         }
 
         [[nodiscard]] Token number(const char c) {
