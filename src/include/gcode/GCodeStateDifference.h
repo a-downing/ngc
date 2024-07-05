@@ -19,7 +19,7 @@ namespace ngc {
         std::optional<GCDist> m_modeDistance;
         std::optional<GCFeed> m_modeFeedrate;
         std::optional<GCUnits> m_modeUnits;
-        std::optional<GCTLen> m_modeToolLengthOffset;
+        std::optional<GCTLen> m_modeToolOffset;
         std::optional<GCCoord> m_modeCoordSys;
         std::optional<GCPath> m_modePath;
 
@@ -38,7 +38,7 @@ namespace ngc {
             if(a.modeDistance() != b.modeDistance()) { m_modeDistance = b.modeDistance(); }
             if(a.modeFeedrate() != b.modeFeedrate()) { m_modeFeedrate = b.modeFeedrate(); }
             if(a.modeUnits() != b.modeUnits()) { m_modeUnits = b.modeUnits(); }
-            if(a.modeToolLengthOffset() != b.modeToolLengthOffset()) { m_modeToolLengthOffset = b.modeToolLengthOffset(); }
+            if(a.modeToolOffset() != b.modeToolOffset()) { m_modeToolOffset = b.modeToolOffset(); }
             if(a.modeCoordSys() != b.modeCoordSys()) { m_modeCoordSys = b.modeCoordSys(); }
             if(a.modePath() != b.modePath()) { m_modePath = b.modePath(); }
 
@@ -73,7 +73,7 @@ namespace ngc {
         std::optional<GCDist> modeDistance() const { return m_modeDistance; }
         std::optional<GCFeed> modeFeedrate() const { return m_modeFeedrate; }
         std::optional<GCUnits> modeUnits() const { return m_modeUnits; }
-        std::optional<GCTLen> modeToolLengthOffset() const { return m_modeToolLengthOffset; }
+        std::optional<GCTLen> modeToolLengthOffset() const { return m_modeToolOffset; }
         std::optional<GCCoord> modeCoordSys() const { return m_modeCoordSys; }
         std::optional<GCPath> modePath() const { return m_modePath; }
         std::optional<MCSpindle> modeSpindle() const { return m_modeSpindle; }
@@ -105,7 +105,7 @@ namespace ngc {
         std::optional<GCDist> takeModeDistance() { return std::exchange(m_modeDistance, std::nullopt); }
         std::optional<GCFeed> takeModeFeedrate() { return std::exchange(m_modeFeedrate, std::nullopt); }
         std::optional<GCUnits> takeModeUnits() { return std::exchange(m_modeUnits, std::nullopt); }
-        std::optional<GCTLen> takeModeToolLengthOffset() { return std::exchange(m_modeToolLengthOffset, std::nullopt); }
+        std::optional<GCTLen> takeModeToolLengthOffset() { return std::exchange(m_modeToolOffset, std::nullopt); }
         std::optional<GCCoord> takeModeCoordSys() { return std::exchange(m_modeCoordSys, std::nullopt); }
         std::optional<GCPath> takeModePath() { return std::exchange(m_modePath, std::nullopt); }
         std::optional<MCSpindle> takeModeSpindle() { return std::exchange(m_modeSpindle, std::nullopt); }
@@ -142,7 +142,7 @@ namespace ngc {
             if(m_modeDistance) { return false; }
             if(m_modeFeedrate) { return false; }
             if(m_modeUnits) { return false; }
-            if(m_modeToolLengthOffset) { return false; }
+            if(m_modeToolOffset) { return false; }
             if(m_modeCoordSys) { return false; }
             if(m_modePath) { return false; }
 
@@ -165,7 +165,7 @@ namespace ngc {
             if(m_modeDistance) { text += std::format("{}, ", name(*m_modeDistance)); }
             if(m_modeFeedrate) { text += std::format("{}, ", name(*m_modeFeedrate)); }
             if(m_modeUnits) { text += std::format("{}, ", name(*m_modeUnits)); }
-            if(m_modeToolLengthOffset) { text += std::format("{}, ", name(*m_modeToolLengthOffset)); }
+            if(m_modeToolOffset) { text += std::format("{}, ", name(*m_modeToolOffset)); }
             if(m_modeCoordSys) { text += std::format("{}, ", name(*m_modeCoordSys)); }
             if(m_modePath) { text += std::format("{}, ", name(*m_modePath)); }
             if(m_nonModal) { text += std::format("{}, ", name(*m_nonModal)); }

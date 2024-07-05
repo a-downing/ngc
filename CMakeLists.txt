@@ -14,6 +14,7 @@ set(IMGUI_DIR imgui)
 
 set(OpenGL_GL_PREFERENCE GLVND)
 find_package(OpenGL REQUIRED)
+find_package(GLUT REQUIRED)
 #find_package(glfw3 REQUIRED)
 add_subdirectory(glfw)
 
@@ -80,7 +81,7 @@ target_include_directories(imgui_main PUBLIC
         src/
         src/include)
 
-target_link_libraries(imgui_main OpenGL::GL glfw)
+target_link_libraries(imgui_main OpenGL::GL OpenGL::GLU glfw)
 
 add_executable(binary_to_compressed_c ${IMGUI_DIR}/misc/fonts/binary_to_compressed_c.cpp)
 

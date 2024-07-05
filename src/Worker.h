@@ -44,6 +44,13 @@ public:
         return m_machine.memory().read(var);
     }
 
+    void lock(const std::function<void()> &callback) const {
+        std::scoped_lock lock(m_mutex);
+        callback();
+    }
+
+    const ngc::Machine &machine() const { return m_machine; }
+
     bool compiled() const {
         std::scoped_lock lock(m_mutex);
         return m_compiled;

@@ -72,8 +72,6 @@ namespace ngc
         const auto fileSize = file.tellg();
         file.seekg(0, std::ios::beg);
 
-        std::println("readFile({}) fileSize: {}", filePath.string(), (size_t)fileSize);
-
         std::string fileContent(fileSize, '\0');
         file.read(&fileContent[0], fileSize);
 

@@ -1,5 +1,7 @@
 #pragma once
 
+#include <functional>
+#include <optional>
 #include <print>
 #include <tuple>
 #include <vector>
@@ -15,17 +17,10 @@
 #include "memory/Memory.h"
 #include "machine/MachineCommand.h"
 #include "memory/Vars.h"
+#include "utils.h"
 
 
 namespace ngc {
-    struct position_t {
-        double x{}, y{}, z{}, a{}, b{}, c{};
-    };
-
-    inline position_t operator+(const position_t &a, const position_t &b) {
-        return { a.x+b.x, a.y+b.y, a.z+b.z, a.a+b.a, a.b+b.b, a.c+b.c };
-    }
-
     class Machine {
         position_t m_pos = {};
         position_t m_toolOffset = {};
@@ -50,7 +45,12 @@ namespace ngc {
         template<typename Self> auto &memory(this Self &&self) { return std::forward<Self>(self).m_memory; }
         template<typename Self> auto &toolTable(this Self &&self) { return std::forward<Self>(self).m_toolTable; }
         template<typename Self> auto &state(this Self &&self) { return std::forward<Self>(self).m_state; }
-        template<typename Self> auto &commands(this Self &&self) { return std::forward<Self>(self).m_commands; }
+
+        void foreachCommand(const std::function<void(const MachineCommand &)> &callback) const {
+            for(const auto &cmd : m_commands) {
+                callback(*cmd.get());
+            }
+        }
 
         void executeBlock(const Block &block) {
             m_state.resetModal();
@@ -72,6 +72,14 @@ namespace ngc {
 
             if(auto modeDistance = diff.takeModeDistance()) {
                 m_state.modeDistance(*modeDistance);
+            }
+
+            if(auto modeFeedrate = diff.takeModeFeedrate()) {
+                if(modeFeedrate != GCFeed::G94) {
+                    PANIC("{}", name(*modeFeedrate));
+                }
+
+                m_state.modeFeedrate(*modeFeedrate);
             }
 
             if(auto modeCoordSys = diff.takeModeCoordSys()) {
@@ -110,7 +118,7 @@ namespace ngc {
                 if(modeSpindle == MCSpindle::M5) {
                     m_commands.emplace_back(std::make_unique<SpindleStop>());
                 } else if(m_state.S() > 0 && (modeSpindle == MCSpindle::M3 || modeSpindle == MCSpindle::M4)) {
-                    const auto dir = modeSpindle == MCSpindle::M3 ? SpindleStart::Dir::CW : SpindleStart::Dir::CCW;
+                    const auto dir = modeSpindle == MCSpindle::M3 ? Direction::CW : Direction::CCW;
                     m_commands.emplace_back(std::make_unique<SpindleStart>(dir, m_state.S()));
                 }
             }
@@ -119,10 +127,15 @@ namespace ngc {
                 int toolNumber = static_cast<int>(m_state.T());
 
                 std::ignore = diff.takeMovement();
-                m_state.modeToolLengthOffset(*modeToolLengthOffset);
+                m_state.modeToolOffset(*modeToolLengthOffset);
 
                 if(auto h = diff.takeH()) {
-                    toolNumber = static_cast<int>(*h);
+                    std::println("GOT HHHHHHHHHHHHHHHHHHHHHHHH");
+                    auto _h = static_cast<int>(*h);
+
+                    if(_h != 0) {
+                        toolNumber = _h;
+                    }
                 }
 
                 if(auto tool = m_toolTable.get(toolNumber)) {
@@ -161,55 +174,88 @@ namespace ngc {
 
     private:
         void handleMotion(const Block &block) {
-            std::println("handleMotion: {}", block.statement()->text());
-            // TODO: handle motion
+            auto workOffset = m_state.nonModal() == GCNonModal::G53 ? position_t() : offset(m_state.modeCoordSys());
+            
+            if(m_state.modeMotion() == GCMotion::G0 || m_state.modeMotion() == GCMotion::G1) {
+                auto pos = position() + workOffset; // TODO: the other offsets
+                auto speed = m_state.modeMotion() == GCMotion::G1 ? m_state.F() : m_state.F(); // TODO: this
+                m_commands.emplace_back(std::make_unique<MoveLine>(m_pos, pos, speed));
+                m_pos = pos;
+                return;
+            }
+
+            if(m_state.modeMotion() == GCMotion::G2 || m_state.modeMotion() == GCMotion::G3) {
+                auto pos = position() + workOffset;
+                auto direction = m_state.modeMotion() == GCMotion::G2 ? Direction::CW : Direction::CCW;
+                auto speed = m_state.modeMotion() == GCMotion::G1 ? m_state.F() : -1.0;
+                std::optional<vec3_t> center;
+
+                if(m_state.modePlane() == GCPlane::G17) {
+                    if(!m_state.I() || !m_state.J()) {
+                        PANIC("missing I or K for G17 arc: {}", block.statement()->text());
+                    }
+
+                    center = vec3_t(m_pos.x + *m_state.I(), m_pos.y + *m_state.J(), m_pos.z);
+                }
+
+                if(m_state.modePlane() == GCPlane::G18) {
+                    if(!m_state.I() || !m_state.K()) {
+                        PANIC("missing I or K for G18 arc: {}", block.statement()->text());
+                    }
+
+                    center = vec3_t(m_pos.x + *m_state.I(), m_pos.y, m_pos.z + *m_state.K());
+                }
+
+                if(m_state.modePlane() == GCPlane::G19) {
+                    if(!m_state.J() || !m_state.K()) {
+                        PANIC("missing J or K for G19 arc: {}", block.statement()->text());
+                    }
+
+                    center = vec3_t(m_pos.x, m_pos.y + *m_state.J(), m_pos.z + *m_state.K());
+                }
+
+                if(!center) {
+                    PANIC();
+                }
+
+                m_commands.emplace_back(std::make_unique<MoveArc>(m_pos, pos, *center, direction, speed));
+                return;
+            }
+
+            PANIC("unhandled motion: {}", block.statement()->text());
         }
 
-        [[nodiscard]] position_t position(const GCodeState &state) {
-            switch(state.modeDistance()) {
-                case GCDist::G90: return positionAbsolute(state);
-                case GCDist::G91: return positionRelative(state);
-                default: throw std::runtime_error(std::format("invalid code GCodeState::{}", std::to_underlying(state.modeDistance())));
-            }
-        }
+        position_t position() const {
+            position_t pos = m_pos;
 
-        [[nodiscard]] position_t positionAbsolute(const GCodeState &state) const {
-            auto pos = position_t();
-
-            if(state.X()) {
-                pos.x = *state.X();
+            if(m_state.X()) {
+                pos.x = m_state.modeDistance() == GCDist::G90 ? *m_state.X() : pos.x + *m_state.X();
             }
 
-            if(state.Y()) {
-                pos.y = *state.Y();
+            if(m_state.Y()) {
+                pos.y = m_state.modeDistance() == GCDist::G90 ? *m_state.Y() : pos.y + *m_state.Y();
             }
 
-            if(state.Z()) {
-                pos.z = *state.Z();
+            if(m_state.Z()) {
+                pos.z = m_state.modeDistance() == GCDist::G90 ? *m_state.Z() : pos.z + *m_state.Z();
+            }
+
+            if(m_state.A()) {
+                pos.a = m_state.modeDistance() == GCDist::G90 ? *m_state.A() : pos.a + *m_state.A();
+            }
+
+            if(m_state.B()) {
+                pos.b = m_state.modeDistance() == GCDist::G90 ? *m_state.B() : pos.b + *m_state.B();
+            }
+
+            if(m_state.C()) {
+                pos.c = m_state.modeDistance() == GCDist::G90 ? *m_state.C() : pos.c + *m_state.C();
             }
 
             return pos;
         }
 
-        [[nodiscard]] position_t positionRelative(const GCodeState &state) const {
-            auto pos = m_pos;
-
-            if(state.X()) {
-                pos.x = *state.X();
-            }
-
-            if(state.Y()) {
-                pos.y = *state.Y();
-            }
-
-            if(state.Z()) {
-                pos.z = *state.Z();
-            }
-
-            return pos;
-        }
-
-        [[nodiscard]] position_t offset(const GCCoord code) {
+        position_t offset(const GCCoord code) {
             switch(code) {
                 case GCCoord::G54: return offset(Var::G54_X, Var::G54_Y, Var::G54_Z, Var::G54_A, Var::G54_B, Var::G54_C);
                 case GCCoord::G55: return offset(Var::G55_X, Var::G55_Y, Var::G55_Z, Var::G55_A, Var::G55_B, Var::G55_C);
@@ -224,7 +270,7 @@ namespace ngc {
             }
         }
 
-        [[nodiscard]] position_t offset(const Var x, const Var y, const Var z, const Var a, const Var b, const Var c) const {
+        position_t offset(const Var x, const Var y, const Var z, const Var a, const Var b, const Var c) const {
             return { m_memory.read(x), m_memory.read(y), m_memory.read(z), m_memory.read(a), m_memory.read(b), m_memory.read(c) };
         }
     };
