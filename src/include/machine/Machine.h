@@ -45,6 +45,7 @@ namespace ngc {
         template<typename Self> auto &memory(this Self &&self) { return std::forward<Self>(self).m_memory; }
         template<typename Self> auto &toolTable(this Self &&self) { return std::forward<Self>(self).m_toolTable; }
         template<typename Self> auto &state(this Self &&self) { return std::forward<Self>(self).m_state; }
+        template<typename Self> auto &commands(this Self &&self) { return std::forward<Self>(self).m_commands; }
 
         void foreachCommand(const std::function<void(const MachineCommand &)> &callback) const {
             for(const auto &cmd : m_commands) {
@@ -178,7 +179,7 @@ namespace ngc {
             
             if(m_state.modeMotion() == GCMotion::G0 || m_state.modeMotion() == GCMotion::G1) {
                 auto pos = position() + workOffset; // TODO: the other offsets
-                auto speed = m_state.modeMotion() == GCMotion::G1 ? m_state.F() : m_state.F(); // TODO: this
+                auto speed = m_state.modeMotion() == GCMotion::G1 ? m_state.F() : -1;
                 m_commands.emplace_back(std::make_unique<MoveLine>(m_pos, pos, speed));
                 m_pos = pos;
                 return;
@@ -186,9 +187,10 @@ namespace ngc {
 
             if(m_state.modeMotion() == GCMotion::G2 || m_state.modeMotion() == GCMotion::G3) {
                 auto pos = position() + workOffset;
-                auto direction = m_state.modeMotion() == GCMotion::G2 ? Direction::CW : Direction::CCW;
+                auto flip = m_state.modeMotion() == GCMotion::G3 ? 1.0 : -1.0;
                 auto speed = m_state.modeMotion() == GCMotion::G1 ? m_state.F() : -1.0;
                 std::optional<vec3_t> center;
+                std::optional<vec3_t> axis;
 
                 if(m_state.modePlane() == GCPlane::G17) {
                     if(!m_state.I() || !m_state.J()) {
@@ -196,6 +198,7 @@ namespace ngc {
                     }
 
                     center = vec3_t(m_pos.x + *m_state.I(), m_pos.y + *m_state.J(), m_pos.z);
+                    axis = vec3_t(0.0, 0.0, 1.0) * flip;
                 }
 
                 if(m_state.modePlane() == GCPlane::G18) {
@@ -204,6 +207,7 @@ namespace ngc {
                     }
 
                     center = vec3_t(m_pos.x + *m_state.I(), m_pos.y, m_pos.z + *m_state.K());
+                    axis = vec3_t(0.0, 1.0, 0.0) * flip;
                 }
 
                 if(m_state.modePlane() == GCPlane::G19) {
@@ -212,13 +216,15 @@ namespace ngc {
                     }
 
                     center = vec3_t(m_pos.x, m_pos.y + *m_state.J(), m_pos.z + *m_state.K());
+                    axis = vec3_t(1.0, 0.0, 0.0) * flip;
                 }
 
-                if(!center) {
+                if(!center || !axis) {
                     PANIC();
                 }
 
-                m_commands.emplace_back(std::make_unique<MoveArc>(m_pos, pos, *center, direction, speed));
+                m_commands.emplace_back(std::make_unique<MoveArc>(m_pos, pos, *center, *axis, speed));
+                m_pos = pos;
                 return;
             }
 

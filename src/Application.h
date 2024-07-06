@@ -1,9 +1,13 @@
 #pragma once
 
-#include "machine/MachineCommand.h"
-#include <GL/glu.h>
+#include <filesystem>
+#include <glm/ext/quaternion_common.hpp>
+#include <print>
+#include <string>
+#include <cmath>
 #include <cstdint>
 #include <ranges>
+#include <numbers>
 
 #ifdef __clang__
     #pragma push_macro("__cpp_concepts")
@@ -14,26 +18,40 @@
     #include <expected>
 #endif
 
-#include <filesystem>
-#include <print>
-#include <string>
-
 #include <GL/gl.h>
 #include <GL/glu.h>
 #include <GLFW/glfw3.h>
 
+#define GLM_ENABLE_EXPERIMENTAL
+#include <glm/glm.hpp>
+#include <glm/vec3.hpp>
+#include <glm/mat4x4.hpp>
+#include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/type_ptr.hpp>
+#include <glm/gtx/vector_angle.hpp>
+#include <glm/gtx/projection.hpp>
+#include <glm/gtx/norm.hpp>
+#include <glm/ext/quaternion_trigonometric.hpp>
+#include <glm/ext/vector_double3.hpp>
+#include <glm/ext/vector_float3.hpp>
+#include <glm/geometric.hpp>
+#include <glm/gtx/compatibility.hpp>
+
 #include "imgui.h"
+#include "imgui_internal.h"
 #include "imgui_stdlib.h"
+#include "gui/imgui_custom.h"
 
 #include "utils.h"
 #include "Worker.h"
 
-#include "gui/imgui_custom.h"
 #include "machine/ToolTable.h"
+#include "machine/MachineCommand.h"
+
 
 #include "gui/tool_table_strings_t.h"
 
-class Application final : public ngc::EvaluatorMessageVisitor {
+class Application final {
     GLFWwindow *m_window;
     std::filesystem::path m_path = std::filesystem::absolute(".").lexically_normal();
     ngc::ToolTable m_tools;
@@ -52,8 +70,21 @@ class Application final : public ngc::EvaluatorMessageVisitor {
 
     Worker m_worker{};
 
+    uint64_t m_frames = 0;
+    double m_time;
+    double m_dt;
+    double m_mouseX;
+    double m_mouseY;
+    double m_mouseDX;
+    double m_mouseDY;
+
+    double m_yaw = 0;
+    double m_pitch = 0;
+    glm::dvec3 m_cameraPosition = { 0.0, -5.0, 0.0 };
+
 public:
-    Application(GLFWwindow *window) : m_window(window) { }
+    Application() = delete;
+    explicit Application(GLFWwindow *window) : m_window(window) { }
 
     void init() {
         auto result = m_tools.load();
@@ -62,6 +93,17 @@ public:
             m_errorMessage = "failed to load tool table";
             m_enableErrorWindow = true;
         }
+    }
+
+    void preRender() {
+        m_frames++;
+        m_dt = ImGui::GetTime() - m_time;
+        m_time = ImGui::GetTime();
+        auto pos = ImGui::GetMousePos();
+        m_mouseDX = pos.x - m_mouseX;
+        m_mouseDY = pos.y - m_mouseY;
+        m_mouseX = pos.x;
+        m_mouseY = pos.y;
     }
 
     void terminate() {
@@ -100,19 +142,84 @@ public:
         initToolTableStrings();
     }
 
+    bool noWindowHasFocus() {
+        auto ctx = ImGui::GetCurrentContext();
+        return ctx->NavWindow == nullptr && ctx->MovingWindow == nullptr && ctx->WheelingWindow == nullptr;
+    }
+
     void render3D() {
+        int width, height;
+        glfwGetWindowSize(m_window, &width, &height);
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
-        gluPerspective(60.0, 1.0, 0.1, 1000.0);
-        gluLookAt(0, -2, 8, 2, 5, 0, 0, 0, 1);
+        gluPerspective(60.0, static_cast<double>(width) / height, 0.001, 1000.0);
+
+        auto down = ImGui::IsMouseDown(ImGuiMouseButton_Left);
+        auto notFocused = noWindowHasFocus();
+
+        auto w = ImGui::IsKeyDown(ImGuiKey_W);
+        auto a = ImGui::IsKeyDown(ImGuiKey_A);
+        auto s = ImGui::IsKeyDown(ImGuiKey_S);
+        auto d = ImGui::IsKeyDown(ImGuiKey_D);
+        auto ctrl = ImGui::IsKeyDown(ImGuiKey_LeftCtrl);
+        auto space = ImGui::IsKeyDown(ImGuiKey_Space);
+        auto shift = ImGui::IsKeyDown(ImGuiKey_LeftShift);
+
+        if(down && notFocused) {
+            m_yaw += m_mouseDX * 0.001;
+            m_pitch += -m_mouseDY * 0.001;
+        }
+
+        glm::dvec3 front;
+        front.x = sin(m_yaw) * cos(m_pitch);
+        front.y = cos(m_yaw) * cos(m_pitch);
+        front.z = sin(m_pitch);
+        
+        glm::dvec3 right;
+        right.x = cos(m_yaw);
+        right.y = -sin(m_yaw);
+        right.z = 0.0f;
+
+        auto cameraFront = glm::normalize(front);
+        auto cameraRight = glm::normalize(right);
+        auto cameraUp = glm::cross(cameraRight, cameraFront);
+
+        if(down && notFocused) {
+            auto speed = shift ? 5.0 : 0.1;
+
+            if(w) {
+                m_cameraPosition += cameraFront * m_dt * speed;
+            }
+
+            if(a) {
+                m_cameraPosition -= cameraRight * m_dt * speed;
+            }
+
+            if(s) {
+                m_cameraPosition -= cameraFront * m_dt * speed;
+            }
+
+            if(d) {
+                m_cameraPosition += cameraRight * m_dt * speed;
+            }
+
+            if(ctrl) {
+                m_cameraPosition -= cameraUp * m_dt * speed;
+            }
+
+            if(space) {
+                m_cameraPosition += cameraUp * m_dt * speed;
+            }
+        }
+
+        auto mat = glm::lookAt(m_cameraPosition, m_cameraPosition + cameraFront, cameraUp);
         
         glMatrixMode(GL_MODELVIEW);
         glLoadIdentity();
-
-        glTranslated(0, 0, -2);
+        glLoadMatrixd(glm::value_ptr(mat));
 
         glBegin(GL_LINES);
-        glColor3f(1.0,0.4,0.4);
+        glColor3f(0.4, 0.4, 0.4);
 
         glVertex3d(-10.0, -10.0, 0.0);
         glVertex3d(-10.0, 10.0, 0.0);
@@ -125,9 +232,26 @@ public:
 
         glVertex3d(10.0, -10.0, 0.0);
         glVertex3d(-10.0, -10.0, 0.0);
+
+        //X
+        glColor3f(1.0, 0.4, 0.4);
+        glVertex3d(0.0, 0.0, 0.0);
+        glVertex3d(1.0, 0.0, 0.0);
+
+        //Y
+        glColor3f(0.4, 1.0, 0.4);
+        glVertex3d(0.0, 0.0, 0.0);
+        glVertex3d(0.0, 1.0, 0.0);
+
+        //Z
+        glColor3f(0.4, 0.4, 1.0);
+        glVertex3d(0.0, 0.0, 0.0);
+        glVertex3d(0.0, 0.0, 1.0);
+
+        glEnd();
 
         m_worker.lock([&]() {
-            m_worker.machine().foreachCommand([](const ngc::MachineCommand &cmd) {
+            m_worker.machine().foreachCommand([&](const ngc::MachineCommand &cmd) {
                 if(auto moveLine = cmd.as<ngc::MoveLine>()) {
                     if(moveLine->speed() == -1.0) {
                         glColor3f(1.0, 1.0, 0.4);
@@ -137,13 +261,87 @@ public:
 
                     auto &v = moveLine->from();
                     auto &w = moveLine->to();
+
+                    glBegin(GL_LINES);
                     glVertex3d(v.x, v.y, v.z);
                     glVertex3d(w.x, w.y, w.z);
+                    glEnd();
+                    
+                    glEnable(GL_POINT_SMOOTH);
+                    glPointSize(2.0);
+
+                    glBegin(GL_POINTS);
+                    glColor3f(0.0, 0.0, 0.0);
+                    glVertex3d(v.x, v.y, v.z);
+                    glVertex3d(w.x, w.y, w.z);
+                    glEnd();
+                }
+
+                if(auto moveArc = cmd.as<ngc::MoveArc>()) {
+                    interpolate(*moveArc, 360, [&](const glm::dvec3 &start, const glm::dvec3 &end, const bool startPoint, const bool endPoint) {
+                        glBegin(GL_LINES);
+                        glColor3f(0.4, 1.0, 0.4);
+                        glVertex3d(start.x, start.y, start.z);
+                        glVertex3d(end.x, end.y, end.z);
+                        glEnd();
+
+                        if(startPoint) {
+                            glEnable(GL_POINT_SMOOTH);
+                            glPointSize(2.0);
+                            glBegin(GL_POINTS);
+                            glColor3f(0.0, 0.0, 0.0);
+                            glVertex3d(start.x, start.y, start.z);
+                            glEnd();
+                        }
+
+                        if(endPoint) {
+                            glEnable(GL_POINT_SMOOTH);
+                            glPointSize(2.0);
+                            glBegin(GL_POINTS);
+                            glColor3f(1.0, 1.0, 1.0);
+                            glVertex3d(end.x, end.y, end.z);
+                            glEnd();
+                        }
+                    });
                 }
             });
         });
+    }
 
-        glEnd();
+    void interpolate(const ngc::MoveArc &arc, int circleResolution, const std::function<void(const glm::dvec3 &start, const glm::dvec3 &end, const bool startPoint, const bool endPoint)> &callback) {
+        glm::dvec3 start = { arc.from().x, arc.from().y, arc.from().z };
+        glm::dvec3 end = { arc.to().x, arc.to().y, arc.to().z };
+        glm::dvec3 center = { arc.center().x, arc.center().y, arc.center().z };
+        glm::dvec3 axis = { arc.axis().x, arc.axis().y, arc.axis().z };
+
+        auto startArm = start - center - glm::proj(start - center, axis);
+        auto endArm = end - center - glm::proj(end - center, axis);
+        auto axial = glm::proj(end - start, axis);
+
+        auto angle = glm::angle(glm::normalize(startArm), glm::normalize(endArm));
+
+        if(angle <= 2.0 * std::numbers::pi / circleResolution) {
+            callback(start, end, true, true);
+            return;
+        }
+
+        int segments = static_cast<int>(angle / (2.0 * std::numbers::pi / circleResolution)) + 1;
+
+        glm::dvec3 prev;
+
+        for(int i = 0; i < segments + 1; i++) {
+            auto s = static_cast<double>(i) / segments;
+            auto startAngle = glm::lerp(0.0, angle, s);
+            auto v1 = glm::rotate(startArm, startAngle, axis);
+            auto v2 = glm::rotate(endArm, -(angle - startAngle), axis);
+            auto v = center + glm::lerp(v1, v2, s) + axial * s;
+
+            if(i > 0) {
+                callback(prev, v, i == 1, i == segments);
+            }
+            
+            prev = v;
+        }
     }
 
     void renderErrorWindow() {
@@ -153,11 +351,30 @@ public:
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4_Redish);
             ImGui::TextUnformatted(m_errorMessage.c_str());
             ImGui::PopStyleColor();
-            ImGui::EndPopup();
         }
+
+        ImGui::EndPopup();
     }
 
     void render() {
+        auto drawList = ImGui::GetForegroundDrawList(ImGui::GetMainViewport());
+        drawList->AddText({ 10, 20 }, IM_COL32(0, 255, 0, 255), std::format("fps: {:.1f}", 1.0 / m_dt).c_str());
+
+        static double lastTime = 0.0;
+        static double avgFps = 0.0;
+
+        constexpr auto alpha = 0.999;
+        avgFps = avgFps * alpha + (1.0 - alpha) * (1.0 / m_dt);
+        
+        if(std::isnan(avgFps)) {
+            avgFps = 1.0;
+        }
+
+        if(lastTime == 0.0 || m_time - lastTime > 1.0) {
+            lastTime = m_time;
+            std::println("fps: {:.1f}", avgFps);
+        }
+
         if(ImGui::BeginMainMenuBar()) {
             if(ImGui::BeginMenu("File")) {
                 ImGui::MenuItem("Open", nullptr, &m_enableOpenDialog);
@@ -170,12 +387,12 @@ public:
                 ImGui::MenuItem("Messages", nullptr, &m_enableMessagesWindow);
                 
                 if(ImGui::MenuItem("Exit")) { glfwSetWindowShouldClose(m_window, GL_TRUE); }
-                
+
                 ImGui::EndMenu();
             }
-
-            ImGui::EndMainMenuBar();
         }
+
+        ImGui::EndMainMenuBar();
 
         if(m_enableOpenDialog) { renderOpenDialog(); }
         if(m_enableProgramWindow) { renderProgramWindow(); }
@@ -192,19 +409,9 @@ public:
                 ImGui::TextUnformatted(std::format("PRINT: {}", msg).c_str());
                 ImGui::PopStyleColor();
             }
-
-            ImGui::End();
         }
-    }
 
-    void visit(const ngc::BlockMessage &msg) override {
-        //std::println("BlockMessage: {}", msg.block().statement()->text());
-        //ImGui::TextUnformatted(msg.block().statement()->text().c_str());
-    }
-
-    void visit(const ngc::PrintMessage &msg) override {
-        //std::println("PrintMessage: {}", msg.text());
-        //ImGui::TextUnformatted(std::format("PRINT: {}", msg.text()).c_str());
+        ImGui::End();
     }
 
     void renderToolWindow() {
@@ -263,9 +470,10 @@ public:
                     ImGui::InputText(std::format("##comment{}", tool.number).c_str(), &tool.comment);
                 }
 
-                ImGui::EndTable();
                 ImGui::PopStyleVar();
             }
+
+            ImGui::EndTable();
 
             if(ImGui::Button("Reload")) {
                 initToolTableStrings();
@@ -282,9 +490,9 @@ public:
             if(ImGui::Button("New")) {
                 m_toolStrings.emplace_back(tool_table_strings_t {});
             }
-
-            ImGui::End();
         }
+
+        ImGui::End();
     }
 
     void renderMemoryWindow() {
@@ -320,12 +528,12 @@ public:
 
                     address++;
                 }
-
-                ImGui::EndTable();
             }
 
-            ImGui::End();
+            ImGui::EndTable();
         }
+
+        ImGui::End();
     }
 
     void renderProgramWindow() {
@@ -350,9 +558,9 @@ public:
                             ImGui::EndTabItem();
                         }
                     }
-
-                    ImGui::EndTabBar();
                 }
+
+                ImGui::EndTabBar();
             }
 
             ImGui::EndChild();
@@ -376,9 +584,9 @@ public:
             }
 
             ImGui::EndChild();
-
-            ImGui::End();
         }
+
+        ImGui::End();
     }
 
     void renderOpenDialog() {

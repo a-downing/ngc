@@ -56,7 +56,7 @@ int main(int, char**) {
     }
 
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(1); // Enable vsync
+    glfwSwapInterval(0);
 
     // Setup Dear ImGui context
     IMGUI_CHECKVERSION();
@@ -93,6 +93,7 @@ int main(int, char**) {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        app.preRender();
         app.render();
 
         // Rendering
