@@ -65,9 +65,9 @@ namespace ngc
             return m_globals.at(var);
         }
 
-        double read(const Var var) const {
+        double read(const Var var, const bool ignoreFlags = true) const {
             const auto addr = deref(var);
-            const auto result = readData(addr, true);
+            const auto result = readData(addr, ignoreFlags);
 
             if(!result) {
                 throw std::logic_error(std::format("Memory::readData failed for Var::{}", std::to_underlying(var)));
@@ -76,12 +76,12 @@ namespace ngc
             return *result;
         }
 
-        void write(const Var var, const double value) {
+        void write(const Var var, const double value, const bool ignoreFlags = true) {
             if(!m_globals.contains(var)) {
                 throw std::logic_error(std::format("Memory::write() unknown Var::{}", std::to_underlying(var)));
             }
 
-            if(!writeData(m_globals.at(var), value, true)) {
+            if(!writeData(m_globals.at(var), value, ignoreFlags)) {
                 throw std::logic_error(std::format("Memory::writeData failed for Var::{}", std::to_underlying(var)));
             }
         }
@@ -104,7 +104,7 @@ namespace ngc
             return value;
         }
 
-        std::expected<double, Error> read(const uint32_t addr) const {
+        std::expected<double, Error> read(const uint32_t addr, const bool ignoreFlags = false) const {
             if(addr == 0) {
                 return std::unexpected(Error::INVALID_DATA_ADDRESS);
             }
@@ -113,10 +113,10 @@ namespace ngc
                 return readStack(addr & ~ADDR_STACK);
             }
 
-            return readData(addr, false);
+            return readData(addr, ignoreFlags);
         }
 
-        std::expected<void, Error> write(const uint32_t addr, const double value) {
+        std::expected<void, Error> write(const uint32_t addr, const double value, const bool ignoreFlags = false) {
             if(addr == 0) {
                 return std::unexpected(Error::INVALID_DATA_ADDRESS);
             }
@@ -125,7 +125,7 @@ namespace ngc
                 return writeStack(addr & ~ADDR_STACK, value);
             }
 
-            return writeData(addr, value, false);
+            return writeData(addr, value, ignoreFlags);
         }
 
         std::expected<bool, Error> isVolatile(const uint32_t addr) const {
