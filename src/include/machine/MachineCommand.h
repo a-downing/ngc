@@ -23,6 +23,10 @@ namespace ngc {
             return { x-p.x, y-p.y, z-p.z };
         }
 
+        vec3_t operator*(const double s) const {
+            return { x*s, y*s, z*s };
+        }
+
         std::string text() const {
             return std::format("vec3_t({}, {}, {})", x, y, z);
         }
@@ -130,11 +134,11 @@ namespace ngc {
         position_t m_from;
         position_t m_to;
         vec3_t m_center;
-        Direction m_direction;
+        vec3_t m_axis;
         double m_speed;
 
     public:
-        MoveArc(const position_t &from, const position_t &to, const vec3_t &center, const Direction direction, const double speed) : m_from(from), m_to(to), m_center(center), m_direction(direction), m_speed(speed) { }
+        MoveArc(const position_t &from, const position_t &to, const vec3_t &center, const vec3_t &axis, const double speed) : m_from(from), m_to(to), m_center(center), m_axis(axis), m_speed(speed) { }
         ~MoveArc() override = default;
 
         bool is(const MoveArc *) const override { return true; }
@@ -142,9 +146,9 @@ namespace ngc {
         const position_t &from() const { return m_from; }
         const position_t &to() const { return m_to; }
         const vec3_t &center() const { return m_center; }
-        Direction direction() const { return m_direction; }
+        const vec3_t &axis() const { return m_axis; }
         double speed() const { return m_speed; }
 
-        std::string text() const override { return std::format("MoveArc(from: {}, to: {}, center: {}, direction: {}, speed: {})", m_from.text(), m_to.text(), m_center.text(), name(m_direction), m_speed); }
+        std::string text() const override { return std::format("MoveArc(from: {}, to: {}, center: {}, axis: {}, speed: {})", m_from.text(), m_to.text(), m_center.text(), m_axis.text(), m_speed); }
     };
 }
