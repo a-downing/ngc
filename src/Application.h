@@ -1,7 +1,6 @@
 #pragma once
 
 #include <filesystem>
-#include <glm/ext/quaternion_common.hpp>
 #include <print>
 #include <string>
 #include <cmath>
@@ -36,6 +35,7 @@
 #include <glm/ext/vector_float3.hpp>
 #include <glm/geometric.hpp>
 #include <glm/gtx/compatibility.hpp>
+#include <glm/ext/quaternion_common.hpp>
 
 #include "imgui.h"
 #include "imgui_internal.h"
@@ -80,7 +80,9 @@ class Application final {
 
     double m_yaw = 0;
     double m_pitch = 0;
-    glm::dvec3 m_cameraPosition = { 0.0, -5.0, 0.0 };
+    glm::dvec3 m_cameraPosition = { 0.0, -12.0, 0.0 };
+    glm::dvec3 m_cameraVelocity = { 0.0, 0.0, 0.0 };
+    double m_cameraAcceleration = 1.0;
 
 public:
     Application() = delete;
@@ -185,31 +187,41 @@ public:
         auto cameraUp = glm::cross(cameraRight, cameraFront);
 
         if(down && notFocused) {
-            auto speed = shift ? 5.0 : 0.1;
+            auto boost = shift ? 10.0 : 1.0;
 
             if(w) {
-                m_cameraPosition += cameraFront * m_dt * speed;
+                m_cameraVelocity += cameraFront * m_cameraAcceleration * boost * m_dt;
             }
 
             if(a) {
-                m_cameraPosition -= cameraRight * m_dt * speed;
+                m_cameraVelocity -= cameraRight * m_cameraAcceleration * boost * m_dt;
             }
 
             if(s) {
-                m_cameraPosition -= cameraFront * m_dt * speed;
+                m_cameraVelocity -= cameraFront * m_cameraAcceleration * boost * m_dt;
             }
 
             if(d) {
-                m_cameraPosition += cameraRight * m_dt * speed;
+                m_cameraVelocity += cameraRight * m_cameraAcceleration * boost * m_dt;
             }
 
             if(ctrl) {
-                m_cameraPosition -= cameraUp * m_dt * speed;
+                m_cameraVelocity -= cameraUp * m_cameraAcceleration * boost * m_dt;
             }
 
             if(space) {
-                m_cameraPosition += cameraUp * m_dt * speed;
+                m_cameraVelocity += cameraUp * m_cameraAcceleration * boost * m_dt;
             }
+
+            if(!w && !a && !s && !d && !ctrl && !space) {
+                m_cameraVelocity = { 0, 0, 0 };
+            }
+
+            if(glm::length(m_cameraVelocity) > boost) {
+                m_cameraVelocity = glm::normalize(m_cameraVelocity) * boost;
+            }
+
+            m_cameraPosition += m_cameraVelocity * m_dt;
         }
 
         auto mat = glm::lookAt(m_cameraPosition, m_cameraPosition + cameraFront, cameraUp);
@@ -219,38 +231,44 @@ public:
         glLoadMatrixd(glm::value_ptr(mat));
 
         glBegin(GL_LINES);
-        glColor3f(0.4, 0.4, 0.4);
-
-        glVertex3d(-10.0, -10.0, 0.0);
-        glVertex3d(-10.0, 10.0, 0.0);
-
-        glVertex3d(-10.0, 10.0, 0.0);
-        glVertex3d(10.0, 10.0, 0.0);
-
-        glVertex3d(10.0, 10.0, 0.0);
-        glVertex3d(10.0, -10.0, 0.0);
-
-        glVertex3d(10.0, -10.0, 0.0);
-        glVertex3d(-10.0, -10.0, 0.0);
 
         //X
         glColor3f(1.0, 0.4, 0.4);
         glVertex3d(0.0, 0.0, 0.0);
-        glVertex3d(1.0, 0.0, 0.0);
+        glVertex3d(2.0, 0.0, 0.0);
+
+        //Y
+        glColor3f(0.4, 2.0, 0.4);
+        glVertex3d(0.0, 0.0, 0.0);
+        glVertex3d(0.0, 2.0, 0.0);
+
+        //Z
+        glColor3f(0.4, 0.4, 2.0);
+        glVertex3d(0.0, 0.0, 0.0);
+        glVertex3d(0.0, 0.0, 2.0);
+
+        auto workOffset = m_worker.lock([&] {
+            return m_worker.machine().workOffset();
+        });
+
+        //X
+        glColor3f(1.0, 0.4, 0.4);
+        glVertex3d(workOffset.x, workOffset.y, workOffset.z);
+        glVertex3d(workOffset.x + 1.0, workOffset.y, workOffset.z);
 
         //Y
         glColor3f(0.4, 1.0, 0.4);
-        glVertex3d(0.0, 0.0, 0.0);
-        glVertex3d(0.0, 1.0, 0.0);
+        glVertex3d(workOffset.x, workOffset.y, workOffset.z);
+        glVertex3d(workOffset.x, workOffset.y + 1.0, workOffset.z);
 
         //Z
         glColor3f(0.4, 0.4, 1.0);
-        glVertex3d(0.0, 0.0, 0.0);
-        glVertex3d(0.0, 0.0, 1.0);
+        glVertex3d(workOffset.x, workOffset.y, workOffset.z);
+        glVertex3d(workOffset.x, workOffset.y, workOffset.z + 1.0);
 
         glEnd();
 
-        m_worker.lock([&]() {
+        m_worker.lock([&] {
             m_worker.machine().foreachCommand([&](const ngc::MachineCommand &cmd) {
                 if(auto moveLine = cmd.as<ngc::MoveLine>()) {
                     if(moveLine->speed() == -1.0) {
@@ -278,7 +296,7 @@ public:
                 }
 
                 if(auto moveArc = cmd.as<ngc::MoveArc>()) {
-                    interpolate(*moveArc, 360, [&](const glm::dvec3 &start, const glm::dvec3 &end, const bool startPoint, const bool endPoint) {
+                    interpolate(*moveArc, 60, [&](const glm::dvec3 &start, const glm::dvec3 &end, const bool startPoint, const bool endPoint) {
                         glBegin(GL_LINES);
                         glColor3f(0.4, 1.0, 0.4);
                         glVertex3d(start.x, start.y, start.z);
@@ -632,7 +650,6 @@ public:
                         }
 
                         m_programSource.emplace_back(*result, entry.path().string());
-                        //m_worker.reset(std::move(programs));
                         m_enableOpenDialog = false;
                         m_enableProgramWindow = true;
                     }

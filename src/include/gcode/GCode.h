@@ -6,61 +6,6 @@
 #include <format>
 #include <print>
 
-// #define GC_MOTION(DO) \
-//     DO(G0, GCMotion) \
-//     DO(G1, GCMotion) \
-//     DO(G2, GCMotion) \
-//     DO(G3, GCMotion)
-
-// #define GC_PLANE(DO) \
-//     DO(G17, GCPlane) \
-//     DO(G18, GCPlane) \
-//     DO(G19, GCPlane)
-
-// #define GC_DISTANCE(DO) \
-//     DO(G90, GCDistance) \
-//     DO(G91, GCDistance)
-
-// #define GC_FEED(DO) \
-//     DO(G93, GCFeed) \
-//     DO(G94, GCFeed)
-
-// #define GC_UNITS(DO) \
-//     DO(G20, GCUnits) \
-//     DO(G21, GCUnits)
-
-// #define GC_TOOL_LEN(DO) \
-//     DO(G43, GCToolLen) \
-//     DO(G49, GCToolLen)
-
-// #define GC_COORD_SYS(DO) \
-//     DO(G54, GCCoordSys) \
-//     DO(G55, GCCoordSys) \
-//     DO(G56, GCCoordSys) \
-//     DO(G57, GCCoordSys) \
-//     DO(G58, GCCoordSys) \
-//     DO(G59, GCCoordSys) \
-//     DO(G59_1, GCCoordSys) \
-//     DO(G59_2, GCCoordSys) \
-//     DO(G59_3, GCCoordSys)
-
-// #define GC_PATH(DO) \
-//     DO(G61_1, GCPath)
-
-// #define GC_NON_MODAL(DO) \
-//     DO(G53, GCNonModal)
-
-// #define GCODES(DO) \
-//     GC_MOTION(DO) \
-//     GC_PLANE(DO) \
-//     GC_DISTANCE(DO) \
-//     GC_FEED(DO) \
-//     GC_UNITS(DO) \
-//     GC_TOOL_LEN(DO) \
-//     GC_COORD_SYS(DO) \
-//     GC_PATH(DO) \
-//     GC_NON_MODAL(DO)
-
 #include "parser/Token.h"
 #include "parser/Expression.h"
 #include "parser/Statement.h"
@@ -72,23 +17,6 @@ namespace ngc {
 }
 
 namespace ngc {
-
-    // enum class GCode {
-    //     #define ENUM_VALUE(name, ...) name,
-    //     GCODES(ENUM_VALUE)
-    //     #undef ENUM_VALUE
-    // };
-
-    // inline constexpr std::string_view name(const GCode code) {
-    //     switch(code) {
-    //         #define CASE(name, ...) case GCode::name: return #name;
-    //         GCODES(CASE)
-    //         #undef CASE
-
-    //         default: UNREACHABLE();
-    //     }
-    // }
-
     inline GCode coordsys(const int i) {
         switch(i) {
             case 1: return GCode::G54;
@@ -191,6 +119,12 @@ namespace ngc {
             case 1:
                 switch(fract) {
                     case 0: return GCode::G1;
+                }
+
+                break;
+            case 10:
+                switch(fract) {
+                    case 0: return GCode::G10;
                 }
 
                 break;
@@ -373,133 +307,102 @@ namespace ngc {
     }
 
     class GCodeState {
-        GCMotion m_modeMotion{};
-        GCPlane m_modePlane{};
-        GCDist m_modeDistance{};
-        GCFeed m_modeFeedrate{};
-        GCUnits m_modeUnits{};
-        GCTLen m_modeToolOffset{};
-        GCCoord m_modeCoordSys{};
-        GCPath m_modePath{};
+    public:
+        std::optional<GCMotion> modeMotion{};
+        std::optional<GCPlane> modePlane{};
+        std::optional<GCDist> modeDistance{};
+        std::optional<GCFeed> modeFeedrate{};
+        std::optional<GCUnits> modeUnits{};
+        std::optional<GCTLen> modeToolOffset{};
+        std::optional<GCCoord> modeCoordSys{};
+        std::optional<GCPath> modePath{};
+        std::optional<MCSpindle> modeSpindle{};
 
-        std::optional<GCNonModal> m_nonModal{};
+        std::optional<GCNonModal> nonModal{};
+        std::optional<MCStop> modeStop{};
+        std::optional<MCToolChange> modeToolChange{};
 
-        MCSpindle m_modeSpindle{};
-        std::optional<MCStop> m_modeStop{};
-        std::optional<MCToolChange> m_modeToolChange{};
-
-        double m_F = 0;
-        double m_T = 0;
-        double m_S = 0;
-        std::optional<double> m_A, m_B, m_C, m_D, m_H, m_I, m_J, m_K, m_L, m_P, m_Q, m_R, m_X, m_Y, m_Z;
+        std::optional<double> A, B, C, D, F, H, I, J, K, L, P, Q, R, S, T, X, Y, Z;
 
     public:
-        GCodeState() {
-            affectState(GCode::G0);
-            affectState(GCode::G17);
-            affectState(GCode::G90);
-            affectState(GCode::G94);
-            affectState(GCode::G20);
-            affectState(GCode::G49);
-            affectState(GCode::G54);
-            affectState(GCode::G61_1);
-            affectState(MCode::M5);
+        static GCodeState makeDefault() {
+            GCodeState state;
+            state.affectState(GCode::G0);
+            state.affectState(GCode::G17);
+            state.affectState(GCode::G90);
+            state.affectState(GCode::G94);
+            state.affectState(GCode::G20);
+            state.affectState(GCode::G49);
+            state.affectState(GCode::G54);
+            state.affectState(GCode::G61_1);
+            state.affectState(MCode::M5);
+            return state;
+        }
+
+        bool empty() const {
+            if(modeMotion) { return false; }
+            if(modePlane) { return false; }
+            if(modeDistance) { return false; }
+            if(modeFeedrate) { return false; }
+            if(modeUnits) { return false; }
+            if(modeToolOffset) { return false; }
+            if(modeCoordSys) { return false; }
+            if(modePath) { return false; }
+            if(modeSpindle) { return false; }
+
+            if(nonModal) { return false; }
+            if(modeStop) { return false; }
+            if(modeToolChange) { return false; }
+
+            if(A || B || C || D || F || H || I || J || K || L || P || Q || R || S || T || X || Y || Z) { return false; }
+
+            return true;
+        }
+        
+        std::expected<void, std::string_view> valid() const {
+            if(!modeMotion) { return std::unexpected("missing motion mode"); }
+            if(!modePlane) { return std::unexpected("missing plane mode"); }
+            if(!modeDistance) { return std::unexpected("missing distance mode"); }
+            if(!modeFeedrate) { return std::unexpected("missing feedrate mode"); }
+            if(!modeUnits) { return std::unexpected("missing units mode"); }
+            if(!modeToolOffset) { return std::unexpected("missing tool offset mode"); }
+            if(!modeCoordSys) { return std::unexpected("missing coordinate system"); }
+            if(!modePath) { return std::unexpected("missing path mode"); }
+            if(!modeSpindle) { return std::unexpected("missing spindle mode"); }
+
+            return {};
         }
 
         void resetModal() {
-            m_nonModal = std::nullopt;
-            m_modeStop = std::nullopt;
-            m_modeToolChange = std::nullopt;
-            m_A = m_B = m_C = m_D = m_H = m_I = m_J = m_K = m_L = m_P = m_Q = m_R = m_X = m_Y = m_Z = std::nullopt;
+            nonModal = std::nullopt;
+            modeStop = std::nullopt;
+            modeToolChange = std::nullopt;
+            A = B = C = D = H = I = J = K = L = P = Q = R = X = Y = Z = std::nullopt;
         }
-
-        GCMotion modeMotion() const { return m_modeMotion; }
-        GCPlane modePlane() const { return m_modePlane; }
-        GCDist modeDistance() const { return m_modeDistance; }
-        GCFeed modeFeedrate() const { return m_modeFeedrate; }
-        GCUnits modeUnits() const { return m_modeUnits; }
-        GCTLen modeToolOffset() const { return m_modeToolOffset; }
-        GCCoord modeCoordSys() const { return m_modeCoordSys; }
-        GCPath modePath() const { return m_modePath; }
-        MCSpindle modeSpindle() const { return m_modeSpindle; }
-        std::optional<MCStop> modeStop() const { return m_modeStop; }
-        std::optional<MCToolChange> modeToolChange() const { return m_modeToolChange; }
-        std::optional<GCNonModal> nonModal() const { return m_nonModal; }
-
-        void modeMotion(const GCMotion x) { m_modeMotion = x; }
-        void modePlane(const GCPlane x) { m_modePlane = x; }
-        void modeDistance(const GCDist x) { m_modeDistance = x; }
-        void modeFeedrate(const GCFeed x) { m_modeFeedrate = x; }
-        void modeUnits(const GCUnits x) { m_modeUnits = x; }
-        void modeToolOffset(const GCTLen x) { m_modeToolOffset = x; }
-        void modeCoordSys(const GCCoord x) { m_modeCoordSys = x; }
-        void modePath(const GCPath x) { m_modePath = x; }
-        void modeSpindle(const MCSpindle x) { m_modeSpindle = x; }
-        void modeStop(const MCStop x) { m_modeStop = x; }
-        void modeToolChange(const MCToolChange x) { m_modeToolChange = x; }
-        void nonModal(const GCNonModal x) { m_nonModal = x; }
-
-        std::optional<double> A() const { return m_A; }
-        std::optional<double> B() const { return m_B; }
-        std::optional<double> C() const { return m_C; }
-        std::optional<double> D() const { return m_D; }
-        double F() const { return m_F; }
-        std::optional<double> H() const { return m_H; }
-        std::optional<double> I() const { return m_I; }
-        std::optional<double> J() const { return m_J; }
-        std::optional<double> K() const { return m_K; }
-        std::optional<double> L() const { return m_L; }
-        std::optional<double> P() const { return m_P; }
-        std::optional<double> Q() const { return m_Q; }
-        std::optional<double> R() const { return m_R; }
-        double S() const { return m_S; }
-        double T() const { return m_T; }
-        std::optional<double> X() const { return m_X; }
-        std::optional<double> Y() const { return m_Y; }
-        std::optional<double> Z() const { return m_Z; }
-
-        void A(const double x) { m_A = x; }
-        void B(const double x) { m_B = x; }
-        void C(const double x) { m_C = x; }
-        void D(const double x) { m_D = x; }
-        void F(const double x) { m_F = x; }
-        void H(const double x) { m_H = x; }
-        void I(const double x) { m_I = x; }
-        void J(const double x) { m_J = x; }
-        void K(const double x) { m_K = x; }
-        void L(const double x) { m_L = x; }
-        void P(const double x) { m_P = x; }
-        void Q(const double x) { m_Q = x; }
-        void R(const double x) { m_R = x; }
-        void S(const double x) { m_S = x; }
-        void T(const double x) { m_T = x; }
-        void X(const double x) { m_X = x; }
-        void Y(const double x) { m_Y = x; }
-        void Z(const double x) { m_Z = x; }
 
         void affectState(const Word &word) {
             switch (word.letter()) {
-                case Letter::A: m_A = word.real(); return;
-                case Letter::B: m_B = word.real(); return;
-                case Letter::C: m_C = word.real(); return;
-                case Letter::D: m_D = word.real(); return;
-                case Letter::F: m_F = word.real(); return;
+                case Letter::A: A = word.real(); return;
+                case Letter::B: B = word.real(); return;
+                case Letter::C: C = word.real(); return;
+                case Letter::D: D = word.real(); return;
+                case Letter::F: F = word.real(); return;
                 case Letter::G: return affectState(convertGCode(word.real()));
-                case Letter::H: m_H = word.real(); return;
-                case Letter::I: m_I = word.real(); return;
-                case Letter::J: m_J = word.real(); return;
-                case Letter::K: m_K = word.real(); return;
-                case Letter::L: m_L = word.real(); return;
+                case Letter::H: H = word.real(); return;
+                case Letter::I: I = word.real(); return;
+                case Letter::J: J = word.real(); return;
+                case Letter::K: K = word.real(); return;
+                case Letter::L: L = word.real(); return;
                 case Letter::M: return affectState(convertMCode(word.real()));
                 case Letter::N: return;
-                case Letter::P: m_P = word.real(); return;
-                case Letter::Q: m_Q = word.real(); return;
-                case Letter::R: m_R = word.real(); return;
-                case Letter::S: m_S = word.real(); return;
-                case Letter::T: m_T = word.real(); return;
-                case Letter::X: m_X = word.real(); return;
-                case Letter::Y: m_Y = word.real(); return;
-                case Letter::Z: m_Z = word.real(); return;
+                case Letter::P: P = word.real(); return;
+                case Letter::Q: Q = word.real(); return;
+                case Letter::R: R = word.real(); return;
+                case Letter::S: S = word.real(); return;
+                case Letter::T: T = word.real(); return;
+                case Letter::X: X = word.real(); return;
+                case Letter::Y: Y = word.real(); return;
+                case Letter::Z: Z = word.real(); return;
             }
 
             PANIC("invalid word {}", word.text());
@@ -511,28 +414,28 @@ namespace ngc {
                 case GCode::G1:
                 case GCode::G2:
                 case GCode::G3:
-                    m_modeMotion = static_cast<GCMotion>(code);
+                    modeMotion = static_cast<GCMotion>(code);
                     return;
                 case GCode::G17:
                 case GCode::G18:
                 case GCode::G19:
-                    m_modePlane = static_cast<GCPlane>(code);
+                    modePlane = static_cast<GCPlane>(code);
                     return;
                 case GCode::G90:
                 case GCode::G91:
-                    m_modeDistance = static_cast<GCDist>(code);
+                    modeDistance = static_cast<GCDist>(code);
                     return;
                 case GCode::G93:
                 case GCode::G94:
-                    m_modeFeedrate = static_cast<GCFeed>(code);
+                    modeFeedrate = static_cast<GCFeed>(code);
                     return;
                 case GCode::G20:
                 case GCode::G21:
-                    m_modeUnits = static_cast<GCUnits>(code);
+                    modeUnits = static_cast<GCUnits>(code);
                     return;
                 case GCode::G43:
                 case GCode::G49:
-                    m_modeToolOffset = static_cast<GCTLen>(code);
+                    modeToolOffset = static_cast<GCTLen>(code);
                     return;
                 case GCode::G54:
                 case GCode::G55:
@@ -543,13 +446,14 @@ namespace ngc {
                 case GCode::G59_1:
                 case GCode::G59_2:
                 case GCode::G59_3:
-                    m_modeCoordSys = static_cast<GCCoord>(code);
+                    modeCoordSys = static_cast<GCCoord>(code);
                     return;
                 case GCode::G61_1:
-                    m_modePath = static_cast<GCPath>(code);
+                    modePath = static_cast<GCPath>(code);
                     return;
                 case GCode::G53:
-                    m_nonModal = static_cast<GCNonModal>(code);
+                case GCode::G10:
+                    nonModal = static_cast<GCNonModal>(code);
                     return;
             }
 
@@ -562,15 +466,15 @@ namespace ngc {
                 case MCode::M1:
                 case MCode::M2:
                 case MCode::M30:
-                    m_modeStop = static_cast<MCStop>(code);
+                    modeStop = static_cast<MCStop>(code);
                     return;
                 case MCode::M3:
                 case MCode::M4:
                 case MCode::M5:
-                    m_modeSpindle = static_cast<MCSpindle>(code);
+                    modeSpindle = static_cast<MCSpindle>(code);
                     return;
                 case MCode::M6:
-                    m_modeToolChange = static_cast<MCToolChange>(code);
+                    modeToolChange = static_cast<MCToolChange>(code);
                     return;
             }
 

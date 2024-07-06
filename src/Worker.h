@@ -11,7 +11,6 @@
 #include "evaluator/Evaluator.h"
 #include "evaluator/Preamble.h"
 #include "machine/Machine.h"
-#include "machine/ToolTable.h"
 #include "memory/Memory.h"
 #include "memory/Vars.h"
 #include "parser/Program.h"
@@ -44,9 +43,9 @@ public:
         return m_machine.memory().read(var);
     }
 
-    void lock(const std::function<void()> &callback) const {
+    auto lock(const auto &callback) const {
         std::scoped_lock lock(m_mutex);
-        callback();
+        return callback();
     }
 
     const ngc::Machine &machine() const { return m_machine; }
@@ -175,8 +174,8 @@ private:
                     state.affectState(word);
                 }
 
-                if(state.modeToolChange()) {
-                    eval.call("_tool_change", state.T());
+                if(state.modeToolChange) {
+                    eval.call("_tool_change", *state.T);
                 }
 
                 std::scoped_lock lock(m_mutex);

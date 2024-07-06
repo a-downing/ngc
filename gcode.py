@@ -6,7 +6,7 @@ units = ["G20", "G21"]
 tool_length = ["G43", "G49"]
 coord_sys = ["G54", "G55", "G56", "G57", "G58", "G59", "G59.1", "G59.2", "G59.3"]
 path = ["G61.1"]
-non_modal = ["G53"]
+non_modal = ["G53", "G10"]
 
 all = motion + plane + distance + feed + units + tool_length + coord_sys + path + non_modal
 ids = dict()
