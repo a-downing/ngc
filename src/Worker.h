@@ -6,7 +6,6 @@
 #include <mutex>
 #include <print>
 #include <thread>
-#include <unistd.h>
 
 #include "evaluator/Evaluator.h"
 #include "evaluator/Preamble.h"
