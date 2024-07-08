@@ -17,6 +17,10 @@
     #include <expected>
 #endif
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include <GL/gl.h>
 #include <GL/glu.h>
 #include <GLFW/glfw3.h>
@@ -47,7 +51,6 @@
 
 #include "machine/ToolTable.h"
 #include "machine/MachineCommand.h"
-
 
 #include "gui/tool_table_strings_t.h"
 

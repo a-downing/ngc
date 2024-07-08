@@ -15,8 +15,7 @@ set(IMGUI_DIR imgui)
 
 set(OpenGL_GL_PREFERENCE LEGACY)
 find_package(OpenGL REQUIRED)
-find_package(glm REQUIRED)
-find_package(GLUT REQUIRED)
+find_package(glm PATHS REQUIRED)
 #find_package(glfw3 REQUIRED)
 add_subdirectory(glfw)
 
@@ -76,16 +75,22 @@ add_executable(imgui_main
         src/imgui_main.cpp
         src/Application.h)
 
-target_include_directories(imgui_main PUBLIC 
+target_include_directories(imgui_main PUBLIC
         ${IMGUI_DIR}
         ${IMGUI_DIR}/backends
         ${IMGUI_DIR}/misc/cpp
         src/
         src/include)
 
-target_link_libraries(imgui_main OpenGL::GL OpenGL::GLU glfw)
+target_link_libraries(imgui_main
+        OpenGL::GL
+        OpenGL::GLU
+        glm::glm-header-only
+        glfw)
 
 add_executable(binary_to_compressed_c ${IMGUI_DIR}/misc/fonts/binary_to_compressed_c.cpp)
 
-add_executable(test src/test.cpp)
-target_include_directories(test PUBLIC src/ src/include)
+# add_executable(test src/test.cpp)
+# target_include_directories(test PUBLIC
+#         src/
+#         src/include)
