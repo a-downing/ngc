@@ -40,11 +40,11 @@ namespace ngc {
         double length() const { return std::sqrt(x*x + y*y + z*z + a*a + b*b + c*c); }
 
         position_t operator+(const position_t &p) const {
-            return { x+p.x, y+p.y, z+p.z, a+p.a, b+p.b, x+p.c };
+            return { x+p.x, y+p.y, z+p.z, a+p.a, b+p.b, c+p.c };
         }
 
         position_t operator-(const position_t &p) const {
-            return { x-p.x, y-p.y, z-p.z, a-p.a, b-p.b, x-p.c };
+            return { x-p.x, y-p.y, z-p.z, a-p.a, b-p.b, c-p.c };
         }
 
         std::string text() const {

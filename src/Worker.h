@@ -19,7 +19,7 @@ class Worker {
     std::condition_variable m_cv;
     std::thread m_thread;
 
-    ngc::Machine m_machine;
+    ngc::Machine m_machine{ ngc::Machine::Unit::Inch };
 
     bool m_doJoin = false;
     bool m_doCompile = false;
@@ -165,6 +165,13 @@ private:
     }
 
     void doExecute() {
+        {
+            std::scoped_lock lock(m_mutex);
+            m_machine.beginProgramRun();
+            m_printMessages.clear();
+            m_blockMessages.clear();
+        }
+
         std::function callback = [&] (std::unique_ptr<const ngc::EvaluatorMessage> msg, ngc::Evaluator &eval) {
             if(auto blockMsg = msg->as<ngc::BlockMessage>()) {
                 ngc::GCodeState state;

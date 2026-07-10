@@ -15,6 +15,7 @@
 #include <format>
 #include <utility>
 #include <stdexcept>
+#include <span>
 
 #include "memory/Vars.h"
 #include "memory/MemoryCell.h"

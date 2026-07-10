@@ -26,9 +26,20 @@
 #include "memory/Vars.h"
 #include "utils.h"
 
-
 namespace ngc {
     class Machine {
+    public:
+        enum class Axis {
+            X, Y, Z, A, B, C
+        };
+
+        enum class Unit {
+            Millimeter,
+            Inch
+        };
+
+    private:
+        Unit m_unit;
         position_t m_pos = {};
         position_t m_workOffset = {};
         position_t m_toolOffset = {};
@@ -38,18 +49,23 @@ namespace ngc {
         std::vector<std::unique_ptr<MachineCommand>> m_commands;
 
     public:
-        enum class Axis {
-            X, Y, Z, A, B, C
-        };
-
-        Machine() {
+        Machine(Unit unit) {
+            m_unit = unit;
             m_memory.init(gVars);
             auto result = m_toolTable.load();
-
             if(!result) {
                 PANIC("{}", result.error());
             }
+            beginProgramRun();
+        }
 
+        void beginProgramRun() {
+            m_pos = {};
+            m_workOffset = {};
+            m_toolOffset = {};
+            m_commands.clear();
+
+            m_state = GCodeState::makeDefault();
             const auto num = static_cast<int>(m_memory.read(Var::COORDSYS));
             m_state.affectState(coordsys(num));
         }
@@ -90,6 +106,10 @@ namespace ngc {
                 m_workOffset = offset(*m_state.modeCoordSys);
             }
 
+            if(state.modeUnits) {
+                m_state.modeUnits = std::exchange(state.modeUnits, std::nullopt);
+            }
+
             if(state.nonModal) {
                 if(m_state.nonModal) {
                     PANIC("already have non-modal: {}", name(*m_state.nonModal));
@@ -103,10 +123,6 @@ namespace ngc {
                         handleG10(block, state);
                         break;
                 }
-            }
-
-            if(state.modeUnits) {
-                m_state.modeUnits = std::exchange(state.modeUnits, std::nullopt);
             }
 
             if(state.modePath) {
@@ -130,7 +146,7 @@ namespace ngc {
             }
 
             if(state.F) {
-                m_state.F = std::exchange(state.F, std::nullopt);
+                m_state.F = *std::exchange(state.F, std::nullopt) * linearScale();
             }
 
             if(state.S) {
@@ -159,25 +175,29 @@ namespace ngc {
             if(state.modeToolOffset) {
                 m_state.modeToolOffset = std::exchange(state.modeToolOffset, std::nullopt);
                 
-                int toolNumber = 0;
+                if(m_state.modeToolOffset == GCTLen::G43) {
+                    int toolNumber = 0;
 
-                if(state.H) {
-                    m_state.H = std::exchange(state.H, std::nullopt);
-                    toolNumber = static_cast<int>(*m_state.H);
-                }
-
-                if(toolNumber == 0) {
-                    if(!m_state.T || static_cast<int>(*m_state.T) == 0) {
-                        PANIC("{}: no tool specified for tool change and no T currently programmed: {}", block.statement()->startToken().location(), block.statement()->text());
+                    if(state.H) {
+                        m_state.H = std::exchange(state.H, std::nullopt);
+                        toolNumber = static_cast<int>(*m_state.H);
                     }
 
-                    toolNumber = static_cast<int>(*m_state.T);
-                }
+                    if(toolNumber == 0) {
+                        if(!m_state.T || static_cast<int>(*m_state.T) == 0) {
+                            PANIC("{}: no tool specified for tool change and no T currently programmed: {}", block.statement()->startToken().location(), block.statement()->text());
+                        }
 
-                if(auto tool = m_toolTable.get(toolNumber)) {
-                    m_toolOffset = { tool->x, tool->y, tool->z, tool->a, tool->b, tool->c };
-                } else {
-                    PANIC("{}: tool not found: {}", block.statement()->startToken().location(), toolNumber);
+                        toolNumber = static_cast<int>(*m_state.T);
+                    }
+
+                    if(auto tool = m_toolTable.get(toolNumber)) {
+                        m_toolOffset = { tool->x, tool->y, tool->z, tool->a, tool->b, tool->c };
+                    } else {
+                        PANIC("{}: tool not found: {}", block.statement()->startToken().location(), toolNumber);
+                    }
+                } else if(m_state.modeToolOffset == GCTLen::G49) {
+                    m_toolOffset = {};
                 }
             }
 
@@ -191,15 +211,15 @@ namespace ngc {
 
             bool hasMovement = false;
 
-            if(state.X) { m_state.X = std::exchange(state.X, std::nullopt); hasMovement = true; }
-            if(state.Y) { m_state.Y = std::exchange(state.Y, std::nullopt); hasMovement = true; }
-            if(state.Z) { m_state.Z = std::exchange(state.Z, std::nullopt); hasMovement = true; }
+            if(state.X) { m_state.X = *std::exchange(state.X, std::nullopt) * linearScale(); hasMovement = true; }
+            if(state.Y) { m_state.Y = *std::exchange(state.Y, std::nullopt) * linearScale(); hasMovement = true; }
+            if(state.Z) { m_state.Z = *std::exchange(state.Z, std::nullopt) * linearScale(); hasMovement = true; }
             if(state.A) { m_state.A = std::exchange(state.A, std::nullopt); hasMovement = true; }
             if(state.B) { m_state.B = std::exchange(state.B, std::nullopt); hasMovement = true; }
             if(state.C) { m_state.C = std::exchange(state.C, std::nullopt); hasMovement = true; }
-            if(state.I) { m_state.I = std::exchange(state.I, std::nullopt); hasMovement = true; }
-            if(state.J) { m_state.J = std::exchange(state.J, std::nullopt); hasMovement = true; }
-            if(state.K) { m_state.K = std::exchange(state.K, std::nullopt); hasMovement = true; }
+            if(state.I) { m_state.I = *std::exchange(state.I, std::nullopt) * linearScale(); hasMovement = true; }
+            if(state.J) { m_state.J = *std::exchange(state.J, std::nullopt) * linearScale(); hasMovement = true; }
+            if(state.K) { m_state.K = *std::exchange(state.K, std::nullopt) * linearScale(); hasMovement = true; }
 
             if(hasMovement) {
                 handleMotion(block);
@@ -225,19 +245,19 @@ namespace ngc {
                 auto startAddr = offsetStartAddress(static_cast<GCCoord>(code));
 
                 if(state.X) {
-                    m_state.X = std::exchange(state.X, std::nullopt);
+                    m_state.X = *std::exchange(state.X, std::nullopt) * linearScale();
                     auto result = m_memory.write(startAddr + 0, *m_state.X, true);
                     if(!result) { PANIC(); }
                 }
 
                 if(state.Y) {
-                    m_state.Y = std::exchange(state.Y, std::nullopt);
+                    m_state.Y = *std::exchange(state.Y, std::nullopt) * linearScale();
                     auto result = m_memory.write(startAddr + 1, *m_state.Y, true);
                     if(!result) { PANIC(); }
                 }
 
                 if(state.Z) {
-                    m_state.Z = std::exchange(state.Z, std::nullopt);
+                    m_state.Z = *std::exchange(state.Z, std::nullopt) * linearScale();
                     auto result = m_memory.write(startAddr + 2, *m_state.Z, true);
                     if(!result) { PANIC(); }
                 }
@@ -280,7 +300,6 @@ namespace ngc {
             if(m_state.modeMotion == GCMotion::G2 || m_state.modeMotion == GCMotion::G3) {
                 auto pos = position();
                 auto flip = m_state.modeMotion == GCMotion::G3 ? 1.0 : -1.0;
-                auto speed = m_state.modeMotion == GCMotion::G1 ? *m_state.F : -1.0;
                 std::optional<vec3_t> center;
                 std::optional<vec3_t> axis;
 
@@ -315,7 +334,7 @@ namespace ngc {
                     PANIC();
                 }
 
-                m_commands.emplace_back(std::make_unique<MoveArc>(m_pos, pos, *center, *axis, speed));
+                m_commands.emplace_back(std::make_unique<MoveArc>(m_pos, pos, *center, *axis, *m_state.F));
                 m_pos = pos;
                 return;
             }
@@ -327,12 +346,12 @@ namespace ngc {
             auto workOffset = m_state.nonModal == GCNonModal::G53 ? position_t() : m_workOffset;
 
             switch(a) {
-                case Axis::X: return workOffset.x;
-                case Axis::Y: return workOffset.y;
-                case Axis::Z: return workOffset.z;
-                case Axis::A: return workOffset.a;
-                case Axis::B: return workOffset.b;
-                case Axis::C: return workOffset.c;
+                case Axis::X: return workOffset.x + m_toolOffset.x;
+                case Axis::Y: return workOffset.y + m_toolOffset.y;
+                case Axis::Z: return workOffset.z + m_toolOffset.z;
+                case Axis::A: return workOffset.a + m_toolOffset.a;
+                case Axis::B: return workOffset.b + m_toolOffset.b;
+                case Axis::C: return workOffset.c + m_toolOffset.c;
             }
 
             PANIC();
@@ -406,6 +425,14 @@ namespace ngc {
             }
 
             PANIC("invalid offset GCode::{}", std::to_underlying(code));
+        }
+
+        double linearScale() const {
+            if(m_unit == Unit::Inch) {
+                return *m_state.modeUnits == GCUnits::G20 ? 1.0 : 1.0 / 25.4;
+            }
+
+            return *m_state.modeUnits == GCUnits::G20 ? 25.4 : 1.0;
         }
     };
 }

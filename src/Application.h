@@ -335,27 +335,44 @@ public:
         glm::dvec3 center = { arc.center().x, arc.center().y, arc.center().z };
         glm::dvec3 axis = { arc.axis().x, arc.axis().y, arc.axis().z };
 
-        auto startArm = start - center - glm::proj(start - center, axis);
-        auto endArm = end - center - glm::proj(end - center, axis);
+        const auto axisUnit = glm::normalize(axis);
+        auto startArm = start - center - glm::proj(start - center, axisUnit);
+        auto endArm = end - center - glm::proj(end - center, axisUnit);
         auto axial = glm::proj(end - start, axis);
 
-        auto angle = glm::angle(glm::normalize(startArm), glm::normalize(endArm));
-
-        if(angle <= 2.0 * std::numbers::pi / circleResolution) {
+        if(circleResolution <= 0 || glm::length2(startArm) == 0.0 || glm::length2(endArm) == 0.0) {
             callback(start, end, true, true);
             return;
         }
 
-        int segments = static_cast<int>(angle / (2.0 * std::numbers::pi / circleResolution)) + 1;
+        const auto startUnit = glm::normalize(startArm);
+        const auto endUnit = glm::normalize(endArm);
+        auto sweep = std::atan2(glm::dot(axisUnit, glm::cross(startUnit, endUnit)), glm::dot(startUnit, endUnit));
+
+        if(sweep < 0.0) {
+            sweep += 2.0 * std::numbers::pi;
+        }
+
+        // With IJK-form arcs, matching radial arms denotes a full circle (possibly helical).
+        if(glm::length2(startArm - endArm) < 1e-18) {
+            sweep = 2.0 * std::numbers::pi;
+        }
+
+        if(sweep <= 2.0 * std::numbers::pi / circleResolution) {
+            callback(start, end, true, true);
+            return;
+        }
+
+        int segments = static_cast<int>(sweep / (2.0 * std::numbers::pi / circleResolution)) + 1;
 
         glm::dvec3 prev;
 
         for(int i = 0; i < segments + 1; i++) {
             auto s = static_cast<double>(i) / segments;
-            auto startAngle = glm::lerp(0.0, angle, s);
-            auto v1 = glm::rotate(startArm, startAngle, axis);
-            auto v2 = glm::rotate(endArm, -(angle - startAngle), axis);
-            auto v = center + glm::lerp(v1, v2, s) + axial * s;
+            const auto angle = sweep * s;
+            const auto fromStart = glm::rotate(startArm, angle, axisUnit);
+            const auto fromEnd = glm::rotate(endArm, -(sweep - angle), axisUnit);
+            auto v = center + glm::lerp(fromStart, fromEnd, s) + axial * s;
 
             if(i > 0) {
                 callback(prev, v, i == 1, i == segments);

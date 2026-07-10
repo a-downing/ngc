@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.28)
 project(ngc)
 
+enable_testing()
+
 set(CMAKE_CXX_STANDARD 23)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -15,7 +17,7 @@ set(IMGUI_DIR imgui)
 
 set(OpenGL_GL_PREFERENCE LEGACY)
 find_package(OpenGL REQUIRED)
-find_package(glm PATHS REQUIRED)
+find_package(glm CONFIG REQUIRED)
 #find_package(glfw3 REQUIRED)
 add_subdirectory(glfw)
 
@@ -90,7 +92,7 @@ target_link_libraries(imgui_main
 
 add_executable(binary_to_compressed_c ${IMGUI_DIR}/misc/fonts/binary_to_compressed_c.cpp)
 
-# add_executable(test src/test.cpp)
-# target_include_directories(test PUBLIC
-#         src/
-#         src/include)
+add_executable(ngc_tests src/test.cpp)
+target_include_directories(ngc_tests PRIVATE src/include)
+add_test(NAME ngc_tests COMMAND ngc_tests)
+set_tests_properties(ngc_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
