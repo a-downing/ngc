@@ -46,7 +46,7 @@ namespace ngc {
         Memory m_memory;
         ToolTable m_toolTable;
         GCodeState m_state = GCodeState::makeDefault();
-        std::vector<std::unique_ptr<MachineCommand>> m_commands;
+        std::vector<MachineCommand> m_commands;
 
     public:
         Machine(Unit unit) {
@@ -76,9 +76,44 @@ namespace ngc {
         template<typename Self> auto &state(this Self &&self) { return std::forward<Self>(self).m_state; }
         template<typename Self> auto &commands(this Self &&self) { return std::forward<Self>(self).m_commands; }
 
+        double arcTolerance() const {
+            constexpr double INCH_TOLERANCE = 0.0005;
+            return m_unit == Unit::Inch ? INCH_TOLERANCE : INCH_TOLERANCE * 25.4;
+        }
+
+        std::expected<void, std::string> validateArc(const position_t &from, const position_t &to, const vec3_t &center) const {
+            double startRadius = 0.0;
+            double endRadius = 0.0;
+
+            switch(*m_state.modePlane) {
+                case GCPlane::G17:
+                    startRadius = std::hypot(from.x - center.x, from.y - center.y);
+                    endRadius = std::hypot(to.x - center.x, to.y - center.y);
+                    break;
+                case GCPlane::G18:
+                    startRadius = std::hypot(from.x - center.x, from.z - center.z);
+                    endRadius = std::hypot(to.x - center.x, to.z - center.z);
+                    break;
+                case GCPlane::G19:
+                    startRadius = std::hypot(from.y - center.y, from.z - center.z);
+                    endRadius = std::hypot(to.y - center.y, to.z - center.z);
+                    break;
+            }
+
+            if(startRadius == 0.0 || endRadius == 0.0) {
+                return std::unexpected("arc radius must be greater than zero");
+            }
+
+            if(std::abs(startRadius - endRadius) > arcTolerance()) {
+                return std::unexpected(std::format("arc radius mismatch: start {} end {} tolerance {}", startRadius, endRadius, arcTolerance()));
+            }
+
+            return {};
+        }
+
         void foreachCommand(const std::function<void(const MachineCommand &)> &callback) const {
             for(const auto &cmd : m_commands) {
-                callback(*cmd.get());
+                callback(cmd);
             }
         }
 
@@ -165,10 +200,10 @@ namespace ngc {
                 m_state.modeSpindle = std::exchange(state.modeSpindle, std::nullopt);
 
                 if(m_state.modeSpindle == MCSpindle::M5) {
-                    m_commands.emplace_back(std::make_unique<SpindleStop>());
+                    m_commands.emplace_back(SpindleStop{});
                 } else if(m_state.S > 0 && (m_state.modeSpindle == MCSpindle::M3 || m_state.modeSpindle == MCSpindle::M4)) {
                     const auto dir = m_state.modeSpindle == MCSpindle::M3 ? Direction::CW : Direction::CCW;
-                    m_commands.emplace_back(std::make_unique<SpindleStart>(dir, *m_state.S));
+                    m_commands.emplace_back(SpindleStart{dir, *m_state.S});
                 }
             }
 
@@ -292,7 +327,7 @@ namespace ngc {
                 auto pos = position();
                 std::println("pos: {}", pos.text());
                 auto speed = m_state.modeMotion == GCMotion::G1 ? *m_state.F : -1;
-                m_commands.emplace_back(std::make_unique<MoveLine>(m_pos, pos, speed));
+                m_commands.emplace_back(MoveLine{m_pos, pos, speed});
                 m_pos = pos;
                 return;
             }
@@ -304,29 +339,29 @@ namespace ngc {
                 std::optional<vec3_t> axis;
 
                 if(m_state.modePlane == GCPlane::G17) {
-                    if(!m_state.I || !m_state.J) {
-                        PANIC("missing I or K for G17 arc: {}", block.statement()->text());
+                    if(!m_state.I && !m_state.J) {
+                        PANIC("missing I and J for G17 arc: {}", block.statement()->text());
                     }
 
-                    center = vec3_t(m_pos.x + *m_state.I, m_pos.y + *m_state.J, m_pos.z);
+                    center = vec3_t(m_pos.x + m_state.I.value_or(0.0), m_pos.y + m_state.J.value_or(0.0), m_pos.z);
                     axis = vec3_t(0.0, 0.0, 1.0) * flip;
                 }
 
                 if(m_state.modePlane == GCPlane::G18) {
-                    if(!m_state.I || !m_state.K) {
-                        PANIC("missing I or K for G18 arc: {}", block.statement()->text());
+                    if(!m_state.I && !m_state.K) {
+                        PANIC("missing I and K for G18 arc: {}", block.statement()->text());
                     }
 
-                    center = vec3_t(m_pos.x + *m_state.I, m_pos.y, m_pos.z + *m_state.K);
+                    center = vec3_t(m_pos.x + m_state.I.value_or(0.0), m_pos.y, m_pos.z + m_state.K.value_or(0.0));
                     axis = vec3_t(0.0, 1.0, 0.0) * flip;
                 }
 
                 if(m_state.modePlane == GCPlane::G19) {
-                    if(!m_state.J || !m_state.K) {
-                        PANIC("missing J or K for G19 arc: {}", block.statement()->text());
+                    if(!m_state.J && !m_state.K) {
+                        PANIC("missing J and K for G19 arc: {}", block.statement()->text());
                     }
 
-                    center = vec3_t(m_pos.x, m_pos.y + *m_state.J, m_pos.z + *m_state.K);
+                    center = vec3_t(m_pos.x, m_pos.y + m_state.J.value_or(0.0), m_pos.z + m_state.K.value_or(0.0));
                     axis = vec3_t(1.0, 0.0, 0.0) * flip;
                 }
 
@@ -334,7 +369,11 @@ namespace ngc {
                     PANIC();
                 }
 
-                m_commands.emplace_back(std::make_unique<MoveArc>(m_pos, pos, *center, *axis, *m_state.F));
+                if(auto valid = validateArc(m_pos, pos, *center); !valid) {
+                    PANIC("{}: {}: {}", block.statement()->startToken().location(), valid.error(), block.statement()->text());
+                }
+
+                m_commands.emplace_back(MoveArc{m_pos, pos, *center, *axis, *m_state.F});
                 m_pos = pos;
                 return;
             }

@@ -1,5 +1,8 @@
 #include <cstdio>
+#include <fstream>
 #include <print>
+#include <string>
+#include <utility>
 
 #include "imgui.h"
 #include "imgui_impl_glfw.h"
@@ -16,6 +19,23 @@
 
 static void glfw_error_callback(int error, const char* description) {
     fprintf(stderr, "GLFW Error %d: %s\n", error, description);
+}
+
+static double scroll_delta = 0.0;
+
+static void application_scroll_callback(GLFWwindow *, double, double yoffset) {
+    scroll_delta += yoffset;
+}
+
+static bool load_window_maximized() {
+    std::ifstream state("window_state.ini");
+    std::string value;
+    return std::getline(state, value) && value == "maximized=1";
+}
+
+static void save_window_maximized(GLFWwindow *window) {
+    std::ofstream state("window_state.ini", std::ios::trunc);
+    state << "maximized=" << (glfwGetWindowAttrib(window, GLFW_MAXIMIZED) == GLFW_TRUE ? 1 : 0) << '\n';
 }
 
 int main(int, char**) {
@@ -49,6 +69,7 @@ int main(int, char**) {
 #endif
 
     // Create window with graphics context
+    glfwWindowHint(GLFW_MAXIMIZED, load_window_maximized() ? GLFW_TRUE : GLFW_FALSE);
     GLFWwindow* window = glfwCreateWindow(1920, 1080, "ngc", nullptr, nullptr);
 
     if (window == nullptr) {
@@ -57,6 +78,7 @@ int main(int, char**) {
 
     glfwMakeContextCurrent(window);
     glfwSwapInterval(0);
+    glfwSetScrollCallback(window, application_scroll_callback);
 
     // Setup Dear ImGui context
     IMGUI_CHECKVERSION();
@@ -93,6 +115,7 @@ int main(int, char**) {
         ImGui_ImplGlfw_NewFrame();
         ImGui::NewFrame();
 
+        app.addScroll(std::exchange(scroll_delta, 0.0));
         app.preRender();
         app.render();
 
@@ -110,6 +133,7 @@ int main(int, char**) {
         glfwSwapBuffers(window);
     }
 
+    save_window_maximized(window);
     app.terminate();
 
     // Cleanup

@@ -4,6 +4,7 @@
 #include <utility>
 #include <string>
 #include <format>
+#include <variant>
 
 #include "utils.h"
 
@@ -66,71 +67,38 @@ namespace ngc {
         PANIC("{} missing case statement for Direction::{}", __func__, std::to_underlying(direction));
     }
 
-    class MachineCommand {
-    public:
-        virtual ~MachineCommand() = default;
-        virtual std::string text() const = 0;
-
-        virtual bool is(const class SpindleStart *) const { return false; }
-        virtual bool is(const class SpindleStop*) const { return false; }
-        virtual bool is(const class MoveLine *) const { return false; }
-        virtual bool is(const class MoveArc *) const { return false; }
-
-        template<typename T>
-        bool is() const requires std::derived_from<T, MachineCommand> {
-            return this->is(static_cast<const T *>(nullptr));
-        }
-
-        template<typename T>
-        const T *as() const requires std::derived_from<T, MachineCommand> {
-            return this->is(static_cast<const T *>(nullptr)) ? static_cast<const T *>(this) : nullptr;
-        }
-    };
-
-    class SpindleStart final : public MachineCommand {
+    class SpindleStart {
         Direction m_direction;
         double m_speed;
 
     public:
         explicit SpindleStart(const Direction dir, const double speed) : m_direction(dir), m_speed(speed) { }
-        ~SpindleStart() override = default;
-
-        bool is(const SpindleStart *) const override { return true; }
-
         Direction direction() const { return m_direction; }
         double speed() const { return m_speed; }
 
-        std::string text() const override { return std::format("Spindle({}, {})", name(m_direction), m_speed); }
+        std::string text() const { return std::format("Spindle({}, {})", name(m_direction), m_speed); }
     };
 
-    class SpindleStop final : public MachineCommand {
+    class SpindleStop {
     public:
-        ~SpindleStop() override = default;
-
-        bool is(const SpindleStop *) const override { return true; }
-
-        std::string text() const override { return "SpindleStop()"; }
+        std::string text() const { return "SpindleStop()"; }
     };
 
-    class MoveLine final : public MachineCommand {
+    class MoveLine {
         position_t m_from;
         position_t m_to;
         double m_speed;
 
     public:
         MoveLine(const position_t &from, const position_t &to, const double speed) : m_from(from), m_to(to), m_speed(speed) { }
-        ~MoveLine() override = default;
-
-        bool is(const MoveLine *) const override { return true; }
-
         const position_t &from() const { return m_from; }
         const position_t &to() const { return m_to; }
         double speed() const { return m_speed; }
 
-        std::string text() const override { return std::format("MoveLine(from: {}, to: {}, speed: {})", m_from.text(), m_to.text(), m_speed); }
+        std::string text() const { return std::format("MoveLine(from: {}, to: {}, speed: {})", m_from.text(), m_to.text(), m_speed); }
     };
 
-    class MoveArc final : public MachineCommand {
+    class MoveArc {
         position_t m_from;
         position_t m_to;
         vec3_t m_center;
@@ -139,16 +107,14 @@ namespace ngc {
 
     public:
         MoveArc(const position_t &from, const position_t &to, const vec3_t &center, const vec3_t &axis, const double speed) : m_from(from), m_to(to), m_center(center), m_axis(axis), m_speed(speed) { }
-        ~MoveArc() override = default;
-
-        bool is(const MoveArc *) const override { return true; }
-
         const position_t &from() const { return m_from; }
         const position_t &to() const { return m_to; }
         const vec3_t &center() const { return m_center; }
         const vec3_t &axis() const { return m_axis; }
         double speed() const { return m_speed; }
 
-        std::string text() const override { return std::format("MoveArc(from: {}, to: {}, center: {}, axis: {}, speed: {})", m_from.text(), m_to.text(), m_center.text(), m_axis.text(), m_speed); }
+        std::string text() const { return std::format("MoveArc(from: {}, to: {}, center: {}, axis: {}, speed: {})", m_from.text(), m_to.text(), m_center.text(), m_axis.text(), m_speed); }
     };
+
+    using MachineCommand = std::variant<SpindleStart, SpindleStop, MoveLine, MoveArc>;
 }

@@ -1,36 +1,23 @@
 #pragma once
 
 #include <condition_variable>
-#include <functional>
-#include <memory>
 #include <mutex>
-#include <print>
 #include <thread>
 
-#include "evaluator/Evaluator.h"
-#include "evaluator/Preamble.h"
-#include "machine/Machine.h"
-#include "memory/Memory.h"
+#include "evaluator/InterpreterSession.h"
 #include "memory/Vars.h"
-#include "parser/Program.h"
 
 class Worker {
     mutable std::mutex m_mutex;
     std::condition_variable m_cv;
     std::thread m_thread;
 
-    ngc::Machine m_machine{ ngc::Machine::Unit::Inch };
+    ngc::InterpreterSession m_session{ ngc::Machine::Unit::Inch };
 
     bool m_doJoin = false;
     bool m_doCompile = false;
     bool m_doExecute = false;
-    bool m_compiled = false;
     bool m_busy = false;
-
-    std::vector<ngc::Program> m_programs;
-    std::vector<ngc::Parser::Error> m_parserErrors;
-    std::vector<std::string> m_printMessages;
-    std::vector<std::string> m_blockMessages;
 
 public:
     Worker() {
@@ -39,7 +26,7 @@ public:
 
     double read(ngc::Var var) {
         std::scoped_lock lock(m_mutex);
-        return m_machine.memory().read(var);
+        return m_session.machine().memory().read(var);
     }
 
     auto lock(const auto &callback) const {
@@ -47,11 +34,11 @@ public:
         return callback();
     }
 
-    const ngc::Machine &machine() const { return m_machine; }
+    const ngc::Machine &machine() const { return m_session.machine(); }
 
     bool compiled() const {
         std::scoped_lock lock(m_mutex);
-        return m_compiled;
+        return m_session.compiled();
     }
 
     bool busy() const {
@@ -61,17 +48,17 @@ public:
 
     std::vector<ngc::Parser::Error> parserErrors() const {
         std::scoped_lock lock(m_mutex);
-        return m_parserErrors;
+        return m_session.parserErrors();
     }
 
     std::vector<std::string> printMessages() const {
         std::scoped_lock lock(m_mutex);
-        return m_printMessages;
+        return m_session.printMessages();
     }
 
     std::vector<std::string> blockMessages() const {
         std::scoped_lock lock(m_mutex);
-        return m_blockMessages;
+        return m_session.blockMessages();
     }
 
     bool compile(const std::vector<std::tuple<std::string, std::string>> &programs) {
@@ -81,16 +68,7 @@ public:
             return false;
         }
 
-        m_programs.clear();
-        m_parserErrors.clear();
-        m_printMessages.clear();
-        m_blockMessages.clear();
-        
-        for(auto &[source, name] : programs) {
-            m_programs.emplace_back(source, name);
-        }
-
-        m_compiled = false;
+        m_session.setPrograms(programs);
         m_doCompile = true;
         m_cv.notify_one();
         return true;
@@ -144,70 +122,20 @@ private:
     }
 
     void doCompile() {
-        m_parserErrors.clear();
-
-        for(auto &program : m_programs) {
-            auto result = program.compile();
-
-            if(!result) {
-                std::scoped_lock lock(m_mutex);
-                m_parserErrors.emplace_back(std::move(result.error()));
-            }
-        }
+        m_session.compile([&](const auto &callback) {
+            std::scoped_lock lock(m_mutex);
+            callback();
+        });
 
         std::scoped_lock lock(m_mutex);
-
-        if(m_parserErrors.empty() && !m_programs.empty()) {
-            m_compiled = true;
-        }
-
         m_busy = false;
     }
 
     void doExecute() {
-        {
+        m_session.execute([&](const auto &callback) {
             std::scoped_lock lock(m_mutex);
-            m_machine.beginProgramRun();
-            m_printMessages.clear();
-            m_blockMessages.clear();
-        }
-
-        std::function callback = [&] (std::unique_ptr<const ngc::EvaluatorMessage> msg, ngc::Evaluator &eval) {
-            if(auto blockMsg = msg->as<ngc::BlockMessage>()) {
-                ngc::GCodeState state;
-
-                for(const auto &word : blockMsg->block().words()) {
-                    state.affectState(word);
-                }
-
-                if(state.modeToolChange) {
-                    eval.call("_tool_change", *state.T);
-                }
-
-                std::scoped_lock lock(m_mutex);
-                m_blockMessages.emplace_back(blockMsg->block().statement()->text());
-
-                m_machine.executeBlock(blockMsg->block());
-            }
-
-            if(auto printMsg = msg->as<ngc::PrintMessage>()) {
-                std::scoped_lock lock(m_mutex);
-                m_printMessages.emplace_back(printMsg->text());
-            }
-        };
-
-        auto eval = ngc::Evaluator(m_machine.memory(), callback);
-
-        auto preamble = ngc::Preamble(m_machine.memory());
-        eval.executeFirstPass(preamble.statements());
-
-        for(const auto &program : m_programs) {
-            eval.executeFirstPass(program.statements());
-        }
-
-        for(const auto &program : m_programs) {
-            eval.executeSecondPass(program.statements());
-        }
+            callback();
+        });
 
         std::scoped_lock lock(m_mutex);
         m_busy = false;

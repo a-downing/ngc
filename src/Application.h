@@ -1,12 +1,16 @@
 #pragma once
 
 #include <filesystem>
+#include <algorithm>
 #include <print>
 #include <string>
 #include <cmath>
 #include <cstdint>
 #include <ranges>
 #include <numbers>
+#include <limits>
+#include <optional>
+#include <utility>
 
 #ifdef __clang__
     #pragma push_macro("__cpp_concepts")
@@ -30,6 +34,7 @@
 #include <glm/vec3.hpp>
 #include <glm/mat4x4.hpp>
 #include <glm/gtc/matrix_transform.hpp>
+#include <glm/gtc/quaternion.hpp>
 #include <glm/gtc/type_ptr.hpp>
 #include <glm/gtx/vector_angle.hpp>
 #include <glm/gtx/projection.hpp>
@@ -73,19 +78,19 @@ class Application final {
 
     Worker m_worker{};
 
-    uint64_t m_frames = 0;
-    double m_time;
-    double m_dt;
-    double m_mouseX;
-    double m_mouseY;
-    double m_mouseDX;
-    double m_mouseDY;
+    double m_time = 0.0;
+    double m_dt = 0.0;
+    double m_mouseX = 0.0;
+    double m_mouseY = 0.0;
+    double m_mouseDX = 0.0;
+    double m_mouseDY = 0.0;
+    double m_scrollDelta = 0.0;
 
-    double m_yaw = 0;
-    double m_pitch = 0;
-    glm::dvec3 m_cameraPosition = { 0.0, -12.0, 0.0 };
-    glm::dvec3 m_cameraVelocity = { 0.0, 0.0, 0.0 };
-    double m_cameraAcceleration = 1.0;
+    glm::dquat m_modelOrientation { 1.0, 0.0, 0.0, 0.0 };
+    glm::dvec2 m_viewPan { 0.0, 0.0 };
+    double m_viewHalfHeight = 6.0;
+    double m_sceneScale = 1.0;
+    glm::dvec3 m_modelPivot = { 0.0, 0.0, 0.0 };
 
 public:
     Application() = delete;
@@ -101,7 +106,6 @@ public:
     }
 
     void preRender() {
-        m_frames++;
         m_dt = ImGui::GetTime() - m_time;
         m_time = ImGui::GetTime();
         auto pos = ImGui::GetMousePos();
@@ -109,6 +113,10 @@ public:
         m_mouseDY = pos.y - m_mouseY;
         m_mouseX = pos.x;
         m_mouseY = pos.y;
+    }
+
+    void addScroll(const double delta) {
+        m_scrollDelta += delta;
     }
 
     void terminate() {
@@ -152,86 +160,179 @@ public:
         return ctx->NavWindow == nullptr && ctx->MovingWindow == nullptr && ctx->WheelingWindow == nullptr;
     }
 
+    void fitToolpathToView(const int width, const int height) {
+        glm::dvec3 minimum(std::numeric_limits<double>::max());
+        glm::dvec3 maximum(std::numeric_limits<double>::lowest());
+        bool hasGeometry = false;
+
+        const auto include = [&](const glm::dvec3 &point) {
+            minimum = glm::min(minimum, point);
+            maximum = glm::max(maximum, point);
+            hasGeometry = true;
+        };
+
+        m_worker.lock([&] {
+            m_worker.machine().foreachCommand([&](const ngc::MachineCommand &command) {
+                std::visit([&](const auto &value) {
+                    using T = std::decay_t<decltype(value)>;
+
+                    if constexpr(std::same_as<T, ngc::MoveLine>) {
+                        include({ value.from().x, value.from().y, value.from().z });
+                        include({ value.to().x, value.to().y, value.to().z });
+                    } else if constexpr(std::same_as<T, ngc::MoveArc>) {
+                        const glm::dvec3 from { value.from().x, value.from().y, value.from().z };
+                        const glm::dvec3 to { value.to().x, value.to().y, value.to().z };
+                        const glm::dvec3 center { value.center().x, value.center().y, value.center().z };
+                        const auto radius = std::max(glm::length(from - center), glm::length(to - center));
+                        include(from);
+                        include(to);
+                        include(center - glm::dvec3(radius));
+                        include(center + glm::dvec3(radius));
+                    }
+                }, command);
+            });
+        });
+
+        if(!hasGeometry) {
+            minimum = { -1.0, -1.0, -1.0 };
+            maximum = { 1.0, 1.0, 1.0 };
+        }
+
+        m_modelPivot = (minimum + maximum) * 0.5;
+        m_viewPan = { 0.0, 0.0 };
+        const auto radius = std::max(glm::length(maximum - minimum) * 0.5, 0.1);
+        m_sceneScale = radius;
+        const auto aspect = static_cast<double>(std::max(width, 1)) / std::max(height, 1);
+        m_viewHalfHeight = radius * 1.1 / std::min(aspect, 1.0);
+    }
+
+    void pickRotationPivot(const int width, const int height) {
+        constexpr double PICK_RADIUS_PIXELS = 30.0;
+        const auto aspect = static_cast<double>(width) / height;
+        const glm::dvec2 mouse { m_mouseX, m_mouseY };
+        auto bestDistanceSquared = PICK_RADIUS_PIXELS * PICK_RADIUS_PIXELS;
+        std::optional<glm::dvec3> bestPoint;
+
+        const auto project = [&](const glm::dvec3 &point) {
+            const auto transformed = m_modelOrientation * (point - m_modelPivot);
+            const auto ndcX = (transformed.x + m_viewPan.x) / (m_viewHalfHeight * aspect);
+            const auto ndcY = (transformed.z + m_viewPan.y) / m_viewHalfHeight;
+            return glm::dvec2((ndcX + 1.0) * width * 0.5, (1.0 - ndcY) * height * 0.5);
+        };
+
+        const auto considerSegment = [&](const glm::dvec3 &from, const glm::dvec3 &to) {
+            const auto screenFrom = project(from);
+            const auto screenTo = project(to);
+            const auto screenSegment = screenTo - screenFrom;
+            const auto lengthSquared = glm::dot(screenSegment, screenSegment);
+            const auto t = lengthSquared > 0.0
+                ? std::clamp(glm::dot(mouse - screenFrom, screenSegment) / lengthSquared, 0.0, 1.0)
+                : 0.0;
+            const auto difference = mouse - glm::mix(screenFrom, screenTo, t);
+            const auto distanceSquared = glm::dot(difference, difference);
+
+            if(distanceSquared < bestDistanceSquared) {
+                bestDistanceSquared = distanceSquared;
+                bestPoint = glm::mix(from, to, t);
+            }
+        };
+
+        m_worker.lock([&] {
+            m_worker.machine().foreachCommand([&](const ngc::MachineCommand &command) {
+                std::visit([&](const auto &value) {
+                    using T = std::decay_t<decltype(value)>;
+
+                    if constexpr(std::same_as<T, ngc::MoveLine>) {
+                        considerSegment(
+                            { value.from().x, value.from().y, value.from().z },
+                            { value.to().x, value.to().y, value.to().z });
+                    } else if constexpr(std::same_as<T, ngc::MoveArc>) {
+                        interpolate(value, 60, [&](const glm::dvec3 &from, const glm::dvec3 &to, bool, bool) {
+                            considerSegment(from, to);
+                        });
+                    }
+                }, command);
+            });
+        });
+
+        if(bestPoint) {
+            // Preserve the current model transform while changing the point
+            // about which subsequent rotations are applied.
+            const auto compensation = m_modelOrientation * (*bestPoint - m_modelPivot);
+            m_viewPan.x += compensation.x;
+            m_viewPan.y += compensation.z;
+            m_modelPivot = *bestPoint;
+        }
+    }
+
     void render3D() {
         int width, height;
         glfwGetWindowSize(m_window, &width, &height);
+        width = std::max(width, 1);
+        height = std::max(height, 1);
+
+        const auto navigationActive = noWindowHasFocus();
+        const auto middleDown = ImGui::IsMouseDown(ImGuiMouseButton_Middle);
+        const auto ctrl = ImGui::IsKeyDown(ImGuiKey_LeftCtrl) || ImGui::IsKeyDown(ImGuiKey_RightCtrl);
+        const auto shift = ImGui::IsKeyDown(ImGuiKey_LeftShift) || ImGui::IsKeyDown(ImGuiKey_RightShift);
+
+        if(navigationActive && ImGui::IsKeyPressed(ImGuiKey_F, false)) {
+            fitToolpathToView(width, height);
+        }
+
+        if(navigationActive && ImGui::IsMouseClicked(ImGuiMouseButton_Middle) && !ctrl && !shift) {
+            pickRotationPivot(width, height);
+        }
+
+        if(navigationActive && middleDown && !ctrl && !shift) {
+            const auto horizontal = glm::angleAxis(-m_mouseDX * 0.01, glm::dvec3(0.0, 0.0, 1.0));
+            const auto vertical = glm::angleAxis(-m_mouseDY * 0.01, glm::dvec3(1.0, 0.0, 0.0));
+            m_modelOrientation = glm::normalize(vertical * horizontal * m_modelOrientation);
+        }
+
+        if(navigationActive && middleDown && ctrl) {
+            const auto worldUnitsPerPixel = 2.0 * m_viewHalfHeight / height;
+            m_viewPan.x += m_mouseDX * worldUnitsPerPixel;
+            m_viewPan.y -= m_mouseDY * worldUnitsPerPixel;
+        }
+
+        const auto scrollDelta = std::exchange(m_scrollDelta, 0.0);
+        auto scaleFactor = 1.0;
+        if(navigationActive && middleDown && shift) {
+            scaleFactor *= std::exp(m_mouseDY * 0.01);
+        }
+        if(scrollDelta != 0.0) {
+            scaleFactor *= std::exp(-scrollDelta * 0.15);
+        }
+
+        const auto aspect = static_cast<double>(width) / height;
+        if(scaleFactor != 1.0) {
+            const auto oldHalfHeight = m_viewHalfHeight;
+            const auto newHalfHeight = std::clamp(oldHalfHeight * scaleFactor, m_sceneScale * 1e-9, m_sceneScale * 1e9);
+            const auto mouseNdcX = 2.0 * m_mouseX / width - 1.0;
+            const auto mouseNdcY = 1.0 - 2.0 * m_mouseY / height;
+
+            // Changing an orthographic projection normally zooms around the
+            // screen center. Shift the view so the point under the cursor
+            // remains under the cursor as the projection scale changes.
+            m_viewPan.x += mouseNdcX * aspect * (newHalfHeight - oldHalfHeight);
+            m_viewPan.y += mouseNdcY * (newHalfHeight - oldHalfHeight);
+            m_viewHalfHeight = newHalfHeight;
+        }
+
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
-        gluPerspective(60.0, static_cast<double>(width) / height, 0.001, 1000.0);
+        glOrtho(-m_viewHalfHeight * aspect, m_viewHalfHeight * aspect,
+                -m_viewHalfHeight, m_viewHalfHeight, -m_sceneScale * 1e6, m_sceneScale * 1e6);
 
-        auto down = ImGui::IsMouseDown(ImGuiMouseButton_Left);
-        auto notFocused = noWindowHasFocus();
+        const auto view = glm::lookAt(glm::dvec3(0.0, -1.0, 0.0), glm::dvec3(0.0), glm::dvec3(0.0, 0.0, 1.0));
+        auto model = glm::translate(glm::dmat4(1.0), glm::dvec3(m_viewPan.x, 0.0, m_viewPan.y));
+        model *= glm::mat4_cast(m_modelOrientation);
+        model = glm::translate(model, -m_modelPivot);
 
-        auto w = ImGui::IsKeyDown(ImGuiKey_W);
-        auto a = ImGui::IsKeyDown(ImGuiKey_A);
-        auto s = ImGui::IsKeyDown(ImGuiKey_S);
-        auto d = ImGui::IsKeyDown(ImGuiKey_D);
-        auto ctrl = ImGui::IsKeyDown(ImGuiKey_LeftCtrl);
-        auto space = ImGui::IsKeyDown(ImGuiKey_Space);
-        auto shift = ImGui::IsKeyDown(ImGuiKey_LeftShift);
-
-        if(down && notFocused) {
-            m_yaw += m_mouseDX * 0.001;
-            m_pitch += -m_mouseDY * 0.001;
-        }
-
-        glm::dvec3 front;
-        front.x = sin(m_yaw) * cos(m_pitch);
-        front.y = cos(m_yaw) * cos(m_pitch);
-        front.z = sin(m_pitch);
-        
-        glm::dvec3 right;
-        right.x = cos(m_yaw);
-        right.y = -sin(m_yaw);
-        right.z = 0.0f;
-
-        auto cameraFront = glm::normalize(front);
-        auto cameraRight = glm::normalize(right);
-        auto cameraUp = glm::cross(cameraRight, cameraFront);
-
-        if(down && notFocused) {
-            auto boost = shift ? 10.0 : 1.0;
-
-            if(w) {
-                m_cameraVelocity += cameraFront * m_cameraAcceleration * boost * m_dt;
-            }
-
-            if(a) {
-                m_cameraVelocity -= cameraRight * m_cameraAcceleration * boost * m_dt;
-            }
-
-            if(s) {
-                m_cameraVelocity -= cameraFront * m_cameraAcceleration * boost * m_dt;
-            }
-
-            if(d) {
-                m_cameraVelocity += cameraRight * m_cameraAcceleration * boost * m_dt;
-            }
-
-            if(ctrl) {
-                m_cameraVelocity -= cameraUp * m_cameraAcceleration * boost * m_dt;
-            }
-
-            if(space) {
-                m_cameraVelocity += cameraUp * m_cameraAcceleration * boost * m_dt;
-            }
-
-            if(!w && !a && !s && !d && !ctrl && !space) {
-                m_cameraVelocity = { 0, 0, 0 };
-            }
-
-            if(glm::length(m_cameraVelocity) > boost) {
-                m_cameraVelocity = glm::normalize(m_cameraVelocity) * boost;
-            }
-
-            m_cameraPosition += m_cameraVelocity * m_dt;
-        }
-
-        auto mat = glm::lookAt(m_cameraPosition, m_cameraPosition + cameraFront, cameraUp);
-        
         glMatrixMode(GL_MODELVIEW);
         glLoadIdentity();
-        glLoadMatrixd(glm::value_ptr(mat));
+        glLoadMatrixd(glm::value_ptr(view * model));
 
         glBegin(GL_LINES);
 
@@ -273,7 +374,7 @@ public:
 
         m_worker.lock([&] {
             m_worker.machine().foreachCommand([&](const ngc::MachineCommand &cmd) {
-                if(auto moveLine = cmd.as<ngc::MoveLine>()) {
+                if(auto moveLine = std::get_if<ngc::MoveLine>(&cmd)) {
                     if(moveLine->speed() == -1.0) {
                         glColor3f(1.0, 1.0, 0.4);
                     } else {
@@ -298,7 +399,7 @@ public:
                     glEnd();
                 }
 
-                if(auto moveArc = cmd.as<ngc::MoveArc>()) {
+                if(auto moveArc = std::get_if<ngc::MoveArc>(&cmd)) {
                     interpolate(*moveArc, 60, [&](const glm::dvec3 &start, const glm::dvec3 &end, const bool startPoint, const bool endPoint) {
                         glBegin(GL_LINES);
                         glColor3f(0.4, 1.0, 0.4);
@@ -576,8 +677,6 @@ public:
 
     void renderProgramWindow() {
         if(ImGui::Begin("Program", &m_enableProgramWindow)) {
-            auto size = ImGui::GetWindowSize();
-
             if(ImGui::BeginChild("top", { 0, 0 }, ImGuiChildFlags_Border | ImGuiChildFlags_ResizeY)) {
                 if(ImGui::Button("Compile Programs", {0,0}, m_worker.busy())) {
                     m_worker.compile(m_programSource);
@@ -631,7 +730,7 @@ public:
         ImGui::OpenPopup("Open File");
 
         if(ImGui::BeginPopupModal("Open File", &m_enableOpenDialog)) {
-            ImGui::Text("path: %s", m_path.c_str());
+            ImGui::Text("path: %s", m_path.string().c_str());
             ImGui::Separator();
 
             if(ImGui::Selectable("..")) {
