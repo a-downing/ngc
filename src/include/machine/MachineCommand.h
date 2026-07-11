@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cmath>
+#include <cstdint>
 #include <utility>
 #include <string>
 #include <format>
@@ -116,5 +117,45 @@ namespace ngc {
         std::string text() const { return std::format("MoveArc(from: {}, to: {}, center: {}, axis: {}, speed: {})", m_from.text(), m_to.text(), m_center.text(), m_axis.text(), m_speed); }
     };
 
-    using MachineCommand = std::variant<SpindleStart, SpindleStop, MoveLine, MoveArc>;
+    class ProbeMove {
+        std::uint64_t m_id;
+        position_t m_from;
+        position_t m_target;
+        double m_feed;
+        bool m_stopOnContact;
+        bool m_errorIfNotFound;
+
+    public:
+        ProbeMove(const std::uint64_t id, const position_t &from, const position_t &target, const double feed,
+                  const bool stopOnContact, const bool errorIfNotFound)
+            : m_id(id), m_from(from), m_target(target), m_feed(feed),
+              m_stopOnContact(stopOnContact), m_errorIfNotFound(errorIfNotFound) { }
+
+        std::uint64_t id() const { return m_id; }
+        const position_t &from() const { return m_from; }
+        const position_t &target() const { return m_target; }
+        double feed() const { return m_feed; }
+        bool stopOnContact() const { return m_stopOnContact; }
+        bool errorIfNotFound() const { return m_errorIfNotFound; }
+
+        std::string text() const {
+            return std::format("ProbeMove(id: {}, from: {}, target: {}, feed: {})", m_id, m_from.text(), m_target.text(), m_feed);
+        }
+    };
+
+    enum class ProbeStatus {
+        Triggered,
+        ReachedTarget,
+        Aborted,
+        Fault
+    };
+
+    struct ProbeResult {
+        std::uint64_t id;
+        ProbeStatus status;
+        position_t triggerPosition;
+        position_t stoppedPosition;
+    };
+
+    using MachineCommand = std::variant<SpindleStart, SpindleStop, MoveLine, MoveArc, ProbeMove>;
 }

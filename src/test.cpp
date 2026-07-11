@@ -2,8 +2,10 @@
 #include <cmath>
 #include <exception>
 #include <format>
+#include <fstream>
 #include <functional>
 #include <iostream>
+#include <iterator>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -12,6 +14,7 @@
 #include "evaluator/InterpreterSession.h"
 #include "evaluator/Preamble.h"
 #include "machine/Machine.h"
+#include "machine/ToolpathRecorder.h"
 #include "parser/Program.h"
 
 namespace {
@@ -28,14 +31,16 @@ namespace {
         require(std::abs(actual - expected) < EPSILON, message);
     }
 
-    void execute(ngc::Machine &machine, const std::string_view source) {
+    std::vector<ngc::MachineCommand> execute(ngc::Machine &machine, const std::string_view source) {
         ngc::Program program(std::string(source), "test.ngc");
         const auto compiled = program.compile();
         require(compiled.has_value(), compiled ? "" : compiled.error().text());
+        std::vector<ngc::MachineCommand> commands;
 
         const std::function callback = [&](std::unique_ptr<const ngc::EvaluatorMessage> message, ngc::Evaluator &) {
             if(const auto block = message->as<ngc::BlockMessage>()) {
-                machine.executeBlock(block->block());
+                auto emitted = machine.executeBlock(block->block());
+                commands.insert(commands.end(), std::make_move_iterator(emitted.begin()), std::make_move_iterator(emitted.end()));
             }
         };
 
@@ -44,12 +49,12 @@ namespace {
         evaluator.executeFirstPass(preamble.statements());
         evaluator.executeFirstPass(program.statements());
         evaluator.executeSecondPass(program.statements());
+        return commands;
     }
 
     std::vector<ngc::MachineCommand> run(const std::string_view source) {
         ngc::Machine machine(UNIT);
-        execute(machine, source);
-        return std::move(machine.commands());
+        return execute(machine, source);
     }
 
     void testRapidAndFeedMove() {
@@ -95,18 +100,17 @@ namespace {
         ngc::Machine machine(UNIT);
         machine.memory().write(ngc::Var::G54_X, 7.0);
 
-        execute(machine, "G1 F10 X3\n");
-        require(machine.commands().size() == 1, "expected one command in the first run");
+        const auto firstCommands = execute(machine, "G1 F10 X3\n");
+        require(firstCommands.size() == 1, "expected one command in the first run");
 
         machine.beginProgramRun();
-        require(machine.commands().empty(), "beginProgramRun must clear generated commands");
         require(machine.state().modeMotion == ngc::GCMotion::G0, "beginProgramRun must restore G0");
         requireNear(machine.memory().read(ngc::Var::G54_X), 7.0, "beginProgramRun must retain coordinate offsets");
 
-        execute(machine, "G1 F10 X3\n");
-        require(machine.commands().size() == 1, "second run must not retain commands from the first run");
+        const auto secondCommands = execute(machine, "G1 F10 X3\n");
+        require(secondCommands.size() == 1, "second run should emit one command");
 
-        const auto *move = std::get_if<ngc::MoveLine>(&machine.commands().front());
+        const auto *move = std::get_if<ngc::MoveLine>(&secondCommands.front());
         require(move != nullptr, "expected a line move in the second run");
         requireNear(move->from().x, 0.0, "second run must begin at the machine origin");
         requireNear(move->to().x, 10.0, "second run must apply the retained G54 offset");
@@ -136,16 +140,16 @@ namespace {
                 sourceValue, sourceValue, sourceValue, sourceValue,
                 sourceValue,
                 sourceValue, sourceValue);
-            execute(machine, source);
+            const auto commands = execute(machine, source);
 
             requireNear(machine.memory().read(ngc::Var::G54_X), expectedValue, "G10 X conversion is incorrect");
             requireNear(machine.memory().read(ngc::Var::G54_Y), expectedValue, "G10 Y conversion is incorrect");
             requireNear(machine.memory().read(ngc::Var::G54_Z), expectedValue, "G10 Z conversion is incorrect");
-            require(machine.commands().size() == 3, "expected a line and two arcs");
+            require(commands.size() == 3, "expected a line and two arcs");
 
-            const auto *line = std::get_if<ngc::MoveLine>(&machine.commands()[0]);
-            const auto *g17Arc = std::get_if<ngc::MoveArc>(&machine.commands()[1]);
-            const auto *g18Arc = std::get_if<ngc::MoveArc>(&machine.commands()[2]);
+            const auto *line = std::get_if<ngc::MoveLine>(&commands[0]);
+            const auto *g17Arc = std::get_if<ngc::MoveArc>(&commands[1]);
+            const auto *g18Arc = std::get_if<ngc::MoveArc>(&commands[2]);
             require(line != nullptr && g17Arc != nullptr && g18Arc != nullptr, "expected one line and two arcs");
 
             requireNear(line->speed(), expectedValue, "feedrate conversion is incorrect");
@@ -175,13 +179,13 @@ namespace {
         for(const auto &[gcodeUnit, sourceValue] : cases) {
             ngc::Machine machine(ngc::Machine::Unit::Inch);
             machine.toolTable().set(tool1.number, tool1);
-            execute(machine, std::format(
+            const auto commands = execute(machine, std::format(
                 "{}\nG43 H1\nG1 F{} X{} Z{}\nG49\nG1 X{} Z{}\n",
                 gcodeUnit, sourceValue, sourceValue, sourceValue, sourceValue, sourceValue));
 
-            require(machine.commands().size() == 2, "expected one G43 move and one G49 move");
-            const auto *compensated = std::get_if<ngc::MoveLine>(&machine.commands()[0]);
-            const auto *cancelled = std::get_if<ngc::MoveLine>(&machine.commands()[1]);
+            require(commands.size() == 2, "expected one G43 move and one G49 move");
+            const auto *compensated = std::get_if<ngc::MoveLine>(&commands[0]);
+            const auto *cancelled = std::get_if<ngc::MoveLine>(&commands[1]);
             require(compensated != nullptr && cancelled != nullptr, "expected line moves");
             requireNear(compensated->to().x, 1.0, "G43 must not rescale the tool-table X offset");
             requireNear(compensated->to().z, 2.234, "G43 H must apply the tool-table Z offset");
@@ -193,10 +197,10 @@ namespace {
         ngc::Machine machine(ngc::Machine::Unit::Inch);
         const ngc::ToolTable::tool_entry_t tool2 { 2, 0.0, 0.0, 3.321, 0.0, 0.0, 0.0, 0.5, "test tool 2" };
         machine.toolTable().set(tool2.number, tool2);
-        execute(machine, "T2\nG43\nG1 F1 X1 Z1\n");
+        const auto commands = execute(machine, "T2\nG43\nG1 F1 X1 Z1\n");
 
-        require(machine.commands().size() == 1, "expected one compensated move");
-        const auto *move = std::get_if<ngc::MoveLine>(&machine.commands().front());
+        require(commands.size() == 1, "expected one compensated move");
+        const auto *move = std::get_if<ngc::MoveLine>(&commands.front());
         require(move != nullptr, "expected a line move");
         requireNear(move->to().z, 4.321, "G43 without H must use the active T tool offset");
     }
@@ -209,10 +213,10 @@ namespace {
         machine.memory().write(ngc::Var::G54_Y, 20.0);
         machine.memory().write(ngc::Var::G54_Z, 30.0);
 
-        execute(machine, "G43 H1\nG1 F1 X1 Y1 Z1\n");
+        const auto commands = execute(machine, "G43 H1\nG1 F1 X1 Y1 Z1\n");
 
-        require(machine.commands().size() == 1, "expected one compensated G54 move");
-        const auto *move = std::get_if<ngc::MoveLine>(&machine.commands().front());
+        require(commands.size() == 1, "expected one compensated G54 move");
+        const auto *move = std::get_if<ngc::MoveLine>(&commands.front());
         require(move != nullptr, "expected a line move");
         requireNear(move->to().x, 13.0, "G43 must combine X tool and G54 offsets");
         requireNear(move->to().y, 24.0, "G43 must combine Y tool and G54 offsets");
@@ -227,10 +231,10 @@ namespace {
         machine.memory().write(ngc::Var::G54_Y, 20.0);
         machine.memory().write(ngc::Var::G54_Z, 30.0);
 
-        execute(machine, "G43 H1\nG53 G1 F1 X1 Y1 Z1\n");
+        const auto commands = execute(machine, "G43 H1\nG53 G1 F1 X1 Y1 Z1\n");
 
-        require(machine.commands().size() == 1, "expected one compensated G53 move");
-        const auto *move = std::get_if<ngc::MoveLine>(&machine.commands().front());
+        require(commands.size() == 1, "expected one compensated G53 move");
+        const auto *move = std::get_if<ngc::MoveLine>(&commands.front());
         require(move != nullptr, "expected a line move");
         requireNear(move->to().x, 3.0, "G53 must bypass G54 X while retaining the tool offset");
         requireNear(move->to().y, 4.0, "G53 must bypass G54 Y while retaining the tool offset");
@@ -296,14 +300,217 @@ namespace {
         require(session.compiled(), "interpreter session should compile a valid program");
         require(session.parserErrors().empty(), "valid session program should have no parser errors");
 
-        session.execute(synchronize);
-        require(session.machine().commands().size() == 2, "interpreter session should execute blocks through its machine");
+        session.begin();
+        const auto first = session.next();
+        require(std::holds_alternative<ngc::MachineCommand>(first), "first next call should emit the first command");
+        require(session.blockMessages().size() == 1, "first next call must not process the second block");
+        require(session.blockMessages().size() == 1, "first next call should process exactly one block");
+
+        const auto second = session.next();
+        require(std::holds_alternative<ngc::MachineCommand>(second), "second next call should emit the second command");
+        require(session.blockMessages().size() == 2, "second next call should process the second block");
+
+        const auto completed = session.next();
+        require(std::holds_alternative<ngc::InterpreterCompleted>(completed), "interpreter session should complete after its commands are consumed");
         require(session.blockMessages().size() == 2, "interpreter session should retain executed block messages");
+
+        session.setPrograms({ { "let #i = 0\nwhile #i < 2 {\nG1 F1 X#i\n#i = #i + 1\n}\n", "loop.ngc" } });
+        session.compile(synchronize);
+        require(session.compiled(), "interpreter session should compile a loop program");
+        session.begin();
+        require(std::holds_alternative<ngc::MachineCommand>(session.next()), "next should yield from inside a loop");
+        require(session.blockMessages().size() == 1, "loop evaluation must pause after its first emitted command");
+        require(std::holds_alternative<ngc::MachineCommand>(session.next()), "next should resume the suspended loop");
+        require(session.blockMessages().size() == 2, "resumed loop should emit its second command");
+        require(std::holds_alternative<ngc::InterpreterCompleted>(session.next()), "loop program should complete after resuming");
 
         session.setPrograms({ { "G0 X[\n", "invalid.ngc" } });
         session.compile(synchronize);
         require(!session.compiled(), "interpreter session should reject an invalid program");
         require(!session.parserErrors().empty(), "invalid session program should retain its parser error");
+    }
+
+    void compileSession(ngc::InterpreterSession &session, const std::string_view source) {
+        session.setPrograms({ { std::string(source), "incremental.ngc" } });
+        session.compile([](const auto &callback) { callback(); });
+        require(session.compiled(), "incremental session test program should compile");
+        session.begin();
+    }
+
+    ngc::MoveLine nextLine(ngc::InterpreterSession &session, const std::string_view message) {
+        const auto event = session.next();
+        const auto command = std::get_if<ngc::MachineCommand>(&event);
+        require(command != nullptr, message);
+        const auto line = std::get_if<ngc::MoveLine>(command);
+        require(line != nullptr, message);
+        return *line;
+    }
+
+    void requireCompleted(ngc::InterpreterSession &session, const std::string_view message) {
+        require(std::holds_alternative<ngc::InterpreterCompleted>(session.next()), message);
+    }
+
+    void testIncrementalSessionControlFlow() {
+        ngc::InterpreterSession session(UNIT);
+
+        compileSession(session,
+            "if 0 {\n"
+            "G1 F1 X1\n"
+            "} else {\n"
+            "G1 F1 X2\n"
+            "}\n");
+        requireNear(nextLine(session, "if/else should yield its selected branch").to().x, 2.0, "else branch should be selected");
+        requireCompleted(session, "if/else session should complete");
+
+        compileSession(session,
+            "sub inner[#x] {\n"
+            "G1 F1 X#x\n"
+            "return #x + 1\n"
+            "}\n"
+            "sub outer[#x] {\n"
+            "return inner[#x]\n"
+            "}\n"
+            "let #result = outer[3]\n"
+            "G1 X#result\n");
+        requireNear(nextLine(session, "nested subroutine should yield from its inner call").to().x, 3.0, "inner subroutine move is incorrect");
+        require(session.blockMessages().size() == 1, "nested call must remain suspended after its first command");
+        requireNear(nextLine(session, "subroutine should resume through its return").to().x, 4.0, "returned subroutine value is incorrect");
+        requireCompleted(session, "nested subroutine session should complete");
+
+        compileSession(session,
+            "let #i = 0\n"
+            "while #i < 5 {\n"
+            "#i = #i + 1\n"
+            "if #i == 2 { continue }\n"
+            "if #i == 4 { break }\n"
+            "G1 F1 X#i\n"
+            "}\n");
+        requireNear(nextLine(session, "loop should yield before continue").to().x, 1.0, "first loop move is incorrect");
+        requireNear(nextLine(session, "loop should resume after continue").to().x, 3.0, "continued loop move is incorrect");
+        requireCompleted(session, "break should complete the loop without another command");
+
+        compileSession(session,
+            "let #x = 1\n"
+            "G1 F1 X#x\n"
+            "#x = 7\n"
+            "G1 X#x\n");
+        requireNear(nextLine(session, "first parameter-dependent move should yield").to().x, 1.0, "initial parameter value is incorrect");
+        requireNear(nextLine(session, "updated parameter-dependent move should yield").to().x, 7.0, "updated parameter value is incorrect");
+        requireCompleted(session, "parameter-dependent session should complete");
+
+        compileSession(session, "G1 F1 X1\nG1 X2\n");
+        nextLine(session, "session should yield before it is stopped");
+        session.stop();
+        compileSession(session, "G1 F1 X9\n");
+        requireNear(nextLine(session, "stopped session should be reusable").to().x, 9.0, "restarted session move is incorrect");
+        requireCompleted(session, "restarted session should complete");
+
+        compileSession(session, "undefined_subroutine[]\n");
+        const auto error = session.next();
+        const auto interpreterError = std::get_if<ngc::InterpreterError>(&error);
+        require(interpreterError != nullptr, "runtime evaluator failure should produce InterpreterError");
+        require(interpreterError->message.find("undefined sub") != std::string::npos, "InterpreterError should retain the evaluator failure");
+    }
+
+    void testProbeCommandAndBarrier() {
+        ngc::Machine machine(UNIT);
+        const auto commands = execute(machine, "G38.3 F5 Z-1\n");
+        require(commands.size() == 1, "G38.3 should emit one probe command");
+        const auto probe = std::get_if<ngc::ProbeMove>(&commands.front());
+        require(probe != nullptr, "G38.3 should emit ProbeMove");
+        require(probe->id() != 0, "probe command should have a nonzero ID");
+        requireNear(probe->from().z, 0.0, "probe start position is incorrect");
+        requireNear(probe->target().z, -1.0, "probe target position is incorrect");
+        requireNear(probe->feed(), 5.0, "probe feedrate is incorrect");
+        require(probe->stopOnContact(), "G38.3 should stop on contact");
+        require(!probe->errorIfNotFound(), "G38.3 should not error when contact is not found");
+
+        ngc::InterpreterSession session(UNIT);
+        compileSession(session, "G38.3 F5 Z-1\nG1 X1\n");
+        const auto command = session.next();
+        const auto emitted = std::get_if<ngc::MachineCommand>(&command);
+        require(emitted != nullptr && std::holds_alternative<ngc::ProbeMove>(*emitted), "session should emit ProbeMove before its barrier");
+        const auto waiting = session.next();
+        const auto probeBarrier = std::get_if<ngc::InterpreterWaitingForProbe>(&waiting);
+        require(probeBarrier != nullptr, "session should wait for a probe result");
+        require(session.blockMessages().size() == 1, "session must not evaluate beyond a probe barrier");
+        const auto sessionProbe = std::get<ngc::ProbeMove>(*emitted);
+        require(probeBarrier->commandId == sessionProbe.id(), "probe barrier should identify its command");
+        session.provideProbeResult({ sessionProbe.id(), ngc::ProbeStatus::Triggered, sessionProbe.target(), sessionProbe.target() });
+        requireNear(session.machine().memory().read(ngc::Var::PROBE_Z), -1.0, "probe result should update #5063");
+        requireNear(session.machine().memory().read(ngc::Var::PROBE_SUCCESS), 1.0, "probe result should update #5070");
+        require(std::holds_alternative<ngc::MachineCommand>(session.next()), "session should resume after receiving a probe result");
+        requireCompleted(session, "session should complete after its probe result");
+    }
+
+    void testAutomaticToolChangeReachesProbeBarrier() {
+        std::ifstream toolChangeFile("autoload/tool_change.ngc");
+        const std::string toolChangeSource {
+            std::istreambuf_iterator<char>(toolChangeFile),
+            std::istreambuf_iterator<char>() };
+        require(!toolChangeSource.empty(), "tool-change autoload program should be readable");
+
+        ngc::InterpreterSession session(UNIT);
+        session.setPrograms({
+            { toolChangeSource, "autoload/tool_change.ngc" },
+            { "T2 M6\n", "tool-change-test.ngc" },
+        });
+        session.compile([](const auto &callback) { callback(); });
+        require(session.compiled(), "automatic tool-change program should compile");
+        session.begin();
+
+        const auto safeZ = nextLine(session, "tool change should retract to safe Z");
+        requireNear(safeZ.to().z, -0.1, "tool-change safe Z should use parameter #5163");
+
+        const auto probeXY = nextLine(session, "tool change should move over the probe");
+        requireNear(probeXY.to().x, -13.940, "probe X should use parameter #5381");
+        requireNear(probeXY.to().y, 2.895, "probe Y should use parameter #5382");
+
+        nextLine(session, "tool change should move to its probe approach height");
+        const auto probeEvent = session.next();
+        const auto command = std::get_if<ngc::MachineCommand>(&probeEvent);
+        require(command != nullptr, "tool change should emit a probe command");
+        const auto probe = std::get_if<ngc::ProbeMove>(command);
+        require(probe != nullptr, "tool change should emit ProbeMove");
+        requireNear(probe->target().x, -13.940, "probe target X is incorrect");
+        requireNear(probe->target().y, 2.895, "probe target Y is incorrect");
+        requireNear(probe->target().z, -6.560, "probe target Z should use parameter #5383");
+        requireNear(probe->feed(), 50.0, "fast probe feedrate is incorrect");
+        require(std::holds_alternative<ngc::InterpreterWaitingForProbe>(session.next()), "tool change should stop at the probe barrier");
+        session.provideProbeResult({ probe->id(), ngc::ProbeStatus::Triggered, probe->target(), probe->target() });
+
+        const auto retract = nextLine(session, "tool change should retract after the fast probe");
+        requireNear(retract.to().z, -6.310, "fast-probe retract distance is incorrect");
+
+        const auto slowProbeEvent = session.next();
+        const auto slowCommand = std::get_if<ngc::MachineCommand>(&slowProbeEvent);
+        require(slowCommand != nullptr, "tool change should emit its slow probe command");
+        const auto slowProbe = std::get_if<ngc::ProbeMove>(slowCommand);
+        require(slowProbe != nullptr, "slow probe should be a ProbeMove");
+        requireNear(slowProbe->feed(), 10.0, "slow probe feedrate is incorrect");
+        require(std::holds_alternative<ngc::InterpreterWaitingForProbe>(session.next()), "tool change should wait for the slow probe result");
+        session.provideProbeResult({ slowProbe->id(), ngc::ProbeStatus::Triggered, slowProbe->target(), slowProbe->target() });
+
+        const auto finalRetract = nextLine(session, "tool change should retract to safe Z after probing");
+        requireNear(finalRetract.to().z, -0.1, "final tool-change retract should use #5163");
+        requireCompleted(session, "dummy probe results should allow the tool-change program to finish");
+    }
+
+    void testToolpathRecorderIsASeparateConsumer() {
+        const auto commands = run("G0 X1\nG1 F2 X3\n");
+        ngc::ToolpathRecorder recorder;
+
+        for(const auto &command : commands) {
+            recorder.consume(command);
+        }
+
+        require(recorder.commands().size() == 2, "toolpath recorder should retain commands supplied by its consumer");
+        std::size_t observed = 0;
+        recorder.foreachCommand([&](const ngc::MachineCommand &) { ++observed; });
+        require(observed == 2, "toolpath recorder should enumerate its recorded commands");
+
+        recorder.clear();
+        require(recorder.commands().empty(), "toolpath recorder should clear between preview runs");
     }
 }
 
@@ -321,6 +528,10 @@ int main() {
         testArcAllowsOmittedZeroCenterOffsets();
         testArcGeometryValidation();
         testInterpreterSessionOwnsCompilationAndExecution();
+        testIncrementalSessionControlFlow();
+        testProbeCommandAndBarrier();
+        testAutomaticToolChangeReachesProbeBarrier();
+        testToolpathRecorderIsASeparateConsumer();
     } catch(const std::exception &error) {
         std::cerr << "ngc_tests failed: " << error.what() << '\n';
         return 1;

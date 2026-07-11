@@ -170,6 +170,12 @@ namespace ngc {
                 }
 
                 break;
+            case 38:
+                switch(fract) {
+                    case 3: return GCode::G38_3;
+                }
+
+                break;
             case 43:
                 switch(fract) {
                     case 0: return GCode::G43;
@@ -414,6 +420,7 @@ namespace ngc {
                 case GCode::G1:
                 case GCode::G2:
                 case GCode::G3:
+                case GCode::G38_3:
                     modeMotion = static_cast<GCMotion>(code);
                     return;
                 case GCode::G17:

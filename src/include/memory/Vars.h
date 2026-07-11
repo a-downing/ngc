@@ -8,9 +8,19 @@
 #include "memory/MemoryCell.h"
 
 #define VARS(DO) \
+    DO(PROBE_X, _probe_x, 5061, READ, 0) \
+    DO(PROBE_Y, _probe_y, 0, READ, 0) \
+    DO(PROBE_Z, _probe_z, 0, READ, 0) \
+    DO(PROBE_A, _probe_a, 0, READ, 0) \
+    DO(PROBE_B, _probe_b, 0, READ, 0) \
+    DO(PROBE_C, _probe_c, 0, READ, 0) \
+    DO(PROBE_U, _probe_u, 0, READ, 0) \
+    DO(PROBE_V, _probe_v, 0, READ, 0) \
+    DO(PROBE_W, _probe_w, 0, READ, 0) \
+    DO(PROBE_SUCCESS, _probe_success, 5070, READ, 0) \
     DO(G28_X, _g28_x, 5161, READ, 0) \
     DO(G28_Y, _g28_y, 0, READ, 0) \
-    DO(G28_Z, _g28_z, 0, READ, 0) \
+    DO(G28_Z, _g28_z, 0, READ, -0.100) \
     DO(G28_A, _g28_a, 0, READ, 0) \
     DO(G28_B, _g28_b, 0, READ, 0) \
     DO(G28_C, _g28_c, 0, READ, 0) \
@@ -75,9 +85,9 @@
     DO(G59_2_A, _g59_2_a, 0, READ, 0) \
     DO(G59_2_B, _g59_2_b, 0, READ, 0) \
     DO(G59_2_C, _g59_2_c, 0, READ, 0) \
-    DO(G59_3_X, _g59_3_x, 5381, READ, 0) \
-    DO(G59_3_Y, _g59_3_y, 0, READ, 0) \
-    DO(G59_3_Z, _g59_3_z, 0, READ, 0) \
+    DO(G59_3_X, _g59_3_x, 5381, READ, -13.940) \
+    DO(G59_3_Y, _g59_3_y, 0, READ, 2.895) \
+    DO(G59_3_Z, _g59_3_z, 0, READ, -6.560) \
     DO(G59_3_A, _g59_3_a, 0, READ, 0) \
     DO(G59_3_B, _g59_3_b, 0, READ, 0) \
     DO(G59_3_C, _g59_3_c, 0, READ, 0)

@@ -10,12 +10,10 @@
 #endif
 
 #include <expected>
-#include <functional>
 #include <optional>
 #include <print>
 #include <vector>
 #include <format>
-#include <memory>
 #include <utility>
 
 #include "gcode/GCode.h"
@@ -46,7 +44,16 @@ namespace ngc {
         Memory m_memory;
         ToolTable m_toolTable;
         GCodeState m_state = GCodeState::makeDefault();
-        std::vector<MachineCommand> m_commands;
+        std::uint64_t m_nextCommandId = 1;
+
+        struct PendingProbe {
+            std::uint64_t id;
+            position_t workOffset;
+            position_t toolOffset;
+            GCUnits programUnit;
+        };
+
+        std::optional<PendingProbe> m_pendingProbe;
 
     public:
         Machine(Unit unit) {
@@ -63,8 +70,7 @@ namespace ngc {
             m_pos = {};
             m_workOffset = {};
             m_toolOffset = {};
-            m_commands.clear();
-
+            m_pendingProbe.reset();
             m_state = GCodeState::makeDefault();
             const auto num = static_cast<int>(m_memory.read(Var::COORDSYS));
             m_state.affectState(coordsys(num));
@@ -74,7 +80,6 @@ namespace ngc {
         template<typename Self> auto &memory(this Self &&self) { return std::forward<Self>(self).m_memory; }
         template<typename Self> auto &toolTable(this Self &&self) { return std::forward<Self>(self).m_toolTable; }
         template<typename Self> auto &state(this Self &&self) { return std::forward<Self>(self).m_state; }
-        template<typename Self> auto &commands(this Self &&self) { return std::forward<Self>(self).m_commands; }
 
         double arcTolerance() const {
             constexpr double INCH_TOLERANCE = 0.0005;
@@ -111,13 +116,29 @@ namespace ngc {
             return {};
         }
 
-        void foreachCommand(const std::function<void(const MachineCommand &)> &callback) const {
-            for(const auto &cmd : m_commands) {
-                callback(cmd);
+        void acceptProbeResult(const ProbeResult &result) {
+            if(!m_pendingProbe || m_pendingProbe->id != result.id) {
+                PANIC("unexpected probe result id {}", result.id);
             }
+
+            const auto workPosition = result.triggerPosition - m_pendingProbe->workOffset - m_pendingProbe->toolOffset;
+            const auto scale = linearScale(m_pendingProbe->programUnit);
+            m_memory.write(Var::PROBE_X, workPosition.x / scale, true);
+            m_memory.write(Var::PROBE_Y, workPosition.y / scale, true);
+            m_memory.write(Var::PROBE_Z, workPosition.z / scale, true);
+            m_memory.write(Var::PROBE_A, workPosition.a, true);
+            m_memory.write(Var::PROBE_B, workPosition.b, true);
+            m_memory.write(Var::PROBE_C, workPosition.c, true);
+            m_memory.write(Var::PROBE_U, 0.0, true);
+            m_memory.write(Var::PROBE_V, 0.0, true);
+            m_memory.write(Var::PROBE_W, 0.0, true);
+            m_memory.write(Var::PROBE_SUCCESS, result.status == ProbeStatus::Triggered ? 1.0 : 0.0, true);
+            m_pos = result.stoppedPosition;
+            m_pendingProbe.reset();
         }
 
-        void executeBlock(const Block &block) {
+        std::vector<MachineCommand> executeBlock(const Block &block) {
+            std::vector<MachineCommand> commands;
             m_workOffset = offset(*m_state.modeCoordSys);
             m_state.resetModal();
             auto valid = m_state.valid();
@@ -129,7 +150,7 @@ namespace ngc {
             GCodeState state;
 
             if(block.blockDelete()) {
-                return;
+                return commands;
             }
 
             for(const auto &word : block.words()) {
@@ -200,10 +221,10 @@ namespace ngc {
                 m_state.modeSpindle = std::exchange(state.modeSpindle, std::nullopt);
 
                 if(m_state.modeSpindle == MCSpindle::M5) {
-                    m_commands.emplace_back(SpindleStop{});
+                    commands.emplace_back(SpindleStop{});
                 } else if(m_state.S > 0 && (m_state.modeSpindle == MCSpindle::M3 || m_state.modeSpindle == MCSpindle::M4)) {
                     const auto dir = m_state.modeSpindle == MCSpindle::M3 ? Direction::CW : Direction::CCW;
-                    m_commands.emplace_back(SpindleStart{dir, *m_state.S});
+                    commands.emplace_back(SpindleStart{dir, *m_state.S});
                 }
             }
 
@@ -257,12 +278,14 @@ namespace ngc {
             if(state.K) { m_state.K = *std::exchange(state.K, std::nullopt) * linearScale(); hasMovement = true; }
 
             if(hasMovement) {
-                handleMotion(block);
+                commands.emplace_back(handleMotion(block));
             }
 
             if(!state.empty()) {
                 PANIC("{}: unhandled gcode state change", block.statement()->startToken().location());
             }
+
+            return commands;
         }
 
     private:
@@ -320,16 +343,16 @@ namespace ngc {
             }
         }
 
-        void handleMotion(const Block &block) {
+        MachineCommand handleMotion(const Block &block) {
             std::println("block: {}", block.statement()->text());
             
             if(m_state.modeMotion == GCMotion::G0 || m_state.modeMotion == GCMotion::G1) {
                 auto pos = position();
                 std::println("pos: {}", pos.text());
                 auto speed = m_state.modeMotion == GCMotion::G1 ? *m_state.F : -1;
-                m_commands.emplace_back(MoveLine{m_pos, pos, speed});
+                auto command = MoveLine{m_pos, pos, speed};
                 m_pos = pos;
-                return;
+                return command;
             }
 
             if(m_state.modeMotion == GCMotion::G2 || m_state.modeMotion == GCMotion::G3) {
@@ -373,9 +396,20 @@ namespace ngc {
                     PANIC("{}: {}: {}", block.statement()->startToken().location(), valid.error(), block.statement()->text());
                 }
 
-                m_commands.emplace_back(MoveArc{m_pos, pos, *center, *axis, *m_state.F});
+                auto command = MoveArc{m_pos, pos, *center, *axis, *m_state.F};
                 m_pos = pos;
-                return;
+                return command;
+            }
+
+            if(m_state.modeMotion == GCMotion::G38_3) {
+                if(!m_state.F || *m_state.F <= 0.0) {
+                    PANIC("G38.3 requires a positive feedrate: {}", block.statement()->text());
+                }
+
+                const auto target = position();
+                const auto id = m_nextCommandId++;
+                m_pendingProbe = PendingProbe { id, m_workOffset, m_toolOffset, *m_state.modeUnits };
+                return ProbeMove { id, m_pos, target, *m_state.F, true, false };
             }
 
             PANIC("unhandled motion: {}", block.statement()->text());
@@ -467,11 +501,15 @@ namespace ngc {
         }
 
         double linearScale() const {
+            return linearScale(*m_state.modeUnits);
+        }
+
+        double linearScale(const GCUnits programUnit) const {
             if(m_unit == Unit::Inch) {
-                return *m_state.modeUnits == GCUnits::G20 ? 1.0 : 1.0 / 25.4;
+                return programUnit == GCUnits::G20 ? 1.0 : 1.0 / 25.4;
             }
 
-            return *m_state.modeUnits == GCUnits::G20 ? 25.4 : 1.0;
+            return programUnit == GCUnits::G20 ? 25.4 : 1.0;
         }
     };
 }

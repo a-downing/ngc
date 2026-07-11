@@ -172,13 +172,16 @@ public:
         };
 
         m_worker.lock([&] {
-            m_worker.machine().foreachCommand([&](const ngc::MachineCommand &command) {
+            m_worker.toolpath().foreachCommand([&](const ngc::MachineCommand &command) {
                 std::visit([&](const auto &value) {
                     using T = std::decay_t<decltype(value)>;
 
                     if constexpr(std::same_as<T, ngc::MoveLine>) {
                         include({ value.from().x, value.from().y, value.from().z });
                         include({ value.to().x, value.to().y, value.to().z });
+                    } else if constexpr(std::same_as<T, ngc::ProbeMove>) {
+                        include({ value.from().x, value.from().y, value.from().z });
+                        include({ value.target().x, value.target().y, value.target().z });
                     } else if constexpr(std::same_as<T, ngc::MoveArc>) {
                         const glm::dvec3 from { value.from().x, value.from().y, value.from().z };
                         const glm::dvec3 to { value.to().x, value.to().y, value.to().z };
@@ -238,7 +241,7 @@ public:
         };
 
         m_worker.lock([&] {
-            m_worker.machine().foreachCommand([&](const ngc::MachineCommand &command) {
+            m_worker.toolpath().foreachCommand([&](const ngc::MachineCommand &command) {
                 std::visit([&](const auto &value) {
                     using T = std::decay_t<decltype(value)>;
 
@@ -246,6 +249,10 @@ public:
                         considerSegment(
                             { value.from().x, value.from().y, value.from().z },
                             { value.to().x, value.to().y, value.to().z });
+                    } else if constexpr(std::same_as<T, ngc::ProbeMove>) {
+                        considerSegment(
+                            { value.from().x, value.from().y, value.from().z },
+                            { value.target().x, value.target().y, value.target().z });
                     } else if constexpr(std::same_as<T, ngc::MoveArc>) {
                         interpolate(value, 60, [&](const glm::dvec3 &from, const glm::dvec3 &to, bool, bool) {
                             considerSegment(from, to);
@@ -299,10 +306,10 @@ public:
         const auto scrollDelta = std::exchange(m_scrollDelta, 0.0);
         auto scaleFactor = 1.0;
         if(navigationActive && middleDown && shift) {
-            scaleFactor *= std::exp(m_mouseDY * 0.01);
+            scaleFactor *= std::exp(-m_mouseDY * 0.01);
         }
         if(scrollDelta != 0.0) {
-            scaleFactor *= std::exp(-scrollDelta * 0.15);
+            scaleFactor *= std::exp(scrollDelta * 0.15);
         }
 
         const auto aspect = static_cast<double>(width) / height;
@@ -373,7 +380,7 @@ public:
         glEnd();
 
         m_worker.lock([&] {
-            m_worker.machine().foreachCommand([&](const ngc::MachineCommand &cmd) {
+            m_worker.toolpath().foreachCommand([&](const ngc::MachineCommand &cmd) {
                 if(auto moveLine = std::get_if<ngc::MoveLine>(&cmd)) {
                     if(moveLine->speed() == -1.0) {
                         glColor3f(1.0, 1.0, 0.4);
@@ -396,6 +403,16 @@ public:
                     glColor3f(0.0, 0.0, 0.0);
                     glVertex3d(v.x, v.y, v.z);
                     glVertex3d(w.x, w.y, w.z);
+                    glEnd();
+                }
+
+                if(auto probeMove = std::get_if<ngc::ProbeMove>(&cmd)) {
+                    const auto &from = probeMove->from();
+                    const auto &target = probeMove->target();
+                    glBegin(GL_LINES);
+                    glColor3f(1.0, 0.4, 0.2);
+                    glVertex3d(from.x, from.y, from.z);
+                    glVertex3d(target.x, target.y, target.z);
                     glEnd();
                 }
 

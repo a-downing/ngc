@@ -1,7 +1,34 @@
-alias #userdata_1 = 1
-#userdata_1 = 333
-
 sub _tool_change[#tool_number] {
-    print["tool_change: ", #tool_number]
-    return #tool_number
+    print["tool change: probing tool ", #tool_number]
+
+    G90
+    G49
+    G20
+
+    (Retract to the machine-coordinate safe Z position.)
+    G53 G0 Z#5163
+
+    (Use G59.3 with its origin at the fixed tool probe.)
+    G10 L2 P9 X#5381 Y#5382 Z#5383
+    G59.3
+    G0 X0 Y0
+    G0 Z4
+
+    (Fast approach, retract, then repeat slowly for the measurement.)
+    G38.3 F50 Z0
+    if #5070 == 0 {
+        print["tool probe did not trigger during fast approach"]
+        return 0
+    }
+
+    G91 G0 Z0.25
+    G90 G38.3 F10 Z0
+    if #5070 == 0 {
+        print["tool probe did not trigger during slow approach"]
+        return 0
+    }
+
+    print["tool probe Z: ", #5063]
+    G53 G0 Z#5163
+    return 1
 }

@@ -1,4 +1,5 @@
 motion = ["G0", "G1", "G2", "G3"]
+probe_motion = ["G38.3"]
 plane = ["G17", "G18", "G19"]
 distance = ["G90", "G91"]
 feed = ["G93", "G94"]
@@ -8,7 +9,7 @@ coord_sys = ["G54", "G55", "G56", "G57", "G58", "G59", "G59.1", "G59.2", "G59.3"
 path = ["G61.1"]
 non_modal = ["G53", "G10"]
 
-all = motion + plane + distance + feed + units + tool_length + coord_sys + path + non_modal
+all = motion + plane + distance + feed + units + tool_length + coord_sys + path + non_modal + probe_motion
 ids = dict()
 id = 0
 
@@ -53,8 +54,8 @@ print()
 decl_enum("GCode", all)
 decl_name("GCode", all)
 
-decl_enum("GCMotion", motion)
-decl_name("GCMotion", motion)
+decl_enum("GCMotion", motion + probe_motion)
+decl_name("GCMotion", motion + probe_motion)
 
 decl_enum("GCPlane", plane)
 decl_name("GCPlane", plane)

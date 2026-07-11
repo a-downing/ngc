@@ -34,6 +34,7 @@ enum class GCode : std::uint8_t {
     G61_1 = 24,
     G53 = 25,
     G10 = 26,
+    G38_3 = 27,
 };
 
 inline std::string_view name(const GCode code) {
@@ -65,6 +66,7 @@ inline std::string_view name(const GCode code) {
         case GCode::G61_1: return "G61.1";
         case GCode::G53: return "G53";
         case GCode::G10: return "G10";
+        case GCode::G38_3: return "G38.3";
     }
 
     PANIC("{}() invalid code GCode::{}", __func__, std::to_underlying(code));
@@ -75,6 +77,7 @@ enum class GCMotion : std::uint8_t {
     G1 = 1,
     G2 = 2,
     G3 = 3,
+    G38_3 = 27,
 };
 
 inline std::string_view name(const GCMotion code) {
@@ -83,6 +86,7 @@ inline std::string_view name(const GCMotion code) {
         case GCMotion::G1: return "G1";
         case GCMotion::G2: return "G2";
         case GCMotion::G3: return "G3";
+        case GCMotion::G38_3: return "G38.3";
     }
 
     PANIC("{}() invalid code GCMotion::{}", __func__, std::to_underlying(code));

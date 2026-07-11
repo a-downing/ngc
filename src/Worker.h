@@ -1,10 +1,12 @@
 #pragma once
 
 #include <condition_variable>
+#include <format>
 #include <mutex>
 #include <thread>
 
 #include "evaluator/InterpreterSession.h"
+#include "machine/ToolpathRecorder.h"
 #include "memory/Vars.h"
 
 class Worker {
@@ -13,6 +15,7 @@ class Worker {
     std::thread m_thread;
 
     ngc::InterpreterSession m_session{ ngc::Machine::Unit::Inch };
+    ngc::ToolpathRecorder m_toolpath;
 
     bool m_doJoin = false;
     bool m_doCompile = false;
@@ -35,6 +38,7 @@ public:
     }
 
     const ngc::Machine &machine() const { return m_session.machine(); }
+    const ngc::ToolpathRecorder &toolpath() const { return m_toolpath; }
 
     bool compiled() const {
         std::scoped_lock lock(m_mutex);
@@ -132,10 +136,50 @@ private:
     }
 
     void doExecute() {
-        m_session.execute([&](const auto &callback) {
+        {
             std::scoped_lock lock(m_mutex);
-            callback();
-        });
+            m_session.begin();
+            m_toolpath.clear();
+        }
+
+        for(;;) {
+            auto event = m_session.next([&](const auto &callback) {
+                std::scoped_lock lock(m_mutex);
+                callback();
+            });
+
+            if(auto command = std::get_if<ngc::MachineCommand>(&event)) {
+                std::scoped_lock lock(m_mutex);
+                m_toolpath.consume(*command);
+
+                if(const auto probe = std::get_if<ngc::ProbeMove>(command)) {
+                    m_session.provideProbeResult({
+                        .id = probe->id(),
+                        .status = ngc::ProbeStatus::Triggered,
+                        .triggerPosition = probe->target(),
+                        .stoppedPosition = probe->target(),
+                    });
+                }
+
+                continue;
+            }
+
+            if(std::holds_alternative<ngc::InterpreterCompleted>(event)) {
+                break;
+            }
+
+            if(const auto waiting = std::get_if<ngc::InterpreterWaitingForProbe>(&event)) {
+                std::scoped_lock lock(m_mutex);
+                m_session.printMessages().emplace_back(std::format("preview stopped at probe command {}", waiting->commandId));
+                break;
+            }
+
+            if(const auto error = std::get_if<ngc::InterpreterError>(&event)) {
+                std::scoped_lock lock(m_mutex);
+                m_session.printMessages().emplace_back(error->message);
+                break;
+            }
+        }
 
         std::scoped_lock lock(m_mutex);
         m_busy = false;
