@@ -52,6 +52,7 @@
 #include "gui/imgui_custom.h"
 
 #include "utils.h"
+#include "SimulationWorker.h"
 #include "Worker.h"
 
 #include "machine/ToolTable.h"
@@ -77,6 +78,9 @@ class Application final {
     std::string m_errorMessage;
 
     Worker m_worker{};
+    SimulationWorker m_simulation{};
+    double m_simulationRate = 1.0;
+    double m_simulatedRapidSpeed = 100.0;
 
     double m_time = 0.0;
     double m_dt = 0.0;
@@ -91,6 +95,73 @@ class Application final {
     double m_viewHalfHeight = 6.0;
     double m_sceneScale = 1.0;
     glm::dvec3 m_modelPivot = { 0.0, 0.0, 0.0 };
+
+    static constexpr double MACHINE_TRIAD_LENGTH = 2.0;
+    static constexpr double WORK_TRIAD_LENGTH = 1.0;
+
+    static glm::dvec3 displayOffset(const glm::dvec3 &offset) {
+        return { offset.x, -offset.y, offset.z };
+    }
+
+    void drawToolWireframe(const ngc::ToolPose &tool) const {
+        const glm::dvec3 top {
+            tool.spindlePosition.x,
+            tool.spindlePosition.y,
+            tool.spindlePosition.z,
+        };
+        const glm::dvec3 tip {
+            tool.tipPosition.x,
+            tool.tipPosition.y,
+            tool.tipPosition.z,
+        };
+        const auto axis = tip - top;
+        if(tool.geometry.number == 0 || glm::length2(axis) < 1e-18) return;
+
+        const auto axisUnit = glm::normalize(axis);
+        const auto cameraDirection = displayOffset(glm::inverse(m_modelOrientation) * glm::dvec3(0.0, 1.0, 0.0));
+        auto radial = glm::cross(axisUnit, cameraDirection);
+        if(glm::length2(radial) < 1e-18) {
+            radial = glm::cross(axisUnit, glm::dvec3(1.0, 0.0, 0.0));
+        }
+        radial = glm::normalize(radial);
+        const auto radius = std::max(tool.geometry.diameter * 0.5, 0.001);
+        const auto edge0 = top + radial * radius;
+        const auto edge1 = top - radial * radius;
+
+        auto circleBasis0 = glm::cross(axisUnit, glm::dvec3(0.0, 0.0, 1.0));
+        if(glm::length2(circleBasis0) < 1e-18) {
+            circleBasis0 = glm::cross(axisUnit, glm::dvec3(0.0, 1.0, 0.0));
+        }
+        circleBasis0 = glm::normalize(circleBasis0);
+        const auto circleBasis1 = glm::normalize(glm::cross(axisUnit, circleBasis0));
+
+        glDisable(GL_DEPTH_TEST);
+        glLineWidth(2.0f);
+        glColor3f(1.0f, 0.85f, 0.05f);
+        glBegin(GL_LINES);
+        glVertex3dv(glm::value_ptr(edge0));
+        glVertex3dv(glm::value_ptr(tip));
+        glVertex3dv(glm::value_ptr(edge1));
+        glVertex3dv(glm::value_ptr(tip));
+        glEnd();
+
+        constexpr int CIRCLE_SEGMENTS = 48;
+        glBegin(GL_LINE_LOOP);
+        for(int segment = 0; segment < CIRCLE_SEGMENTS; segment++) {
+            const auto angle = 2.0 * std::numbers::pi * static_cast<double>(segment) / CIRCLE_SEGMENTS;
+            const auto point = top + radius * (std::cos(angle) * circleBasis0 + std::sin(angle) * circleBasis1);
+            glVertex3dv(glm::value_ptr(point));
+        }
+        glEnd();
+
+        glEnable(GL_POINT_SMOOTH);
+        glPointSize(5.0f);
+        glBegin(GL_POINTS);
+        glVertex3dv(glm::value_ptr(top));
+        glEnd();
+        glPointSize(1.0f);
+        glLineWidth(1.0f);
+    }
 
 public:
     Application() = delete;
@@ -120,6 +191,7 @@ public:
     }
 
     void terminate() {
+        m_simulation.join();
         m_worker.join();
     }
 
@@ -138,7 +210,7 @@ public:
             if(!tool) {
                 m_errorMessage = std::format("tool #{}: {}", toolStrings.number, tool.error());
                 m_enableErrorWindow = true;
-                break;
+                return;
             }
 
             m_tools.set(tool->number, *tool);
@@ -148,6 +220,30 @@ public:
 
         if(!result) {
             m_errorMessage = result.error();
+            m_enableErrorWindow = true;
+            return;
+        }
+
+        if(!m_worker.setToolTable(m_tools)) {
+            m_errorMessage = "tool table was saved, but cannot be applied while the worker is busy";
+            m_enableErrorWindow = true;
+            return;
+        }
+
+        initToolTableStrings();
+    }
+
+    void reloadToolTable() {
+        const auto result = m_tools.load();
+
+        if(!result) {
+            m_errorMessage = result.error();
+            m_enableErrorWindow = true;
+            return;
+        }
+
+        if(!m_worker.setToolTable(m_tools)) {
+            m_errorMessage = "tool table cannot be reloaded while the worker is busy";
             m_enableErrorWindow = true;
             return;
         }
@@ -217,13 +313,13 @@ public:
         std::optional<glm::dvec3> bestPoint;
 
         const auto project = [&](const glm::dvec3 &point) {
-            const auto transformed = m_modelOrientation * (point - m_modelPivot);
+            const auto transformed = m_modelOrientation * displayOffset(point - m_modelPivot);
             const auto ndcX = (transformed.x + m_viewPan.x) / (m_viewHalfHeight * aspect);
             const auto ndcY = (transformed.z + m_viewPan.y) / m_viewHalfHeight;
             return glm::dvec2((ndcX + 1.0) * width * 0.5, (1.0 - ndcY) * height * 0.5);
         };
 
-        const auto considerSegment = [&](const glm::dvec3 &from, const glm::dvec3 &to) {
+        const auto segmentHit = [&](const glm::dvec3 &from, const glm::dvec3 &to) {
             const auto screenFrom = project(from);
             const auto screenTo = project(to);
             const auto screenSegment = screenTo - screenFrom;
@@ -232,11 +328,26 @@ public:
                 ? std::clamp(glm::dot(mouse - screenFrom, screenSegment) / lengthSquared, 0.0, 1.0)
                 : 0.0;
             const auto difference = mouse - glm::mix(screenFrom, screenTo, t);
-            const auto distanceSquared = glm::dot(difference, difference);
+            return std::pair { glm::dot(difference, difference), t };
+        };
+
+        const auto considerSegment = [&](const glm::dvec3 &from, const glm::dvec3 &to) {
+            const auto [distanceSquared, t] = segmentHit(from, to);
 
             if(distanceSquared < bestDistanceSquared) {
                 bestDistanceSquared = distanceSquared;
                 bestPoint = glm::mix(from, to, t);
+            }
+        };
+
+        const auto considerTriadAxis = [&](const glm::dvec3 &origin, const glm::dvec3 &axisEnd) {
+            const auto [distanceSquared, _] = segmentHit(origin, axisEnd);
+
+            // Triads are drawn over the toolpath, so give them priority when
+            // their projected geometry is equally close to the cursor.
+            if(distanceSquared <= bestDistanceSquared) {
+                bestDistanceSquared = distanceSquared;
+                bestPoint = origin;
             }
         };
 
@@ -260,12 +371,23 @@ public:
                     }
                 }, command);
             });
+
+            const glm::dvec3 machineOrigin { 0.0, 0.0, 0.0 };
+            const auto &workOffset = m_worker.machine().workOffset();
+            const glm::dvec3 workOrigin { workOffset.x, workOffset.y, workOffset.z };
+
+            considerTriadAxis(machineOrigin, machineOrigin + glm::dvec3(MACHINE_TRIAD_LENGTH, 0.0, 0.0));
+            considerTriadAxis(machineOrigin, machineOrigin + glm::dvec3(0.0, MACHINE_TRIAD_LENGTH, 0.0));
+            considerTriadAxis(machineOrigin, machineOrigin + glm::dvec3(0.0, 0.0, MACHINE_TRIAD_LENGTH));
+            considerTriadAxis(workOrigin, workOrigin + glm::dvec3(WORK_TRIAD_LENGTH, 0.0, 0.0));
+            considerTriadAxis(workOrigin, workOrigin + glm::dvec3(0.0, WORK_TRIAD_LENGTH, 0.0));
+            considerTriadAxis(workOrigin, workOrigin + glm::dvec3(0.0, 0.0, WORK_TRIAD_LENGTH));
         });
 
         if(bestPoint) {
             // Preserve the current model transform while changing the point
             // about which subsequent rotations are applied.
-            const auto compensation = m_modelOrientation * (*bestPoint - m_modelPivot);
+            const auto compensation = m_modelOrientation * displayOffset(*bestPoint - m_modelPivot);
             m_viewPan.x += compensation.x;
             m_viewPan.y += compensation.z;
             m_modelPivot = *bestPoint;
@@ -335,57 +457,108 @@ public:
         const auto view = glm::lookAt(glm::dvec3(0.0, -1.0, 0.0), glm::dvec3(0.0), glm::dvec3(0.0, 0.0, 1.0));
         auto model = glm::translate(glm::dmat4(1.0), glm::dvec3(m_viewPan.x, 0.0, m_viewPan.y));
         model *= glm::mat4_cast(m_modelOrientation);
+        model = glm::scale(model, glm::dvec3(1.0, -1.0, 1.0));
         model = glm::translate(model, -m_modelPivot);
 
         glMatrixMode(GL_MODELVIEW);
         glLoadIdentity();
         glLoadMatrixd(glm::value_ptr(view * model));
 
-        glBegin(GL_LINES);
+        glEnable(GL_BLEND);
+        glBlendFunc(GL_SRC_ALPHA, GL_ONE_MINUS_SRC_ALPHA);
+        glEnable(GL_LINE_SMOOTH);
+        glHint(GL_LINE_SMOOTH_HINT, GL_NICEST);
+        glEnable(GL_POINT_SMOOTH);
+        glHint(GL_POINT_SMOOTH_HINT, GL_NICEST);
 
-        //X
-        glColor3f(1.0, 0.4, 0.4);
-        glVertex3d(0.0, 0.0, 0.0);
-        glVertex3d(2.0, 0.0, 0.0);
+        struct CoordinateDisplay {
+            ngc::position_t workOffset;
+            std::string workCoordinateName;
+        };
 
-        //Y
-        glColor3f(0.4, 2.0, 0.4);
-        glVertex3d(0.0, 0.0, 0.0);
-        glVertex3d(0.0, 2.0, 0.0);
-
-        //Z
-        glColor3f(0.4, 0.4, 2.0);
-        glVertex3d(0.0, 0.0, 0.0);
-        glVertex3d(0.0, 0.0, 2.0);
-
-        auto workOffset = m_worker.lock([&] {
-            return m_worker.machine().workOffset();
+        const auto coordinates = m_worker.lock([&] {
+            const auto &machine = m_worker.machine();
+            return CoordinateDisplay {
+                .workOffset = machine.workOffset(),
+                .workCoordinateName = std::string(ngc::name(*machine.state().modeCoordSys)),
+            };
         });
 
-        //X
-        glColor3f(1.0, 0.4, 0.4);
-        glVertex3d(workOffset.x, workOffset.y, workOffset.z);
-        glVertex3d(workOffset.x + 1.0, workOffset.y, workOffset.z);
+        const auto drawTriad = [](const glm::dvec3 &origin, const double length, const bool dashed) {
+            if(dashed) {
+                glEnable(GL_LINE_STIPPLE);
+                glLineStipple(1, 0x3333);
+            }
 
-        //Y
-        glColor3f(0.4, 1.0, 0.4);
-        glVertex3d(workOffset.x, workOffset.y, workOffset.z);
-        glVertex3d(workOffset.x, workOffset.y + 1.0, workOffset.z);
+            const auto intensity = dashed ? 1.0f : 0.55f;
+            glBegin(GL_LINES);
+            glColor3f(intensity, 0.2f * intensity, 0.2f * intensity);
+            glVertex3d(origin.x, origin.y, origin.z);
+            glVertex3d(origin.x + length, origin.y, origin.z);
+            glColor3f(0.2f * intensity, intensity, 0.2f * intensity);
+            glVertex3d(origin.x, origin.y, origin.z);
+            glVertex3d(origin.x, origin.y + length, origin.z);
+            glColor3f(0.25f * intensity, 0.45f * intensity, intensity);
+            glVertex3d(origin.x, origin.y, origin.z);
+            glVertex3d(origin.x, origin.y, origin.z + length);
+            glEnd();
 
-        //Z
-        glColor3f(0.4, 0.4, 1.0);
-        glVertex3d(workOffset.x, workOffset.y, workOffset.z);
-        glVertex3d(workOffset.x, workOffset.y, workOffset.z + 1.0);
+            if(dashed) {
+                glDisable(GL_LINE_STIPPLE);
+            }
 
-        glEnd();
+            glEnable(GL_POINT_SMOOTH);
+            glPointSize(dashed ? 7.0f : 9.0f);
+            glBegin(GL_POINTS);
+            glColor3f(dashed ? 1.0f : 0.95f, dashed ? 0.75f : 0.95f, dashed ? 0.15f : 0.95f);
+            glVertex3d(origin.x, origin.y, origin.z);
+            glEnd();
+        };
 
+        glLineWidth(2.0f);
+        drawTriad({ 0.0, 0.0, 0.0 }, MACHINE_TRIAD_LENGTH, false);
+        glLineWidth(5.0f);
+        drawTriad({ coordinates.workOffset.x, coordinates.workOffset.y, coordinates.workOffset.z }, WORK_TRIAD_LENGTH, true);
+        glLineWidth(1.0f);
+        glPointSize(1.0f);
+
+        const auto projectPoint = [&](const glm::dvec3 &point) {
+            const auto transformed = m_modelOrientation * displayOffset(point - m_modelPivot);
+            const auto ndcX = (transformed.x + m_viewPan.x) / (m_viewHalfHeight * aspect);
+            const auto ndcY = (transformed.z + m_viewPan.y) / m_viewHalfHeight;
+            return ImVec2(
+                static_cast<float>((ndcX + 1.0) * width * 0.5),
+                static_cast<float>((1.0 - ndcY) * height * 0.5));
+        };
+
+        const auto machineOrigin = projectPoint({ 0.0, 0.0, 0.0 });
+        const auto workOrigin = projectPoint({ coordinates.workOffset.x, coordinates.workOffset.y, coordinates.workOffset.z });
+        const auto screenDifference = ImVec2(workOrigin.x - machineOrigin.x, workOrigin.y - machineOrigin.y);
+        const auto originsOverlap = screenDifference.x * screenDifference.x + screenDifference.y * screenDifference.y < 24.0f * 24.0f;
+        const auto machineLabelPosition = ImVec2(machineOrigin.x + 8.0f, machineOrigin.y - (originsOverlap ? 28.0f : 18.0f));
+        const auto workLabelPosition = ImVec2(workOrigin.x + 8.0f, workOrigin.y + (originsOverlap ? 6.0f : -18.0f));
+
+        auto *drawList = ImGui::GetForegroundDrawList(ImGui::GetMainViewport());
+        drawList->AddText(machineLabelPosition, IM_COL32(180, 180, 180, 255), "MCS");
+        drawList->AddText(
+            workLabelPosition,
+            IM_COL32(255, 205, 45, 255),
+            std::format("{} WCS", coordinates.workCoordinateName).c_str());
+
+        glLineWidth(2.0f);
         m_worker.lock([&] {
             m_worker.toolpath().foreachCommand([&](const ngc::MachineCommand &cmd) {
                 if(auto moveLine = std::get_if<ngc::MoveLine>(&cmd)) {
-                    if(moveLine->speed() == -1.0) {
+                    if(moveLine->machineCoordinates()) {
                         glColor3f(1.0, 1.0, 0.4);
                     } else {
                         glColor3f(0.4, 0.4, 1.0);
+                    }
+
+                    const auto rapid = moveLine->speed() == -1.0;
+                    if(rapid) {
+                        glEnable(GL_LINE_STIPPLE);
+                        glLineStipple(6, 0x5555);
                     }
 
                     auto &v = moveLine->from();
@@ -395,6 +568,8 @@ public:
                     glVertex3d(v.x, v.y, v.z);
                     glVertex3d(w.x, w.y, w.z);
                     glEnd();
+
+                    if(rapid) glDisable(GL_LINE_STIPPLE);
                     
                     glEnable(GL_POINT_SMOOTH);
                     glPointSize(2.0);
@@ -445,58 +620,30 @@ public:
                 }
             });
         });
+        glLineWidth(1.0f);
+
+        const auto simulation = m_simulation.snapshot();
+        if(simulation.status != ngc::SimulationStatus::Stopped) {
+            drawToolWireframe(simulation.toolPose);
+        }
     }
 
     void interpolate(const ngc::MoveArc &arc, int circleResolution, const std::function<void(const glm::dvec3 &start, const glm::dvec3 &end, const bool startPoint, const bool endPoint)> &callback) {
-        glm::dvec3 start = { arc.from().x, arc.from().y, arc.from().z };
-        glm::dvec3 end = { arc.to().x, arc.to().y, arc.to().z };
-        glm::dvec3 center = { arc.center().x, arc.center().y, arc.center().z };
-        glm::dvec3 axis = { arc.axis().x, arc.axis().y, arc.axis().z };
+        const auto geometry = ngc::simulation_detail::arcGeometry(arc);
+        const auto sweep = geometry ? geometry->sweep : 0.0;
+        const auto segments = geometry && circleResolution > 0
+            ? std::max(1, static_cast<int>(std::ceil(sweep * circleResolution / (2.0 * std::numbers::pi))))
+            : 1;
 
-        const auto axisUnit = glm::normalize(axis);
-        auto startArm = start - center - glm::proj(start - center, axisUnit);
-        auto endArm = end - center - glm::proj(end - center, axisUnit);
-        auto axial = glm::proj(end - start, axis);
-
-        if(circleResolution <= 0 || glm::length2(startArm) == 0.0 || glm::length2(endArm) == 0.0) {
-            callback(start, end, true, true);
-            return;
-        }
-
-        const auto startUnit = glm::normalize(startArm);
-        const auto endUnit = glm::normalize(endArm);
-        auto sweep = std::atan2(glm::dot(axisUnit, glm::cross(startUnit, endUnit)), glm::dot(startUnit, endUnit));
-
-        if(sweep < 0.0) {
-            sweep += 2.0 * std::numbers::pi;
-        }
-
-        // With IJK-form arcs, matching radial arms denotes a full circle (possibly helical).
-        if(glm::length2(startArm - endArm) < 1e-18) {
-            sweep = 2.0 * std::numbers::pi;
-        }
-
-        if(sweep <= 2.0 * std::numbers::pi / circleResolution) {
-            callback(start, end, true, true);
-            return;
-        }
-
-        int segments = static_cast<int>(sweep / (2.0 * std::numbers::pi / circleResolution)) + 1;
-
-        glm::dvec3 prev;
-
-        for(int i = 0; i < segments + 1; i++) {
-            auto s = static_cast<double>(i) / segments;
-            const auto angle = sweep * s;
-            const auto fromStart = glm::rotate(startArm, angle, axisUnit);
-            const auto fromEnd = glm::rotate(endArm, -(sweep - angle), axisUnit);
-            auto v = center + glm::lerp(fromStart, fromEnd, s) + axial * s;
-
-            if(i > 0) {
-                callback(prev, v, i == 1, i == segments);
-            }
-            
-            prev = v;
+        auto previous = arc.from();
+        for(int i = 1; i <= segments; i++) {
+            const auto current = ngc::simulation_detail::interpolate(arc, static_cast<double>(i) / segments);
+            callback(
+                { previous.x, previous.y, previous.z },
+                { current.x, current.y, current.z },
+                i == 1,
+                i == segments);
+            previous = current;
         }
     }
 
@@ -571,10 +718,18 @@ public:
     }
 
     void renderToolWindow() {
-        if(ImGui::Begin("Tool Table", &m_enableToolWindow, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, { 0, 0 });
+        ImGui::SetNextWindowSize({ 950.0f, 360.0f }, ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSizeConstraints({ 500.0f, 220.0f }, { FLT_MAX, FLT_MAX });
 
-            if(ImGui::BeginTable("", 9, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg | ImGuiTableFlags_SizingFixedFit | ImGuiTableFlags_Resizable)) {
+        if(ImGui::Begin("Tool Table", &m_enableToolWindow)) {
+            ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, { 0, 0 });
+            const auto tableHeight = -ImGui::GetFrameHeightWithSpacing();
+
+            if(ImGui::BeginTable("##tool_table", 9,
+                                 ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg |
+                                 ImGuiTableFlags_SizingStretchProp | ImGuiTableFlags_Resizable |
+                                 ImGuiTableFlags_ScrollX | ImGuiTableFlags_ScrollY,
+                                 { 0.0f, tableHeight })) {
                 ImGui::TableSetupColumn("Tool Number");
                 ImGui::TableSetupColumn("X");
                 ImGui::TableSetupColumn("Y");
@@ -586,53 +741,56 @@ public:
                 ImGui::TableSetupColumn("Comment");
                 ImGui::TableHeadersRow();
 
-                for(auto &tool : m_toolStrings) {
+                for(std::size_t row = 0; row < m_toolStrings.size(); row++) {
+                    auto &tool = m_toolStrings[row];
+                    ImGui::PushID(static_cast<int>(row));
                     ImGui::TableNextRow();
 
                     ImGui::TableSetColumnIndex(0);
                     ImGui::SetNextItemWidth(-FLT_MIN);
-                    ImGui::InputText(std::format("##number{}", tool.number).c_str(), &tool.number);
+                    ImGui::InputText("##number", &tool.number);
 
                     ImGui::TableSetColumnIndex(1);
                     ImGui::SetNextItemWidth(-FLT_MIN);
-                    ImGui::InputText(std::format("##x{}", tool.number).c_str(), &tool.x);
+                    ImGui::InputText("##x", &tool.x);
 
                     ImGui::TableSetColumnIndex(2);
                     ImGui::SetNextItemWidth(-FLT_MIN);
-                    ImGui::InputText(std::format("##y{}", tool.number).c_str(), &tool.y);
+                    ImGui::InputText("##y", &tool.y);
 
                     ImGui::TableSetColumnIndex(3);
                     ImGui::SetNextItemWidth(-FLT_MIN);
-                    ImGui::InputText(std::format("##z{}", tool.number).c_str(), &tool.z);
+                    ImGui::InputText("##z", &tool.z);
 
                     ImGui::TableSetColumnIndex(4);
                     ImGui::SetNextItemWidth(-FLT_MIN);
-                    ImGui::InputText(std::format("##a{}", tool.number).c_str(), &tool.a);
+                    ImGui::InputText("##a", &tool.a);
 
                     ImGui::TableSetColumnIndex(5);
                     ImGui::SetNextItemWidth(-FLT_MIN);
-                    ImGui::InputText(std::format("##b{}", tool.number).c_str(), &tool.b);
+                    ImGui::InputText("##b", &tool.b);
 
                     ImGui::TableSetColumnIndex(6);
                     ImGui::SetNextItemWidth(-FLT_MIN);
-                    ImGui::InputText(std::format("##c{}", tool.number).c_str(), &tool.c);
+                    ImGui::InputText("##c", &tool.c);
 
                     ImGui::TableSetColumnIndex(7);
                     ImGui::SetNextItemWidth(-FLT_MIN);
-                    ImGui::InputText(std::format("##diameter{}", tool.number).c_str(), &tool.diameter);
+                    ImGui::InputText("##diameter", &tool.diameter);
 
                     ImGui::TableSetColumnIndex(8);
                     ImGui::SetNextItemWidth(-FLT_MIN);
-                    ImGui::InputText(std::format("##comment{}", tool.number).c_str(), &tool.comment);
+                    ImGui::InputText("##comment", &tool.comment);
+                    ImGui::PopID();
                 }
 
-                ImGui::PopStyleVar();
+                ImGui::EndTable();
             }
 
-            ImGui::EndTable();
+            ImGui::PopStyleVar();
 
             if(ImGui::Button("Reload")) {
-                initToolTableStrings();
+                reloadToolTable();
             }
 
             ImGui::SameLine();
@@ -644,7 +802,25 @@ public:
             ImGui::SameLine();
 
             if(ImGui::Button("New")) {
-                m_toolStrings.emplace_back(tool_table_strings_t {});
+                int nextToolNumber = 1;
+
+                for(const auto &tool : m_toolStrings) {
+                    if(const auto number = ngc::fromChars(tool.number)) {
+                        nextToolNumber = std::max(nextToolNumber, static_cast<int>(*number) + 1);
+                    }
+                }
+
+                m_toolStrings.emplace_back(tool_table_strings_t {
+                    .number = ngc::toChars(nextToolNumber),
+                    .x = "0",
+                    .y = "0",
+                    .z = "0",
+                    .a = "0",
+                    .b = "0",
+                    .c = "0",
+                    .diameter = "0",
+                    .comment = {},
+                });
             }
         }
 
@@ -700,9 +876,61 @@ public:
                 }
 
                 if(m_worker.compiled()) {
-                    if(ImGui::Button("Execute")) {
+                    if(ImGui::Button("Build Preview")) {
                         m_worker.execute();
                     }
+                }
+
+                const auto simulation = m_simulation.snapshot();
+                const auto simulationActive = simulation.status == ngc::SimulationStatus::Running
+                    || simulation.status == ngc::SimulationStatus::Paused;
+
+                ImGui::SameLine();
+                ImGui::BeginDisabled(m_programSource.empty() || simulationActive);
+                if(ImGui::Button("Run Simulation")) {
+                    m_simulation.setPlaybackRate(m_simulationRate);
+                    m_simulation.setRapidSpeed(m_simulatedRapidSpeed);
+                    m_simulation.start(m_programSource, m_tools);
+                }
+                ImGui::EndDisabled();
+
+                ImGui::SameLine();
+                ImGui::BeginDisabled(!simulationActive);
+                if(simulation.status == ngc::SimulationStatus::Paused) {
+                    if(ImGui::Button("Resume")) m_simulation.resume();
+                } else {
+                    if(ImGui::Button("Pause")) m_simulation.pause();
+                }
+                ImGui::SameLine();
+                if(ImGui::Button("Stop")) m_simulation.stop();
+                ImGui::EndDisabled();
+
+                ImGui::SetNextItemWidth(120.0f);
+                if(ImGui::InputDouble("Playback rate", &m_simulationRate, 0.1, 1.0, "%.2fx")) {
+                    m_simulationRate = std::clamp(m_simulationRate, 0.01, 1000.0);
+                    m_simulation.setPlaybackRate(m_simulationRate);
+                }
+                ImGui::SameLine();
+                ImGui::SetNextItemWidth(120.0f);
+                if(ImGui::InputDouble("Rapid speed", &m_simulatedRapidSpeed, 10.0, 100.0, "%.2f")) {
+                    m_simulatedRapidSpeed = std::max(m_simulatedRapidSpeed, 1e-6);
+                    m_simulation.setRapidSpeed(m_simulatedRapidSpeed);
+                }
+
+                const auto statusText = [&] {
+                    switch(simulation.status) {
+                        case ngc::SimulationStatus::Stopped: return "Stopped";
+                        case ngc::SimulationStatus::Running: return "Running";
+                        case ngc::SimulationStatus::Paused: return "Paused";
+                        case ngc::SimulationStatus::Completed: return "Completed";
+                        case ngc::SimulationStatus::Error: return "Error";
+                    }
+                    return "Unknown";
+                }();
+                ImGui::Text("Simulation: %s  XYZ: %.4f, %.4f, %.4f",
+                            statusText, simulation.toolPosition.x, simulation.toolPosition.y, simulation.toolPosition.z);
+                if(!simulation.error.empty()) {
+                    ImGui::TextColored(ImVec4_Redish, "%s", simulation.error.c_str());
                 }
 
                 if(ImGui::BeginTabBar("programs")) {

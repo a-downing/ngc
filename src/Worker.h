@@ -6,6 +6,8 @@
 #include <thread>
 
 #include "evaluator/InterpreterSession.h"
+#include "machine/ExecutionDriver.h"
+#include "machine/SimulationExecutor.h"
 #include "machine/ToolpathRecorder.h"
 #include "memory/Vars.h"
 
@@ -14,7 +16,9 @@ class Worker {
     std::condition_variable m_cv;
     std::thread m_thread;
 
-    ngc::InterpreterSession m_session{ ngc::Machine::Unit::Inch };
+    ngc::InterpreterSession m_session{ ngc::Machine::Unit::Inch, ngc::InterpretationMode::Preview };
+    ngc::SimulationExecutor m_executor;
+    ngc::ExecutionDriver m_driver{ m_session, m_executor };
     ngc::ToolpathRecorder m_toolpath;
 
     bool m_doJoin = false;
@@ -48,6 +52,17 @@ public:
     bool busy() const {
         std::scoped_lock lock(m_mutex);
         return m_busy;
+    }
+
+    bool setToolTable(const ngc::ToolTable &tools) {
+        std::scoped_lock lock(m_mutex);
+
+        if(m_busy) {
+            return false;
+        }
+
+        m_session.machine().toolTable() = tools;
+        return true;
     }
 
     std::vector<ngc::Parser::Error> parserErrors() const {
@@ -139,44 +154,30 @@ private:
         {
             std::scoped_lock lock(m_mutex);
             m_session.begin();
+            m_executor.reset();
+            m_driver.reset();
             m_toolpath.clear();
         }
 
         for(;;) {
-            auto event = m_session.next([&](const auto &callback) {
+            m_driver.pumpOne([&](const auto &callback) {
                 std::scoped_lock lock(m_mutex);
                 callback();
+            }, [&](const ngc::MachineCommand &command, const ngc::position_t &toolOffset, const ngc::ToolGeometry &) {
+                std::scoped_lock lock(m_mutex);
+                m_toolpath.consume(command, toolOffset);
             });
 
-            if(auto command = std::get_if<ngc::MachineCommand>(&event)) {
+            m_executor.completeQueued();
+            {
                 std::scoped_lock lock(m_mutex);
-                m_toolpath.consume(*command);
-
-                if(const auto probe = std::get_if<ngc::ProbeMove>(command)) {
-                    m_session.provideProbeResult({
-                        .id = probe->id(),
-                        .status = ngc::ProbeStatus::Triggered,
-                        .triggerPosition = probe->target(),
-                        .stoppedPosition = probe->target(),
-                    });
-                }
-
-                continue;
+                m_driver.deliverProbeResult();
             }
 
-            if(std::holds_alternative<ngc::InterpreterCompleted>(event)) {
-                break;
-            }
-
-            if(const auto waiting = std::get_if<ngc::InterpreterWaitingForProbe>(&event)) {
+            if(m_driver.state() == ngc::ExecutionDriverState::Completed) break;
+            if(m_driver.state() == ngc::ExecutionDriverState::Error) {
                 std::scoped_lock lock(m_mutex);
-                m_session.printMessages().emplace_back(std::format("preview stopped at probe command {}", waiting->commandId));
-                break;
-            }
-
-            if(const auto error = std::get_if<ngc::InterpreterError>(&event)) {
-                std::scoped_lock lock(m_mutex);
-                m_session.printMessages().emplace_back(error->message);
+                m_session.printMessages().emplace_back(*m_driver.error());
                 break;
             }
         }

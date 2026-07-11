@@ -235,6 +235,7 @@ namespace ngc {
                 break;
             case 61:
                 switch(fract) {
+                    case 0: return GCode::G61;
                     case 1: return GCode::G61_1;
                 }
 
@@ -242,12 +243,14 @@ namespace ngc {
             case 90:
                 switch(fract) {
                     case 0: return GCode::G90;
+                    case 1: return GCode::G90_1;
                 }
 
                 break;
             case 91:
                 switch(fract) {
                     case 0: return GCode::G91;
+                    case 1: return GCode::G91_1;
                 }
 
                 break;
@@ -317,6 +320,7 @@ namespace ngc {
         std::optional<GCMotion> modeMotion{};
         std::optional<GCPlane> modePlane{};
         std::optional<GCDist> modeDistance{};
+        std::optional<GCArcDist> modeArcDistance{};
         std::optional<GCFeed> modeFeedrate{};
         std::optional<GCUnits> modeUnits{};
         std::optional<GCTLen> modeToolOffset{};
@@ -336,6 +340,7 @@ namespace ngc {
             state.affectState(GCode::G0);
             state.affectState(GCode::G17);
             state.affectState(GCode::G90);
+            state.affectState(GCode::G91_1);
             state.affectState(GCode::G94);
             state.affectState(GCode::G20);
             state.affectState(GCode::G49);
@@ -349,6 +354,7 @@ namespace ngc {
             if(modeMotion) { return false; }
             if(modePlane) { return false; }
             if(modeDistance) { return false; }
+            if(modeArcDistance) { return false; }
             if(modeFeedrate) { return false; }
             if(modeUnits) { return false; }
             if(modeToolOffset) { return false; }
@@ -369,6 +375,7 @@ namespace ngc {
             if(!modeMotion) { return std::unexpected("missing motion mode"); }
             if(!modePlane) { return std::unexpected("missing plane mode"); }
             if(!modeDistance) { return std::unexpected("missing distance mode"); }
+            if(!modeArcDistance) { return std::unexpected("missing arc distance mode"); }
             if(!modeFeedrate) { return std::unexpected("missing feedrate mode"); }
             if(!modeUnits) { return std::unexpected("missing units mode"); }
             if(!modeToolOffset) { return std::unexpected("missing tool offset mode"); }
@@ -432,6 +439,10 @@ namespace ngc {
                 case GCode::G91:
                     modeDistance = static_cast<GCDist>(code);
                     return;
+                case GCode::G90_1:
+                case GCode::G91_1:
+                    modeArcDistance = static_cast<GCArcDist>(code);
+                    return;
                 case GCode::G93:
                 case GCode::G94:
                     modeFeedrate = static_cast<GCFeed>(code);
@@ -455,6 +466,7 @@ namespace ngc {
                 case GCode::G59_3:
                     modeCoordSys = static_cast<GCCoord>(code);
                     return;
+                case GCode::G61:
                 case GCode::G61_1:
                     modePath = static_cast<GCPath>(code);
                     return;

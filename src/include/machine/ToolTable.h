@@ -39,7 +39,7 @@ namespace ngc {
         auto begin() const { return m_tools.begin(); }
         auto end() const { return m_tools.end(); }
 
-        std::optional<tool_entry_t> get(int num) {
+        std::optional<tool_entry_t> get(int num) const {
             if(!m_tools.contains(num)) {
                 return std::nullopt;
             }

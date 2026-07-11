@@ -30,6 +30,7 @@ namespace ngc
 
     public:
         static constexpr uint32_t ADDR_STACK = 0x80000000;
+        static constexpr uint32_t MAX_USER_PARAMETER = 5000;
 
         enum class Error {
             INVALID_DATA_ADDRESS,
@@ -48,7 +49,11 @@ namespace ngc
 
             for(const auto &[var, name, addr, flags, value] : specs) {
                 while(m_data.size() < addr) {
-                    addData(MemoryCell(MemoryCell::Flags::READ | MemoryCell::Flags::WRITE));
+                    if(m_data.size() <= MAX_USER_PARAMETER) {
+                        addData(MemoryCell(MemoryCell::Flags::READ | MemoryCell::Flags::WRITE | MemoryCell::Flags::VOLATILE));
+                    } else {
+                        addData(MemoryCell(MemoryCell::Flags::NONE));
+                    }
                 }
 
                 auto _addr = addData(MemoryCell(flags, value));

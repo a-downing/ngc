@@ -14,6 +14,8 @@
 #include "evaluator/InterpreterSession.h"
 #include "evaluator/Preamble.h"
 #include "machine/Machine.h"
+#include "machine/ExecutionDriver.h"
+#include "machine/SimulationExecutor.h"
 #include "machine/ToolpathRecorder.h"
 #include "parser/Program.h"
 
@@ -83,6 +85,32 @@ namespace {
         requireNear(arc->axis().z, 1.0, "G3 must have a positive G17 axis");
         requireNear(arc->to().x, 0.0, "arc endpoint X is incorrect");
         requireNear(arc->to().y, 10.0, "arc endpoint Y is incorrect");
+    }
+
+    void testArcCenterDistanceModes() {
+        const auto incremental = run(
+            "G90 G91.1 G1 F10 X10 Y0\n"
+            "G3 X0 Y10 I-10 J0\n");
+        require(incremental.size() == 2, "incremental arc-center mode should emit a line and an arc");
+        const auto *incrementalArc = std::get_if<ngc::MoveArc>(&incremental[1]);
+        require(incrementalArc != nullptr, "G91.1 should emit an arc");
+        requireNear(incrementalArc->center().x, 0.0, "G91.1 I should be relative to the arc start");
+        requireNear(incrementalArc->center().y, 0.0, "G91.1 J should be relative to the arc start");
+        requireNear(incrementalArc->to().x, 0.0, "G91.1 must not change G90 endpoint mode");
+
+        ngc::Machine machine(UNIT);
+        machine.memory().write(ngc::Var::G54_X, 10.0);
+        machine.memory().write(ngc::Var::G54_Y, 20.0);
+        const auto absolute = execute(machine,
+            "G90 G90.1 G1 F10 X1 Y0\n"
+            "G3 X0 Y1 I0 J0\n");
+        require(absolute.size() == 2, "absolute arc-center mode should emit a line and an arc");
+        const auto *absoluteArc = std::get_if<ngc::MoveArc>(&absolute[1]);
+        require(absoluteArc != nullptr, "G90.1 should emit an arc");
+        requireNear(absoluteArc->center().x, 10.0, "G90.1 I should use the active work-coordinate origin");
+        requireNear(absoluteArc->center().y, 20.0, "G90.1 J should use the active work-coordinate origin");
+        requireNear(absoluteArc->to().x, 10.0, "G90.1 must retain the active work offset");
+        requireNear(absoluteArc->to().y, 21.0, "G90.1 endpoint should remain in G90 work coordinates");
     }
 
     void testIncrementalMove() {
@@ -239,6 +267,7 @@ namespace {
         requireNear(move->to().x, 3.0, "G53 must bypass G54 X while retaining the tool offset");
         requireNear(move->to().y, 4.0, "G53 must bypass G54 Y while retaining the tool offset");
         requireNear(move->to().z, 5.0, "G53 must bypass G54 Z while retaining the tool offset");
+        require(move->machineCoordinates(), "G53 motion should retain its machine-coordinate display metadata");
     }
 
     void testArcAllowsOmittedZeroCenterOffsets() {
@@ -293,7 +322,7 @@ namespace {
 
     void testInterpreterSessionOwnsCompilationAndExecution() {
         const auto synchronize = [](const auto &callback) { callback(); };
-        ngc::InterpreterSession session(UNIT);
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::RealRun);
 
         session.setPrograms({ { "G0 X10\nG1 F20 X15\n", "session.ngc" } });
         session.compile(synchronize);
@@ -350,8 +379,43 @@ namespace {
         require(std::holds_alternative<ngc::InterpreterCompleted>(session.next()), message);
     }
 
+    void testInterpreterTaskVariable() {
+        const auto testMode = [](const ngc::InterpretationMode mode, const double expectedTaskValue) {
+            ngc::InterpreterSession session(UNIT, mode);
+            compileSession(session,
+                "let #task_ptr = &#_task\n"
+                "G1 F1 X&#_task\n"
+                "G1 X##task_ptr\n");
+
+            requireNear(session.machine().memory().read(ngc::Var::TASK), expectedTaskValue,
+                        "session should install the correct _task value");
+            requireNear(nextLine(session, "_task address should produce a line move").to().x, 6000.0,
+                        "&_task should resolve to parameter 6000");
+            requireNear(nextLine(session, "indirect _task read should produce a line move").to().x, expectedTaskValue,
+                        "indirect _task read should match the session mode");
+            requireCompleted(session, "_task program should complete");
+        };
+
+        testMode(ngc::InterpretationMode::Preview, 0.0);
+        testMode(ngc::InterpretationMode::Simulation, 1.0);
+        testMode(ngc::InterpretationMode::RealRun, 2.0);
+
+        const auto requireWriteRejected = [](const std::string_view source) {
+            ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::RealRun);
+            compileSession(session, source);
+            const auto event = session.next();
+            const auto error = std::get_if<ngc::InterpreterError>(&event);
+            require(error != nullptr, "writing _task should produce an interpreter error");
+            require(error->message == "WRITE", "writing _task should fail because the memory cell is read-only");
+        };
+
+        requireWriteRejected("#_task = 0\n");
+        requireWriteRejected("#6000 = 0\n");
+        requireWriteRejected("let #task_ptr = &#_task\n##task_ptr = 0\n");
+    }
+
     void testIncrementalSessionControlFlow() {
-        ngc::InterpreterSession session(UNIT);
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::RealRun);
 
         compileSession(session,
             "if 0 {\n"
@@ -425,7 +489,7 @@ namespace {
         require(probe->stopOnContact(), "G38.3 should stop on contact");
         require(!probe->errorIfNotFound(), "G38.3 should not error when contact is not found");
 
-        ngc::InterpreterSession session(UNIT);
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::RealRun);
         compileSession(session, "G38.3 F5 Z-1\nG1 X1\n");
         const auto command = session.next();
         const auto emitted = std::get_if<ngc::MachineCommand>(&command);
@@ -450,7 +514,7 @@ namespace {
             std::istreambuf_iterator<char>() };
         require(!toolChangeSource.empty(), "tool-change autoload program should be readable");
 
-        ngc::InterpreterSession session(UNIT);
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::RealRun);
         session.setPrograms({
             { toolChangeSource, "autoload/tool_change.ngc" },
             { "T2 M6\n", "tool-change-test.ngc" },
@@ -512,12 +576,130 @@ namespace {
         recorder.clear();
         require(recorder.commands().empty(), "toolpath recorder should clear between preview runs");
     }
+
+    void testToolpathRecorderAppliesPerCommandToolOffset() {
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::Preview);
+        ngc::ToolpathRecorder recorder;
+        compileSession(session,
+            "G43 H7 G1 F1 Z3\n"
+            "G49 G1 Z4\n");
+
+        for(int i = 0; i < 2; i++) {
+            const auto event = session.next();
+            const auto command = std::get_if<ngc::MachineCommand>(&event);
+            require(command != nullptr, "tool-offset preview should emit a motion command");
+            recorder.consume(*command, session.machine().toolOffset());
+        }
+
+        requireCompleted(session, "tool-offset preview should complete");
+        require(recorder.commands().size() == 2, "tool-offset preview should retain both motions");
+
+        const auto *compensated = std::get_if<ngc::MoveLine>(&recorder.commands()[0]);
+        const auto *uncompensated = std::get_if<ngc::MoveLine>(&recorder.commands()[1]);
+        require(compensated != nullptr && uncompensated != nullptr, "tool-offset preview should retain line motions");
+        requireNear(compensated->to().z, 3.0, "G43 preview endpoint should be the cutter-tip position");
+        requireNear(uncompensated->to().z, 4.0, "G49 preview endpoint should not retain the previous tool offset");
+    }
+
+    void testSimulationExecutorInterpolatesAndAppliesToolOffset() {
+        ngc::SimulationExecutor simulator;
+        simulator.reset();
+        simulator.advance(1.0);
+        require(simulator.empty(), "advancing an empty simulator should be a no-op");
+        simulator.setStatus(ngc::SimulationStatus::Running);
+        simulator.consume({
+            ngc::MoveLine { { 0, 0, 0, 0, 0, 0 }, { 2, 0, 0, 0, 0, 0 }, 60.0 },
+            { 0, 0, 0.5, 0, 0, 0 },
+            { .number = 1, .offset = { 0, 0, 0.5, 0, 0, 0 }, .diameter = 0.25 },
+        });
+
+        simulator.advance(1.0);
+        const auto halfway = simulator.snapshot();
+        requireNear(halfway.machinePosition.x, 1.0, "simulation should interpolate feed motion using elapsed time");
+        requireNear(halfway.commandProgress, 0.5, "simulation should report active command progress");
+        requireNear(halfway.toolPosition.z, -0.5, "simulation should apply the captured tool offset to its display position");
+
+        simulator.advance(1.0);
+        const auto finished = simulator.snapshot();
+        requireNear(finished.machinePosition.x, 2.0, "simulation should finish at the commanded endpoint");
+        require(simulator.empty(), "completed simulated motion should leave the executor empty");
+    }
+
+    void testSimulationExecutorCompletesProbeAtTarget() {
+        ngc::SimulationExecutor simulator;
+        simulator.reset();
+        simulator.consume({ ngc::ProbeMove { 42, { 0, 0, 0, 0, 0, 0 }, { 0, 0, -1, 0, 0, 0 }, 60, true, false }, {} });
+        simulator.advance(1.0);
+
+        const auto result = simulator.takeProbeResult();
+        require(result.has_value(), "completed simulated probe should produce a result");
+        require(result->id == 42, "simulated probe result should match its command");
+        require(result->status == ngc::ProbeStatus::Triggered, "simulated G38.3 should trigger at its target");
+        requireNear(result->triggerPosition.z, -1.0, "simulated probe trigger should be the requested target");
+        requireNear(result->stoppedPosition.z, -1.0, "simulated probe should stop at the requested target");
+    }
+
+    void testSimulationProbeUsesPhysicalToolLengthWithoutG43() {
+        ngc::SimulationExecutor simulator;
+        simulator.reset();
+        simulator.consume({
+            ngc::ProbeMove { 7, { 0, 0, 4, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0 }, 60, true, false },
+            {},
+            { .number = 7, .offset = { 0, 0, 2, 0, 0, 0 }, .diameter = 0.5 },
+        });
+        simulator.advance(2.0);
+
+        const auto snapshot = simulator.snapshot();
+        const auto result = simulator.takeProbeResult();
+        require(result.has_value(), "physical tool probe should reach its simulated contact");
+        requireNear(result->stoppedPosition.z, 2.0, "spindle should stop one tool length above the probe target");
+        requireNear(snapshot.toolPosition.z, 0.0, "physical tool tip should stop at the probe target");
+
+        simulator.consume({
+            ngc::MoveLine { { 0, 0, 0, 0, 0, 0 }, { 0, 0, 4, 0, 0, 0 }, 60.0 },
+            {},
+            { .number = 7, .offset = { 0, 0, 2, 0, 0, 0 }, .diameter = 0.5 },
+        });
+        simulator.advance(1.0);
+        requireNear(simulator.snapshot().machinePosition.z, 3.0,
+                    "post-probe travel should start at the actual stopped position");
+        requireNear(simulator.snapshot().toolPosition.z, 1.0,
+                    "post-probe tool-tip travel should retract away from the probe");
+    }
+
+    void testImmediateExecutionDriverUsesSimulationProbePath() {
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::Preview);
+        ngc::SimulationExecutor executor;
+        ngc::ExecutionDriver driver(session, executor);
+        compileSession(session, "G0 Z4\nG38.3 F60 Z0\nG91 G0 Z1\n");
+        session.begin();
+        session.machine().prepareToolChange(7);
+        executor.reset();
+        driver.reset();
+
+        int probeCount = 0;
+        while(driver.state() == ngc::ExecutionDriverState::Running) {
+            driver.pumpOne([](const auto &callback) { callback(); },
+                [&](const ngc::MachineCommand &command, const ngc::position_t &, const ngc::ToolGeometry &) {
+                    if(std::holds_alternative<ngc::ProbeMove>(command)) probeCount++;
+                });
+            executor.completeQueued();
+            driver.deliverProbeResult();
+        }
+
+        require(driver.state() == ngc::ExecutionDriverState::Completed,
+                "immediate execution driver should complete the preview");
+        require(probeCount == 1, "immediate execution should use the shared probe path");
+        requireNear(session.machine().memory().read(ngc::Var::TASK), 0.0,
+                    "immediate preview should retain the preview _task value");
+    }
 }
 
 int main() {
     try {
         testRapidAndFeedMove();
         testArcUsesModalFeedrate();
+        testArcCenterDistanceModes();
         testIncrementalMove();
         testBeginProgramRunResetsRuntimeState();
         testLinearUnitConversion();
@@ -528,10 +710,16 @@ int main() {
         testArcAllowsOmittedZeroCenterOffsets();
         testArcGeometryValidation();
         testInterpreterSessionOwnsCompilationAndExecution();
+        testInterpreterTaskVariable();
         testIncrementalSessionControlFlow();
         testProbeCommandAndBarrier();
         testAutomaticToolChangeReachesProbeBarrier();
         testToolpathRecorderIsASeparateConsumer();
+        testToolpathRecorderAppliesPerCommandToolOffset();
+        testSimulationExecutorInterpolatesAndAppliesToolOffset();
+        testSimulationExecutorCompletesProbeAtTarget();
+        testSimulationProbeUsesPhysicalToolLengthWithoutG43();
+        testImmediateExecutionDriverUsesSimulationProbePath();
     } catch(const std::exception &error) {
         std::cerr << "ngc_tests failed: " << error.what() << '\n';
         return 1;

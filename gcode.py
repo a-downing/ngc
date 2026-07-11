@@ -1,15 +1,20 @@
+import argparse
+import contextlib
+
+
 motion = ["G0", "G1", "G2", "G3"]
 probe_motion = ["G38.3"]
 plane = ["G17", "G18", "G19"]
 distance = ["G90", "G91"]
+arc_distance = ["G90.1", "G91.1"]
 feed = ["G93", "G94"]
 units = ["G20", "G21"]
 tool_length = ["G43", "G49"]
 coord_sys = ["G54", "G55", "G56", "G57", "G58", "G59", "G59.1", "G59.2", "G59.3"]
-path = ["G61.1"]
+path = ["G61", "G61.1"]
 non_modal = ["G53", "G10"]
 
-all = motion + plane + distance + feed + units + tool_length + coord_sys + path + non_modal + probe_motion
+all = motion + plane + distance + arc_distance + feed + units + tool_length + coord_sys + path + non_modal + probe_motion
 ids = dict()
 id = 0
 
@@ -42,41 +47,58 @@ def decl_name(name, codes):
     print("}\n")
 
 
-print("#pragma once")
-print()
-print("#include <cstdint>")
-print("#include <utility>")
-print("#include <string_view>")
-print()
-print("#include \"utils.h\"")
-print()
+def generate():
+    print("#pragma once")
+    print()
+    print("#include <cstdint>")
+    print("#include <utility>")
+    print("#include <string_view>")
+    print()
+    print("#include \"utils.h\"")
+    print()
 
-decl_enum("GCode", all)
-decl_name("GCode", all)
+    decl_enum("GCode", all)
+    decl_name("GCode", all)
 
-decl_enum("GCMotion", motion + probe_motion)
-decl_name("GCMotion", motion + probe_motion)
+    decl_enum("GCMotion", motion + probe_motion)
+    decl_name("GCMotion", motion + probe_motion)
 
-decl_enum("GCPlane", plane)
-decl_name("GCPlane", plane)
+    decl_enum("GCPlane", plane)
+    decl_name("GCPlane", plane)
 
-decl_enum("GCDist", distance)
-decl_name("GCDist", distance)
+    decl_enum("GCDist", distance)
+    decl_name("GCDist", distance)
 
-decl_enum("GCFeed", feed)
-decl_name("GCFeed", feed)
+    decl_enum("GCArcDist", arc_distance)
+    decl_name("GCArcDist", arc_distance)
 
-decl_enum("GCUnits", units)
-decl_name("GCUnits", units)
+    decl_enum("GCFeed", feed)
+    decl_name("GCFeed", feed)
 
-decl_enum("GCTLen", tool_length)
-decl_name("GCTLen", tool_length)
+    decl_enum("GCUnits", units)
+    decl_name("GCUnits", units)
 
-decl_enum("GCCoord", coord_sys)
-decl_name("GCCoord", coord_sys)
+    decl_enum("GCTLen", tool_length)
+    decl_name("GCTLen", tool_length)
 
-decl_enum("GCPath", path)
-decl_name("GCPath", path)
+    decl_enum("GCCoord", coord_sys)
+    decl_name("GCCoord", coord_sys)
 
-decl_enum("GCNonModal", non_modal)
-decl_name("GCNonModal", non_modal)
+    decl_enum("GCPath", path)
+    decl_name("GCPath", path)
+
+    decl_enum("GCNonModal", non_modal)
+    decl_name("GCNonModal", non_modal)
+
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Generate the G-code enum header")
+    parser.add_argument("--output", help="write UTF-8 output directly to this file")
+    args = parser.parse_args()
+
+    if args.output:
+        with open(args.output, "w", encoding="utf-8", newline="\n") as output:
+            with contextlib.redirect_stdout(output):
+                generate()
+    else:
+        generate()

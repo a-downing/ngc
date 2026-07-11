@@ -7,6 +7,7 @@ namespace ngc
     class MemoryCell {
     public:
         enum Flags {
+            NONE = 0,
             READ = 1,
             WRITE = 2,
             VOLATILE = 4

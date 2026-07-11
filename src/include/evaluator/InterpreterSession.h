@@ -20,6 +20,21 @@
 #include "parser/Program.h"
 
 namespace ngc {
+    enum class InterpretationMode {
+        Preview,
+        Simulation,
+        RealRun,
+    };
+
+    constexpr double taskValue(const InterpretationMode mode) {
+        switch(mode) {
+            case InterpretationMode::Preview: return 0.0;
+            case InterpretationMode::Simulation: return 1.0;
+            case InterpretationMode::RealRun: return 2.0;
+        }
+        return 0.0;
+    }
+
     struct InterpreterCompleted { };
 
     struct InterpreterError {
@@ -36,6 +51,7 @@ namespace ngc {
         struct ExecutionStopped { };
 
         Machine m_machine;
+        InterpretationMode m_mode;
         std::vector<Program> m_programs;
         std::vector<Parser::Error> m_parserErrors;
         std::vector<std::string> m_printMessages;
@@ -56,7 +72,7 @@ namespace ngc {
         std::optional<std::string> m_executionError;
 
     public:
-        explicit InterpreterSession(const Machine::Unit unit) : m_machine(unit) { }
+        InterpreterSession(const Machine::Unit unit, const InterpretationMode mode) : m_machine(unit), m_mode(mode) { }
 
         ~InterpreterSession() {
             stop();
@@ -107,6 +123,7 @@ namespace ngc {
         void begin() {
             stop();
             m_machine.beginProgramRun();
+            m_machine.memory().write(Var::TASK, taskValue(m_mode), true);
             m_printMessages.clear();
             m_blockMessages.clear();
             m_pendingCommands.clear();
@@ -216,6 +233,7 @@ namespace ngc {
                         }
 
                         if(state.modeToolChange) {
+                            m_machine.prepareToolChange(static_cast<int>(*state.T));
                             evaluator.call("_tool_change", *state.T);
                         }
                     }

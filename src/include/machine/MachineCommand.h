@@ -80,6 +80,18 @@ namespace ngc {
         std::string text() const { return std::format("Spindle({}, {})", name(m_direction), m_speed); }
     };
 
+    struct ToolGeometry {
+        int number = 0;
+        position_t offset{};
+        double diameter = 0.0;
+    };
+
+    struct ToolPose {
+        ToolGeometry geometry{};
+        position_t spindlePosition{};
+        position_t tipPosition{};
+    };
+
     class SpindleStop {
     public:
         std::string text() const { return "SpindleStop()"; }
@@ -89,14 +101,20 @@ namespace ngc {
         position_t m_from;
         position_t m_to;
         double m_speed;
+        bool m_machineCoordinates;
 
     public:
-        MoveLine(const position_t &from, const position_t &to, const double speed) : m_from(from), m_to(to), m_speed(speed) { }
+        MoveLine(const position_t &from, const position_t &to, const double speed, const bool machineCoordinates = false)
+            : m_from(from), m_to(to), m_speed(speed), m_machineCoordinates(machineCoordinates) { }
         const position_t &from() const { return m_from; }
         const position_t &to() const { return m_to; }
         double speed() const { return m_speed; }
+        bool machineCoordinates() const { return m_machineCoordinates; }
 
-        std::string text() const { return std::format("MoveLine(from: {}, to: {}, speed: {})", m_from.text(), m_to.text(), m_speed); }
+        std::string text() const {
+            return std::format("MoveLine(from: {}, to: {}, speed: {}, machineCoordinates: {})",
+                               m_from.text(), m_to.text(), m_speed, m_machineCoordinates);
+        }
     };
 
     class MoveArc {

@@ -16,25 +16,28 @@ enum class GCode : std::uint8_t {
     G19 = 6,
     G90 = 7,
     G91 = 8,
-    G93 = 9,
-    G94 = 10,
-    G20 = 11,
-    G21 = 12,
-    G43 = 13,
-    G49 = 14,
-    G54 = 15,
-    G55 = 16,
-    G56 = 17,
-    G57 = 18,
-    G58 = 19,
-    G59 = 20,
-    G59_1 = 21,
-    G59_2 = 22,
-    G59_3 = 23,
-    G61_1 = 24,
-    G53 = 25,
-    G10 = 26,
-    G38_3 = 27,
+    G90_1 = 9,
+    G91_1 = 10,
+    G93 = 11,
+    G94 = 12,
+    G20 = 13,
+    G21 = 14,
+    G43 = 15,
+    G49 = 16,
+    G54 = 17,
+    G55 = 18,
+    G56 = 19,
+    G57 = 20,
+    G58 = 21,
+    G59 = 22,
+    G59_1 = 23,
+    G59_2 = 24,
+    G59_3 = 25,
+    G61 = 26,
+    G61_1 = 27,
+    G53 = 28,
+    G10 = 29,
+    G38_3 = 30,
 };
 
 inline std::string_view name(const GCode code) {
@@ -48,6 +51,8 @@ inline std::string_view name(const GCode code) {
         case GCode::G19: return "G19";
         case GCode::G90: return "G90";
         case GCode::G91: return "G91";
+        case GCode::G90_1: return "G90.1";
+        case GCode::G91_1: return "G91.1";
         case GCode::G93: return "G93";
         case GCode::G94: return "G94";
         case GCode::G20: return "G20";
@@ -63,6 +68,7 @@ inline std::string_view name(const GCode code) {
         case GCode::G59_1: return "G59.1";
         case GCode::G59_2: return "G59.2";
         case GCode::G59_3: return "G59.3";
+        case GCode::G61: return "G61";
         case GCode::G61_1: return "G61.1";
         case GCode::G53: return "G53";
         case GCode::G10: return "G10";
@@ -77,7 +83,7 @@ enum class GCMotion : std::uint8_t {
     G1 = 1,
     G2 = 2,
     G3 = 3,
-    G38_3 = 27,
+    G38_3 = 30,
 };
 
 inline std::string_view name(const GCMotion code) {
@@ -122,9 +128,23 @@ inline std::string_view name(const GCDist code) {
     PANIC("{}() invalid code GCDist::{}", __func__, std::to_underlying(code));
 }
 
+enum class GCArcDist : std::uint8_t {
+    G90_1 = 9,
+    G91_1 = 10,
+};
+
+inline std::string_view name(const GCArcDist code) {
+    switch(code) {
+        case GCArcDist::G90_1: return "G90.1";
+        case GCArcDist::G91_1: return "G91.1";
+    }
+
+    PANIC("{}() invalid code GCArcDist::{}", __func__, std::to_underlying(code));
+}
+
 enum class GCFeed : std::uint8_t {
-    G93 = 9,
-    G94 = 10,
+    G93 = 11,
+    G94 = 12,
 };
 
 inline std::string_view name(const GCFeed code) {
@@ -137,8 +157,8 @@ inline std::string_view name(const GCFeed code) {
 }
 
 enum class GCUnits : std::uint8_t {
-    G20 = 11,
-    G21 = 12,
+    G20 = 13,
+    G21 = 14,
 };
 
 inline std::string_view name(const GCUnits code) {
@@ -151,8 +171,8 @@ inline std::string_view name(const GCUnits code) {
 }
 
 enum class GCTLen : std::uint8_t {
-    G43 = 13,
-    G49 = 14,
+    G43 = 15,
+    G49 = 16,
 };
 
 inline std::string_view name(const GCTLen code) {
@@ -165,15 +185,15 @@ inline std::string_view name(const GCTLen code) {
 }
 
 enum class GCCoord : std::uint8_t {
-    G54 = 15,
-    G55 = 16,
-    G56 = 17,
-    G57 = 18,
-    G58 = 19,
-    G59 = 20,
-    G59_1 = 21,
-    G59_2 = 22,
-    G59_3 = 23,
+    G54 = 17,
+    G55 = 18,
+    G56 = 19,
+    G57 = 20,
+    G58 = 21,
+    G59 = 22,
+    G59_1 = 23,
+    G59_2 = 24,
+    G59_3 = 25,
 };
 
 inline std::string_view name(const GCCoord code) {
@@ -193,11 +213,13 @@ inline std::string_view name(const GCCoord code) {
 }
 
 enum class GCPath : std::uint8_t {
-    G61_1 = 24,
+    G61 = 26,
+    G61_1 = 27,
 };
 
 inline std::string_view name(const GCPath code) {
     switch(code) {
+        case GCPath::G61: return "G61";
         case GCPath::G61_1: return "G61.1";
     }
 
@@ -205,8 +227,8 @@ inline std::string_view name(const GCPath code) {
 }
 
 enum class GCNonModal : std::uint8_t {
-    G53 = 25,
-    G10 = 26,
+    G53 = 28,
+    G10 = 29,
 };
 
 inline std::string_view name(const GCNonModal code) {

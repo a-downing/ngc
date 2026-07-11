@@ -44,6 +44,7 @@ namespace ngc {
         Memory m_memory;
         ToolTable m_toolTable;
         GCodeState m_state = GCodeState::makeDefault();
+        int m_physicalToolNumber = 0;
         std::uint64_t m_nextCommandId = 1;
 
         struct PendingProbe {
@@ -70,6 +71,7 @@ namespace ngc {
             m_pos = {};
             m_workOffset = {};
             m_toolOffset = {};
+            m_physicalToolNumber = 0;
             m_pendingProbe.reset();
             m_state = GCodeState::makeDefault();
             const auto num = static_cast<int>(m_memory.read(Var::COORDSYS));
@@ -77,6 +79,18 @@ namespace ngc {
         }
 
         template<typename Self> auto &workOffset(this Self &&self) { return std::forward<Self>(self).m_workOffset; }
+        template<typename Self> auto &toolOffset(this Self &&self) { return std::forward<Self>(self).m_toolOffset; }
+        ToolGeometry toolGeometry() const {
+            const auto tool = m_toolTable.get(m_physicalToolNumber);
+            if(!tool) return {};
+            return {
+                .number = m_physicalToolNumber,
+                .offset = { tool->x, tool->y, tool->z, tool->a, tool->b, tool->c },
+                .diameter = tool->diameter,
+            };
+        }
+        position_t physicalToolOffset() const { return toolGeometry().offset; }
+        void prepareToolChange(const int toolNumber) { m_physicalToolNumber = toolNumber; }
         template<typename Self> auto &memory(this Self &&self) { return std::forward<Self>(self).m_memory; }
         template<typename Self> auto &toolTable(this Self &&self) { return std::forward<Self>(self).m_toolTable; }
         template<typename Self> auto &state(this Self &&self) { return std::forward<Self>(self).m_state; }
@@ -191,6 +205,10 @@ namespace ngc {
 
             if(state.modeDistance) {
                 m_state.modeDistance = std::exchange(state.modeDistance, std::nullopt);
+            }
+
+            if(state.modeArcDistance) {
+                m_state.modeArcDistance = std::exchange(state.modeArcDistance, std::nullopt);
             }
 
             if(state.modeFeedrate) {
@@ -350,7 +368,7 @@ namespace ngc {
                 auto pos = position();
                 std::println("pos: {}", pos.text());
                 auto speed = m_state.modeMotion == GCMotion::G1 ? *m_state.F : -1;
-                auto command = MoveLine{m_pos, pos, speed};
+                auto command = MoveLine{m_pos, pos, speed, m_state.nonModal == GCNonModal::G53};
                 m_pos = pos;
                 return command;
             }
@@ -361,12 +379,31 @@ namespace ngc {
                 std::optional<vec3_t> center;
                 std::optional<vec3_t> axis;
 
+                const auto centerCoordinate = [&](const Axis coordinateAxis, const std::optional<double> word) {
+                    if(m_state.modeArcDistance == GCArcDist::G91_1) {
+                        switch(coordinateAxis) {
+                            case Axis::X: return m_pos.x + word.value_or(0.0);
+                            case Axis::Y: return m_pos.y + word.value_or(0.0);
+                            case Axis::Z: return m_pos.z + word.value_or(0.0);
+                            case Axis::A:
+                            case Axis::B:
+                            case Axis::C: PANIC("rotary axis cannot be an arc center coordinate");
+                        }
+                    }
+
+                    if(m_state.modeArcDistance == GCArcDist::G90_1) {
+                        return word.value_or(0.0) + offsets(coordinateAxis);
+                    }
+
+                    PANIC("invalid arc distance mode");
+                };
+
                 if(m_state.modePlane == GCPlane::G17) {
                     if(!m_state.I && !m_state.J) {
                         PANIC("missing I and J for G17 arc: {}", block.statement()->text());
                     }
 
-                    center = vec3_t(m_pos.x + m_state.I.value_or(0.0), m_pos.y + m_state.J.value_or(0.0), m_pos.z);
+                    center = vec3_t(centerCoordinate(Axis::X, m_state.I), centerCoordinate(Axis::Y, m_state.J), m_pos.z);
                     axis = vec3_t(0.0, 0.0, 1.0) * flip;
                 }
 
@@ -375,7 +412,7 @@ namespace ngc {
                         PANIC("missing I and K for G18 arc: {}", block.statement()->text());
                     }
 
-                    center = vec3_t(m_pos.x + m_state.I.value_or(0.0), m_pos.y, m_pos.z + m_state.K.value_or(0.0));
+                    center = vec3_t(centerCoordinate(Axis::X, m_state.I), m_pos.y, centerCoordinate(Axis::Z, m_state.K));
                     axis = vec3_t(0.0, 1.0, 0.0) * flip;
                 }
 
@@ -384,7 +421,7 @@ namespace ngc {
                         PANIC("missing J and K for G19 arc: {}", block.statement()->text());
                     }
 
-                    center = vec3_t(m_pos.x, m_pos.y + m_state.J.value_or(0.0), m_pos.z + m_state.K.value_or(0.0));
+                    center = vec3_t(m_pos.x, centerCoordinate(Axis::Y, m_state.J), centerCoordinate(Axis::Z, m_state.K));
                     axis = vec3_t(1.0, 0.0, 0.0) * flip;
                 }
 
