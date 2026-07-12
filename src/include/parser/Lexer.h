@@ -1,15 +1,6 @@
 #pragma once
 
-#include <ostream>
-#ifdef __clang__
-    #pragma push_macro("__cpp_concepts")
-    #define __cpp_concepts 202002L
-    #include <expected>
-    #pragma pop_macro("__cpp_concepts")
-#else
-    #include <expected>
-#endif
-
+#include <expected>
 #include <memory>
 #include <cctype>
 #include <format>
@@ -66,7 +57,7 @@ namespace ngc
         [[nodiscard]] std::expected<Token, Error> nextToken() {
             if(m_state == State::BEGIN) {
                 while(!end()) {
-                    if(!std::isspace(peek())) {
+                    if(!std::isspace(static_cast<unsigned char>(peek()))) {
                         break;
                     }
 
@@ -81,7 +72,7 @@ namespace ngc
             }
 
             while(!end()) {
-                if(!std::isspace(peek()) || check('\n')) {
+                if(!std::isspace(static_cast<unsigned char>(peek())) || check('\n')) {
                     break;
                 }
 
@@ -144,6 +135,8 @@ namespace ngc
                 if(match('=')) {
                     return makeToken(Token::Kind::NE);
                 }
+
+                break;
             case '<':
                 if(match('=')) {
                     return makeToken(Token::Kind::LE);
@@ -163,22 +156,24 @@ namespace ngc
 
                 return makeToken(Token::Kind::MUL);
             case '.':
-                if(std::isdigit(peek())) {
+                if(std::isdigit(static_cast<unsigned char>(peek()))) {
                     return number(c);
                 }
+
+                break;
             case '#':
-                if(std::isalpha(peek()) || check('_')) {
+                if(std::isalpha(static_cast<unsigned char>(peek())) || check('_')) {
                     return identifier(Token::Kind::NAMED_VARIABLE);
                 }
 
                 return makeToken(Token::Kind::POUND);
             }
 
-            if(std::isdigit(c)) {
+            if(std::isdigit(static_cast<unsigned char>(c))) {
                 return number(c);
             }
 
-            if(std::isalpha(c) || c == '_') {
+            if(std::isalpha(static_cast<unsigned char>(c)) || c == '_') {
                 return identifier(Token::Kind::IDENTIFIER);
             }
 
@@ -216,7 +211,7 @@ namespace ngc
         }
 
         [[nodiscard]] std::expected<Token, Error> identifier(const Token::Kind kind) {
-            while(std::isalnum(peek()) || check('_')) {
+            while(std::isalnum(static_cast<unsigned char>(peek())) || check('_')) {
                 advance();
             }
 
@@ -251,13 +246,13 @@ namespace ngc
         }
 
         void consume_number() {
-            while(std::isdigit(peek())) {
+            while(std::isdigit(static_cast<unsigned char>(peek()))) {
                 advance();
             }
         }
 
         [[nodiscard]] std::expected<Token, Error> letter(const Token::Kind kind) {
-            if(std::isalpha(peek())) {
+            if(std::isalpha(static_cast<unsigned char>(peek()))) {
                 return identifier(Token::Kind::IDENTIFIER);
             }
 
@@ -373,7 +368,7 @@ namespace ngc
 
         [[nodiscard]] static bool iequal(const std::string_view a, const std::string_view b) {
             return a.size() == b.size() && std::equal(a.begin(), a.end(), b.begin(), [](const char _a, const char _b) {
-                return std::tolower(_a) == std::tolower(_b);
+                return std::tolower(static_cast<unsigned char>(_a)) == std::tolower(static_cast<unsigned char>(_b));
             });
         }
     };

@@ -97,6 +97,7 @@ sub tworeturns[#a, #b] {
 print["tworeturns: ", tworeturns[3, 5]]
 print["tworeturns: ", tworeturns[3, 5]]
 
+F100
 G01 X1
 G01 Y2
 G01 Z3
@@ -105,7 +106,7 @@ G01 X4
 /G01 Y5
 G01 Z6
 
-print["_userdata_1: ", #userdata_1]
+(print["_userdata_1: ", #userdata_1])
 
 M6 T2
 

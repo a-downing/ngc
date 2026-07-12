@@ -1,13 +1,6 @@
 #pragma once
 
-#ifdef __clang__
-    #pragma push_macro("__cpp_concepts")
-    #define __cpp_concepts 202002L
-    #include <expected>
-    #pragma pop_macro("__cpp_concepts")
-#else
-    #include <expected>
-#endif
+#include <expected>
 
 #include <format>
 #include <print>
@@ -18,6 +11,14 @@
 #include <array>
 #include <source_location>
 #include <limits>
+#include <atomic>
+
+#ifdef _WIN32
+    #ifndef NOMINMAX
+        #define NOMINMAX
+    #endif
+    #include <windows.h>
+#endif
 
 #define PANIC(...) ngc::panic(std::source_location::current(), "PANIC" __VA_OPT__(,) __VA_ARGS__)
 #define UNREACHABLE(...) ngc::panic(std::source_location::current(), "UNREACHABLE" __VA_OPT__(,) __VA_ARGS__)
@@ -98,17 +99,50 @@ namespace ngc
     }
 
     inline std::expected<void, std::ios_base::failure> writeFile(const std::filesystem::path& filePath, const std::string_view text) {
-        std::ofstream file(filePath, std::ios::binary | std::ios::trunc);
+        static std::atomic_uint64_t nextTemporaryId = 1;
+        auto temporaryPath = filePath;
+        temporaryPath += std::format(".tmp.{}", nextTemporaryId.fetch_add(1, std::memory_order_relaxed));
+
+        std::ofstream file(temporaryPath, std::ios::binary | std::ios::trunc);
 
         if (!file) {
-            return std::unexpected(std::ios_base::failure(std::format("failed to open '{}'", filePath.string())));
+            return std::unexpected(std::ios_base::failure(std::format("failed to open temporary file '{}'", temporaryPath.string())));
         }
 
         file.write(text.data(), static_cast<std::streamsize>(text.size()));
         file.flush();
         if(!file) {
+            file.close();
+            std::error_code ignored;
+            std::filesystem::remove(temporaryPath, ignored);
             return std::unexpected(std::ios_base::failure(std::format("failed to write all of '{}'", filePath.string())));
         }
+
+        file.close();
+        if(!file) {
+            std::error_code ignored;
+            std::filesystem::remove(temporaryPath, ignored);
+            return std::unexpected(std::ios_base::failure(std::format("failed to close temporary file for '{}'", filePath.string())));
+        }
+
+#ifdef _WIN32
+        if(!MoveFileExW(temporaryPath.c_str(), filePath.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)) {
+            const auto error = GetLastError();
+            std::error_code ignored;
+            std::filesystem::remove(temporaryPath, ignored);
+            return std::unexpected(std::ios_base::failure(
+                std::format("failed to replace '{}' (Windows error {})", filePath.string(), error)));
+        }
+#else
+        std::error_code replaceError;
+        std::filesystem::rename(temporaryPath, filePath, replaceError);
+        if(replaceError) {
+            std::error_code ignored;
+            std::filesystem::remove(temporaryPath, ignored);
+            return std::unexpected(std::ios_base::failure(
+                std::format("failed to replace '{}': {}", filePath.string(), replaceError.message())));
+        }
+#endif
 
         return {};
     }

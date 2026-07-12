@@ -112,6 +112,8 @@ Toolpath preview geometry is canonical program geometry: it is derived from emit
 
 ## Near-term work
 
+MDI is currently connected only to simulated execution. Preserve a target-selection boundary: the intended future UI has explicit Real and Simulated MDI modes. Entering Simulated mode will snapshot the authoritative real-machine state into an isolated simulation branch; returning to Real mode will discard that branch without merging simulated pose, modal state, offsets, parameters, or tool state back into the real machine. Do not let this future mode switch bypass executor ownership, probe barriers, or command-boundary synchronization.
+
 Likely next steps are:
 
 1. Add a motion/planner consumer that owns bounded command buffering and supplies real probe results to `InterpreterSession`; reuse the `ExecutionDriver` barrier contract without treating `SimulationExecutor` as a real executor.

@@ -242,7 +242,6 @@ namespace ngc
 
         [[nodiscard]] std::unique_ptr<Expression> parseExpression() {
             auto expr = parseAssignmentExpression();
-            //std::println("expr: {} {}", expr->className(), expr->text());
             return expr;
         }
 
@@ -477,8 +476,6 @@ namespace ngc
         [[nodiscard]] Token nextToken() const {
             for(;;) {
                 const auto token = m_lexer.nextToken();
-                //std::println("TOKEN: {} '{}'", token->name(), token->text());
-
                 if(!token) {
                     error("lexer error", token.error());
                 }

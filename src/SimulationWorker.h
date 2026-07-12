@@ -29,17 +29,21 @@ class SimulationWorker {
     bool m_stop = false;
     bool m_paused = false;
     bool m_running = false;
+    bool m_preserveState = false;
     double m_playbackRate = 1.0;
     double m_rapidSpeed = 100.0;
 
 public:
-    SimulationWorker() : m_thread(&SimulationWorker::work, this) { }
+    SimulationWorker() {
+        m_thread = std::thread(&SimulationWorker::work, this);
+    }
     ~SimulationWorker() { join(); }
 
     SimulationWorker(const SimulationWorker &) = delete;
     SimulationWorker &operator=(const SimulationWorker &) = delete;
 
-    bool start(const std::vector<std::tuple<std::string, std::string>> &programs, const ngc::ToolTable &toolTable) {
+    bool start(const std::vector<std::tuple<std::string, std::string>> &programs, const ngc::ToolTable &toolTable,
+               const bool preserveState = false) {
         std::scoped_lock lock(m_mutex);
         if(m_running || m_start || programs.empty()) return false;
         m_programs = programs;
@@ -47,7 +51,23 @@ public:
         m_start = true;
         m_stop = false;
         m_paused = false;
+        m_preserveState = preserveState;
+        if(preserveState) m_executor.prepareContinuation();
+        else m_executor.reset();
+        m_executor.setRapidSpeed(m_rapidSpeed);
+        m_executor.setStatus(ngc::SimulationStatus::Running);
         m_cv.notify_all();
+        return true;
+    }
+
+    bool resetSimulation() {
+        std::scoped_lock lock(m_mutex);
+        if(m_running || m_start) return false;
+        m_session.machine().beginProgramRun();
+        m_executor.reset();
+        m_driver.reset();
+        m_statusMessages.clear();
+        m_programs.clear();
         return true;
     }
 
@@ -67,9 +87,14 @@ public:
     void stop() {
         std::scoped_lock lock(m_mutex);
         if(m_running || m_start) {
+            const auto pendingStart = m_start && !m_running;
             m_stop = true;
             m_start = false;
             m_paused = false;
+            if(pendingStart) {
+                m_stop = false;
+                m_executor.prepareContinuation();
+            }
             m_cv.notify_all();
         }
     }
@@ -112,9 +137,11 @@ private:
 
             auto programs = m_programs;
             auto toolTable = m_toolTable;
+            const auto preserveState = m_preserveState;
             m_start = false;
             m_running = true;
-            m_executor.reset();
+            if(preserveState) m_executor.prepareContinuation();
+            else m_executor.reset();
             m_driver.reset();
             m_statusMessages.clear();
             m_executor.setRapidSpeed(m_rapidSpeed);
@@ -124,7 +151,8 @@ private:
             m_session.setPrograms(programs);
             m_session.machine().toolTable() = std::move(toolTable);
             m_session.compile([](const auto &callback) { callback(); });
-            m_session.begin();
+            if(preserveState) m_session.beginContinuation();
+            else m_session.begin();
 
             auto previous = clock::now();
 
@@ -134,7 +162,7 @@ private:
                     const auto joining = m_join;
                     m_stop = false;
                     m_running = false;
-                    m_executor.reset();
+                    m_executor.prepareContinuation();
                     lock.unlock();
                     m_session.stop();
                     if(joining) return;

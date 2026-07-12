@@ -1,13 +1,6 @@
 #pragma once
 
-#ifdef __clang__
-    #pragma push_macro("__cpp_concepts")
-    #define __cpp_concepts 202002L
-    #include <expected>
-    #pragma pop_macro("__cpp_concepts")
-#else
-    #include <expected>
-#endif
+#include <expected>
 
 #include <cstddef>
 #include <cstdint>

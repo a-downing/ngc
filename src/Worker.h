@@ -5,6 +5,7 @@
 #include <mutex>
 #include <optional>
 #include <thread>
+#include <unordered_map>
 
 #include "evaluator/InterpreterSession.h"
 #include "machine/ExecutionDriver.h"
@@ -21,6 +22,7 @@ class Worker {
     ngc::SimulationExecutor m_executor;
     ngc::ExecutionDriver m_driver{ m_session, m_executor };
     ngc::ToolpathRecorder m_toolpath;
+    std::unordered_map<ngc::Var, double> m_parameterSnapshot;
 
     bool m_doJoin = false;
     bool m_doCompile = false;
@@ -29,12 +31,18 @@ class Worker {
 
 public:
     Worker() {
+        refreshParameterSnapshot();
         m_thread = std::thread(&Worker::work, this);
     }
 
-    double read(ngc::Var var) {
+    ~Worker() { join(); }
+
+    Worker(const Worker &) = delete;
+    Worker &operator=(const Worker &) = delete;
+
+    double read(ngc::Var var) const {
         std::scoped_lock lock(m_mutex);
-        return m_session.machine().memory().read(var);
+        return m_parameterSnapshot.at(var);
     }
 
     auto lock(const auto &callback) const {
@@ -91,7 +99,9 @@ public:
 
     void join() {
         std::unique_lock lock(m_mutex);
+        if(!m_thread.joinable()) return;
         m_doJoin = true;
+        m_session.requestStop();
         m_cv.notify_one();
         lock.unlock();
         m_thread.join();
@@ -138,12 +148,14 @@ private:
                 m_doCompile = false;
                 lock.unlock();
                 doCompile();
+                continue;
             }
 
             if(m_doExecute) {
                 m_doExecute = false;
                 lock.unlock();
                 doExecute();
+                continue;
             }
         }
     }
@@ -177,6 +189,17 @@ private:
                 m_toolpath.consume(command, toolOffset, workCoordinateSystem);
             });
 
+            {
+                // nextWithBlocks() returns only while the evaluator is paused or after it has joined.
+                std::scoped_lock lock(m_mutex);
+                refreshParameterSnapshot();
+            }
+
+            if(joinRequested()) {
+                m_session.stop();
+                break;
+            }
+
             m_executor.completeQueued();
             {
                 std::scoped_lock lock(m_mutex);
@@ -191,5 +214,16 @@ private:
 
         std::scoped_lock lock(m_mutex);
         m_busy = false;
+    }
+
+    void refreshParameterSnapshot() {
+        for(const auto &[var, _name, _address, _flags, _value] : ngc::gVars) {
+            m_parameterSnapshot.insert_or_assign(var, m_session.machine().memory().read(var));
+        }
+    }
+
+    bool joinRequested() const {
+        std::scoped_lock lock(m_mutex);
+        return m_doJoin;
     }
 };

@@ -1,4 +1,5 @@
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <exception>
 #include <format>
@@ -9,6 +10,7 @@
 #include <iterator>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <vector>
 
 #include "evaluator/Evaluator.h"
@@ -21,6 +23,7 @@
 #include "machine/ToolTable.h"
 #include "memory/Memory.h"
 #include "parser/Program.h"
+#include "SimulationWorker.h"
 
 namespace {
     constexpr double EPSILON = 1e-9;
@@ -119,17 +122,27 @@ namespace {
         }
 
         ngc::ToolTable table;
+        table.set(42, { 42, 1, 2, 3, 4, 5, 6, 0.75, "existing" });
         const auto loaded = table.load(path);
         std::filesystem::remove(path);
         require(!loaded.has_value(), "duplicate tool numbers should fail to load");
         require(loaded.error().find("row:2 duplicate tool number 7") != std::string::npos,
                 "duplicate tool error should identify its row and tool number");
+        require(table.get(42).has_value(), "a failed tool-table load should preserve the existing table");
+        require(!table.get(7).has_value(), "a failed tool-table load should not retain partially parsed rows");
     }
 
     void testNumericParsingRejectsTrailingGarbage() {
         require(ngc::fromChars("12.5").has_value(), "a complete number should parse");
         require(!ngc::fromChars("12.5xyz").has_value(), "trailing garbage should make a number invalid");
         require(!ngc::fromChars("").has_value(), "an empty number should be invalid");
+    }
+
+    void testLexerRejectsIncompleteOperators() {
+        for(const std::string_view source : { "!1\n", ".\n" }) {
+            ngc::Program program(std::string(source), "invalid-token.ngc");
+            require(!program.compile().has_value(), "an incomplete operator should produce a parser error");
+        }
     }
 
     void testFileHelpersHandleEmptyAndFailedIo() {
@@ -144,8 +157,9 @@ namespace {
         require(empty && empty->empty(), "reading an empty file should return an empty string");
 
         require(ngc::writeFile(contentPath, "abc\n123").has_value(), "writing file content should succeed");
+        require(ngc::writeFile(contentPath, "replacement").has_value(), "atomically replacing file content should succeed");
         const auto content = ngc::readFile(contentPath);
-        require(content && *content == "abc\n123", "file helpers should preserve exact binary content");
+        require(content && *content == "replacement", "file replacement should publish the complete new content");
         require(!ngc::readFile(missingPath).has_value(), "reading a missing file should fail");
 
         std::filesystem::remove(emptyPath);
@@ -182,6 +196,147 @@ namespace {
         requireInterpreterError("G93\n", "unsupported feed mode G93");
         requireInterpreterError("G10 L20 P1 X1\n", "unsupported G10 L20");
         requireInterpreterError("G0 O1\n", "unsupported word O1");
+    }
+
+    void testFailedBlockRollsBackMachineState() {
+        ngc::Machine machine(UNIT);
+        machine.memory().write(ngc::Var::G54_X, 10.0);
+
+        bool rejected = false;
+        try {
+            static_cast<void>(execute(machine, "G21 G10 L2 P1 X20 Q1\n"));
+        } catch(const std::exception &) {
+            rejected = true;
+        }
+        require(rejected, "a block with an unsupported word should fail");
+
+        requireNear(machine.memory().read(ngc::Var::G54_X), 10.0,
+                    "a failed block must not retain partial persistent-offset writes");
+        require(machine.state().modeUnits == ngc::GCUnits::G20,
+                "a failed block must restore its previous modal state");
+    }
+
+    void testInterpreterCancellationInterruptsEvaluation() {
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::Preview);
+        session.setPrograms({ { "while 1 {}\n", "cancellation.ngc" } });
+        session.compile([](const auto &callback) { callback(); });
+        require(session.compiled(), "cancellation regression program should compile");
+        session.begin();
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        session.requestStop();
+        session.stop();
+    }
+
+    void testSimulationWorkerStartsPlayback() {
+        SimulationWorker worker;
+        ngc::ToolTable tools;
+        tools.set(1, { 1, 0, 0, 2, 0, 0, 0, 0.5, "simulation tool" });
+        require(worker.start({ { "sub _tool_change[#tool] {}\nT1 M6\nG0 X1\n", "simulation-worker.ngc" } }, tools),
+                "simulation worker should accept a program");
+
+        auto snapshot = worker.snapshot();
+        require(snapshot.status == ngc::SimulationStatus::Running,
+                "simulation worker should publish its running state synchronously from start");
+        for(int attempt = 0; attempt < 5000 && snapshot.toolPose.geometry.number != 1; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        const auto toolMessage = std::format("simulation worker did not publish tool 1: status {} tool {} error '{}'",
+                                             static_cast<int>(snapshot.status), snapshot.toolPose.geometry.number,
+                                             snapshot.error);
+        require(snapshot.toolPose.geometry.number == 1, toolMessage);
+        requireNear(snapshot.toolPose.tipPosition.z, snapshot.toolPose.spindlePosition.z - 2.0,
+                    "simulation worker should publish the physical cutter position");
+        worker.join();
+    }
+
+    void testAdaptivePocketsStartsSimulation() {
+        const auto hello = ngc::readFile("autoload/hello.ngc");
+        const auto world = ngc::readFile("autoload/world.ngc");
+        const auto toolChange = ngc::readFile("autoload/tool_change.ngc");
+        const auto main = ngc::readFile("adaptive_pockets.ngc");
+        require(hello && world && toolChange && main, "adaptive-pockets simulation inputs should load");
+
+        ngc::ToolTable tools;
+        const auto loadedTools = tools.load();
+        require(loadedTools.has_value(), loadedTools ? "" : loadedTools.error());
+
+        SimulationWorker worker;
+        require(worker.start({ { *hello, "autoload/hello.ngc" }, { *world, "autoload/world.ngc" },
+                               { *toolChange, "autoload/tool_change.ngc" }, { *main, "adaptive_pockets.ngc" } }, tools),
+                "adaptive-pockets simulation should start");
+
+        auto snapshot = worker.snapshot();
+        for(int attempt = 0; attempt < 2000 && snapshot.activeBlocks.empty()
+            && snapshot.completedLineFlags.empty() && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        const auto message = std::format("adaptive-pockets simulation did not publish block lifecycle: status {} error '{}'",
+                                         static_cast<int>(snapshot.status), snapshot.error);
+        require(!snapshot.activeBlocks.empty() || !snapshot.completedLineFlags.empty(), message);
+        worker.join();
+    }
+
+    void testMdiToolChangeUsesAutoloadPrograms() {
+        const auto hello = ngc::readFile("autoload/hello.ngc");
+        const auto world = ngc::readFile("autoload/world.ngc");
+        const auto toolChange = ngc::readFile("autoload/tool_change.ngc");
+        require(hello && world && toolChange, "MDI autoload programs should load");
+
+        ngc::ToolTable tools;
+        const auto loadedTools = tools.load();
+        require(loadedTools.has_value(), loadedTools ? "" : loadedTools.error());
+
+        SimulationWorker worker;
+        worker.setPlaybackRate(1000.0);
+        require(worker.start({ { *hello, "autoload/hello.ngc" }, { *world, "autoload/world.ngc" },
+                               { *toolChange, "autoload/tool_change.ngc" }, { "T2 M6\n", "<MDI>" } }, tools),
+                "MDI tool change should start");
+
+        auto snapshot = worker.snapshot();
+        for(int attempt = 0; attempt < 3000 && snapshot.toolPose.geometry.number != 2
+            && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        const auto message = std::format("MDI T2 M6 did not select tool 2: status {} error '{}'",
+                                         static_cast<int>(snapshot.status), snapshot.error);
+        require(snapshot.toolPose.geometry.number == 2, message);
+        worker.join();
+    }
+
+    void testSimulationWorkerPersistsUntilReset() {
+        SimulationWorker worker;
+        ngc::ToolTable tools;
+        worker.setPlaybackRate(1000.0);
+
+        const auto waitForCompletion = [&](const std::string_view message) {
+            auto snapshot = worker.snapshot();
+            for(int attempt = 0; attempt < 2000 && snapshot.status != ngc::SimulationStatus::Completed
+                && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                snapshot = worker.snapshot();
+            }
+            require(snapshot.status == ngc::SimulationStatus::Completed, message);
+            return snapshot;
+        };
+
+        require(worker.start({ { "G0 X1\n", "<MDI>" } }, tools, true),
+                "first persistent simulation command should start");
+        requireNear(waitForCompletion("first persistent command should complete").machinePosition.x, 1.0,
+                    "first persistent command should end at X1");
+
+        require(worker.start({ { "G91 G0 X1\n", "<MDI>" } }, tools, true),
+                "second persistent simulation command should start");
+        requireNear(waitForCompletion("second persistent command should complete").machinePosition.x, 2.0,
+                    "second command should continue from the prior simulated position");
+
+        require(worker.resetSimulation(), "idle simulation should reset");
+        const auto reset = worker.snapshot();
+        require(reset.status == ngc::SimulationStatus::Stopped, "reset simulation should report stopped");
+        requireNear(reset.machinePosition.x, 0.0, "reset simulation should restore the initial pose");
+        worker.join();
     }
 
     void testInterpreterStatusMessagesPreserveOrder() {
@@ -596,6 +751,53 @@ namespace {
         requireCompleted(session, "break should complete the loop without another command");
 
         compileSession(session,
+            "sub return_from_if[] {\n"
+            "if 1 {\n"
+            "return 7\n"
+            "return 8\n"
+            "}\n"
+            "return 9\n"
+            "}\n"
+            "G1 F1 X[return_from_if[]]\n"
+            "sub return_from_loop[] {\n"
+            "let #i = 0\n"
+            "while #i < 1 {\n"
+            "return 6\n"
+            "#i = #i + 1\n"
+            "}\n"
+            "return 9\n"
+            "}\n"
+            "G1 X[return_from_loop[]]\n");
+        requireNear(nextLine(session, "return should propagate out of an if").to().x, 7.0,
+                    "statements after a nested return must not execute");
+        requireNear(nextLine(session, "return should propagate out of a loop").to().x, 6.0,
+                    "a loop must preserve a nested return value");
+        requireCompleted(session, "nested return session should complete");
+
+        compileSession(session,
+            "let #i = 0\n"
+            "let #side_effect = 0\n"
+            "while #i < 2 {\n"
+            "#i = #i + 1\n"
+            "if #i == 1 {\n"
+            "continue\n"
+            "#side_effect = 99\n"
+            "}\n"
+            "#side_effect = #side_effect + 1\n"
+            "}\n"
+            "G1 F1 X#side_effect\n"
+            "while 1 {\n"
+            "break\n"
+            "#side_effect = 99\n"
+            "}\n"
+            "G1 X#side_effect\n");
+        requireNear(nextLine(session, "continue should skip its remaining compound body").to().x, 1.0,
+                    "statements after continue must not execute");
+        requireNear(nextLine(session, "break should skip its remaining compound body").to().x, 1.0,
+                    "statements after break must not execute");
+        requireCompleted(session, "nested break and continue session should complete");
+
+        compileSession(session,
             "let #x = 1\n"
             "G1 F1 X#x\n"
             "#x = 7\n"
@@ -915,10 +1117,17 @@ int main() {
         testToolTableLoadsFinalLineWithoutNewline();
         testToolTableRejectsDuplicateToolNumbers();
         testNumericParsingRejectsTrailingGarbage();
+        testLexerRejectsIncompleteOperators();
         testFileHelpersHandleEmptyAndFailedIo();
         testRapidAndFeedMove();
         testFeedMotionRequiresFeedrate();
         testUnsupportedCodesProduceInterpreterErrors();
+        testFailedBlockRollsBackMachineState();
+        testInterpreterCancellationInterruptsEvaluation();
+        testSimulationWorkerStartsPlayback();
+        testAdaptivePocketsStartsSimulation();
+        testMdiToolChangeUsesAutoloadPrograms();
+        testSimulationWorkerPersistsUntilReset();
         testInterpreterStatusMessagesPreserveOrder();
         testArcUsesModalFeedrate();
         testArcCenterDistanceModes();

@@ -140,6 +140,15 @@ namespace ngc {
         }
 
         void begin() {
+            beginImpl(true);
+        }
+
+        void beginContinuation() {
+            beginImpl(false);
+        }
+
+    private:
+        void beginImpl(const bool resetMachine) {
             stop();
             m_statusMessages.clear();
             m_blockMessages.clear();
@@ -158,7 +167,7 @@ namespace ngc {
             m_executionStarted = true;
 
             try {
-                m_machine.beginProgramRun();
+                if(resetMachine) m_machine.beginProgramRun();
                 m_machine.memory().write(Var::TASK, taskValue(m_mode), true);
             } catch(const std::exception &error) {
                 m_executionError = error.what();
@@ -174,6 +183,8 @@ namespace ngc {
 
             m_executionThread = std::thread(&InterpreterSession::evaluate, this);
         }
+
+    public:
 
         InterpreterEvent next() {
             return next([](const auto &callback) { callback(); });
@@ -277,13 +288,17 @@ namespace ngc {
             m_pendingProbe.reset();
         }
 
-        void stop() {
+        void requestStop() {
             {
                 std::scoped_lock lock(m_executionMutex);
                 m_stopExecution = true;
                 m_resumeEvaluator = true;
             }
             m_executionCv.notify_all();
+        }
+
+        void stop() {
+            requestStop();
             finishExecutionThread();
             m_executionStarted = false;
             m_evaluatorPaused = false;
@@ -343,7 +358,11 @@ namespace ngc {
                     publishMessage(std::move(message));
                 };
 
-                Evaluator evaluator(m_machine.memory(), callback);
+                const auto interrupt = [&] {
+                    std::scoped_lock lock(m_executionMutex);
+                    if(m_stopExecution) throw ExecutionStopped {};
+                };
+                Evaluator evaluator(m_machine.memory(), callback, interrupt);
                 Preamble preamble(m_machine.memory());
                 evaluator.executeFirstPass(preamble.statements());
 

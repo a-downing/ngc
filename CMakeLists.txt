@@ -21,6 +21,14 @@ find_package(glm CONFIG REQUIRED)
 #find_package(glfw3 REQUIRED)
 add_subdirectory(glfw)
 
+add_library(ngc_core STATIC
+        src/Evaluator.cpp
+        src/Machine.cpp
+        src/SimulationExecutor.cpp
+        src/ToolTable.cpp)
+target_include_directories(ngc_core PUBLIC src/include)
+ngc_target_defaults(ngc_core)
+
 # add_library(utils)
 # target_sources(utils PUBLIC FILE_SET CXX_MODULES FILES src/modules/Utils.cppm)
 
@@ -86,6 +94,7 @@ target_link_libraries(ngc_imgui PUBLIC
 
 add_executable(imgui_main
         src/imgui_main.cpp
+        src/Application.cpp
         src/Application.h)
 
 target_include_directories(imgui_main PRIVATE
@@ -93,6 +102,7 @@ target_include_directories(imgui_main PRIVATE
         src/include)
 
 target_link_libraries(imgui_main
+        ngc_core
         ngc_imgui
         OpenGL::GL
         OpenGL::GLU
@@ -102,7 +112,8 @@ ngc_target_defaults(imgui_main)
 add_executable(binary_to_compressed_c ${IMGUI_DIR}/misc/fonts/binary_to_compressed_c.cpp)
 
 add_executable(ngc_tests src/test.cpp)
-target_include_directories(ngc_tests PRIVATE src/include)
+target_include_directories(ngc_tests PRIVATE src)
+target_link_libraries(ngc_tests PRIVATE ngc_core)
 ngc_target_defaults(ngc_tests)
 add_test(NAME ngc_tests COMMAND ngc_tests)
 set_tests_properties(ngc_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
