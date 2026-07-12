@@ -3,6 +3,7 @@
 #include <exception>
 #include <format>
 #include <fstream>
+#include <filesystem>
 #include <functional>
 #include <iostream>
 #include <iterator>
@@ -17,6 +18,8 @@
 #include "machine/ExecutionDriver.h"
 #include "machine/SimulationExecutor.h"
 #include "machine/ToolpathRecorder.h"
+#include "machine/ToolTable.h"
+#include "memory/Memory.h"
 #include "parser/Program.h"
 
 namespace {
@@ -73,6 +76,132 @@ namespace {
         requireNear(feed->to().x, 20.0, "G1 endpoint is incorrect");
     }
 
+    void testMemoryStackBounds() {
+        ngc::Memory memory;
+        const auto address = memory.push(12.5);
+        requireNear(*memory.read(address), 12.5, "stack value should be readable");
+
+        const auto invalid = memory.read(address + 1);
+        require(!invalid && invalid.error() == ngc::Memory::Error::INVALID_STACK_ADDRESS,
+                "an out-of-range stack address should return INVALID_STACK_ADDRESS");
+
+        requireNear(memory.pop(), 12.5, "stack pop should return the last value");
+        try {
+            static_cast<void>(memory.pop());
+            require(false, "popping an empty stack should fail");
+        } catch(const std::logic_error &) {
+        }
+    }
+
+    void testToolTableLoadsFinalLineWithoutNewline() {
+        const auto path = std::filesystem::temp_directory_path() / "ngc-tool-table-no-newline.txt";
+        {
+            std::ofstream file(path, std::ios::binary | std::ios::trunc);
+            file << "7 1 2 3 4 5 6 0.25 final comment";
+        }
+
+        ngc::ToolTable table;
+        const auto loaded = table.load(path);
+        std::filesystem::remove(path);
+        require(loaded.has_value(), loaded ? "" : loaded.error());
+        const auto tool = table.get(7);
+        require(tool.has_value(), "final tool-table row should be loaded");
+        requireNear(tool->diameter, 0.25, "final tool-table numeric value should not be truncated");
+        require(tool->comment == "final comment", "final tool-table comment should not be truncated");
+    }
+
+    void testToolTableRejectsDuplicateToolNumbers() {
+        const auto path = std::filesystem::temp_directory_path() / "ngc-tool-table-duplicate.txt";
+        {
+            std::ofstream file(path, std::ios::binary | std::ios::trunc);
+            file << "7 1 2 3 4 5 6 0.25 first\n"
+                    "7 6 5 4 3 2 1 0.5 duplicate\n";
+        }
+
+        ngc::ToolTable table;
+        const auto loaded = table.load(path);
+        std::filesystem::remove(path);
+        require(!loaded.has_value(), "duplicate tool numbers should fail to load");
+        require(loaded.error().find("row:2 duplicate tool number 7") != std::string::npos,
+                "duplicate tool error should identify its row and tool number");
+    }
+
+    void testNumericParsingRejectsTrailingGarbage() {
+        require(ngc::fromChars("12.5").has_value(), "a complete number should parse");
+        require(!ngc::fromChars("12.5xyz").has_value(), "trailing garbage should make a number invalid");
+        require(!ngc::fromChars("").has_value(), "an empty number should be invalid");
+    }
+
+    void testFileHelpersHandleEmptyAndFailedIo() {
+        const auto directory = std::filesystem::temp_directory_path();
+        const auto emptyPath = directory / "ngc-empty-file-test.txt";
+        const auto contentPath = directory / "ngc-content-file-test.txt";
+        const auto missingPath = directory / "ngc-missing-file-test.txt";
+        std::filesystem::remove(missingPath);
+
+        require(ngc::writeFile(emptyPath, {}).has_value(), "writing an empty file should succeed");
+        const auto empty = ngc::readFile(emptyPath);
+        require(empty && empty->empty(), "reading an empty file should return an empty string");
+
+        require(ngc::writeFile(contentPath, "abc\n123").has_value(), "writing file content should succeed");
+        const auto content = ngc::readFile(contentPath);
+        require(content && *content == "abc\n123", "file helpers should preserve exact binary content");
+        require(!ngc::readFile(missingPath).has_value(), "reading a missing file should fail");
+
+        std::filesystem::remove(emptyPath);
+        std::filesystem::remove(contentPath);
+    }
+
+    void testFeedMotionRequiresFeedrate() {
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::RealRun);
+        session.setPrograms({ { "G1 X1\n", "missing-feed.ngc" } });
+        session.compile([](const auto &callback) { callback(); });
+        require(session.compiled(), "missing-feed regression program should compile");
+        const auto event = session.next();
+        const auto error = std::get_if<ngc::InterpreterError>(&event);
+        require(error != nullptr, "G1 without a modal feedrate should produce an interpreter error");
+        require(error->message.find("positive feedrate") != std::string::npos,
+                "missing G1 feedrate error should explain the requirement");
+    }
+
+    void requireInterpreterError(const std::string_view source, const std::string_view expectedText) {
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::RealRun);
+        session.setPrograms({ { std::string(source), "invalid-code.ngc" } });
+        session.compile([](const auto &callback) { callback(); });
+        require(session.compiled(), "invalid-code regression program should parse before interpretation");
+        const auto event = session.next();
+        const auto error = std::get_if<ngc::InterpreterError>(&event);
+        require(error != nullptr, "invalid or unsupported G-code should produce an interpreter error");
+        require(error->message.find(expectedText) != std::string::npos,
+                "interpreter error should explain the unsupported operation");
+    }
+
+    void testUnsupportedCodesProduceInterpreterErrors() {
+        requireInterpreterError("G99\n", "unsupported G-code G99");
+        requireInterpreterError("M99\n", "unsupported M-code M99");
+        requireInterpreterError("G93\n", "unsupported feed mode G93");
+        requireInterpreterError("G10 L20 P1 X1\n", "unsupported G10 L20");
+        requireInterpreterError("G0 O1\n", "unsupported word O1");
+    }
+
+    void testInterpreterStatusMessagesPreserveOrder() {
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::RealRun);
+        session.setPrograms({ { "print[\"before error\"]\nG1 X1\n", "status-order.ngc" } });
+        session.compile([](const auto &callback) { callback(); });
+
+        const auto event = session.next();
+        require(std::holds_alternative<ngc::InterpreterError>(event),
+                "status-order program should terminate with an interpreter error");
+        const auto &messages = session.statusMessages();
+        require(messages.size() == 2, "print and error should share one status stream");
+        require(messages[0].kind == ngc::InterpreterStatusKind::Print,
+                "print should retain its position before a later error");
+        require(messages[1].kind == ngc::InterpreterStatusKind::Error,
+                "terminal error should follow earlier print output");
+        require(messages[1].text.find("status-order.ngc:2:1") != std::string::npos,
+                "block errors should include source, line, and column");
+    }
+
     void testArcUsesModalFeedrate() {
         const auto commands = run("G1 F120 X10 Y0\nG3 X0 Y10 I-10 J0\n");
         require(commands.size() == 2, "expected one line and one arc");
@@ -127,6 +256,10 @@ namespace {
     void testBeginProgramRunResetsRuntimeState() {
         ngc::Machine machine(UNIT);
         machine.memory().write(ngc::Var::G54_X, 7.0);
+        const auto firstProgramAddress = machine.memory().addData(
+            ngc::MemoryCell(ngc::MemoryCell::Flags::READ | ngc::MemoryCell::Flags::WRITE, 42.0));
+        requireNear(*machine.memory().read(firstProgramAddress), 42.0,
+                    "program-owned memory should be readable during its run");
 
         const auto firstCommands = execute(machine, "G1 F10 X3\n");
         require(firstCommands.size() == 1, "expected one command in the first run");
@@ -134,6 +267,12 @@ namespace {
         machine.beginProgramRun();
         require(machine.state().modeMotion == ngc::GCMotion::G0, "beginProgramRun must restore G0");
         requireNear(machine.memory().read(ngc::Var::G54_X), 7.0, "beginProgramRun must retain coordinate offsets");
+        require(!machine.memory().read(firstProgramAddress).has_value(),
+                "beginProgramRun must discard program-owned memory");
+        const auto secondProgramAddress = machine.memory().addData(
+            ngc::MemoryCell(ngc::MemoryCell::Flags::READ | ngc::MemoryCell::Flags::WRITE, 84.0));
+        require(secondProgramAddress == firstProgramAddress,
+                "new runs should reuse the program-storage address range");
 
         const auto secondCommands = execute(machine, "G1 F10 X3\n");
         require(secondCommands.size() == 1, "second run should emit one command");
@@ -406,7 +545,10 @@ namespace {
             const auto event = session.next();
             const auto error = std::get_if<ngc::InterpreterError>(&event);
             require(error != nullptr, "writing _task should produce an interpreter error");
-            require(error->message == "WRITE", "writing _task should fail because the memory cell is read-only");
+            require(error->message.find("WRITE") != std::string::npos,
+                    "writing _task should fail because the memory cell is read-only");
+            require(error->message.find("incremental.ngc:") != std::string::npos,
+                    "writing _task error should identify its source location");
         };
 
         requireWriteRejected("#_task = 0\n");
@@ -474,6 +616,8 @@ namespace {
         const auto interpreterError = std::get_if<ngc::InterpreterError>(&error);
         require(interpreterError != nullptr, "runtime evaluator failure should produce InterpreterError");
         require(interpreterError->message.find("undefined sub") != std::string::npos, "InterpreterError should retain the evaluator failure");
+        require(interpreterError->message.find("incremental.ngc:1:1") != std::string::npos,
+                "runtime evaluator failure should include its statement location");
     }
 
     void testProbeCommandAndBarrier() {
@@ -522,6 +666,12 @@ namespace {
         session.compile([](const auto &callback) { callback(); });
         require(session.compiled(), "automatic tool-change program should compile");
         session.begin();
+
+        const auto toolChangeEvent = session.nextWithBlocks([](const auto &callback) { callback(); });
+        const auto toolChangeBlock = std::get_if<ngc::InterpreterBlockLifecycle>(&toolChangeEvent);
+        require(toolChangeBlock != nullptr && toolChangeBlock->phase == ngc::BlockLifecyclePhase::Entered
+                    && toolChangeBlock->block.text == "T2 M6",
+                "M6 block should be published before entering the tool-change subroutine");
 
         const auto safeZ = nextLine(session, "tool change should retract to safe Z");
         requireNear(safeZ.to().z, -0.1, "tool-change safe Z should use parameter #5163");
@@ -575,6 +725,57 @@ namespace {
 
         recorder.clear();
         require(recorder.commands().empty(), "toolpath recorder should clear between preview runs");
+        require(recorder.workCoordinateSystems().empty(), "toolpath recorder should clear retained WCS frames");
+    }
+
+    void testToolpathRecorderRetainsUsedWorkCoordinateSystems() {
+        ngc::ToolpathRecorder recorder;
+        const ngc::MoveLine move { {}, { 1, 0, 0, 0, 0, 0 }, 1.0 };
+        recorder.consume(move, {}, ngc::WorkCoordinateSystem { "G59.3", { 10, 20, 30, 0, 0, 0 } });
+        recorder.consume(move, {}, ngc::WorkCoordinateSystem { "G54", { 1, 2, 3, 0, 0, 0 } });
+
+        require(recorder.workCoordinateSystems().size() == 2,
+                "preview should retain each WCS used by recorded motion");
+        require(recorder.workCoordinateSystems()[0].name == "G59.3",
+                "nested tool-change WCS should remain in preview metadata");
+        require(recorder.workCoordinateSystems()[1].name == "G54",
+                "final program WCS should remain in preview metadata");
+    }
+
+    void testToolChangePreviewRetainsNestedAndFinalWorkCoordinateSystems() {
+        std::ifstream toolChangeFile("autoload/tool_change.ngc");
+        const std::string toolChangeSource {
+            std::istreambuf_iterator<char>(toolChangeFile),
+            std::istreambuf_iterator<char>() };
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::Preview);
+        session.setPrograms({
+            { toolChangeSource, "autoload/tool_change.ngc" },
+            { "T2 M6\nG54\nG0 X1\n", "wcs-preview.ngc" },
+        });
+        session.compile([](const auto &callback) { callback(); });
+        require(session.compiled(), "tool-change WCS preview should compile");
+        session.begin();
+
+        ngc::SimulationExecutor executor;
+        ngc::ExecutionDriver driver(session, executor);
+        ngc::ToolpathRecorder recorder;
+        while(driver.state() == ngc::ExecutionDriverState::Running) {
+            driver.pumpOne([](const auto &callback) { callback(); },
+                [&](const ngc::MachineCommand &command, const ngc::position_t &toolOffset,
+                    const ngc::ToolGeometry &, const ngc::WorkCoordinateSystem &workCoordinateSystem) {
+                    recorder.consume(command, toolOffset, workCoordinateSystem);
+                });
+            executor.completeQueued();
+            driver.deliverProbeResult();
+        }
+
+        require(driver.state() == ngc::ExecutionDriverState::Completed,
+                "tool-change WCS preview should complete through simulated probe barriers");
+        const auto &systems = recorder.workCoordinateSystems();
+        require(std::ranges::find_if(systems, [](const auto &value) { return value.name == "G59.3"; }) != systems.end(),
+                "preview should retain G59.3 used inside the nested tool-change call");
+        require(std::ranges::find_if(systems, [](const auto &value) { return value.name == "G54"; }) != systems.end(),
+                "preview should retain G54 selected by the main program after tool change");
     }
 
     void testToolpathRecorderAppliesPerCommandToolOffset() {
@@ -611,6 +812,9 @@ namespace {
             ngc::MoveLine { { 0, 0, 0, 0, 0, 0 }, { 2, 0, 0, 0, 0, 0 }, 60.0 },
             { 0, 0, 0.5, 0, 0, 0 },
             { .number = 1, .offset = { 0, 0, 0.5, 0, 0, 0 }, .diameter = 0.25 },
+            ngc::WorkCoordinateSystem { "G54", { 1, 2, 3, 0, 0, 0 } },
+            { "G1", "G17", "G90", "G94", "G20", "G54" },
+            ngc::BlockExecution { 1, "G1 F60 X2", "test.ngc", 1 },
         });
 
         simulator.advance(1.0);
@@ -618,6 +822,10 @@ namespace {
         requireNear(halfway.machinePosition.x, 1.0, "simulation should interpolate feed motion using elapsed time");
         requireNear(halfway.commandProgress, 0.5, "simulation should report active command progress");
         requireNear(halfway.toolPosition.z, -0.5, "simulation should apply the captured tool offset to its display position");
+        require(halfway.activeWorkCoordinateSystem && halfway.activeWorkCoordinateSystem->name == "G54",
+                "simulation should expose the WCS captured with its active command");
+        require(halfway.activeModalGCodes.front() == "G1",
+                "simulation should expose modal G-codes captured with its active command");
 
         simulator.advance(1.0);
         const auto finished = simulator.snapshot();
@@ -680,7 +888,8 @@ namespace {
         int probeCount = 0;
         while(driver.state() == ngc::ExecutionDriverState::Running) {
             driver.pumpOne([](const auto &callback) { callback(); },
-                [&](const ngc::MachineCommand &command, const ngc::position_t &, const ngc::ToolGeometry &) {
+                [&](const ngc::MachineCommand &command, const ngc::position_t &, const ngc::ToolGeometry &,
+                    const ngc::WorkCoordinateSystem &) {
                     if(std::holds_alternative<ngc::ProbeMove>(command)) probeCount++;
                 });
             executor.completeQueued();
@@ -690,6 +899,11 @@ namespace {
         require(driver.state() == ngc::ExecutionDriverState::Completed,
                 "immediate execution driver should complete the preview");
         require(probeCount == 1, "immediate execution should use the shared probe path");
+        const auto completedBlocks = executor.snapshot().completedBlocks;
+        require(std::ranges::find_if(completedBlocks, [](const ngc::BlockExecution &block) {
+                    return block.text == "G91 G0 Z1";
+                }) != completedBlocks.end(),
+                "execution metadata should retain every interpreted G-code block");
         requireNear(session.machine().memory().read(ngc::Var::TASK), 0.0,
                     "immediate preview should retain the preview _task value");
     }
@@ -697,7 +911,15 @@ namespace {
 
 int main() {
     try {
+        testMemoryStackBounds();
+        testToolTableLoadsFinalLineWithoutNewline();
+        testToolTableRejectsDuplicateToolNumbers();
+        testNumericParsingRejectsTrailingGarbage();
+        testFileHelpersHandleEmptyAndFailedIo();
         testRapidAndFeedMove();
+        testFeedMotionRequiresFeedrate();
+        testUnsupportedCodesProduceInterpreterErrors();
+        testInterpreterStatusMessagesPreserveOrder();
         testArcUsesModalFeedrate();
         testArcCenterDistanceModes();
         testIncrementalMove();
@@ -715,6 +937,8 @@ int main() {
         testProbeCommandAndBarrier();
         testAutomaticToolChangeReachesProbeBarrier();
         testToolpathRecorderIsASeparateConsumer();
+        testToolpathRecorderRetainsUsedWorkCoordinateSystems();
+        testToolChangePreviewRetainsNestedAndFinalWorkCoordinateSystems();
         testToolpathRecorderAppliesPerCommandToolOffset();
         testSimulationExecutorInterpolatesAndAppliesToolOffset();
         testSimulationExecutorCompletesProbeAtTarget();

@@ -9,6 +9,7 @@
     #include <expected>
 #endif
 
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 #include <unordered_map>
@@ -27,6 +28,7 @@ namespace ngc
         std::vector<double> m_stack;
         std::unordered_map<Var, uint32_t> m_globals;
         std::vector<uint32_t> m_addrs;
+        std::size_t m_programStorageBegin = 0;
 
     public:
         static constexpr uint32_t ADDR_STACK = 0x80000000;
@@ -61,6 +63,13 @@ namespace ngc
                 m_globals.emplace(var, _addr);
                 m_addrs.emplace_back(_addr);
             }
+
+            m_programStorageBegin = m_data.size();
+        }
+
+        void resetProgramStorage() {
+            m_data.erase(m_data.begin() + static_cast<std::ptrdiff_t>(m_programStorageBegin), m_data.end());
+            m_stack.clear();
         }
 
         size_t deref(const Var var) const {
@@ -105,6 +114,9 @@ namespace ngc
         }
 
         double pop() {
+            if(m_stack.empty()) {
+                throw std::logic_error("Memory::pop called with an empty stack");
+            }
             const double value = m_stack.back();
             m_stack.pop_back();
             return value;
@@ -185,7 +197,7 @@ namespace ngc
         }
 
         std::expected<double, Error> readStack(const size_t index) const {
-            if(index >= m_data.size()) {
+            if(index >= m_stack.size()) {
                 return std::unexpected(Error::INVALID_STACK_ADDRESS);
             }
 

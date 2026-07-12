@@ -92,6 +92,11 @@ namespace ngc {
         position_t tipPosition{};
     };
 
+    struct WorkCoordinateSystem {
+        std::string name;
+        position_t offset{};
+    };
+
     class SpindleStop {
     public:
         std::string text() const { return "SpindleStop()"; }

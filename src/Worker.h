@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <format>
 #include <mutex>
+#include <optional>
 #include <thread>
 
 #include "evaluator/InterpreterSession.h"
@@ -70,11 +71,6 @@ public:
         return m_session.parserErrors();
     }
 
-    std::vector<std::string> printMessages() const {
-        std::scoped_lock lock(m_mutex);
-        return m_session.printMessages();
-    }
-
     std::vector<std::string> blockMessages() const {
         std::scoped_lock lock(m_mutex);
         return m_session.blockMessages();
@@ -110,6 +106,18 @@ public:
 
         m_doExecute = true;
         m_cv.notify_one();
+        return true;
+    }
+
+    std::vector<ngc::InterpreterStatusMessage> statusMessages() const {
+        std::scoped_lock lock(m_mutex);
+        return m_session.statusMessages();
+    }
+
+    bool clearToolpath() {
+        std::scoped_lock lock(m_mutex);
+        if(m_busy) return false;
+        m_toolpath.clear();
         return true;
     }
 
@@ -163,9 +171,10 @@ private:
             m_driver.pumpOne([&](const auto &callback) {
                 std::scoped_lock lock(m_mutex);
                 callback();
-            }, [&](const ngc::MachineCommand &command, const ngc::position_t &toolOffset, const ngc::ToolGeometry &) {
+            }, [&](const ngc::MachineCommand &command, const ngc::position_t &toolOffset, const ngc::ToolGeometry &,
+                   const ngc::WorkCoordinateSystem &workCoordinateSystem) {
                 std::scoped_lock lock(m_mutex);
-                m_toolpath.consume(command, toolOffset);
+                m_toolpath.consume(command, toolOffset, workCoordinateSystem);
             });
 
             m_executor.completeQueued();
@@ -176,8 +185,6 @@ private:
 
             if(m_driver.state() == ngc::ExecutionDriverState::Completed) break;
             if(m_driver.state() == ngc::ExecutionDriverState::Error) {
-                std::scoped_lock lock(m_mutex);
-                m_session.printMessages().emplace_back(*m_driver.error());
                 break;
             }
         }

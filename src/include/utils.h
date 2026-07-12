@@ -17,6 +17,7 @@
 #include <charconv>
 #include <array>
 #include <source_location>
+#include <limits>
 
 #define PANIC(...) ngc::panic(std::source_location::current(), "PANIC" __VA_OPT__(,) __VA_ARGS__)
 #define UNREACHABLE(...) ngc::panic(std::source_location::current(), "UNREACHABLE" __VA_OPT__(,) __VA_ARGS__)
@@ -58,6 +59,10 @@ namespace ngc
             return std::unexpected(ec);
         }
 
+        if(ptr != text.data() + text.size()) {
+            return std::unexpected(std::errc::invalid_argument);
+        }
+
         return d;
     }
 
@@ -65,27 +70,45 @@ namespace ngc
         std::ifstream file(filePath, std::ios::binary);
 
         if (!file) {
-            return std::unexpected(std::ios_base::failure("Failed to open file"));
+            return std::unexpected(std::ios_base::failure(std::format("failed to open '{}'", filePath.string())));
         }
 
         file.seekg(0, std::ios::end);
         const auto fileSize = file.tellg();
+        if(fileSize < 0) {
+            return std::unexpected(std::ios_base::failure(std::format("failed to determine size of '{}'", filePath.string())));
+        }
+        if(static_cast<std::uintmax_t>(fileSize) > std::numeric_limits<std::size_t>::max()) {
+            return std::unexpected(std::ios_base::failure(std::format("'{}' is too large to read", filePath.string())));
+        }
         file.seekg(0, std::ios::beg);
+        if(!file) {
+            return std::unexpected(std::ios_base::failure(std::format("failed to seek '{}'", filePath.string())));
+        }
 
-        std::string fileContent(fileSize, '\0');
-        file.read(&fileContent[0], fileSize);
+        std::string fileContent(static_cast<std::size_t>(fileSize), '\0');
+        if(!fileContent.empty()) {
+            file.read(fileContent.data(), static_cast<std::streamsize>(fileContent.size()));
+            if(!file || file.gcount() != static_cast<std::streamsize>(fileContent.size())) {
+                return std::unexpected(std::ios_base::failure(std::format("failed to read all of '{}'", filePath.string())));
+            }
+        }
 
         return fileContent;
     }
 
     inline std::expected<void, std::ios_base::failure> writeFile(const std::filesystem::path& filePath, const std::string_view text) {
-        std::ofstream file(filePath);
+        std::ofstream file(filePath, std::ios::binary | std::ios::trunc);
 
         if (!file) {
-            return std::unexpected(std::ios_base::failure("Failed to open file"));
+            return std::unexpected(std::ios_base::failure(std::format("failed to open '{}'", filePath.string())));
         }
 
-        file.write(text.data(), text.size());
+        file.write(text.data(), static_cast<std::streamsize>(text.size()));
+        file.flush();
+        if(!file) {
+            return std::unexpected(std::ios_base::failure(std::format("failed to write all of '{}'", filePath.string())));
+        }
 
         return {};
     }

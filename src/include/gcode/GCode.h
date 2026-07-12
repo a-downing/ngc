@@ -30,7 +30,7 @@ namespace ngc {
             case 9: return GCode::G59_3;
         }
 
-        PANIC("invalid coordinate system number: {}", i);
+        throw std::runtime_error(std::format("invalid coordinate system number {}", i));
     }
 
     inline int coordsys(const GCCoord code) {
@@ -105,7 +105,7 @@ namespace ngc {
         [[nodiscard]] bool blockDelete() const { return m_statement->blockDelete() != std::nullopt; }
     };
 
-    constexpr GCode convertGCode(double real) {
+    inline GCode convertGCode(double real) {
         const int whole = static_cast<int>(real);
         const int fract = static_cast<int>((real - whole) * 10 + 0.5);
 
@@ -268,10 +268,10 @@ namespace ngc {
                 break;
         }
 
-        PANIC("invalid gcode G{}", real);
+        throw std::runtime_error(std::format("unsupported G-code G{}", real));
     }
 
-    constexpr MCode convertMCode(const double real) {
+    inline MCode convertMCode(const double real) {
         switch(static_cast<int>(real)) {
             case 0: return MCode::M0;
             case 1: return MCode::M1;
@@ -283,7 +283,7 @@ namespace ngc {
             case 6: return MCode::M6;
         }
 
-        PANIC("invalid m-code M{}", real);
+        throw std::runtime_error(std::format("unsupported M-code M{}", real));
     }
 
     constexpr Letter convertLetter(const Token::Kind kind) {
@@ -310,6 +310,7 @@ namespace ngc {
             case Token::Kind::X: return Letter::X;
             case Token::Kind::Y: return Letter::Y;
             case Token::Kind::Z: return Letter::Z;
+            default: break;
         }
 
         PANIC("can't convert token {} to Letter", name(kind));
@@ -408,6 +409,7 @@ namespace ngc {
                 case Letter::L: L = word.real(); return;
                 case Letter::M: return affectState(convertMCode(word.real()));
                 case Letter::N: return;
+                case Letter::O: break;
                 case Letter::P: P = word.real(); return;
                 case Letter::Q: Q = word.real(); return;
                 case Letter::R: R = word.real(); return;
@@ -418,7 +420,7 @@ namespace ngc {
                 case Letter::Z: Z = word.real(); return;
             }
 
-            PANIC("invalid word {}", word.text());
+            throw std::runtime_error(std::format("unsupported word {}", word.text()));
         }
 
         void affectState(const GCode code) {

@@ -13,6 +13,7 @@
 #include <print>
 #include <format>
 #include <map>
+#include <sstream>
 #include <utility>
 #include <cctype>
 
@@ -51,78 +52,48 @@ namespace ngc {
             m_tools.insert_or_assign(num, tool);
         }
 
-        std::expected<void, std::string> load() {
+        std::expected<void, std::string> load(const std::filesystem::path &path = FILENAME) {
             m_tools.clear();
-            const auto result = readFile(FILENAME);
+            const auto result = readFile(path);
 
             if(!result) {
                 return std::unexpected(result.error().what());
             }
 
-            const std::string &text = *result;
-            std::string token;
-            int col = 0;
-            tool_entry_t tool;
+            std::istringstream input(*result);
+            std::string line;
+            std::size_t row = 0;
+            while(std::getline(input, line)) {
+                ++row;
+                if(line.find_first_not_of(" \t\r") == std::string::npos) continue;
 
-            for(size_t i = 0; i < text.size(); i++) {
-                const char c = text[i];
-
-                if((!std::isspace(c) || col >= 8) && c != '\n' && i < text.size() - 1) {
-                    token += c;
-                    continue;
+                tool_entry_t tool{};
+                std::istringstream fields(line);
+                if(!(fields >> tool.number >> tool.x >> tool.y >> tool.z
+                     >> tool.a >> tool.b >> tool.c >> tool.diameter)) {
+                    return std::unexpected(std::format("{}: row:{} expected 8 numeric values", path.string(), row));
                 }
 
-                if((std::isspace(c) || i == text.size() - 1) && col < 8 && !token.empty()) {
-                    auto value = fromChars(token);
-
-                    if(!value) {
-                        return std::unexpected(std::format("{}: row:{} col:{} failed to convert '{}' to number", FILENAME, m_tools.size()+1, col+1, token));
-                    }
-
-                    switch (col) {
-                        case 0: tool.number = static_cast<int>(*value); break;
-                        case 1: tool.x = *value; break;
-                        case 2: tool.y = *value; break;
-                        case 3: tool.z = *value; break;
-                        case 4: tool.a = *value; break;
-                        case 5: tool.b = *value; break;
-                        case 6: tool.c = *value; break;
-                        case 7: tool.diameter = *value; break;
-                        default: std::println(stderr, "tool_table: {}", token);
-                    }
-
-                    token.clear();
-                    col++;
-                }
-
-                if(c == '\n' || i == text.size() - 1) {
-                    if(col == 0) {
-                        continue;
-                    }
-
-                    if(col < 8) {
-                        return std::unexpected(std::format("{}: row:{} expected 8 values", FILENAME, m_tools.size()+1));
-                    }
-
-                    tool.comment = std::move(token);
-                    
-                    m_tools.emplace(tool.number, tool);
-                    col = 0;
-                    token.clear();
+                std::getline(fields >> std::ws, tool.comment);
+                const auto toolNumber = tool.number;
+                const auto [_, inserted] = m_tools.emplace(toolNumber, std::move(tool));
+                if(!inserted) {
+                    return std::unexpected(std::format("{}: row:{} duplicate tool number {}",
+                                                       path.string(), row, toolNumber));
                 }
             }
 
             return {};
         }
 
-        std::expected<void, std::string> save() const {
+        std::expected<void, std::string> save(const std::filesystem::path &path = FILENAME) const {
             std::string text;
 
             for(const auto &[_, tool] : m_tools) {
                 text += std::format("{} {} {} {} {} {} {} {} {}\n", tool.number, tool.x, tool.y, tool.z, tool.a, tool.b, tool.c, tool.diameter, tool.comment);
             }
 
-            auto result = writeFile(FILENAME, text);
+            auto result = writeFile(path, text);
 
             if(!result) {
                 return std::unexpected(result.error().what());

@@ -11,8 +11,11 @@
 #include <type_traits>
 #include <utility>
 #include <variant>
+#include <vector>
+#include <unordered_map>
 
 #include "machine/MachineCommand.h"
+#include "evaluator/InterpreterStatus.h"
 
 namespace ngc {
     enum class SimulationStatus {
@@ -24,9 +27,28 @@ namespace ngc {
     };
 
     struct SimulatedCommand {
-        MachineCommand command;
+        std::optional<MachineCommand> command;
         position_t toolOffset{};
         ToolGeometry tool{};
+        std::optional<WorkCoordinateSystem> workCoordinateSystem;
+        std::vector<std::string> modalGCodes;
+        std::optional<BlockExecution> block;
+        std::optional<InterpreterBlockLifecycle> lifecycle;
+
+        SimulatedCommand(MachineCommand commandValue, position_t activeToolOffset = {}, ToolGeometry toolGeometry = {},
+                         std::optional<WorkCoordinateSystem> activeWorkCoordinateSystem = std::nullopt,
+                         std::vector<std::string> activeModalGCodes = {},
+                         std::optional<BlockExecution> blockExecution = std::nullopt)
+            : command(std::move(commandValue)), toolOffset(activeToolOffset), tool(std::move(toolGeometry)),
+              workCoordinateSystem(std::move(activeWorkCoordinateSystem)), modalGCodes(std::move(activeModalGCodes)),
+              block(std::move(blockExecution)) { }
+
+        static SimulatedCommand lifecycleMarker(InterpreterBlockLifecycle blockLifecycle) {
+            SimulatedCommand marker { SpindleStop {} };
+            marker.command.reset();
+            marker.lifecycle = std::move(blockLifecycle);
+            return marker;
+        }
     };
 
     struct SimulationSnapshot {
@@ -40,6 +62,13 @@ namespace ngc {
         double spindleSpeed = 0.0;
         Direction spindleDirection = Direction::CW;
         std::string error;
+        std::vector<InterpreterStatusMessage> statusMessages;
+        std::optional<WorkCoordinateSystem> activeWorkCoordinateSystem;
+        std::vector<std::string> activeModalGCodes;
+        std::vector<WorkCoordinateSystem> usedWorkCoordinateSystems;
+        std::vector<BlockExecution> activeBlocks;
+        std::vector<BlockExecution> completedBlocks;
+        std::unordered_map<std::string, std::vector<std::uint8_t>> completedLineFlags;
     };
 
     namespace simulation_detail {
@@ -156,6 +185,9 @@ namespace ngc {
         void setRapidSpeed(const double speed) { m_rapidSpeed = std::max(speed, 1e-9); }
         void setStatus(const SimulationStatus status) { m_snapshot.status = status; }
         void setError(std::string error) {
+            m_queue.clear();
+            m_active.reset();
+            m_probeResult.reset();
             m_snapshot.status = SimulationStatus::Error;
             m_snapshot.error = std::move(error);
         }
@@ -171,10 +203,23 @@ namespace ngc {
                     }
                     m_active.emplace(std::move(m_queue.front()));
                     m_queue.pop_front();
+                    if(m_active->workCoordinateSystem) {
+                        m_snapshot.activeWorkCoordinateSystem = m_active->workCoordinateSystem;
+                        const auto match = std::ranges::find_if(m_snapshot.usedWorkCoordinateSystems,
+                            [&](const WorkCoordinateSystem &value) {
+                                return value.name == m_active->workCoordinateSystem->name;
+                            });
+                        if(match == m_snapshot.usedWorkCoordinateSystems.end()) {
+                            m_snapshot.usedWorkCoordinateSystems.push_back(*m_active->workCoordinateSystem);
+                        } else {
+                            *match = *m_active->workCoordinateSystem;
+                        }
+                    }
+                    m_snapshot.activeModalGCodes = m_active->modalGCodes;
                     m_elapsed = 0.0;
                     m_motionStart = m_snapshot.machinePosition;
                     m_duration = commandDuration(*m_active);
-                    if(!isMotion(m_active->command)) {
+                    if(!m_active->command || !isMotion(*m_active->command)) {
                         completeActive();
                         continue;
                     }
@@ -206,6 +251,26 @@ namespace ngc {
 
         SimulationSnapshot snapshot() const { return m_snapshot; }
 
+        SimulationSnapshot lightweightSnapshot() const {
+            SimulationSnapshot result;
+            result.status = m_snapshot.status;
+            result.machinePosition = m_snapshot.machinePosition;
+            result.toolPosition = m_snapshot.toolPosition;
+            result.toolPose = m_snapshot.toolPose;
+            result.commandProgress = m_snapshot.commandProgress;
+            result.hasActiveMotion = m_snapshot.hasActiveMotion;
+            result.spindleRunning = m_snapshot.spindleRunning;
+            result.spindleSpeed = m_snapshot.spindleSpeed;
+            result.spindleDirection = m_snapshot.spindleDirection;
+            result.error = m_snapshot.error;
+            result.activeWorkCoordinateSystem = m_snapshot.activeWorkCoordinateSystem;
+            result.activeModalGCodes = m_snapshot.activeModalGCodes;
+            result.usedWorkCoordinateSystems = m_snapshot.usedWorkCoordinateSystems;
+            result.activeBlocks = m_snapshot.activeBlocks;
+            result.completedLineFlags = m_snapshot.completedLineFlags;
+            return result;
+        }
+
         std::optional<ProbeResult> takeProbeResult() {
             return std::exchange(m_probeResult, std::nullopt);
         }
@@ -222,7 +287,7 @@ namespace ngc {
         }
 
         double commandDuration(const SimulatedCommand &simulated) const {
-            const auto &command = simulated.command;
+            if(!simulated.command) return 0.0;
             return std::visit([&](const auto &value) {
                 using T = std::decay_t<decltype(value)>;
                 if constexpr(std::same_as<T, MoveLine>) {
@@ -235,7 +300,7 @@ namespace ngc {
                 } else {
                     return 0.0;
                 }
-            }, command);
+            }, *simulated.command);
         }
 
         void updateActive() {
@@ -248,7 +313,7 @@ namespace ngc {
                 if constexpr(std::same_as<T, MoveArc>) return simulation_detail::interpolate(value, progress);
                 if constexpr(std::same_as<T, ProbeMove>) return simulation_detail::mix(m_motionStart, probeContactPosition(*m_active, value), progress);
                 return m_snapshot.machinePosition;
-            }, m_active->command);
+            }, *m_active->command);
             m_lastToolOffset = m_active->tool.offset;
             m_snapshot.toolPosition = m_snapshot.machinePosition - m_lastToolOffset;
             m_snapshot.toolPose = {
@@ -259,6 +324,29 @@ namespace ngc {
         }
 
         void completeActive() {
+            if(!m_active->command) {
+                if(m_active->lifecycle) {
+                    const auto &lifecycle = *m_active->lifecycle;
+                    if(lifecycle.phase == BlockLifecyclePhase::Entered) {
+                        m_snapshot.activeBlocks.emplace_back(lifecycle.block);
+                    } else {
+                        const auto match = std::ranges::find_if(m_snapshot.activeBlocks, [&](const BlockExecution &block) {
+                            return block.id == lifecycle.block.id;
+                        });
+                        if(match != m_snapshot.activeBlocks.end()) m_snapshot.activeBlocks.erase(match);
+                        m_snapshot.completedBlocks.emplace_back(lifecycle.block);
+                        auto &flags = m_snapshot.completedLineFlags[lifecycle.block.source];
+                        if(lifecycle.block.line >= static_cast<int>(flags.size())) {
+                            flags.resize(static_cast<std::size_t>(lifecycle.block.line) + 1);
+                        }
+                        flags[lifecycle.block.line] = 1;
+                    }
+                }
+                m_snapshot.hasActiveMotion = false;
+                m_snapshot.commandProgress = 1.0;
+                m_active.reset();
+                return;
+            }
             std::visit([&](const auto &value) {
                 using T = std::decay_t<decltype(value)>;
                 if constexpr(std::same_as<T, SpindleStart>) {
@@ -280,7 +368,7 @@ namespace ngc {
                 } else {
                     updateActive();
                 }
-            }, m_active->command);
+            }, *m_active->command);
             m_snapshot.hasActiveMotion = false;
             m_snapshot.commandProgress = 1.0;
             m_active.reset();

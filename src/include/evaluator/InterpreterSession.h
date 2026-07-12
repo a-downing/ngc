@@ -15,6 +15,7 @@
 #include <vector>
 
 #include "evaluator/Evaluator.h"
+#include "evaluator/InterpreterStatus.h"
 #include "evaluator/Preamble.h"
 #include "machine/Machine.h"
 #include "parser/Program.h"
@@ -45,7 +46,21 @@ namespace ngc {
         std::uint64_t commandId;
     };
 
-    using InterpreterEvent = std::variant<MachineCommand, InterpreterWaitingForProbe, InterpreterCompleted, InterpreterError>;
+    struct BlockExecution {
+        std::uint64_t id;
+        std::string text;
+        std::string source;
+        int line;
+    };
+
+    enum class BlockLifecyclePhase { Entered, Completed };
+
+    struct InterpreterBlockLifecycle {
+        BlockExecution block;
+        BlockLifecyclePhase phase;
+    };
+
+    using InterpreterEvent = std::variant<MachineCommand, InterpreterBlockLifecycle, InterpreterWaitingForProbe, InterpreterCompleted, InterpreterError>;
 
     class InterpreterSession {
         struct ExecutionStopped { };
@@ -54,7 +69,7 @@ namespace ngc {
         InterpretationMode m_mode;
         std::vector<Program> m_programs;
         std::vector<Parser::Error> m_parserErrors;
-        std::vector<std::string> m_printMessages;
+        std::vector<InterpreterStatusMessage> m_statusMessages;
         std::vector<std::string> m_blockMessages;
         bool m_compiled = false;
 
@@ -62,7 +77,9 @@ namespace ngc {
         std::condition_variable m_executionCv;
         std::thread m_executionThread;
         std::unique_ptr<const EvaluatorMessage> m_pendingMessage;
+        std::optional<BlockExecution> m_pendingMessageBlock;
         std::deque<MachineCommand> m_pendingCommands;
+        std::deque<InterpreterBlockLifecycle> m_pendingBlockLifecycle;
         std::optional<std::uint64_t> m_pendingProbe;
         bool m_evaluatorPaused = false;
         bool m_resumeEvaluator = false;
@@ -70,6 +87,8 @@ namespace ngc {
         bool m_executionFinished = false;
         bool m_stopExecution = false;
         std::optional<std::string> m_executionError;
+        std::uint64_t m_nextBlockExecutionId = 1;
+        std::optional<InterpreterBlockLifecycle> m_publishedBlockLifecycle;
 
     public:
         InterpreterSession(const Machine::Unit unit, const InterpretationMode mode) : m_machine(unit), m_mode(mode) { }
@@ -83,7 +102,7 @@ namespace ngc {
 
         template<typename Self> auto &machine(this Self &&self) { return std::forward<Self>(self).m_machine; }
         template<typename Self> auto &parserErrors(this Self &&self) { return std::forward<Self>(self).m_parserErrors; }
-        template<typename Self> auto &printMessages(this Self &&self) { return std::forward<Self>(self).m_printMessages; }
+        template<typename Self> auto &statusMessages(this Self &&self) { return std::forward<Self>(self).m_statusMessages; }
         template<typename Self> auto &blockMessages(this Self &&self) { return std::forward<Self>(self).m_blockMessages; }
 
         bool compiled() const { return m_compiled; }
@@ -92,7 +111,7 @@ namespace ngc {
             stop();
             m_programs.clear();
             m_parserErrors.clear();
-            m_printMessages.clear();
+            m_statusMessages.clear();
             m_blockMessages.clear();
 
             for(const auto &[source, name] : programs) {
@@ -122,19 +141,30 @@ namespace ngc {
 
         void begin() {
             stop();
-            m_machine.beginProgramRun();
-            m_machine.memory().write(Var::TASK, taskValue(m_mode), true);
-            m_printMessages.clear();
+            m_statusMessages.clear();
             m_blockMessages.clear();
             m_pendingCommands.clear();
+            m_pendingBlockLifecycle.clear();
             m_pendingProbe.reset();
             m_pendingMessage.reset();
+            m_pendingMessageBlock.reset();
             m_executionError.reset();
+            m_nextBlockExecutionId = 1;
+            m_publishedBlockLifecycle.reset();
             m_evaluatorPaused = false;
             m_resumeEvaluator = false;
             m_executionFinished = false;
             m_stopExecution = false;
             m_executionStarted = true;
+
+            try {
+                m_machine.beginProgramRun();
+                m_machine.memory().write(Var::TASK, taskValue(m_mode), true);
+            } catch(const std::exception &error) {
+                m_executionError = error.what();
+                m_executionFinished = true;
+                return;
+            }
 
             if(!m_compiled) {
                 m_executionError = "interpreter session has not compiled a program";
@@ -151,6 +181,17 @@ namespace ngc {
 
         template<typename Synchronize>
         InterpreterEvent next(Synchronize &&synchronize) {
+            return nextImpl(std::forward<Synchronize>(synchronize), false);
+        }
+
+        template<typename Synchronize>
+        InterpreterEvent nextWithBlocks(Synchronize &&synchronize) {
+            return nextImpl(std::forward<Synchronize>(synchronize), true);
+        }
+
+    private:
+        template<typename Synchronize>
+        InterpreterEvent nextImpl(Synchronize &&synchronize, const bool includeBlocks) {
             if(!m_executionStarted) {
                 begin();
             }
@@ -158,6 +199,12 @@ namespace ngc {
             for(;;) {
                 if(m_pendingProbe) {
                     return InterpreterWaitingForProbe { *m_pendingProbe };
+                }
+
+                if(!m_pendingBlockLifecycle.empty()) {
+                    auto lifecycle = std::move(m_pendingBlockLifecycle.front());
+                    m_pendingBlockLifecycle.pop_front();
+                    if(includeBlocks) return lifecycle;
                 }
 
                 if(!m_pendingCommands.empty()) {
@@ -175,13 +222,34 @@ namespace ngc {
 
                 std::unique_lock lock(m_executionMutex);
                 m_executionCv.wait(lock, [&] {
-                    return m_pendingMessage || m_executionFinished;
+                    return m_pendingMessage || m_publishedBlockLifecycle || m_executionFinished;
                 });
+
+                if(m_publishedBlockLifecycle) {
+                    auto lifecycle = std::move(*m_publishedBlockLifecycle);
+                    m_publishedBlockLifecycle.reset();
+                    lock.unlock();
+                    synchronize([&] { m_pendingBlockLifecycle.emplace_back(std::move(lifecycle)); });
+                    continue;
+                }
 
                 if(m_pendingMessage) {
                     auto message = std::move(m_pendingMessage);
+                    auto block = std::exchange(m_pendingMessageBlock, std::nullopt);
                     lock.unlock();
-                    synchronize([&] { processMessage(*message); });
+                    try {
+                        synchronize([&] { processMessage(*message, block); });
+                    } catch(const std::exception &error) {
+                        const auto text = statusErrorText(*message, error.what());
+                        stop();
+                        m_statusMessages.push_back({ InterpreterStatusKind::Error, text });
+                        return InterpreterError { text };
+                    } catch(...) {
+                        const auto text = statusErrorText(*message, "unknown interpreter error");
+                        stop();
+                        m_statusMessages.push_back({ InterpreterStatusKind::Error, text });
+                        return InterpreterError { text };
+                    }
                     continue;
                 }
 
@@ -190,12 +258,15 @@ namespace ngc {
                 finishExecutionThread();
 
                 if(error) {
+                    m_statusMessages.push_back({ InterpreterStatusKind::Error, *error });
                     return InterpreterError { *error };
                 }
 
                 return InterpreterCompleted {};
             }
         }
+
+    public:
 
         void provideProbeResult(const ProbeResult &result) {
             if(!m_pendingProbe || *m_pendingProbe != result.id) {
@@ -217,25 +288,56 @@ namespace ngc {
             m_executionStarted = false;
             m_evaluatorPaused = false;
             m_pendingMessage.reset();
+            m_pendingMessageBlock.reset();
+            m_publishedBlockLifecycle.reset();
             m_pendingCommands.clear();
+            m_pendingBlockLifecycle.clear();
             m_pendingProbe.reset();
         }
 
     private:
+        static std::string statusErrorText(const EvaluatorMessage &message, const std::string_view error) {
+            if(const auto blockMessage = message.as<BlockMessage>()) {
+                const auto location = blockMessage->block().statement()->startToken().location();
+                if(error.starts_with(location)) return std::string(error);
+                return std::format("{}: {}", location, error);
+            }
+            return std::string(error);
+        }
+
         void evaluate() {
             try {
                 const std::function callback = [&] (std::unique_ptr<const EvaluatorMessage> message, Evaluator &evaluator) {
                     if(const auto blockMessage = message->as<BlockMessage>()) {
+                        const auto &statement = *blockMessage->block().statement();
+                        const auto &token = statement.startToken();
+                        const BlockExecution execution {
+                            .id = m_nextBlockExecutionId++,
+                            .text = statement.text(),
+                            .source = std::string(token.source()->name()),
+                            .line = token.source()->line(),
+                        };
                         GCodeState state;
 
-                        for(const auto &word : blockMessage->block().words()) {
-                            state.affectState(word);
+                        try {
+                            for(const auto &word : blockMessage->block().words()) {
+                                state.affectState(word);
+                            }
+                        } catch(const std::exception &error) {
+                            throw std::runtime_error(std::format("{}: {}", token.location(), error.what()));
                         }
 
                         if(state.modeToolChange) {
                             m_machine.prepareToolChange(static_cast<int>(*state.T));
+                            publishMessage(std::move(message), execution);
                             evaluator.call("_tool_change", *state.T);
+                            publishBlockLifecycle({ execution, BlockLifecyclePhase::Completed });
+                            return;
                         }
+
+                        publishMessage(std::move(message), execution);
+                        publishBlockLifecycle({ execution, BlockLifecyclePhase::Completed });
+                        return;
                     }
 
                     publishMessage(std::move(message));
@@ -268,9 +370,11 @@ namespace ngc {
             m_executionCv.notify_all();
         }
 
-        void publishMessage(std::unique_ptr<const EvaluatorMessage> message) {
+        void publishMessage(std::unique_ptr<const EvaluatorMessage> message,
+                            std::optional<BlockExecution> block = std::nullopt) {
             std::unique_lock lock(m_executionMutex);
             m_pendingMessage = std::move(message);
+            m_pendingMessageBlock = std::move(block);
             m_evaluatorPaused = true;
             m_executionCv.notify_all();
             m_executionCv.wait(lock, [&] { return m_resumeEvaluator || m_stopExecution; });
@@ -283,9 +387,23 @@ namespace ngc {
             m_evaluatorPaused = false;
         }
 
-        void processMessage(const EvaluatorMessage &message) {
+        void publishBlockLifecycle(InterpreterBlockLifecycle lifecycle) {
+            std::unique_lock lock(m_executionMutex);
+            m_publishedBlockLifecycle = std::move(lifecycle);
+            m_evaluatorPaused = true;
+            m_executionCv.notify_all();
+            m_executionCv.wait(lock, [&] { return m_resumeEvaluator || m_stopExecution; });
+
+            if(m_stopExecution) throw ExecutionStopped {};
+            m_resumeEvaluator = false;
+            m_evaluatorPaused = false;
+        }
+
+        void processMessage(const EvaluatorMessage &message, const std::optional<BlockExecution> &block) {
             if(const auto blockMessage = message.as<BlockMessage>()) {
-                m_blockMessages.emplace_back(blockMessage->block().statement()->text());
+                auto text = blockMessage->block().statement()->text();
+                m_blockMessages.emplace_back(text);
+                if(block) m_pendingBlockLifecycle.push_back({ *block, BlockLifecyclePhase::Entered });
                 auto commands = m_machine.executeBlock(blockMessage->block());
 
                 for(auto &command : commands) {
@@ -294,7 +412,7 @@ namespace ngc {
             }
 
             if(const auto printMessage = message.as<PrintMessage>()) {
-                m_printMessages.emplace_back(printMessage->text());
+                m_statusMessages.push_back({ InterpreterStatusKind::Print, printMessage->text() });
             }
         }
 

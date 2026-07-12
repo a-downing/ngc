@@ -62,12 +62,13 @@ namespace ngc {
             m_memory.init(gVars);
             auto result = m_toolTable.load();
             if(!result) {
-                PANIC("{}", result.error());
+                throw std::runtime_error(std::format("failed to load tool table: {}", result.error()));
             }
             beginProgramRun();
         }
 
         void beginProgramRun() {
+            m_memory.resetProgramStorage();
             m_pos = {};
             m_workOffset = {};
             m_toolOffset = {};
@@ -94,6 +95,23 @@ namespace ngc {
         template<typename Self> auto &memory(this Self &&self) { return std::forward<Self>(self).m_memory; }
         template<typename Self> auto &toolTable(this Self &&self) { return std::forward<Self>(self).m_toolTable; }
         template<typename Self> auto &state(this Self &&self) { return std::forward<Self>(self).m_state; }
+
+        std::vector<std::string> activeModalGCodes() const {
+            std::vector<std::string> codes;
+            const auto append = [&](const auto &code) {
+                if(code) codes.emplace_back(name(*code));
+            };
+            append(m_state.modeMotion);
+            append(m_state.modePlane);
+            append(m_state.modeDistance);
+            append(m_state.modeArcDistance);
+            append(m_state.modeFeedrate);
+            append(m_state.modeUnits);
+            append(m_state.modeToolOffset);
+            append(m_state.modeCoordSys);
+            append(m_state.modePath);
+            return codes;
+        }
 
         double arcTolerance() const {
             constexpr double INCH_TOLERANCE = 0.0005;
@@ -182,7 +200,7 @@ namespace ngc {
 
             if(state.nonModal) {
                 if(m_state.nonModal) {
-                    PANIC("already have non-modal: {}", name(*m_state.nonModal));
+                    throw std::runtime_error(std::format("multiple non-modal G-codes in block: {}", block.statement()->text()));
                 }
 
                 switch(*state.nonModal) {
@@ -213,7 +231,8 @@ namespace ngc {
 
             if(state.modeFeedrate) {
                 if(state.modeFeedrate != GCFeed::G94) {
-                    PANIC("{}", name(*state.modeFeedrate));
+                    throw std::runtime_error(std::format("unsupported feed mode {}: {}",
+                                                         name(*state.modeFeedrate), block.statement()->text()));
                 }
 
                 m_state.modeFeedrate = std::exchange(state.modeFeedrate, std::nullopt);
@@ -259,7 +278,8 @@ namespace ngc {
 
                     if(toolNumber == 0) {
                         if(!m_state.T || static_cast<int>(*m_state.T) == 0) {
-                            PANIC("{}: no tool specified for tool change and no T currently programmed: {}", block.statement()->startToken().location(), block.statement()->text());
+                            throw std::runtime_error(std::format("{}: G43 requires H or a programmed tool: {}",
+                                                                 block.statement()->startToken().location(), block.statement()->text()));
                         }
 
                         toolNumber = static_cast<int>(*m_state.T);
@@ -268,7 +288,9 @@ namespace ngc {
                     if(auto tool = m_toolTable.get(toolNumber)) {
                         m_toolOffset = { tool->x, tool->y, tool->z, tool->a, tool->b, tool->c };
                     } else {
-                        PANIC("{}: tool not found: {}", block.statement()->startToken().location(), toolNumber);
+                        throw std::runtime_error(std::format("{}: tool {} not found: {}",
+                                                             block.statement()->startToken().location(), toolNumber,
+                                                             block.statement()->text()));
                     }
                 } else if(m_state.modeToolOffset == GCTLen::G49) {
                     m_toolOffset = {};
@@ -300,7 +322,8 @@ namespace ngc {
             }
 
             if(!state.empty()) {
-                PANIC("{}: unhandled gcode state change", block.statement()->startToken().location());
+                throw std::runtime_error(std::format("{}: unsupported word or code in block: {}",
+                                                     block.statement()->startToken().location(), block.statement()->text()));
             }
 
             return commands;
@@ -309,7 +332,8 @@ namespace ngc {
     private:
         void handleG10(const Block &block, GCodeState &state) {
             if(!state.L || !state.P) {
-                PANIC("{}: G10 missing L or P: {}", block.statement()->startToken().location(), block.statement()->text());
+                throw std::runtime_error(std::format("{}: G10 requires L and P: {}",
+                                                     block.statement()->startToken().location(), block.statement()->text()));
             }
 
             m_state.L = std::exchange(state.L, std::nullopt);
@@ -317,7 +341,13 @@ namespace ngc {
 
             if(*m_state.L == 2.0) {
                 m_state.nonModal = std::exchange(state.nonModal, std::nullopt);
-                auto code = coordsys(static_cast<int>(*m_state.P));
+                const auto coordinateSystem = static_cast<int>(*m_state.P);
+                if(*m_state.P != coordinateSystem || coordinateSystem < 1 || coordinateSystem > 9) {
+                    throw std::runtime_error(std::format("{}: G10 has invalid coordinate system P{}: {}",
+                                                         block.statement()->startToken().location(), *m_state.P,
+                                                         block.statement()->text()));
+                }
+                auto code = coordsys(coordinateSystem);
                 auto startAddr = offsetStartAddress(static_cast<GCCoord>(code));
 
                 if(state.X) {
@@ -359,12 +389,19 @@ namespace ngc {
                 m_workOffset = offset(*m_state.modeCoordSys);
                 return;
             }
+
+            throw std::runtime_error(std::format("{}: unsupported G10 L{} operation: {}",
+                                                 block.statement()->startToken().location(), *m_state.L,
+                                                 block.statement()->text()));
         }
 
         MachineCommand handleMotion(const Block &block) {
             std::println("block: {}", block.statement()->text());
             
             if(m_state.modeMotion == GCMotion::G0 || m_state.modeMotion == GCMotion::G1) {
+                if(m_state.modeMotion == GCMotion::G1 && (!m_state.F || *m_state.F <= 0.0)) {
+                    throw std::runtime_error(std::format("G1 requires a positive feedrate: {}", block.statement()->text()));
+                }
                 auto pos = position();
                 std::println("pos: {}", pos.text());
                 auto speed = m_state.modeMotion == GCMotion::G1 ? *m_state.F : -1;
@@ -374,6 +411,10 @@ namespace ngc {
             }
 
             if(m_state.modeMotion == GCMotion::G2 || m_state.modeMotion == GCMotion::G3) {
+                if(!m_state.F || *m_state.F <= 0.0) {
+                    throw std::runtime_error(std::format("{} requires a positive feedrate: {}",
+                                                         name(*m_state.modeMotion), block.statement()->text()));
+                }
                 auto pos = position();
                 auto flip = m_state.modeMotion == GCMotion::G3 ? 1.0 : -1.0;
                 std::optional<vec3_t> center;
@@ -400,7 +441,7 @@ namespace ngc {
 
                 if(m_state.modePlane == GCPlane::G17) {
                     if(!m_state.I && !m_state.J) {
-                        PANIC("missing I and J for G17 arc: {}", block.statement()->text());
+                        throw std::runtime_error(std::format("G17 arc requires I or J: {}", block.statement()->text()));
                     }
 
                     center = vec3_t(centerCoordinate(Axis::X, m_state.I), centerCoordinate(Axis::Y, m_state.J), m_pos.z);
@@ -409,7 +450,7 @@ namespace ngc {
 
                 if(m_state.modePlane == GCPlane::G18) {
                     if(!m_state.I && !m_state.K) {
-                        PANIC("missing I and K for G18 arc: {}", block.statement()->text());
+                        throw std::runtime_error(std::format("G18 arc requires I or K: {}", block.statement()->text()));
                     }
 
                     center = vec3_t(centerCoordinate(Axis::X, m_state.I), m_pos.y, centerCoordinate(Axis::Z, m_state.K));
@@ -418,7 +459,7 @@ namespace ngc {
 
                 if(m_state.modePlane == GCPlane::G19) {
                     if(!m_state.J && !m_state.K) {
-                        PANIC("missing J and K for G19 arc: {}", block.statement()->text());
+                        throw std::runtime_error(std::format("G19 arc requires J or K: {}", block.statement()->text()));
                     }
 
                     center = vec3_t(m_pos.x, centerCoordinate(Axis::Y, m_state.J), centerCoordinate(Axis::Z, m_state.K));
@@ -430,7 +471,8 @@ namespace ngc {
                 }
 
                 if(auto valid = validateArc(m_pos, pos, *center); !valid) {
-                    PANIC("{}: {}: {}", block.statement()->startToken().location(), valid.error(), block.statement()->text());
+                    throw std::runtime_error(std::format("{}: {}: {}", block.statement()->startToken().location(),
+                                                         valid.error(), block.statement()->text()));
                 }
 
                 auto command = MoveArc{m_pos, pos, *center, *axis, *m_state.F};
@@ -440,7 +482,7 @@ namespace ngc {
 
             if(m_state.modeMotion == GCMotion::G38_3) {
                 if(!m_state.F || *m_state.F <= 0.0) {
-                    PANIC("G38.3 requires a positive feedrate: {}", block.statement()->text());
+                    throw std::runtime_error(std::format("G38.3 requires a positive feedrate: {}", block.statement()->text()));
                 }
 
                 const auto target = position();

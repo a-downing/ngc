@@ -8,10 +8,10 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
-add_compile_options(-g -O2 -Wall -Wextra)
-add_link_options(-g)
-#add_compile_options(-g -O2 -fsanitize=undefined -fsanitize=address -Wall -Wextra)
-#add_link_options(-fsanitize=undefined -fsanitize=address)
+function(ngc_target_defaults target)
+    target_compile_options(${target} PRIVATE -g -O2 -Wall -Wextra)
+    target_link_options(${target} PRIVATE -g)
+endfunction()
 
 set(IMGUI_DIR imgui)
 
@@ -65,7 +65,7 @@ add_subdirectory(glfw)
 # add_executable(ngc main.cpp)
 # target_link_libraries(ngc utils parser memory evaluator machine)
 
-add_executable(imgui_main
+add_library(ngc_imgui STATIC
         ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp
         ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
         ${IMGUI_DIR}/misc/cpp/imgui_stdlib.cpp
@@ -73,26 +73,36 @@ add_executable(imgui_main
         ${IMGUI_DIR}/imgui_draw.cpp
         ${IMGUI_DIR}/imgui_demo.cpp
         ${IMGUI_DIR}/imgui_tables.cpp
-        ${IMGUI_DIR}/imgui_widgets.cpp
+        ${IMGUI_DIR}/imgui_widgets.cpp)
+
+target_include_directories(ngc_imgui PUBLIC
+        ${IMGUI_DIR}
+        ${IMGUI_DIR}/backends
+        ${IMGUI_DIR}/misc/cpp)
+
+target_link_libraries(ngc_imgui PUBLIC
+        OpenGL::GL
+        glfw)
+
+add_executable(imgui_main
         src/imgui_main.cpp
         src/Application.h)
 
-target_include_directories(imgui_main PUBLIC
-        ${IMGUI_DIR}
-        ${IMGUI_DIR}/backends
-        ${IMGUI_DIR}/misc/cpp
+target_include_directories(imgui_main PRIVATE
         src/
         src/include)
 
 target_link_libraries(imgui_main
+        ngc_imgui
         OpenGL::GL
         OpenGL::GLU
-        glm::glm-header-only
-        glfw)
+        glm::glm-header-only)
+ngc_target_defaults(imgui_main)
 
 add_executable(binary_to_compressed_c ${IMGUI_DIR}/misc/fonts/binary_to_compressed_c.cpp)
 
 add_executable(ngc_tests src/test.cpp)
 target_include_directories(ngc_tests PRIVATE src/include)
+ngc_target_defaults(ngc_tests)
 add_test(NAME ngc_tests COMMAND ngc_tests)
 set_tests_properties(ngc_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

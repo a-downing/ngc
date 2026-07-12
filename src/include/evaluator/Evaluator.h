@@ -192,7 +192,7 @@ namespace ngc {
             auto ctx = createScopeContext(true);
 
             for(const auto &stmt : program) {
-                stmt->accept(*this, &ctx);
+                executeStatement(stmt, &ctx);
             }
         }
 
@@ -217,7 +217,7 @@ namespace ngc {
             }
 
             for(const auto &s : stmt->statements()) {
-                s->accept(*this, ctx);
+                executeStatement(s.get(), ctx);
             }
         }
 
@@ -272,12 +272,12 @@ namespace ngc {
         void visit(const IfStatement* stmt, VisitorContext* ctx) override {
             if(eval(stmt->condition(), ctx) != 0.0) {
                 auto newCtx = createScopeContext();
-                stmt->body()->accept(*this, &newCtx);
+                executeStatement(stmt->body(), &newCtx);
                 context(ctx)->action = newCtx.action;
             } else {
                 if(stmt->elseBody()) {
                     auto newCtx = createScopeContext();
-                    stmt->elseBody()->accept(*this, &newCtx);
+                    executeStatement(stmt->elseBody(), &newCtx);
                     context(ctx)->action = newCtx.action;
                 }
             }
@@ -289,7 +289,7 @@ namespace ngc {
                 bool doBreak = false;
 
                 for(const auto &s : stmt->body()->statements()) {
-                    s->accept(*this, &newCtx);
+                    executeStatement(s.get(), &newCtx);
 
                     if(newCtx.action == Context::CONTINUE) {
                         break;
@@ -358,7 +358,7 @@ namespace ngc {
             }
 
             for(const auto &s : stmt->body()->statements()) {
-                s->accept(*this, &newCtx);
+                executeStatement(s.get(), &newCtx);
 
                 if(newCtx.action == Context::RETURN) {
                     context(ctx)->result = newCtx.result;
@@ -489,6 +489,16 @@ namespace ngc {
             }
 
             m_subScope.back().emplace(sig, stmt);
+        }
+
+        void executeStatement(const Statement *statement, VisitorContext *ctx) {
+            try {
+                statement->accept(*this, ctx);
+            } catch(const std::exception &error) {
+                const auto location = statement->startToken().location();
+                if(std::string_view(error.what()).starts_with(location)) throw;
+                throw std::runtime_error(std::format("{}: {}", location, error.what()));
+            }
         }
 
         double eval(const RealExpression *expr, VisitorContext *ctx, const bool dereference = true) {

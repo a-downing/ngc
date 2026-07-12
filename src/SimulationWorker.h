@@ -22,6 +22,7 @@ class SimulationWorker {
     ngc::ExecutionDriver m_driver{ m_session, m_executor };
     std::vector<std::tuple<std::string, std::string>> m_programs;
     ngc::ToolTable m_toolTable;
+    std::vector<ngc::InterpreterStatusMessage> m_statusMessages;
 
     bool m_join = false;
     bool m_start = false;
@@ -85,7 +86,8 @@ public:
 
     ngc::SimulationSnapshot snapshot() const {
         std::scoped_lock lock(m_mutex);
-        auto result = m_executor.snapshot();
+        auto result = m_executor.lightweightSnapshot();
+        result.statusMessages = m_statusMessages;
         if(m_running && m_paused) result.status = ngc::SimulationStatus::Paused;
         return result;
     }
@@ -114,6 +116,7 @@ private:
             m_running = true;
             m_executor.reset();
             m_driver.reset();
+            m_statusMessages.clear();
             m_executor.setRapidSpeed(m_rapidSpeed);
             m_executor.setStatus(ngc::SimulationStatus::Running);
             lock.unlock();
@@ -154,8 +157,10 @@ private:
                     while(m_executor.canAccept()
                           && m_driver.pumpOne(
                               [](const auto &callback) { callback(); },
-                              [](const ngc::MachineCommand &, const ngc::position_t &, const ngc::ToolGeometry &) { })) {
+                              [](const ngc::MachineCommand &, const ngc::position_t &, const ngc::ToolGeometry &,
+                                 const ngc::WorkCoordinateSystem &) { })) {
                     }
+                    m_statusMessages = m_session.statusMessages();
                     lock.unlock();
                 }
 
