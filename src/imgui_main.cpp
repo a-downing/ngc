@@ -9,6 +9,7 @@
 #include "imgui_impl_opengl3.h"
 
 #include "Application.h"
+#include "machine/MachineConfiguration.h"
 
 #define GL_SILENCE_DEPRECATION
 #if defined(IMGUI_IMPL_OPENGL_ES2)
@@ -39,6 +40,12 @@ static void save_window_maximized(GLFWwindow *window) {
 }
 
 int main(int, char**) {
+    const auto configuration = ngc::loadMachineConfiguration("machine.toml");
+    if(!configuration) {
+        std::println(stderr, "Failed to load machine configuration: {}", configuration.error());
+        return 1;
+    }
+
     glfwSetErrorCallback(glfw_error_callback);
 
     if (!glfwInit()) {
@@ -99,7 +106,7 @@ int main(int, char**) {
 
     //auto font = io.Fonts->AddFontFromFileTTF("fonts/main_font.ttf", 20);
 
-    Application app(window);
+    Application app(window, *configuration);
     app.init();
 
     while (!glfwWindowShouldClose(window)) {

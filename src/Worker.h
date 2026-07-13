@@ -8,9 +8,9 @@
 #include <unordered_map>
 
 #include "evaluator/InterpreterSession.h"
-#include "machine/ExecutionDriver.h"
-#include "machine/SimulationExecutor.h"
+#include "machine/MockMotionBackend.h"
 #include "machine/ToolpathRecorder.h"
+#include "machine/TrajectoryExecutionDriver.h"
 #include "memory/Vars.h"
 
 class Worker {
@@ -18,19 +18,23 @@ class Worker {
     std::condition_variable m_cv;
     std::thread m_thread;
 
-    ngc::InterpreterSession m_session{ ngc::Machine::Unit::Inch, ngc::InterpretationMode::Preview };
-    ngc::SimulationExecutor m_executor;
-    ngc::ExecutionDriver m_driver{ m_session, m_executor };
+    ngc::InterpreterSession m_session;
+    ngc::MockMotionBackend m_backend;
+    ngc::TrajectoryExecutionDriver m_driver;
     ngc::ToolpathRecorder m_toolpath;
+    ngc::MockTrajectorySnapshot m_backendTrajectory;
     std::unordered_map<ngc::Var, double> m_parameterSnapshot;
 
     bool m_doJoin = false;
     bool m_doCompile = false;
     bool m_doExecute = false;
     bool m_busy = false;
+    ngc::EpochId m_nextEpoch = 1;
 
 public:
-    Worker() {
+    explicit Worker(const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch,
+                    const ngc::TrajectoryLimits limits = {})
+        : m_session(unit, ngc::InterpretationMode::Preview), m_driver(m_session, m_backend, limits) {
         refreshParameterSnapshot();
         m_thread = std::thread(&Worker::work, this);
     }
@@ -52,6 +56,7 @@ public:
 
     const ngc::Machine &machine() const { return m_session.machine(); }
     const ngc::ToolpathRecorder &toolpath() const { return m_toolpath; }
+    const ngc::MockTrajectorySnapshot &backendTrajectory() const { return m_backendTrajectory; }
 
     bool compiled() const {
         std::scoped_lock lock(m_mutex);
@@ -174,22 +179,34 @@ private:
         {
             std::scoped_lock lock(m_mutex);
             m_session.begin();
-            m_executor.reset();
-            m_driver.reset();
             m_toolpath.clear();
+            m_backend.clearTrajectoryDiagnostics();
+            m_backendTrajectory = {};
+            m_driver.setLimits({ 10.0, 100.0, 0.0001 });
+            if(!m_driver.begin(m_nextEpoch++)) {
+                m_busy = false;
+                return;
+            }
         }
 
         for(;;) {
-            m_driver.pumpOne([&](const auto &callback) {
-                std::scoped_lock lock(m_mutex);
-                callback();
-            }, [&](const ngc::MachineCommand &command, const ngc::position_t &toolOffset, const ngc::ToolGeometry &,
-                   const ngc::WorkCoordinateSystem &workCoordinateSystem) {
-                std::scoped_lock lock(m_mutex);
-                m_toolpath.consume(command, toolOffset, workCoordinateSystem,
-                    m_session.machine().state().modePath == ngc::GCPath::G64,
-                    m_session.machine().pathTolerance());
-            });
+            for(int fill = 0; fill < 64; ++fill) {
+                if(!m_driver.pumpOne([&](const auto &callback) {
+                    std::scoped_lock lock(m_mutex);
+                    callback();
+                }, [&](const ngc::MachineCommand &command, const ngc::PlanChunk &) {
+                    std::scoped_lock lock(m_mutex);
+                    if(const auto *probe = std::get_if<ngc::ProbeMove>(&command))
+                        (void)m_backend.configureSyntheticProbe(probe->id(), m_session.machine().toolGeometry().offset,
+                                                                m_session.machine().toolOffset());
+                    const ngc::WorkCoordinateSystem workCoordinateSystem {
+                        std::string(ngc::name(*m_session.machine().state().modeCoordSys)),
+                        m_session.machine().workOffset() };
+                    m_toolpath.consume(command, m_session.machine().toolOffset(), workCoordinateSystem,
+                        m_session.machine().state().modePath == ngc::GCPath::G64,
+                        m_session.machine().pathTolerance());
+                })) break;
+            }
 
             {
                 // nextWithBlocks() returns only while the evaluator is paused or after it has joined.
@@ -202,19 +219,21 @@ private:
                 break;
             }
 
-            m_executor.completeQueued();
+            m_backend.runUntilIdle();
             {
                 std::scoped_lock lock(m_mutex);
-                m_driver.deliverProbeResult();
+                m_driver.serviceBackend();
             }
 
-            if(m_driver.state() == ngc::ExecutionDriverState::Completed) break;
-            if(m_driver.state() == ngc::ExecutionDriverState::Error) {
+            if(m_driver.state() == ngc::TrajectoryDriverState::Completed) break;
+            if(m_driver.state() == ngc::TrajectoryDriverState::Error) {
                 break;
             }
         }
 
+        const auto backendTrajectory = m_backend.trajectorySnapshot();
         std::scoped_lock lock(m_mutex);
+        m_backendTrajectory = backendTrajectory;
         m_busy = false;
     }
 

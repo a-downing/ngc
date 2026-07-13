@@ -20,13 +20,32 @@ find_package(OpenGL REQUIRED)
 find_package(glm CONFIG REQUIRED)
 #find_package(glfw3 REQUIRED)
 add_subdirectory(glfw)
+set(BUILD_EXAMPLES OFF)
+set(BUILD_PYTHON_MODULE OFF)
+set(BUILD_CLOUD_CLIENT OFF)
+set(BUILD_TESTS OFF)
+set(BUILD_BENCHMARK OFF)
+set(BUILD_SHARED_LIBS OFF)
+add_subdirectory(ruckig EXCLUDE_FROM_ALL)
+target_compile_definitions(ruckig PUBLIC _USE_MATH_DEFINES)
+add_subdirectory(tomlplusplus EXCLUDE_FROM_ALL)
+unset(BUILD_EXAMPLES)
+unset(BUILD_PYTHON_MODULE)
+unset(BUILD_CLOUD_CLIENT)
+unset(BUILD_TESTS)
+unset(BUILD_BENCHMARK)
+unset(BUILD_SHARED_LIBS)
 
 add_library(ngc_core STATIC
+        src/ArcInterpolation.cpp
+        src/MachineConfiguration.cpp
+        src/ExactStopTrajectoryPlanner.cpp
         src/Evaluator.cpp
         src/Machine.cpp
-        src/SimulationExecutor.cpp
+        src/MockMotionBackend.cpp
         src/ToolTable.cpp)
 target_include_directories(ngc_core PUBLIC src/include)
+target_link_libraries(ngc_core PRIVATE ruckig tomlplusplus::tomlplusplus)
 ngc_target_defaults(ngc_core)
 
 # add_library(utils)

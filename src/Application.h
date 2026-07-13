@@ -2,6 +2,8 @@
 
 #include <memory>
 
+#include "machine/MachineConfiguration.h"
+
 struct GLFWwindow;
 
 class ApplicationImpl;
@@ -11,7 +13,7 @@ class Application final {
 
 public:
     Application() = delete;
-    explicit Application(GLFWwindow *window);
+    Application(GLFWwindow *window, const ngc::MachineConfiguration &configuration);
     ~Application();
 
     Application(const Application &) = delete;

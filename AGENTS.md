@@ -8,13 +8,13 @@ This repository is a C++23 non-real-time CNC front end. Its current pipeline is:
 lexer -> parser/AST -> InterpreterSession/evaluator -> modal Machine -> MachineCommand stream -> consumer(s)
 ```
 
-`InterpreterSession` incrementally evaluates the program and emits one `MachineCommand` at a time. `ExecutionDriver` connects an interpreter session to `SimulationExecutor` and owns command pumping and the probe-result barrier handshake. `Worker` runs immediate preview and retains a `ToolpathRecorder`; `SimulationWorker` runs timed playback and exposes `SimulationSnapshot` state to the OpenGL UI. Preview and timed simulation intentionally remain separate retained products while sharing the same executor/probing path.
+`InterpreterSession` incrementally evaluates the program and emits one `MachineCommand` at a time. `TrajectoryExecutionDriver` connects it to `ExactStopTrajectoryPlanner`, which compiles timed axis-polynomial `PlanChunk` values for the generic `MotionBackend` SPSC contract and owns the probe-result barrier handshake. `MockMotionBackend` is the current non-RT implementation of that production-shaped contract. `Worker` runs immediate preview and retains a `ToolpathRecorder`; `SimulationWorker` runs timed playback and exposes NRT `SimulationSnapshot` presentation state to the OpenGL UI.
 
-This is not yet a trajectory planner, real-time executor, or HAL component. Preserve the separation between interpretation, planning, real-time execution, and hardware access.
+The repository now contains an exact-stop trajectory planner and a non-RT mock backend, but not a real-time executor or HAL component. Preserve the separation between interpretation, planning, real-time execution, and hardware access.
 
 ## Build environment
 
-The active development environment is Windows with Clang, Ninja, CMake, and vcpkg. GLM is supplied by vcpkg; GLFW and ImGui are Git submodules.
+The active development environment is Windows with Clang, Ninja, CMake, and vcpkg. GLM is supplied by vcpkg; GLFW, ImGui, Ruckig, and toml++ are Git submodules.
 
 Configure a fresh build with:
 
@@ -36,6 +36,12 @@ ctest --test-dir build --output-on-failure
 Tests are framework-free in `src/test.cpp`. CTest runs them from the source directory because `Machine` loads `tool_table.txt` relative to the working directory.
 
 Project warning, optimization, and debug flags are target-scoped. Bundled GLFW and ImGui sources live in their own dependency targets and must not inherit project-wide compiler flags.
+
+## Machine configuration
+
+`machine.toml` is loaded and validated once at application startup through the project-owned `MachineConfiguration` layer. toml++ must remain isolated to that loader; planners, workers, and backends receive typed configuration values rather than parsing files. A missing or invalid configuration is a startup error with source location context.
+
+`machine.units` selects the fixed internal `Machine::Unit`. Current `[trajectory]` values use that machine unit and seconds: `path_acceleration`, `path_jerk`, `rapid_velocity`, and `arc_chord_tolerance`. `rapid_velocity` is converted at the loader boundary to the canonical per-minute representation currently expected by the planner. Configuration parsing and disk access must never enter the RT backend.
 
 ## Important current decisions
 
@@ -62,9 +68,19 @@ Project warning, optimization, and debug flags are target-scoped. Bundled GLFW a
 - `InterpreterSession` retains one chronological typed status stream containing `Print` and `Error` entries. Do not split terminal interpreter errors back into a separate print/error collection or regroup messages by severity in the UI. Prints are blue and prefixed `PRINT:`; errors are red and prefixed `ERROR:`.
 - Errors associated with a source statement or block must include source name, line, and column. Statement evaluation and consumer-thread block processing both add location context without duplicating an existing location prefix.
 
+## Exact-stop trajectory planning
+
+`ExactStopTrajectoryPlanner` currently treats every canonical motion as an exact stop. It uses one-degree-of-freedom Ruckig rest-to-rest timing to produce jerk-limited S-curve phases, maps those phases onto axis cubic position polynomials, and validates the emitted axis-space acceleration and jerk. The current limits are aggregate path/vector limits, not yet independent per-axis constraints.
+
+Lines and adaptively subdivided circular/helical arcs are emitted through the same fixed-capacity `PlanChunk` representation. Arc speed receives an up-front curvature/centripetal acceleration cap, followed by polynomial constraint validation and uniform time stretching. `arc_chord_tolerance` currently drives a conservative straight-chord subdivision formula even though the emitted spans are cubic; replace this with verified cubic arc approximation before increasing RT plan density.
+
+The RT-facing contract contains only bounded, allocation-free plan/control/event/snapshot data transported by SPSC channels. Cubic spans provide position as a function of span time and include cached terminal state. Do not add UI strings, TOML objects, G-code entities, synthetic probe settings, or debug trajectory storage to `MotionBackend`.
+
+`MockMotionBackend` implements the same contract without claiming real-time behavior. Its separate `MockTrajectoryDiagnostics` interface records actually executed/truncated polynomial spans for the red/white UI development overlay. That diagnostic path is mock-only and must not be added to the production RT interface.
+
 ## Concurrency and lifecycle
 
-`Worker` and `SimulationWorker` each own a persistent `InterpreterSession` on a background thread. Both use `ExecutionDriver` and `SimulationExecutor`; preview calls `completeQueued()` for immediate pacing, while timed simulation advances from a steady clock and playback-rate multiplier. Any mutation or traversal shared with the GUI must be protected by the owning worker mutex. Do not hold a GUI-facing mutex while waiting for future physical motion or probe completion.
+`Worker` and `SimulationWorker` each own a persistent `InterpreterSession` on a background thread. Both use `TrajectoryExecutionDriver` and `MockMotionBackend`; preview drains the mock backend immediately, while timed simulation advances it from a steady clock and playback-rate multiplier. UI-only strings, WCS/modal metadata, tool overlays, and block lifecycle state remain in NRT presentation storage keyed by epoch/chunk ID and never cross the RT contract. Any mutation or traversal shared with the GUI must be protected by the owning worker mutex. Do not hold a GUI-facing mutex while waiting for future physical motion or probe completion.
 
 Timed simulation fills the executor's bounded queue before advancing so dense short-segment paths are not limited to one command per display/update cycle. Queue filling must stop at a probe barrier and resume only after the matching result is delivered. When the executor drains and interpretation can immediately provide more commands, do not impose the normal 8 ms timed wait.
 
@@ -74,7 +90,7 @@ Program execution must not append to a previous run or start from its final posi
 
 Exceptions raised while processing evaluator messages on the consumer thread must be caught by `InterpreterSession` and returned as `InterpreterError`. Do not allow invalid G-code or modal state to escape into a Visual C++ assertion, `std::exit`, or GUI-thread termination.
 
-Timed simulation must stop immediately on an interpreter error and discard active/queued simulated motion. Its GUI snapshot is deliberately lightweight: the full completed `BlockExecution` history remains available from `SimulationExecutor::snapshot()`, while `SimulationWorker` uses compact per-source completed-line flags rather than copying every completed block and its strings each frame.
+Timed simulation must stop immediately on an interpreter error and discard active/queued simulated motion. Its GUI snapshot is deliberately lightweight and uses compact per-source completed-line flags rather than copying every completed block and its strings each frame.
 
 A consumer must return a matching `ProbeResult` with `provideProbeResult()` before evaluation can pass a probe barrier.
 
@@ -88,15 +104,15 @@ Machine emits ProbeMove -> real-time executor/HAL -> executor returns ProbeResul
 
 The real-time executor must latch the position at the probe signal transition and report it separately from the final stopped position. The interpreter pauses at a probe barrier because later blocks may read `#5061` through `#5070`.
 
-Current preview and timed simulation both use `SimulationExecutor`. Its preview-only synthetic probe contact accounts for the selected physical tool offset even when G43 is inactive, reports matching trigger/stopped machine positions, and lets the interpreter resume. This is simulation behavior, not a physical-execution implementation. A physical executor must sample the probe input, latch the transition position, stop motion, and return a real `ProbeResult`.
+Current preview and timed simulation both use `MockMotionBackend`. Its mock-only synthetic probe configuration accounts for the selected physical tool offset even when G43 is inactive, reports matching trigger/stopped machine positions, and lets the interpreter resume through the same backend event channel. This is simulation behavior and is deliberately absent from `MotionBackend`. A physical backend must sample the probe input during the scheduled probe span, latch the transition position, stop motion, and return a real `ProbeResult`.
 
 Toolpath preview geometry is canonical program geometry: it is derived from emitted command coordinates plus G53/active work/tool-offset semantics. Do not shift retained toolpath lines using physical tool geometry. Physical tool length and diameter belong to the simulated tool overlay and synthetic contact behavior.
 
-`ExecutionDriver` captures the active WCS name/offset and active modal G-code set with each command. G53 commands retain the modal WCS metadata even though their motion bypasses the work offset. `ToolpathRecorder` retains distinct WCS frames used by preview motion; timed simulation applies WCS/modal metadata only when the corresponding queued command becomes active, not when the interpreter reads ahead.
+`TrajectoryExecutionDriver` associates command presentation metadata with epoch/chunk identity outside the RT contract. G53 commands retain the modal WCS metadata even though their motion bypasses the work offset. `ToolpathRecorder` retains distinct WCS frames used by preview motion; timed simulation applies WCS/modal metadata only when the corresponding queued command becomes active, not when the interpreter reads ahead.
 
 ## Experimental G64 spline preview
 
-The current G64 work is deliberately isolated preview experimentation, not a trajectory planner. `ToolpathRecorder` retains the active G64 flag and optional machine-unit tolerance alongside each command without changing `MachineCommand`. Spline construction occurs only while rebuilding the revision-cached preview geometry. Do not route these preview splines into `SimulationExecutor`, interpretation, or a future real executor.
+The current G64 work is deliberately isolated preview experimentation, not executable trajectory planning. `ToolpathRecorder` retains the active G64 flag and optional machine-unit tolerance alongside each command without changing `MachineCommand`. Spline construction occurs only while rebuilding the revision-cached preview geometry. Do not route these preview splines into `MotionBackend`; executable motion currently uses exact-stop compilation.
 
 Preserve exact canonical lines and arcs outside local blend neighborhoods. The experiment has two cases:
 
@@ -139,10 +155,14 @@ MDI is currently connected only to simulated execution. Preserve a target-select
 
 Likely next steps are:
 
-1. Add a motion/planner consumer that owns bounded command buffering and supplies real probe results to `InterpreterSession`; reuse the `ExecutionDriver` barrier contract without treating `SimulationExecutor` as a real executor.
-2. Define abort, fault, and cancellation behavior for a pending probe and its evaluator thread.
-3. Expand G38 support beyond G38.3 and test unsuccessful, aborted, and faulted probe results.
-4. Later add R-form arcs, executable G64/path-control semantics, richer canonical records, and trajectory planning. Do not mistake the experimental preview fitter for this planner work.
+1. Extend `machine.toml` and `TrajectoryLimits` with independent XYZABC velocity, acceleration, and jerk constraints; calculate path limits from axis derivatives and retain final axis-space verification as authority.
+2. Replace conservative chord-based arc subdivision with tolerance-verified cubic circular/helical approximation, while retaining the existing cubic RT representation.
+3. Design executable G64 as a bounded-look-ahead, non-RT planner. Build tolerance-bounded path blends, calculate curvature/axis velocity ceilings, run forward/backward reachability, and jointly emit time-domain cubic spans with shared position, velocity, and acceleration at boundaries. Published prefixes become immutable; difficult windows must safely slow down or fall back to exact stop.
+4. Instrument planning latency, queue reserve, constraint margins, and planned duration. Later compare representative paths against a development-only offline optimizer before pursuing extra time-optimal complexity.
+5. Add a physical implementation of `MotionBackend` using the existing bounded SPSC plan/control/event/snapshot contract, and define abort, fault, cancellation, and pending-probe behavior before connecting hardware.
+6. Expand G38 support beyond G38.3 and test unsuccessful, aborted, and faulted probe results; later add R-form arcs and richer canonical records.
+
+Do not route the experimental preview spline fitter directly into execution. It is useful geometric research, but executable G64 must independently prove ordered path tolerance, per-axis constraints, and C2 time-domain continuity.
 
 ## Worktree discipline
 

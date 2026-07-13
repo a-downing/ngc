@@ -1,5 +1,6 @@
 #include "Application.h"
 #include "PreviewSpline.h"
+#include "machine/ArcInterpolation.h"
 
 #include <filesystem>
 #include <fstream>
@@ -88,10 +89,10 @@ class ApplicationImpl final {
 
     std::string m_errorMessage;
 
-    Worker m_worker{};
-    SimulationWorker m_simulation{};
+    Worker m_worker;
+    SimulationWorker m_simulation;
     double m_simulationRate = 1.0;
-    double m_simulatedRapidSpeed = 100.0;
+    double m_simulatedRapidSpeed;
 
     double m_time = 0.0;
     double m_dt = 0.0;
@@ -107,6 +108,7 @@ class ApplicationImpl final {
 
     struct PreviewRenderCache {
         std::optional<std::uint64_t> revision;
+        std::optional<std::uint64_t> backendTrajectoryRevision;
         std::vector<glm::dvec3> feedLines;
         std::vector<glm::dvec3> rapidLines;
         std::vector<glm::dvec3> g53FeedLines;
@@ -117,6 +119,8 @@ class ApplicationImpl final {
         std::vector<glm::dvec3> g64ClusterSplineLines;
         std::vector<glm::dvec3> g64ControlPolygon;
         std::vector<glm::dvec3> g64ControlPoints;
+        std::vector<glm::dvec3> backendTrajectoryLines;
+        std::vector<glm::dvec3> backendStopTailLines;
         std::vector<glm::dvec3> darkPoints;
         std::vector<glm::dvec3> lightPoints;
     } m_previewRenderCache;
@@ -213,7 +217,10 @@ class ApplicationImpl final {
 
 public:
     ApplicationImpl() = delete;
-    explicit ApplicationImpl(GLFWwindow *window) : m_window(window) { }
+    ApplicationImpl(GLFWwindow *window, const ngc::MachineConfiguration &configuration)
+        : m_window(window), m_worker(configuration.unit, configuration.trajectory),
+          m_simulation(configuration.unit, configuration.trajectory),
+          m_simulatedRapidSpeed(configuration.trajectory.rapidSpeed) { }
 
     void init() {
         auto result = m_tools.load();
@@ -465,7 +472,9 @@ public:
 
         m_worker.lock([&] {
             const auto &toolpath = m_worker.toolpath();
-            if(m_previewRenderCache.revision == toolpath.revision()) return;
+            const auto &backendTrajectory = m_worker.backendTrajectory();
+            if(m_previewRenderCache.revision == toolpath.revision()
+               && m_previewRenderCache.backendTrajectoryRevision == backendTrajectory.revision) return;
 
             auto &cache = m_previewRenderCache;
             cache.feedLines.clear();
@@ -478,6 +487,8 @@ public:
             cache.g64ClusterSplineLines.clear();
             cache.g64ControlPolygon.clear();
             cache.g64ControlPoints.clear();
+            cache.backendTrajectoryLines.clear();
+            cache.backendStopTailLines.clear();
             cache.darkPoints.clear();
             cache.lightPoints.clear();
 
@@ -655,7 +666,29 @@ public:
                 }
             }
             flushSpline();
+
+            const auto evaluatePolynomial = [](const ngc::AxisPolynomialSpan &span, const double u) {
+                const auto component = [&](const double ngc::position_t::*member) {
+                    return ((span.a.*member*u + span.b.*member)*u + span.c.*member)*u + span.d.*member;
+                };
+                return glm::dvec3(component(&ngc::position_t::x), component(&ngc::position_t::y),
+                                  component(&ngc::position_t::z));
+            };
+            for(const auto &executed : backendTrajectory.spans) {
+                auto &vertices = executed.stopTail ? cache.backendStopTailLines : cache.backendTrajectoryLines;
+                constexpr int SAMPLES = 32;
+                auto previous = evaluatePolynomial(executed.polynomial, 0.0);
+                for(int sample = 1; sample <= SAMPLES; ++sample) {
+                    const auto u = executed.executedUntil * static_cast<double>(sample) / SAMPLES;
+                    const auto current = evaluatePolynomial(executed.polynomial, u);
+                    if(glm::length(current - previous) > 1e-12) segment(vertices, previous, current);
+                    previous = current;
+                }
+                const auto terminal = point(executed.terminalPosition);
+                if(glm::length(terminal - previous) > 1e-12) segment(vertices, previous, terminal);
+            }
             cache.revision = toolpath.revision();
+            cache.backendTrajectoryRevision = backendTrajectory.revision;
         });
     }
 
@@ -900,6 +933,9 @@ public:
         glPointSize(3.0f);
         drawVertices(m_previewRenderCache.darkPoints, GL_POINTS, 0.0f, 0.0f, 0.0f);
         drawVertices(m_previewRenderCache.lightPoints, GL_POINTS, 0.1f, 0.55f, 0.1f);
+        glLineWidth(1.0f);
+        drawVertices(m_previewRenderCache.backendTrajectoryLines, GL_LINES, 1.0f, 0.15f, 0.15f);
+        drawVertices(m_previewRenderCache.backendStopTailLines, GL_LINES, 1.0f, 1.0f, 1.0f);
         glLineWidth(1.0f);
 
         const auto simulation = m_simulation.snapshot();
@@ -1632,7 +1668,8 @@ public:
     }
 };
 
-Application::Application(GLFWwindow *window) : m_impl(std::make_unique<ApplicationImpl>(window)) { }
+Application::Application(GLFWwindow *window, const ngc::MachineConfiguration &configuration)
+    : m_impl(std::make_unique<ApplicationImpl>(window, configuration)) { }
 Application::~Application() = default;
 
 void Application::init() { m_impl->init(); }

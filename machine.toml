@@ -1,0 +1,13 @@
+# Values in this file use the configured machine unit and seconds.
+[machine]
+units = "inch"
+
+[trajectory]
+# machine-units / second^2
+path_acceleration = 5.0
+# machine-units / second^3
+path_jerk = 20.0
+# machine-units / second
+rapid_velocity = 3.33
+# machine-units
+arc_chord_tolerance = 0.0001

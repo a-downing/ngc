@@ -4,3 +4,9 @@
 [submodule "glfw"]
 	path = glfw
 	url = https://github.com/glfw/glfw.git
+[submodule "ruckig"]
+	path = ruckig
+	url = https://github.com/pantor/ruckig.git
+[submodule "tomlplusplus"]
+	path = tomlplusplus
+	url = https://github.com/marzer/tomlplusplus.git
