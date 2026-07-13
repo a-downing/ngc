@@ -15,6 +15,7 @@ namespace ngc {
     using ChunkId = std::uint64_t;
     using SpanId = std::uint64_t;
     using RequestId = std::uint64_t;
+    using JogId = std::uint64_t;
     using BranchSequence = std::uint64_t;
 
     struct MotionState {
@@ -182,6 +183,64 @@ namespace ngc {
     enum class PublishResult : std::uint8_t { Published, Full, Invalid };
     enum class SubmitResult : std::uint8_t { Submitted, Full };
 
+    enum class AxisId : std::uint8_t { X, Y, Z, A, B, C };
+    enum class JogTargetType : std::uint8_t { Axis, JointGroup, Joint };
+
+    struct JogTarget {
+        JogTargetType type = JogTargetType::Axis;
+        AxisId axis = AxisId::X;
+        // Zero for Axis. JointGroup selects all coupled joints atomically; Joint
+        // must contain exactly one bit. The backend validates the mask against
+        // its typed machine configuration. JointGroup and Joint targets remain
+        // usable before homing; Axis targets require a valid machine coordinate.
+        JointMask joints = 0;
+    };
+
+    struct JogMotionLimits {
+        double velocity = 0.0;
+        double acceleration = 0.0;
+        double jerk = 0.0;
+    };
+
+    struct JogTravelRange {
+        double minimum = 0.0;
+        double maximum = 0.0;
+        bool enabled = false;
+    };
+
+    // Continuous jogging is a renewable dead-man lease measured in fixed servo
+    // ticks. The backend clamps leaseTicks to its configured maximum and begins
+    // a constrained stop if the matching renewal is not received in time.
+    struct StartContinuousJogRequest {
+        RequestId id = 0;
+        JogId jog = 0;
+        JogTarget target{};
+        double signedVelocity = 0.0;
+        // Reduced limits for entering the jog; stopLimits retain the selected
+        // axis/joint's physical stopping authority.
+        JogMotionLimits limits{};
+        JogMotionLimits stopLimits{};
+        JogTravelRange travel{};
+        std::uint32_t leaseTicks = 0;
+    };
+
+    struct StartIncrementalJogRequest {
+        RequestId id = 0;
+        JogId jog = 0;
+        JogTarget target{};
+        double distance = 0.0;
+        double velocity = 0.0;
+        // Reduced jog profile limits and separate physical stop limits.
+        JogMotionLimits limits{};
+        JogMotionLimits stopLimits{};
+        JogTravelRange travel{};
+    };
+
+    // Renewals and stops apply only to the exactly matching active jog token;
+    // delayed requests for an old token cannot revive or stop a newer jog.
+    struct RenewJogLeaseRequest { RequestId id = 0; JogId jog = 0; };
+    struct StopJogRequest { RequestId id = 0; JogId jog = 0; };
+
     struct EnableRequest { RequestId id = 0; };
     struct DisableRequest { RequestId id = 0; };
     struct StartRequest { RequestId id = 0; EpochId epoch = 0; };
@@ -192,7 +251,10 @@ namespace ngc {
     struct SetJointPositionRequest { RequestId id = 0; JointMask joints = 0; JointVector position{}; };
     using ControlRequest = std::variant<EnableRequest, DisableRequest, StartRequest,
                                         FeedHoldRequest, ResumeRequest, AbortRequest, ResetRequest,
-                                        SetJointPositionRequest>;
+                                        SetJointPositionRequest, StartContinuousJogRequest,
+                                        StartIncrementalJogRequest, RenewJogLeaseRequest,
+                                        StopJogRequest>;
+    static_assert(std::is_trivially_copyable_v<ControlRequest>);
 
     struct ChunkAccepted { EpochId epoch; ChunkId chunk; };
     struct ChunkRejected { EpochId epoch; ChunkId chunk; };
@@ -214,12 +276,30 @@ namespace ngc {
         JointMotionState triggerState;
         JointMotionState stoppedState;
     };
+    enum class JogStopReason : std::uint8_t {
+        TargetReached,
+        RequestedStop,
+        LeaseExpired,
+        LimitReached,
+        Disabled,
+        Aborted,
+        Fault,
+        Superseded,
+    };
+    struct JogStopped {
+        JogId jog;
+        JogTarget target;
+        JogStopReason reason;
+        MotionState axisState;
+        JointMotionState jointState;
+    };
     struct RequestCompleted { RequestId request; bool succeeded; };
     struct BackendHeld { EpochId epoch; MotionState state; ProgramCursor cursor; };
     struct BackendFault { std::uint32_t code; };
     using ExecutionEvent = std::variant<ChunkAccepted, ChunkRejected, ChunkRetired, BranchSelected,
                                         TriggeredMoveCompleted, TriggeredJointMoveCompleted,
-                                        RequestCompleted, BackendHeld, BackendFault>;
+                                        JogStopped, RequestCompleted, BackendHeld, BackendFault>;
+    static_assert(std::is_trivially_copyable_v<ExecutionEvent>);
 
     struct ExecutionSnapshot {
         BackendState state = BackendState::Disabled;

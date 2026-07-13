@@ -19,6 +19,11 @@ namespace ngc {
         double schedulerPeriod = 0.01;
     };
 
+    struct JoggingConfiguration {
+        double acceleration = 0.0;
+        double jerk = 0.0;
+    };
+
     struct AxisConfiguration {
         Machine::Axis axis = Machine::Axis::X;
         std::vector<JointId> joints;
@@ -84,6 +89,7 @@ namespace ngc {
         std::vector<Machine::Axis> coordinates;
         TrajectoryLimits trajectory;
         SimulationTiming simulation;
+        JoggingConfiguration jogging;
         std::vector<AxisConfiguration> axes;
         std::vector<DigitalInputConfiguration> digitalInputs;
         ProbingConfiguration probing;

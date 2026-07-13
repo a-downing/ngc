@@ -5,7 +5,9 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstddef>
 #include <cstdint>
+#include <deque>
 #include <mutex>
 #include <map>
 #include <ranges>
@@ -24,6 +26,7 @@
 #include "WindowsServoPacer.h"
 
 class SimulationWorker {
+    static constexpr std::size_t MAX_PENDING_JOG_CONTROLS = 16;
     struct ChunkPresentation {
         ngc::ToolGeometry tool{};
         ngc::position_t activeToolOffset{};
@@ -56,6 +59,9 @@ class SimulationWorker {
     bool m_running = false;
     bool m_preserveState = false;
     bool m_home = false;
+    std::deque<ngc::ControlRequest> m_jogControls;
+    std::optional<ngc::JogId> m_activeJog;
+    ngc::JointMask m_homedJoints = 0;
     std::vector<ngc::AxisConfiguration> m_axes;
     std::vector<ngc::JointConfiguration> m_joints;
     ngc::HomingConfiguration m_homing;
@@ -102,7 +108,7 @@ public:
     bool start(const std::vector<std::tuple<std::string, std::string>> &programs, const ngc::ToolTable &tools,
                const bool preserveState = false) {
         std::scoped_lock lock(m_mutex);
-        if(m_running || m_start || m_home || programs.empty()) return false;
+        if(m_running || m_start || m_home || m_activeJog || programs.empty()) return false;
         m_programs = programs;
         m_toolTable = tools;
         m_preserveState = preserveState;
@@ -116,7 +122,7 @@ public:
 
     bool resetSimulation() {
         std::scoped_lock lock(m_mutex);
-        if(m_running || m_start || m_home) return false;
+        if(m_running || m_start || m_home || m_activeJog) return false;
         m_session.machine().beginProgramRun();
         m_snapshot = {};
         clearPresentation();
@@ -126,7 +132,7 @@ public:
 
     bool home() {
         std::scoped_lock lock(m_mutex);
-        if(m_running || m_start || m_home || m_joints.empty() || m_homing.groups.empty()) return false;
+        if(m_running || m_start || m_home || m_activeJog || m_joints.empty() || m_homing.groups.empty()) return false;
         m_home = true;
         m_stop = false;
         m_paused = false;
@@ -142,11 +148,59 @@ public:
         return !m_joints.empty() && !m_homing.groups.empty();
     }
 
+    bool startJog(const ngc::ControlRequest &request) {
+        const auto jog = std::visit([](const auto &value) -> std::optional<ngc::JogId> {
+            using T = std::decay_t<decltype(value)>;
+            if constexpr(std::same_as<T, ngc::StartContinuousJogRequest>
+                         || std::same_as<T, ngc::StartIncrementalJogRequest>) return value.jog;
+            return std::nullopt;
+        }, request);
+        std::scoped_lock lock(m_mutex);
+        if(!jog || *jog == 0 || m_running || m_start || m_home || m_activeJog) return false;
+        m_activeJog = *jog;
+        m_jogControls.push_back(request);
+        m_snapshot.status = ngc::SimulationStatus::Running;
+        m_snapshot.jogging = true;
+        m_snapshot.lastJogStopReason.reset();
+        m_cv.notify_all();
+        return true;
+    }
+
+    bool renewJog(const ngc::RequestId request, const ngc::JogId jog) {
+        std::scoped_lock lock(m_mutex);
+        if(!m_activeJog || *m_activeJog != jog) return false;
+        if(std::ranges::any_of(m_jogControls, [&](const auto &control) {
+            const auto *renewal = std::get_if<ngc::RenewJogLeaseRequest>(&control);
+            return renewal && renewal->jog == jog;
+        })) return true;
+        if(m_jogControls.size() >= MAX_PENDING_JOG_CONTROLS) return false;
+        m_jogControls.emplace_back(ngc::RenewJogLeaseRequest { request, jog });
+        m_cv.notify_all();
+        return true;
+    }
+
+    bool stopJog(const ngc::RequestId request, const ngc::JogId jog) {
+        std::scoped_lock lock(m_mutex);
+        if(!m_activeJog || *m_activeJog != jog) return false;
+        std::erase_if(m_jogControls, [&](const auto &control) {
+            const auto *renewal = std::get_if<ngc::RenewJogLeaseRequest>(&control);
+            return renewal && renewal->jog == jog;
+        });
+        if(std::ranges::any_of(m_jogControls, [&](const auto &control) {
+            const auto *stop = std::get_if<ngc::StopJogRequest>(&control);
+            return stop && stop->jog == jog;
+        })) return true;
+        if(m_jogControls.size() >= MAX_PENDING_JOG_CONTROLS) return false;
+        m_jogControls.emplace_back(ngc::StopJogRequest { request, jog });
+        m_cv.notify_all();
+        return true;
+    }
+
     void pause() { std::scoped_lock lock(m_mutex); if(m_running) { m_paused = true; m_executorPaused = true; } }
     void resume() { std::scoped_lock lock(m_mutex); if(m_running) { m_paused = false; m_executorPaused = false; m_cv.notify_all(); } }
     void stop() {
         std::scoped_lock lock(m_mutex);
-        if(m_running || m_start || m_home) {
+        if(m_running || m_start || m_home || m_activeJog) {
             m_stop = true;
             m_start = false;
             m_home = false;
@@ -289,6 +343,7 @@ private:
     }
 
     void applyHomingBackendSnapshot(const ngc::ExecutionSnapshot &backend) {
+        m_snapshot.joints = backend.commandedJoints;
         for(const auto &axis : m_axes) {
             double sum = 0.0;
             std::size_t count = 0;
@@ -550,6 +605,124 @@ private:
         m_running = false;
         m_snapshot.status = ngc::SimulationStatus::Completed;
         m_snapshot.hasActiveMotion = false;
+        m_homedJoints = allJoints;
+        m_snapshot.homedJoints = m_homedJoints;
+        updateHomingToolPose();
+    }
+
+    void failJog(const std::string &message) {
+        std::scoped_lock lock(m_mutex);
+        m_snapshot.status = ngc::SimulationStatus::Error;
+        m_snapshot.error = message;
+        m_snapshot.hasActiveMotion = false;
+        m_snapshot.jogging = false;
+        m_activeJog.reset();
+        m_jogControls.clear();
+        m_running = false;
+    }
+
+    void runJogging(const ngc::ControlRequest &firstRequest) {
+        const auto epoch = m_nextEpoch++;
+        const auto firstRequestId = std::visit([](const auto &request) { return request.id; }, firstRequest);
+        ngc::RequestId internalRequest = std::numeric_limits<ngc::RequestId>::max() - 16;
+        ngc::JointMask allJoints = 0;
+        ngc::JointVector initial;
+        {
+            std::scoped_lock lock(m_mutex);
+            m_snapshot.status = ngc::SimulationStatus::Running;
+            m_snapshot.error.clear();
+            m_snapshot.jogging = true;
+            m_snapshot.homedJoints = m_homedJoints;
+            for(const auto &joint : m_joints) {
+                allJoints |= ngc::JointMask { 1 } << joint.id;
+                initial[joint.id] = axisComponent(m_snapshot.machinePosition, joint.axis)
+                    * joint.coordinateScale;
+            }
+            std::visit([&](const auto &request) {
+                using T = std::decay_t<decltype(request)>;
+                if constexpr(std::same_as<T, ngc::StartContinuousJogRequest>
+                             || std::same_as<T, ngc::StartIncrementalJogRequest>)
+                    m_snapshot.activeJogTarget = request.target;
+            }, firstRequest);
+            updateHomingToolPose();
+        }
+
+        if(!submitHomingControl(ngc::ResetRequest { internalRequest--, epoch })
+           || !submitHomingControl(ngc::EnableRequest { internalRequest-- })
+           || !setHomingJointPositions(epoch, allJoints, initial, internalRequest)
+           || m_backend.trySubmit(firstRequest) != ngc::SubmitResult::Submitted) {
+            failJog("failed to initialize the mock backend for jogging");
+            return;
+        }
+        m_backend.advance(0.0);
+
+        bool finished = false;
+        bool abortSubmitted = false;
+        while(!finished) {
+            std::deque<ngc::ControlRequest> controls;
+            bool joining = false;
+            {
+                std::scoped_lock lock(m_mutex);
+                joining = m_join;
+                if((m_stop || joining) && !abortSubmitted) {
+                    controls.emplace_back(ngc::AbortRequest { internalRequest-- });
+                    abortSubmitted = true;
+                    m_stop = false;
+                }
+                controls.insert(controls.end(), m_jogControls.begin(), m_jogControls.end());
+                m_jogControls.clear();
+            }
+            for(const auto &control : controls) {
+                if(m_backend.trySubmit(control) != ngc::SubmitResult::Submitted) {
+                    failJog("mock backend jog control channel is full");
+                    return;
+                }
+            }
+
+            const auto multiplier = m_executorTickMultiplier.load(std::memory_order_relaxed);
+            const auto ticks = static_cast<std::uint64_t>(m_servoTicksPerSchedulerPeriod) * multiplier;
+            for(std::uint64_t tick = 0; tick < ticks; ++tick)
+                m_backend.advanceTick(m_servoPeriod, tick + 1 == ticks);
+
+            ngc::ExecutionSnapshot backendSnapshot;
+            while(m_backend.tryTakeSnapshot(backendSnapshot)) {
+                std::scoped_lock lock(m_mutex);
+                applyHomingBackendSnapshot(backendSnapshot);
+            }
+            {
+                std::scoped_lock lock(m_mutex);
+                m_snapshot.servoTicks += ticks;
+            }
+
+            ngc::ExecutionEvent event;
+            while(m_backend.tryTakeEvent(event)) {
+                if(const auto *completed = std::get_if<ngc::RequestCompleted>(&event)) {
+                    if(!completed->succeeded && completed->request == firstRequestId) {
+                        failJog("mock backend rejected a jog control request");
+                        return;
+                    }
+                } else if(const auto *stopped = std::get_if<ngc::JogStopped>(&event)) {
+                    std::scoped_lock lock(m_mutex);
+                    if(m_activeJog && stopped->jog == *m_activeJog) {
+                        m_snapshot.lastJogStopReason = stopped->reason;
+                        finished = true;
+                    }
+                } else if(const auto *fault = std::get_if<ngc::BackendFault>(&event)) {
+                    failJog("mock jogging backend fault " + std::to_string(fault->code));
+                    return;
+                }
+            }
+            if(!finished) std::this_thread::sleep_for(std::chrono::duration<double>(m_schedulerPeriod));
+            if(joining && finished) break;
+        }
+
+        std::scoped_lock lock(m_mutex);
+        m_running = false;
+        m_activeJog.reset();
+        m_snapshot.status = ngc::SimulationStatus::Completed;
+        m_snapshot.jogging = false;
+        m_snapshot.hasActiveMotion = false;
+        m_snapshot.activeJogTarget.reset();
         updateHomingToolPose();
     }
 
@@ -557,8 +730,17 @@ private:
         using clock = std::chrono::steady_clock;
         for(;;) {
             std::unique_lock lock(m_mutex);
-            m_cv.wait(lock, [&] { return m_join || m_start || m_home; });
+            m_cv.wait(lock, [&] { return m_join || m_start || m_home || !m_jogControls.empty(); });
             if(m_join) return;
+            if(!m_jogControls.empty()) {
+                auto request = std::move(m_jogControls.front());
+                m_jogControls.pop_front();
+                m_running = true;
+                m_stop = false;
+                lock.unlock();
+                runJogging(request);
+                continue;
+            }
             if(m_home) {
                 m_home = false;
                 m_running = true;

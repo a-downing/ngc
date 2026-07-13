@@ -143,6 +143,7 @@ namespace ngc {
             const auto *machine = document["machine"].as_table();
             const auto *trajectory = document["trajectory"].as_table();
             const auto *simulation = document["simulation"].as_table();
+            const auto *jogging = document["jogging"].as_table();
             const auto *axes = document["axes"].as_table();
             const auto *digitalInputs = document["digital_inputs"].as_table();
             const auto *probing = document["probing"].as_table();
@@ -151,6 +152,7 @@ namespace ngc {
             if(!machine) return std::unexpected(configurationError(path, "machine", "missing table"));
             if(!trajectory) return std::unexpected(configurationError(path, "trajectory", "missing table"));
             if(!simulation) return std::unexpected(configurationError(path, "simulation", "missing table"));
+            if(!jogging) return std::unexpected(configurationError(path, "jogging", "missing table"));
             if(!axes) return std::unexpected(configurationError(path, "axes", "missing table"));
             if(!digitalInputs)
                 return std::unexpected(configurationError(path, "digital_inputs", "missing table"));
@@ -191,12 +193,16 @@ namespace ngc {
             const auto chordTolerance = positiveNumber(*trajectory, "arc_chord_tolerance", path);
             const auto servoPeriod = positiveNumber(*simulation, "servo_period", path);
             const auto schedulerPeriod = positiveNumber(*simulation, "scheduler_period", path);
+            const auto jogAcceleration = positiveNumber(*jogging, "acceleration", path);
+            const auto jogJerk = positiveNumber(*jogging, "jerk", path);
             if(!acceleration) return std::unexpected(acceleration.error());
             if(!jerk) return std::unexpected(jerk.error());
             if(!rapidVelocity) return std::unexpected(rapidVelocity.error());
             if(!chordTolerance) return std::unexpected(chordTolerance.error());
             if(!servoPeriod) return std::unexpected(servoPeriod.error());
             if(!schedulerPeriod) return std::unexpected(schedulerPeriod.error());
+            if(!jogAcceleration) return std::unexpected(jogAcceleration.error());
+            if(!jogJerk) return std::unexpected(jogJerk.error());
             const auto schedulerTicks = *schedulerPeriod / *servoPeriod;
             if(schedulerTicks < 1.0 || std::abs(schedulerTicks - std::round(schedulerTicks)) > 1e-9)
                 return std::unexpected(configurationError(
@@ -207,6 +213,7 @@ namespace ngc {
             result.trajectory.rapidSpeed = *rapidVelocity * 60.0;
             result.trajectory.arcChordTolerance = *chordTolerance;
             result.simulation = { *servoPeriod, *schedulerPeriod };
+            result.jogging = { *jogAcceleration, *jogJerk };
 
             std::unordered_set<JointId> axisJointIds;
             for(const auto axis : result.coordinates) {

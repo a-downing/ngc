@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <algorithm>
+#include <array>
 #include <print>
 #include <string>
 #include <cmath>
@@ -86,7 +87,18 @@ class ApplicationImpl final {
     float m_programPaneWidth = 440.0f;
     float m_statusBarHeight = 170.0f;
     float m_toolbarHeight = 42.0f;
+    float m_jogPaneWidth = 270.0f;
     ImVec4 m_viewportRect { 0, 0, 0, 0 };
+    bool m_showJogPane = false;
+    int m_jogTargetMode = 0;
+    bool m_continuousJog = true;
+    bool m_individualJogEnabled = false;
+    double m_jogSpeedPercent = 25.0;
+    int m_jogStepIndex = 2;
+    ngc::RequestId m_nextJogRequest = 1000;
+    ngc::JogId m_nextJogId = 1;
+    std::optional<ngc::JogId> m_uiContinuousJog;
+    double m_lastJogRenewal = 0.0;
 
     // windows
     bool m_enableOpenDialog = false;
@@ -98,7 +110,10 @@ class ApplicationImpl final {
     std::string m_errorMessage;
 
     ngc::SimulationTiming m_simulationTiming;
+    ngc::JoggingConfiguration m_joggingConfiguration;
     ngc::Machine::Unit m_machineUnit;
+    std::vector<ngc::AxisConfiguration> m_axes;
+    std::vector<ngc::JointConfiguration> m_joints;
     Worker m_worker;
     SimulationWorker m_simulation;
     int m_simulationTickMultiplier = 1;
@@ -260,7 +275,9 @@ class ApplicationImpl final {
 public:
     ApplicationImpl() = delete;
     ApplicationImpl(GLFWwindow *window, const ngc::MachineConfiguration &configuration)
-        : m_window(window), m_simulationTiming(configuration.simulation), m_machineUnit(configuration.unit),
+        : m_window(window), m_simulationTiming(configuration.simulation),
+          m_joggingConfiguration(configuration.jogging), m_machineUnit(configuration.unit),
+          m_axes(configuration.axes), m_joints(configuration.joints),
           m_worker(configuration.unit, configuration.trajectory, configuration.simulation.servoPeriod),
           m_simulation(configuration),
           m_simulatedRapidSpeed(configuration.trajectory.rapidSpeed) { }
@@ -1150,6 +1167,9 @@ public:
         ImGui::EndDisabled();
 
         ImGui::SameLine();
+        if(ImGui::Button(m_showJogPane ? "Hide Jog" : "Jog")) m_showJogPane = !m_showJogPane;
+
+        ImGui::SameLine();
         ImGui::BeginDisabled(simulationActive);
         if(ImGui::Button("Reset Simulation")) m_simulation.resetSimulation();
         ImGui::EndDisabled();
@@ -1342,6 +1362,222 @@ public:
         ImGui::End();
     }
 
+    static const char *axisLabel(const ngc::Machine::Axis axis) {
+        switch(axis) {
+            case ngc::Machine::Axis::X: return "X";
+            case ngc::Machine::Axis::Y: return "Y";
+            case ngc::Machine::Axis::Z: return "Z";
+            case ngc::Machine::Axis::A: return "A";
+            case ngc::Machine::Axis::B: return "B";
+            case ngc::Machine::Axis::C: return "C";
+        }
+        return "?";
+    }
+
+    static ngc::AxisId jogAxis(const ngc::Machine::Axis axis) {
+        return static_cast<ngc::AxisId>(static_cast<std::uint8_t>(axis));
+    }
+
+    static double axisValue(const ngc::position_t &position, const ngc::Machine::Axis axis) {
+        switch(axis) {
+            case ngc::Machine::Axis::X: return position.x;
+            case ngc::Machine::Axis::Y: return position.y;
+            case ngc::Machine::Axis::Z: return position.z;
+            case ngc::Machine::Axis::A: return position.a;
+            case ngc::Machine::Axis::B: return position.b;
+            case ngc::Machine::Axis::C: return position.c;
+        }
+        return 0.0;
+    }
+
+    void renderJogPane(const ImGuiViewport &viewport, const ngc::SimulationSnapshot &simulation,
+                       const float contentBottom) {
+        const auto left = viewport.Pos.x + viewport.Size.x - m_jogPaneWidth;
+        ImGui::SetNextWindowPos({ left, viewport.Pos.y + m_toolbarHeight });
+        ImGui::SetNextWindowSize({ m_jogPaneWidth, contentBottom - viewport.Pos.y - m_toolbarHeight });
+        constexpr auto flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove
+            | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
+        ImGui::Begin("##jog_pane", nullptr, flags);
+
+        ImGui::TextUnformatted("Jog");
+        ImGui::Separator();
+        const char *modes[] = { "Axes", "Coupled joints", "Individual joints" };
+        ImGui::SetNextItemWidth(-FLT_MIN);
+        if(ImGui::Combo("##jog_target_mode", &m_jogTargetMode, modes, 3)) {
+            m_individualJogEnabled = false;
+        }
+        if(ImGui::RadioButton("Continuous", m_continuousJog)) m_continuousJog = true;
+        ImGui::SameLine();
+        if(ImGui::RadioButton("Incremental", !m_continuousJog)) m_continuousJog = false;
+
+        auto speed = static_cast<float>(m_jogSpeedPercent);
+        if(ImGui::SliderFloat("Speed", &speed, 1.0f, 100.0f, "%.0f%%")) m_jogSpeedPercent = speed;
+        const std::array inchSteps { 0.001, 0.01, 0.1, 1.0 };
+        const std::array millimetreSteps { 0.01, 0.1, 1.0, 10.0 };
+        const auto &steps = m_machineUnit == ngc::Machine::Unit::Inch ? inchSteps : millimetreSteps;
+        if(!m_continuousJog) {
+            const auto preview = std::format("{:.3f}", steps[static_cast<std::size_t>(m_jogStepIndex)]);
+            if(ImGui::BeginCombo("Step", preview.c_str())) {
+                for(int index = 0; index < static_cast<int>(steps.size()); ++index) {
+                    if(ImGui::Selectable(std::format("{:.3f}", steps[index]).c_str(), index == m_jogStepIndex))
+                        m_jogStepIndex = index;
+                }
+                ImGui::EndCombo();
+            }
+        }
+
+        if(m_jogTargetMode == 2) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.65f, 0.2f, 1.0f));
+            ImGui::Checkbox("Enable individual joints", &m_individualJogEnabled);
+            ImGui::PopStyleColor();
+            ImGui::TextWrapped("Independent movement can rack a multi-motor gantry.");
+        }
+        ImGui::Separator();
+
+        const auto otherMotion = (simulation.status == ngc::SimulationStatus::Running
+                                  || simulation.status == ngc::SimulationStatus::Paused)
+            && !simulation.jogging;
+        bool heldThisFrame = false;
+        const auto leaseTicks = static_cast<std::uint32_t>(std::max(
+            1.0, std::ceil(0.020 / m_simulationTiming.servoPeriod)
+                * static_cast<double>(m_simulationTickMultiplier)));
+        const auto submitDirection = [&](const std::string &label, const ngc::JogTarget target,
+                                         const ngc::JogMotionLimits limits,
+                                         const ngc::JogMotionLimits stopLimits,
+                                         const ngc::JogTravelRange travel, const double direction,
+                                         const bool enabled) {
+            ImGui::BeginDisabled(!enabled || otherMotion || (simulation.jogging && !m_uiContinuousJog));
+            const auto clicked = ImGui::Button(label.c_str(), { 54.0f, 0.0f });
+            const auto held = ImGui::IsItemActive();
+            const auto activated = ImGui::IsItemActivated();
+            ImGui::EndDisabled();
+            if(m_continuousJog && held) {
+                heldThisFrame = true;
+                if(!m_uiContinuousJog && activated) {
+                    const auto jog = m_nextJogId++;
+                    const ngc::StartContinuousJogRequest request {
+                        .id = m_nextJogRequest++, .jog = jog, .target = target,
+                        .signedVelocity = direction * limits.velocity * m_jogSpeedPercent / 100.0,
+                        .limits = limits, .stopLimits = stopLimits,
+                        .travel = travel, .leaseTicks = leaseTicks,
+                    };
+                    if(m_simulation.startJog(ngc::ControlRequest { request })) {
+                        m_uiContinuousJog = jog;
+                        m_lastJogRenewal = m_time;
+                    }
+                } else if(m_time - m_lastJogRenewal >= 0.005) {
+                    if(m_simulation.renewJog(m_nextJogRequest++, *m_uiContinuousJog))
+                        m_lastJogRenewal = m_time;
+                }
+            } else if(!m_continuousJog && clicked && enabled && !otherMotion && !simulation.jogging) {
+                const ngc::StartIncrementalJogRequest request {
+                    .id = m_nextJogRequest++, .jog = m_nextJogId++, .target = target,
+                    .distance = direction * steps[static_cast<std::size_t>(m_jogStepIndex)],
+                    .velocity = limits.velocity * m_jogSpeedPercent / 100.0,
+                    .limits = limits, .stopLimits = stopLimits, .travel = travel,
+                };
+                (void)m_simulation.startJog(ngc::ControlRequest { request });
+            }
+        };
+
+        if(m_jogTargetMode < 2) {
+            for(const auto &axis : m_axes) {
+                ngc::JointMask joints = 0;
+                auto velocity = axis.maxVelocity;
+                auto acceleration = axis.maxAcceleration;
+                auto jerk = std::numeric_limits<double>::infinity();
+                for(const auto id : axis.joints) {
+                    joints |= ngc::JointMask { 1 } << id;
+                    const auto found = std::ranges::find(m_joints, id, &ngc::JointConfiguration::id);
+                    if(found != m_joints.end()) {
+                        velocity = std::min(velocity, found->maxVelocity);
+                        acceleration = std::min(acceleration, found->maxAcceleration);
+                        jerk = std::min(jerk, found->maxJerk);
+                    }
+                }
+                const auto homed = (simulation.homedJoints & joints) == joints;
+                const auto enabled = m_jogTargetMode == 1 || homed;
+                ImGui::Text("%s  % .4f%s", axisLabel(axis.axis), axisValue(simulation.machinePosition, axis.axis),
+                            homed ? "" : "  unhomed");
+                ImGui::SameLine(std::max(100.0f, ImGui::GetWindowWidth() - 130.0f));
+                const ngc::JogTarget target { ngc::JogTargetType::JointGroup, jogAxis(axis.axis), joints };
+                const ngc::JogMotionLimits stopLimits { velocity, acceleration, jerk };
+                const ngc::JogMotionLimits limits {
+                    velocity,
+                    std::min(acceleration, m_joggingConfiguration.acceleration),
+                    std::min(jerk, m_joggingConfiguration.jerk),
+                };
+                const ngc::JogTravelRange travel { axis.minimum, axis.maximum, homed };
+                submitDirection(std::format("-##{}", axisLabel(axis.axis)), target, limits, stopLimits,
+                                travel, -1.0, enabled);
+                ImGui::SameLine();
+                submitDirection(std::format("+##{}", axisLabel(axis.axis)), target, limits, stopLimits,
+                                travel, 1.0, enabled);
+            }
+        } else {
+            for(const auto &joint : m_joints) {
+                const auto mask = static_cast<ngc::JointMask>(ngc::JointMask { 1 } << joint.id);
+                const auto homed = (simulation.homedJoints & mask) != 0;
+                ImGui::Text("%s  % .4f%s", joint.name.c_str(), simulation.joints.position[joint.id],
+                            homed ? "" : "  unhomed");
+                ImGui::SameLine(std::max(100.0f, ImGui::GetWindowWidth() - 130.0f));
+                const ngc::JogTarget target { ngc::JogTargetType::Joint, jogAxis(joint.axis), mask };
+                const auto velocity = std::max(1e-6, joint.maxVelocity * 0.25);
+                const ngc::JogMotionLimits stopLimits {
+                    velocity, joint.maxAcceleration, joint.maxJerk };
+                const ngc::JogMotionLimits limits {
+                    velocity,
+                    std::min(joint.maxAcceleration, m_joggingConfiguration.acceleration),
+                    std::min(joint.maxJerk, m_joggingConfiguration.jerk),
+                };
+                const auto low = std::min(joint.minimum * joint.coordinateScale,
+                                          joint.maximum * joint.coordinateScale);
+                const auto high = std::max(joint.minimum * joint.coordinateScale,
+                                           joint.maximum * joint.coordinateScale);
+                const ngc::JogTravelRange travel { low, high, homed };
+                submitDirection(std::format("-##joint{}", joint.id), target, limits, stopLimits, travel, -1.0,
+                                m_individualJogEnabled);
+                ImGui::SameLine();
+                submitDirection(std::format("+##joint{}", joint.id), target, limits, stopLimits, travel, 1.0,
+                                m_individualJogEnabled);
+            }
+        }
+
+        if(m_uiContinuousJog && (!heldThisFrame || !m_continuousJog || !m_showJogPane)) {
+            (void)m_simulation.stopJog(m_nextJogRequest++, *m_uiContinuousJog);
+            m_uiContinuousJog.reset();
+        }
+
+        ImGui::Separator();
+        if(simulation.lastJogStopReason) {
+            const auto reason = [&] {
+                switch(*simulation.lastJogStopReason) {
+                    case ngc::JogStopReason::TargetReached: return "target reached";
+                    case ngc::JogStopReason::RequestedStop: return "released";
+                    case ngc::JogStopReason::LeaseExpired: return "lease expired";
+                    case ngc::JogStopReason::LimitReached: return "limit reached";
+                    case ngc::JogStopReason::Disabled: return "disabled";
+                    case ngc::JogStopReason::Aborted: return "aborted";
+                    case ngc::JogStopReason::Fault: return "fault";
+                    case ngc::JogStopReason::Superseded: return "superseded";
+                }
+                return "unknown";
+            }();
+            ImGui::TextDisabled("Last stop: %s", reason);
+        }
+        ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.65f, 0.08f, 0.08f, 1.0f));
+        if(ImGui::Button("STOP MOTION", { -FLT_MIN, 0.0f })) {
+            if(m_uiContinuousJog) {
+                (void)m_simulation.stopJog(m_nextJogRequest++, *m_uiContinuousJog);
+                m_uiContinuousJog.reset();
+            } else {
+                m_simulation.stop();
+            }
+        }
+        ImGui::PopStyleColor();
+        ImGui::End();
+    }
+
     void renderStatusBar(const ImGuiViewport &viewport, const ngc::SimulationSnapshot &simulation) {
         const auto y = viewport.Pos.y + viewport.Size.y - m_statusBarHeight;
         ImGui::SetNextWindowPos({ viewport.Pos.x, y });
@@ -1423,7 +1659,7 @@ public:
         ImGui::InvisibleButton("##drag_program", { -FLT_MIN, -FLT_MIN });
         if(ImGui::IsItemActive()) {
             m_programPaneWidth = std::clamp(m_programPaneWidth + ImGui::GetIO().MouseDelta.x, 260.0f,
-                                            viewport.Size.x - 240.0f);
+                                            viewport.Size.x - (m_showJogPane ? m_jogPaneWidth : 0.0f) - 240.0f);
         }
         ImGui::End();
 
@@ -1454,12 +1690,17 @@ public:
         m_viewportRect = {
             viewport.Pos.x + m_programPaneWidth,
             viewport.Pos.y + m_toolbarHeight,
-            viewport.Pos.x + viewport.Size.x,
+            viewport.Pos.x + viewport.Size.x - (m_showJogPane ? m_jogPaneWidth : 0.0f),
             contentBottom,
         };
 
         renderToolbar(viewport, simulation);
         renderProgramPane(viewport, simulation, contentBottom);
+        if(m_showJogPane) renderJogPane(viewport, simulation, contentBottom);
+        else if(m_uiContinuousJog) {
+            (void)m_simulation.stopJog(m_nextJogRequest++, *m_uiContinuousJog);
+            m_uiContinuousJog.reset();
+        }
         renderStatusBar(viewport, simulation);
         renderSplitters(viewport, contentBottom);
 

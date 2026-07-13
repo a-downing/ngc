@@ -19,6 +19,14 @@ servo_period = 0.001
 # seconds between Windows mock-executor scheduler wakes (100 Hz)
 scheduler_period = 0.01
 
+[jogging]
+# Global reduced limits used while accelerating into a jog.
+# Controlled jogging stops use the configured physical axis/joint limits.
+# machine-units / second^2
+acceleration = 5.0
+# machine-units / second^3
+jerk = 25.0
+
 # Logical machine axes. Multiple joints may map to one axis; Y uses two joints
 # so its gantry can be squared during homing and coupled during normal motion.
 [axes.x]
@@ -30,7 +38,7 @@ max_acceleration = 100
 
 [axes.y]
 joints = [1, 2]
-minimum = -0.1
+minimum = 0
 maximum = 33.25
 max_velocity = 3.33333333333
 max_acceleration = 100

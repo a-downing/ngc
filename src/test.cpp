@@ -922,6 +922,11 @@ namespace {
         require(session.compiled(), "automatic tool-change program should compile");
         session.begin();
 
+        const auto toolChangeSynchronization = session.nextWithBlocks(
+            [](const auto &callback) { callback(); });
+        require(std::holds_alternative<ngc::InterpreterWaitingForSynchronization>(toolChangeSynchronization),
+                "M6 should synchronize before preparing or entering the tool-change subroutine");
+        session.provideSynchronization();
         const auto toolChangeEvent = session.nextWithBlocks([](const auto &callback) { callback(); });
         const auto toolChangeBlock = std::get_if<ngc::InterpreterBlockLifecycle>(&toolChangeEvent);
         require(toolChangeBlock != nullptr && toolChangeBlock->phase == ngc::BlockLifecyclePhase::Entered
@@ -1146,6 +1151,105 @@ namespace {
                     "mock diagnostics should end normal motion at its terminal position");
         require(trajectory.spans.back().stopTail,
                 "mock diagnostics should distinguish the executed stop tail");
+    }
+
+    void testJogControlUsesBoundedBackendTransport() {
+        const ngc::JogTarget group {
+            .type = ngc::JogTargetType::JointGroup,
+            .axis = ngc::AxisId::Y,
+            .joints = ngc::JointMask { (1U << 1U) | (1U << 2U) },
+        };
+        const ngc::StartContinuousJogRequest jog {
+            .id = 41,
+            .jog = 73,
+            .target = group,
+            .signedVelocity = -0.5,
+            .limits = { .velocity = 1.0, .acceleration = 2.0, .jerk = 10.0 },
+            .stopLimits = { .velocity = 1.0, .acceleration = 8.0, .jerk = 40.0 },
+            .leaseTicks = 3,
+        };
+        const ngc::ControlRequest control = jog;
+        const auto *transported = std::get_if<ngc::StartContinuousJogRequest>(&control);
+        require(transported != nullptr && transported->target.joints == group.joints,
+                "one bounded control request should retain the complete atomic joint group");
+
+        ngc::MockMotionBackend backend;
+        require(backend.trySubmit(ngc::ResetRequest { 1, 9 }) == ngc::SubmitResult::Submitted,
+                "jog test reset should fit in the control channel");
+        require(backend.trySubmit(ngc::EnableRequest { 2 }) == ngc::SubmitResult::Submitted,
+                "jog test enable should fit in the control channel");
+        backend.advance(0.0);
+        ngc::ExecutionEvent event;
+        while(backend.tryTakeEvent(event)) { }
+
+        require(backend.trySubmit(control) == ngc::SubmitResult::Submitted,
+                "jog control should use the existing bounded backend control channel");
+        backend.advance(0.0);
+        for(int tick = 0; tick < 3; ++tick) backend.advanceTick(0.001, true);
+        backend.runUntilIdle(0.001);
+
+        bool accepted = false;
+        std::optional<ngc::JogStopped> stopped;
+        while(backend.tryTakeEvent(event)) {
+            if(const auto *completed = std::get_if<ngc::RequestCompleted>(&event))
+                accepted = completed->request == jog.id && completed->succeeded;
+            if(const auto *jogEvent = std::get_if<ngc::JogStopped>(&event)) stopped = *jogEvent;
+        }
+        require(accepted, "held mock backend should accept a valid grouped jog");
+        require(stopped && stopped->reason == ngc::JogStopReason::LeaseExpired,
+                "an unrenewed continuous jog must stop when its backend lease expires");
+        require(stopped->jointState.position[1] < 0.0,
+                "lease-protected jog should calculate motion before stopping");
+        requireNear(stopped->jointState.position[1], stopped->jointState.position[2],
+                    "one scalar grouped-jog profile must keep both gantry joints synchronized");
+        requireNear(stopped->jointState.velocity[1], 0.0,
+                    "lease expiration must finish with a constrained zero-velocity state");
+
+        const ngc::StartIncrementalJogRequest incremental {
+            .id = 42,
+            .jog = 74,
+            .target = group,
+            .distance = 0.1,
+            .velocity = 0.5,
+            .limits = { .velocity = 1.0, .acceleration = 2.0, .jerk = 10.0 },
+            .stopLimits = { .velocity = 1.0, .acceleration = 8.0, .jerk = 40.0 },
+        };
+        require(backend.trySubmit(incremental) == ngc::SubmitResult::Submitted,
+                "incremental jog should use the same bounded control channel");
+        backend.runUntilIdle(0.001);
+        std::optional<ngc::JogStopped> incrementalStopped;
+        while(backend.tryTakeEvent(event))
+            if(const auto *jogEvent = std::get_if<ngc::JogStopped>(&event)) incrementalStopped = *jogEvent;
+        require(incrementalStopped
+                    && incrementalStopped->reason == ngc::JogStopReason::TargetReached,
+                "incremental jog should report bounded target completion");
+        requireNear(incrementalStopped->jointState.position[1],
+                    stopped->jointState.position[1] + incremental.distance,
+                    "incremental jog should move the requested group distance");
+
+        auto heldJog = jog;
+        heldJog.id = 43;
+        heldJog.jog = 75;
+        heldJog.signedVelocity = 0.5;
+        heldJog.leaseTicks = 1000;
+        require(backend.trySubmit(heldJog) == ngc::SubmitResult::Submitted,
+                "second continuous jog should submit from held state");
+        backend.advanceTick(0.01, true);
+        require(backend.trySubmit(ngc::StopJogRequest { 44, 999 }) == ngc::SubmitResult::Submitted,
+                "stale-token stop should still traverse the bounded control channel");
+        require(backend.trySubmit(ngc::StopJogRequest { 45, heldJog.jog }) == ngc::SubmitResult::Submitted,
+                "matching stop should traverse the bounded control channel");
+        backend.runUntilIdle(0.001);
+        bool staleStopRejected = false;
+        std::optional<ngc::JogStopped> requestedStop;
+        while(backend.tryTakeEvent(event)) {
+            if(const auto *completed = std::get_if<ngc::RequestCompleted>(&event))
+                if(completed->request == 44) staleStopRejected = !completed->succeeded;
+            if(const auto *jogEvent = std::get_if<ngc::JogStopped>(&event)) requestedStop = *jogEvent;
+        }
+        require(staleStopRejected, "a delayed token must not stop a newer jog");
+        require(requestedStop && requestedStop->reason == ngc::JogStopReason::RequestedStop,
+                "matching StopJog should produce a constrained requested stop");
     }
 
     void testMockBackendDrainsAFullPlanHorizonWithoutEventOverflow() {
@@ -1682,6 +1786,10 @@ namespace {
                     "machine configuration should load the fixed simulation servo period");
         requireNear(configuration->simulation.schedulerPeriod, 0.01,
                     "machine configuration should load the independent scheduler period");
+        requireNear(configuration->jogging.acceleration, 5.0,
+                    "machine configuration should load the global jog acceleration");
+        requireNear(configuration->jogging.jerk, 25.0,
+                    "machine configuration should load the global jog jerk");
 
         require(configuration->coordinates == std::vector {
                     ngc::Machine::Axis::X, ngc::Machine::Axis::Y, ngc::Machine::Axis::Z },
@@ -1781,6 +1889,57 @@ namespace {
                 "homing without a loaded tool should retain the no-tool presentation state");
         requireNear(snapshot.toolPosition.x, snapshot.machinePosition.x,
                     "the no-tool position marker should track the machine position");
+        worker.join();
+    }
+
+    void testSimulationWorkerJogsCoupledJointsBeforeHoming() {
+        auto configuration = ngc::loadMachineConfiguration("machine.toml");
+        require(configuration.has_value(), configuration ? "" : configuration.error());
+        configuration->simulation.schedulerPeriod = configuration->simulation.servoPeriod;
+        SimulationWorker worker(*configuration);
+
+        const auto axis = std::ranges::find(configuration->axes, ngc::Machine::Axis::Y,
+                                            &ngc::AxisConfiguration::axis);
+        require(axis != configuration->axes.end(), "pre-home jog test should find configured Y");
+        ngc::JointMask joints = 0;
+        double jerk = std::numeric_limits<double>::infinity();
+        for(const auto id : axis->joints) {
+            joints |= static_cast<ngc::JointMask>(ngc::JointMask { 1 } << id);
+            const auto joint = std::ranges::find(configuration->joints, id,
+                                                 &ngc::JointConfiguration::id);
+            require(joint != configuration->joints.end(), "Y jog group joint should be configured");
+            jerk = std::min(jerk, joint->maxJerk);
+        }
+        const ngc::StartContinuousJogRequest request {
+            .id = 100,
+            .jog = 200,
+            .target = { ngc::JogTargetType::JointGroup, ngc::AxisId::Y, joints },
+            .signedVelocity = 0.5,
+            .limits = { axis->maxVelocity, configuration->jogging.acceleration,
+                        configuration->jogging.jerk },
+            .stopLimits = { axis->maxVelocity, axis->maxAcceleration, jerk },
+            .leaseTicks = 5,
+        };
+        require(worker.startJog(ngc::ControlRequest { request }),
+                "coupled Y jogging should be allowed before homing");
+
+        auto snapshot = worker.snapshot();
+        for(int attempt = 0; attempt < 2000
+            && snapshot.status != ngc::SimulationStatus::Completed
+            && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(snapshot.status == ngc::SimulationStatus::Completed,
+                std::format("pre-home coupled jog should stop safely: {}", snapshot.error));
+        require(snapshot.lastJogStopReason == ngc::JogStopReason::LeaseExpired,
+                "worker should expose backend lease expiry as the jog stop reason");
+        require(snapshot.homedJoints == 0,
+                "joint jogging must not falsely mark the machine as homed");
+        require(snapshot.machinePosition.y > 6.0,
+                "pre-home coupled jogging should visibly move the simulated Y axis");
+        requireNear(snapshot.joints.position[1], snapshot.joints.position[2],
+                    "pre-home coupled Y jogging should keep both ball-screw joints together");
         worker.join();
     }
 
@@ -1988,6 +2147,94 @@ namespace {
         requireNear(latest.commanded.position.z, -1.0,
                     "mock RT execution should preserve its final Z position");
     }
+
+    void testParameterReadWaitsForPriorMotionCompletion() {
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::Simulation);
+        compileSession(session, "G1 F60 X1\n#100 = #101\nG1 X2\n");
+        require(session.machine().memory().write(101, 7.0).has_value(),
+                "parameter-read synchronization test should seed its source parameter");
+
+        ngc::MockMotionBackend backend;
+        ngc::TrajectoryExecutionDriver driver(session, backend, {
+            .pathAcceleration = 2.0,
+            .rapidSpeed = 100.0,
+            .arcChordTolerance = 0.0001,
+            .pathJerk = 10.0,
+        });
+        require(driver.begin(40), "parameter-read synchronization driver should initialize");
+        backend.advance(0.0);
+        driver.serviceBackend();
+        const auto parameter = [&] { return session.machine().memory().read(100).value(); };
+
+        int observedCommands = 0;
+        for(int guard = 0; guard < 100 && !driver.synchronizationPending(); ++guard)
+            require(driver.pumpOne([](const auto &callback) { callback(); },
+                                   [&](const ngc::MachineCommand &) { ++observedCommands; }),
+                    "driver should reach the parameter-read synchronization barrier");
+        require(driver.synchronizationPending(),
+                "a parameter read following motion should publish a synchronization wait");
+        require(observedCommands == 1,
+                "motion after a parameter read must not be interpreted before synchronization");
+        requireNear(parameter(), 0.0,
+                    "assignment containing the read must not execute while prior motion is queued");
+
+        backend.advanceTick(0.001, true);
+        driver.serviceBackend();
+        require(driver.synchronizationPending(),
+                "a partially executed move must not release a parameter read");
+        requireNear(parameter(), 0.0,
+                    "parameter read must remain pending while prior motion is moving");
+
+        backend.runUntilIdle(0.001);
+        driver.serviceBackend();
+        require(!driver.synchronizationPending(),
+                "held state after motion completion should satisfy the synchronization wait");
+        requireNear(parameter(), 0.0,
+                    "satisfying the barrier should not run procedural code on the backend thread");
+
+        backend.advance(0.0);
+        driver.serviceBackend();
+        for(int guard = 0; guard < 100 && parameter() != 7.0; ++guard)
+            (void)driver.pumpOne([](const auto &callback) { callback(); },
+                                 [&](const ngc::MachineCommand &) { ++observedCommands; });
+        requireNear(parameter(), 7.0,
+                    "parameter read should execute after prior motion reaches held state");
+    }
+
+    void testMotionWordSynchronizationPolicy() {
+        struct Case {
+            std::string_view expression;
+            bool shouldSynchronize;
+        };
+        for(const auto &[expression, shouldSynchronize] : {
+                Case { "[1]", false },
+                Case { "[1 + 1]", false },
+                Case { "[#5400]", true },
+                Case { "#5400", true },
+            }) {
+            ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::Simulation);
+            compileSession(session, std::format("G1 F60 X0.5\nG1 X{}\n", expression));
+
+            bool sawFirstMotion = false;
+            for(int guard = 0; guard < 20 && !sawFirstMotion; ++guard) {
+                const auto event = session.nextWithBlocks([](const auto &callback) { callback(); });
+                sawFirstMotion = std::holds_alternative<ngc::MachineCommand>(event);
+            }
+            require(sawFirstMotion, "bracket synchronization test should emit its preceding motion");
+
+            bool synchronized = false;
+            bool emittedSecondMotion = false;
+            for(int guard = 0; guard < 20 && !synchronized && !emittedSecondMotion; ++guard) {
+                const auto event = session.nextWithBlocks([](const auto &callback) { callback(); });
+                synchronized = std::holds_alternative<ngc::InterpreterWaitingForSynchronization>(event);
+                emittedSecondMotion = std::holds_alternative<ngc::MachineCommand>(event);
+            }
+            require(synchronized == shouldSynchronize,
+                    std::format("motion word {} synchronization policy mismatch", expression));
+            require(emittedSecondMotion != shouldSynchronize,
+                    std::format("motion word {} emitted at the wrong side of synchronization", expression));
+        }
+    }
 }
 
 int main() {
@@ -2032,6 +2279,7 @@ int main() {
         testToolpathRecorderAppliesPerCommandToolOffset();
         testSpscChannelIsBoundedAndOrdered();
         testMockMotionBackendUsesProductionTransportContract();
+        testJogControlUsesBoundedBackendTransport();
         testMockBackendAdvancesOneFixedServoTick();
         testMockBackendDrainsAFullPlanHorizonWithoutEventOverflow();
         testImmediateDrainStopsAtHeldWithStaleDescendants();
@@ -2044,9 +2292,12 @@ int main() {
         testMockDiagnosticPositionsFollowServoPeriod();
         testMachineConfigurationLoadsTrajectoryLimits();
         testConfiguredHomingMovesFromPowerUpPosition();
+        testSimulationWorkerJogsCoupledJointsBeforeHoming();
         testProbeCompilesAsBackendOwnedTriggeredMove();
         testDualScrewJointMoveStopsEachMotorOnItsOwnSwitch();
         testTrajectoryDriverConnectsInterpreterToMockRtBackend();
+        testParameterReadWaitsForPriorMotionCompletion();
+        testMotionWordSynchronizationPolicy();
     } catch(const std::exception &error) {
         std::cerr << "ngc_tests failed: " << error.what() << '\n';
         return 1;

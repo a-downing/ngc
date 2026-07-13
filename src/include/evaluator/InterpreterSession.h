@@ -46,6 +46,8 @@ namespace ngc {
         std::uint64_t commandId;
     };
 
+    struct InterpreterWaitingForSynchronization { };
+
     struct BlockExecution {
         std::uint64_t id;
         std::string text;
@@ -60,7 +62,9 @@ namespace ngc {
         BlockLifecyclePhase phase;
     };
 
-    using InterpreterEvent = std::variant<MachineCommand, InterpreterBlockLifecycle, InterpreterWaitingForProbe, InterpreterCompleted, InterpreterError>;
+    using InterpreterEvent = std::variant<MachineCommand, InterpreterBlockLifecycle,
+        InterpreterWaitingForProbe, InterpreterWaitingForSynchronization,
+        InterpreterCompleted, InterpreterError>;
 
     class InterpreterSession {
         struct ExecutionStopped { };
@@ -81,6 +85,7 @@ namespace ngc {
         std::deque<MachineCommand> m_pendingCommands;
         std::deque<InterpreterBlockLifecycle> m_pendingBlockLifecycle;
         std::optional<std::uint64_t> m_pendingProbe;
+        bool m_pendingSynchronization = false;
         bool m_evaluatorPaused = false;
         bool m_resumeEvaluator = false;
         bool m_executionStarted = false;
@@ -155,6 +160,7 @@ namespace ngc {
             m_pendingCommands.clear();
             m_pendingBlockLifecycle.clear();
             m_pendingProbe.reset();
+            m_pendingSynchronization = false;
             m_pendingMessage.reset();
             m_pendingMessageBlock.reset();
             m_executionError.reset();
@@ -192,7 +198,11 @@ namespace ngc {
 
         template<typename Synchronize>
         InterpreterEvent next(Synchronize &&synchronize) {
-            return nextImpl(std::forward<Synchronize>(synchronize), false);
+            for(;;) {
+                auto event = nextImpl(std::forward<Synchronize>(synchronize), false);
+                if(!std::holds_alternative<InterpreterWaitingForSynchronization>(event)) return event;
+                provideSynchronization();
+            }
         }
 
         template<typename Synchronize>
@@ -211,6 +221,8 @@ namespace ngc {
                 if(m_pendingProbe) {
                     return InterpreterWaitingForProbe { *m_pendingProbe };
                 }
+
+                if(m_pendingSynchronization) return InterpreterWaitingForSynchronization {};
 
                 if(!m_pendingBlockLifecycle.empty()) {
                     auto lifecycle = std::move(m_pendingBlockLifecycle.front());
@@ -248,6 +260,10 @@ namespace ngc {
                     auto message = std::move(m_pendingMessage);
                     auto block = std::exchange(m_pendingMessageBlock, std::nullopt);
                     lock.unlock();
+                    if(message->as<SynchronizationMessage>()) {
+                        m_pendingSynchronization = true;
+                        return InterpreterWaitingForSynchronization {};
+                    }
                     try {
                         synchronize([&] { processMessage(*message, block); });
                     } catch(const std::exception &error) {
@@ -288,6 +304,12 @@ namespace ngc {
             m_pendingProbe.reset();
         }
 
+        void provideSynchronization() {
+            if(!m_pendingSynchronization)
+                throw std::logic_error("interpreter is not waiting for synchronization");
+            m_pendingSynchronization = false;
+        }
+
         void requestStop() {
             {
                 std::scoped_lock lock(m_executionMutex);
@@ -308,6 +330,7 @@ namespace ngc {
             m_pendingCommands.clear();
             m_pendingBlockLifecycle.clear();
             m_pendingProbe.reset();
+            m_pendingSynchronization = false;
         }
 
     private:
@@ -343,6 +366,7 @@ namespace ngc {
                         }
 
                         if(state.modeToolChange) {
+                            evaluator.synchronize();
                             m_machine.prepareToolChange(static_cast<int>(*state.T));
                             publishMessage(std::move(message), execution);
                             evaluator.call("_tool_change", *state.T);

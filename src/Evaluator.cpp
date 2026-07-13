@@ -311,6 +311,7 @@ namespace ngc {
 
             // TODO: more extensible way to evaluate built in functions
             if(expr->name() == "print") {
+                synchronize();
                 std::string text;
 
                 for(const auto &arg : expr->args()) {
@@ -505,11 +506,16 @@ namespace ngc {
             }
         }
 
+        void synchronize() {
+            m_callback(std::make_unique<SynchronizationMessage>(), m_owner);
+        }
+
         void interrupt() const {
             if(m_interrupt) m_interrupt();
         }
 
         double eval(const RealExpression *expr, VisitorContext *ctx, const bool dereference = true) {
+            if(dereference && expr->is<VariableExpression>()) synchronize();
             expr->accept(*this, ctx);
 
             if(dereference && expr->is<VariableExpression>()) {
@@ -587,5 +593,8 @@ namespace ngc {
     }
     void Evaluator::executeSecondPass(const std::span<const Statement * const> program) {
         m_impl->executeSecondPass(program);
+    }
+    void Evaluator::synchronize() {
+        m_impl->synchronize();
     }
 }

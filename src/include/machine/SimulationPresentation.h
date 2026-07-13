@@ -8,6 +8,7 @@
 
 #include "evaluator/InterpreterStatus.h"
 #include "machine/MachineCommand.h"
+#include "machine/MotionBackend.h"
 
 namespace ngc {
     enum class SimulationStatus { Stopped, Running, Paused, Completed, Error };
@@ -28,6 +29,11 @@ namespace ngc {
         double maximumWakeLatenessSeconds = 0.0;
         double maximumTickExecutionSeconds = 0.0;
         bool hasActiveMotion = false;
+        bool jogging = false;
+        JointMask homedJoints = 0;
+        JointMotionState joints{};
+        std::optional<JogTarget> activeJogTarget;
+        std::optional<JogStopReason> lastJogStopReason;
         bool spindleRunning = false;
         double spindleSpeed = 0.0;
         Direction spindleDirection = Direction::CW;

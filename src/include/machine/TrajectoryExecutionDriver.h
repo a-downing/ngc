@@ -26,6 +26,7 @@ namespace ngc {
         std::size_t m_outstandingChunks = 0;
         bool m_interpretationComplete = false;
         bool m_probePending = false;
+        bool m_synchronizationPending = false;
         bool m_waitingForHeld = false;
         EpochId m_epoch = 1;
         RequestId m_nextRequest = 1;
@@ -46,6 +47,7 @@ namespace ngc {
             m_outstandingChunks = 0;
             m_interpretationComplete = false;
             m_probePending = false;
+            m_synchronizationPending = false;
             m_waitingForHeld = false;
             m_backendReady = false;
             m_epoch = epoch;
@@ -59,7 +61,8 @@ namespace ngc {
 
         template<typename Synchronize, typename Observe, typename ObserveLifecycle = std::nullptr_t>
         bool pumpOne(Synchronize &&synchronize, Observe &&observe, ObserveLifecycle &&observeLifecycle = nullptr) {
-            if(m_error || !m_backendReady || m_interpretationComplete || m_waitingForHeld) return false;
+            if(m_error || !m_backendReady || m_interpretationComplete || m_waitingForHeld
+               || m_synchronizationPending) return false;
             if(m_pending) {
                 const auto publication = m_backend.tryPublish(*m_pending);
                 if(publication == PublishResult::Full) return false;
@@ -120,6 +123,12 @@ namespace ngc {
                 else m_error = "trajectory backend rejected a planner-produced chunk";
             } else if(std::holds_alternative<InterpreterCompleted>(event)) {
                 m_interpretationComplete = true;
+            } else if(std::holds_alternative<InterpreterWaitingForSynchronization>(event)) {
+                if(m_outstandingChunks == 0 && !m_pending) {
+                    m_session.provideSynchronization();
+                } else {
+                    m_synchronizationPending = true;
+                }
             } else if(const auto *error = std::get_if<InterpreterError>(&event)) {
                 m_error = error->message;
             }
@@ -163,6 +172,10 @@ namespace ngc {
                 } else if(const auto *held = std::get_if<BackendHeld>(&event)) {
                     if(held->epoch == m_epoch) {
                         m_waitingForHeld = false;
+                        if(m_synchronizationPending) {
+                            m_session.provideSynchronization();
+                            m_synchronizationPending = false;
+                        }
                     }
                     if(held->epoch == m_epoch && !m_interpretationComplete && !m_probePending) {
                         ++m_epoch;
@@ -223,6 +236,7 @@ namespace ngc {
         std::size_t outstandingChunks() const { return m_outstandingChunks; }
         bool interpretationComplete() const { return m_interpretationComplete; }
         bool probePending() const { return m_probePending; }
+        bool synchronizationPending() const { return m_synchronizationPending; }
         EpochId epoch() const { return m_epoch; }
         bool waitingForHeld() const { return m_waitingForHeld; }
     };
