@@ -167,6 +167,52 @@ namespace ngc {
                 + value.a*value.a + value.b*value.b + value.c*value.c);
         }
 
+        constexpr std::array AXIS_COMPONENTS {
+            &position_t::x, &position_t::y, &position_t::z,
+            &position_t::a, &position_t::b, &position_t::c,
+        };
+
+        bool positiveAxisLimits(const position_t &limits) {
+            return std::ranges::all_of(AXIS_COMPONENTS, [&](const auto component) {
+                return limits.*component > 0.0;
+            });
+        }
+
+        double pathLimit(const position_t &maximumTangent, const position_t &axisLimits) {
+            auto result = std::numeric_limits<double>::infinity();
+            for(const auto component : AXIS_COMPONENTS) {
+                const auto derivative = std::abs(maximumTangent.*component);
+                if(derivative > 1e-15)
+                    result = std::min(result, axisLimits.*component / derivative);
+            }
+            return result;
+        }
+
+        double maximumAxisVelocity(const AxisPolynomialSpan &span, const double position_t::*component) {
+            const auto at = [&](const double u) {
+                return std::abs((3.0*span.a.*component*u*u + 2.0*span.b.*component*u
+                    + span.c.*component) * span.inverseDuration);
+            };
+            auto result = std::max(at(0.0), at(1.0));
+            if(std::abs(span.a.*component) > 1e-15) {
+                const auto stationary = -(span.b.*component) / (3.0*(span.a.*component));
+                if(stationary > 0.0 && stationary < 1.0) result = std::max(result, at(stationary));
+            }
+            return result;
+        }
+
+        double maximumAxisAcceleration(const AxisPolynomialSpan &span, const double position_t::*component) {
+            const auto at = [&](const double u) {
+                return std::abs((6.0*span.a.*component*u + 2.0*span.b.*component)
+                    * span.inverseDurationSquared);
+            };
+            return std::max(at(0.0), at(1.0));
+        }
+
+        double maximumAxisJerk(const AxisPolynomialSpan &span, const double position_t::*component) {
+            return std::abs(6.0*span.a.*component * span.inverseDurationCubed);
+        }
+
         std::expected<std::vector<TimeBoundary>, std::string> timeLaw(
                 const double length, const double requestedVelocity, const double acceleration, const double jerk) {
             if(std::isinf(acceleration)) {
@@ -211,7 +257,10 @@ namespace ngc {
 
     std::expected<PlanChunk, std::string> ExactStopTrajectoryPlanner::compile(const MachineCommand &command) {
         if(m_limits.pathAcceleration <= 0.0 || m_limits.pathJerk <= 0.0
-           || m_limits.rapidSpeed <= 0.0 || m_limits.arcChordTolerance <= 0.0)
+           || m_limits.rapidSpeed <= 0.0 || m_limits.arcChordTolerance <= 0.0
+           || !positiveAxisLimits(m_limits.axisVelocity)
+           || !positiveAxisLimits(m_limits.axisAcceleration)
+           || !positiveAxisLimits(m_limits.axisJerk))
             return std::unexpected("trajectory limits must be positive");
         if(std::holds_alternative<ProbeMove>(command))
             return std::unexpected("probe moves must be compiled as executor-owned triggered moves");
@@ -223,15 +272,21 @@ namespace ngc {
         chunk.branch = chunk.id;
 
         auto appendMotion = [&](const double length, const double speedPerMinute,
+                                const position_t &maximumTangent,
                                 const auto &sample, const auto &verify) -> std::optional<std::string> {
             if(length <= 1e-12) {
                 auto hold = hermite(m_nextSpan++, sample(0.0), sample(length), 0.0, 0.0, 1e-6);
                 if(!chunk.normalMotion.push(hold)) return "trajectory chunk span capacity exceeded";
                 return std::nullopt;
             }
-            const auto requestedVelocity = speedPerMinute / 60.0;
+            const auto requestedVelocity = std::min(speedPerMinute / 60.0,
+                pathLimit(maximumTangent, m_limits.axisVelocity));
             if(requestedVelocity <= 0.0) return "motion speed must be positive";
-            const auto timing = timeLaw(length, requestedVelocity, m_limits.pathAcceleration, m_limits.pathJerk);
+            const auto acceleration = std::min(m_limits.pathAcceleration,
+                pathLimit(maximumTangent, m_limits.axisAcceleration));
+            const auto jerk = std::min(m_limits.pathJerk,
+                pathLimit(maximumTangent, m_limits.axisJerk));
+            const auto timing = timeLaw(length, requestedVelocity, acceleration, jerk);
             if(!timing) return timing.error();
             const auto &boundaries = *timing;
             for(std::size_t phase = 1; phase < boundaries.size(); ++phase) {
@@ -261,11 +316,20 @@ namespace ngc {
 
             double maximumAcceleration = 0.0;
             double maximumJerk = 0.0;
+            auto axisScaleFactor = 1.0;
             for(const auto &span : chunk.normalMotion) {
                 maximumAcceleration = std::max(maximumAcceleration, maximumLinearAcceleration(span));
                 maximumJerk = std::max(maximumJerk, maximumLinearJerk(span));
+                for(const auto component : AXIS_COMPONENTS) {
+                    axisScaleFactor = std::max(axisScaleFactor,
+                        maximumAxisVelocity(span, component) / (m_limits.axisVelocity.*component));
+                    axisScaleFactor = std::max(axisScaleFactor, std::sqrt(
+                        maximumAxisAcceleration(span, component) / (m_limits.axisAcceleration.*component)));
+                    axisScaleFactor = std::max(axisScaleFactor, std::cbrt(
+                        maximumAxisJerk(span, component) / (m_limits.axisJerk.*component)));
+                }
             }
-            const auto scaleFactor = std::max({1.0,
+            const auto scaleFactor = std::max({1.0, axisScaleFactor,
                 std::sqrt(maximumAcceleration / m_limits.pathAcceleration),
                 std::cbrt(maximumJerk / m_limits.pathJerk)});
             if(scaleFactor > 1.0 + 1e-9) {
@@ -293,7 +357,7 @@ namespace ngc {
                 const auto sample = [&](const double distance) { return PathSample { add(source, scaled(tangent, distance)), tangent }; };
                 const auto speed = value.speed() < 0.0 ? m_limits.rapidSpeed : value.speed();
                 const auto accept = [](const AxisPolynomialSpan &, double, double, double, double) { return true; };
-                if(auto result = appendMotion(length, speed, sample, accept)) return result;
+                if(auto result = appendMotion(length, speed, tangent, sample, accept)) return result;
                 m_position = target;
             } else if constexpr(std::same_as<T, ProbeMove>) {
                 return "unreachable probe compilation path";
@@ -306,6 +370,17 @@ namespace ngc {
                 const auto sample = [&](const double distance) {
                     return PathSample { positionAt(distance), reference.tangentAtDistance(distance) };
                 };
+                position_t maximumTangent{};
+                constexpr unsigned tangentIntervals = 256;
+                for(unsigned index = 0; index <= tangentIntervals; ++index) {
+                    const auto derivative = reference.derivative(
+                        static_cast<double>(index) / tangentIntervals);
+                    const auto magnitude = derivative.length();
+                    const auto tangent = magnitude > 0.0 ? scaled(derivative, 1.0 / magnitude) : position_t{};
+                    for(const auto component : AXIS_COMPONENTS)
+                        maximumTangent.*component = std::max(maximumTangent.*component,
+                            std::abs(tangent.*component));
+                }
                 auto arcSpeed = value.speed();
                 if(!std::isinf(m_limits.pathAcceleration) && length > 1e-12) {
                     const auto curvature = reference.curvatureAccelerationBound();
@@ -318,7 +393,7 @@ namespace ngc {
                         m_limits.arcChordTolerance, positionAt,
                         [&](const double from, const double to) { return reference.chordErrorBound(from, to); });
                 };
-                if(auto result = appendMotion(length, arcSpeed, sample, accept)) return result;
+                if(auto result = appendMotion(length, arcSpeed, maximumTangent, sample, accept)) return result;
                 m_position = value.to();
             } else if constexpr(std::same_as<T, SpindleStart> || std::same_as<T, SpindleStop>) {
                 const PathSample held { m_position, {} };
@@ -340,7 +415,8 @@ namespace ngc {
         const PathSample held { chunk.branchState.position, {} };
         auto stop = hermite(m_nextSpan++, held, held, 0.0, 0.0, 1e-6);
         stop.end = chunk.branchState;
-        chunk.stopTail.push(stop);
+        if(!chunk.stopTail.push(stop))
+            return std::unexpected("trajectory chunk stop-tail capacity exceeded");
         chunk.stopState = chunk.branchState;
         m_previousBranch = chunk.branch;
         return chunk;
@@ -348,7 +424,10 @@ namespace ngc {
 
     std::expected<TriggeredMove, std::string> ExactStopTrajectoryPlanner::compileTriggeredMove(
             const ProbeMove &command, const DigitalInputId input, const InputCondition condition) {
-        if(m_limits.pathAcceleration <= 0.0 || m_limits.pathJerk <= 0.0 || command.feed() <= 0.0)
+        if(m_limits.pathAcceleration <= 0.0 || m_limits.pathJerk <= 0.0 || command.feed() <= 0.0
+           || !positiveAxisLimits(m_limits.axisVelocity)
+           || !positiveAxisLimits(m_limits.axisAcceleration)
+           || !positiveAxisLimits(m_limits.axisJerk))
             return std::unexpected("triggered-move limits must be positive");
         const auto delta = subtract(command.target(), command.from());
         const auto length = std::sqrt(delta.x*delta.x + delta.y*delta.y + delta.z*delta.z
@@ -367,9 +446,12 @@ namespace ngc {
         move.branch = move.id;
         move.moveId = command.id();
         move.target = command.target();
-        move.limits.velocity = magnitudes(command.feed() / 60.0);
-        move.limits.acceleration = magnitudes(m_limits.pathAcceleration);
-        move.limits.jerk = magnitudes(m_limits.pathJerk);
+        move.limits.velocity = magnitudes(std::min(command.feed() / 60.0,
+            pathLimit(direction, m_limits.axisVelocity)));
+        move.limits.acceleration = magnitudes(std::min(m_limits.pathAcceleration,
+            pathLimit(direction, m_limits.axisAcceleration)));
+        move.limits.jerk = magnitudes(std::min(m_limits.pathJerk,
+            pathLimit(direction, m_limits.axisJerk)));
         move.input = input;
         move.condition = condition;
         move.triggerRequired = command.errorIfNotFound();

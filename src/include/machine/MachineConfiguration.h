@@ -31,6 +31,7 @@ namespace ngc {
         double maximum = 0.0;
         double maxVelocity = 0.0;
         double maxAcceleration = 0.0;
+        double maxJerk = 0.0;
     };
 
     struct DigitalInputConfiguration {

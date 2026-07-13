@@ -184,7 +184,6 @@ private:
             m_toolpath.clear();
             m_backend.clearTrajectoryDiagnostics();
             m_backendTrajectory = {};
-            m_driver.setLimits({ 10.0, 100.0, 0.0001 });
             if(!m_driver.begin(m_nextEpoch++)) {
                 m_busy = false;
                 return;
@@ -196,7 +195,8 @@ private:
                 if(!m_driver.pumpOne([&](const auto &callback) {
                     std::scoped_lock lock(m_mutex);
                     callback();
-                }, [&](const ngc::MachineCommand &command, const ngc::ExecutionItem &item) {
+                }, [&](const ngc::MachineCommand &command, const ngc::ExecutionItem &item,
+                       const ngc::TrajectoryPlanningMetadata &planning) {
                     std::scoped_lock lock(m_mutex);
                     if(std::holds_alternative<ngc::ProbeMove>(command)) {
                         const auto &move = std::get<ngc::TriggeredMove>(item);
@@ -208,8 +208,8 @@ private:
                         std::string(ngc::name(*m_session.machine().state().modeCoordSys)),
                         m_session.machine().workOffset() };
                     m_toolpath.consume(command, m_session.machine().toolOffset(), workCoordinateSystem,
-                        m_session.machine().state().modePath == ngc::GCPath::G64,
-                        m_session.machine().pathTolerance());
+                        planning.pathMode == ngc::ExecutablePathMode::Continuous,
+                        planning.pathTolerance);
                 })) break;
             }
 

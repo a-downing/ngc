@@ -1440,6 +1440,47 @@ namespace {
         return std::sqrt(x*x + y*y + z*z + a*a + b*b + c*c);
     }
 
+    double spanAxisVelocity(const ngc::AxisPolynomialSpan &span,
+                            const double ngc::position_t::*component) {
+        const auto at = [&](const double u) {
+            return std::abs((3.0*span.a.*component*u*u + 2.0*span.b.*component*u
+                + span.c.*component) * span.inverseDuration);
+        };
+        auto result = std::max(at(0.0), at(1.0));
+        if(std::abs(span.a.*component) > 1e-15) {
+            const auto stationary = -(span.b.*component) / (3.0*(span.a.*component));
+            if(stationary > 0.0 && stationary < 1.0) result = std::max(result, at(stationary));
+        }
+        return result;
+    }
+
+    double spanAxisAcceleration(const ngc::AxisPolynomialSpan &span,
+                                const double ngc::position_t::*component) {
+        const auto at = [&](const double u) {
+            return std::abs((6.0*span.a.*component*u + 2.0*span.b.*component)
+                * span.inverseDurationSquared);
+        };
+        return std::max(at(0.0), at(1.0));
+    }
+
+    double spanAxisJerk(const ngc::AxisPolynomialSpan &span,
+                        const double ngc::position_t::*component) {
+        return std::abs(6.0*span.a.*component * span.inverseDurationCubed);
+    }
+
+    void requireAxisLimits(const ngc::PlanChunk &chunk, const double ngc::position_t::*component,
+                           const double velocity, const double acceleration, const double jerk,
+                           const std::string_view context) {
+        for(const auto &span : chunk.normalMotion) {
+            require(spanAxisVelocity(span, component) <= velocity + 1e-8,
+                    std::format("{} should respect axis velocity", context));
+            require(spanAxisAcceleration(span, component) <= acceleration + 1e-8,
+                    std::format("{} should respect axis acceleration", context));
+            require(spanAxisJerk(span, component) <= jerk + 1e-8,
+                    std::format("{} should respect axis jerk", context));
+        }
+    }
+
     void testExactStopPlannerCompilesLinesAndArcs() {
         constexpr double ACCELERATION = 4.0;
         constexpr double JERK = 8.0;
@@ -1521,6 +1562,98 @@ namespace {
                     "constant-speed line should have no quadratic position term");
         requireNear(constantSpeed->normalMotion[0].duration, 2.0,
                     "constant-speed line duration should be distance divided by feed");
+    }
+
+    void testExactStopPlannerEnforcesIndependentAxisLimits() {
+        constexpr auto infinity = std::numeric_limits<double>::infinity();
+        ngc::ExactStopTrajectoryPlanner planner({
+            .pathAcceleration = infinity,
+            .rapidSpeed = 600.0,
+            .arcChordTolerance = 0.0001,
+            .pathJerk = infinity,
+            .axisVelocity = { 0.25, 0.5, infinity, 0.1, infinity, infinity },
+            .axisAcceleration = { 0.5, 1.0, infinity, 0.2, infinity, infinity },
+            .axisJerk = { 2.0, 4.0, infinity, 0.5, infinity, infinity },
+        });
+        planner.reset(11);
+
+        const ngc::position_t diagonalEnd { 1, 1, 0, 1, 0, 0 };
+        const auto diagonal = planner.compile(ngc::MoveLine { {}, diagonalEnd, 600.0 });
+        require(diagonal.has_value(), diagonal ? "" : diagonal.error());
+        requireAxisLimits(*diagonal, &ngc::position_t::x, 0.25, 0.5, 2.0, "diagonal X");
+        requireAxisLimits(*diagonal, &ngc::position_t::y, 0.5, 1.0, 4.0, "diagonal Y");
+        requireAxisLimits(*diagonal, &ngc::position_t::a, 0.1, 0.2, 0.5, "diagonal A");
+
+        auto rapidEnd = diagonalEnd;
+        rapidEnd.x += 1.0;
+        const auto rapid = planner.compile(ngc::MoveLine { diagonalEnd, rapidEnd, -1.0 });
+        require(rapid.has_value(), rapid ? "" : rapid.error());
+        requireAxisLimits(*rapid, &ngc::position_t::x, 0.25, 0.5, 2.0, "rapid X");
+
+        ngc::ExactStopTrajectoryPlanner arcPlanner({
+            .pathAcceleration = infinity,
+            .rapidSpeed = 600.0,
+            .arcChordTolerance = 0.0001,
+            .pathJerk = infinity,
+            .axisVelocity = { 0.2, 0.35, infinity, infinity, infinity, infinity },
+            .axisAcceleration = { 0.3, 0.6, infinity, infinity, infinity, infinity },
+            .axisJerk = { 2.0, 3.0, infinity, infinity, infinity, infinity },
+        });
+        const ngc::position_t arcStart { 1, 0, 0, 0, 0, 0 };
+        arcPlanner.reset(12, arcStart);
+        const auto arc = arcPlanner.compile(ngc::MoveArc {
+            arcStart, { 0, 1, 0, 0, 0, 0 }, {}, { 0, 0, 1 }, 600.0 });
+        require(arc.has_value(), arc ? "" : arc.error());
+        requireAxisLimits(*arc, &ngc::position_t::x, 0.2, 0.3, 2.0, "arc X");
+        requireAxisLimits(*arc, &ngc::position_t::y, 0.35, 0.6, 3.0, "arc Y");
+    }
+
+    void testBoundedLookaheadCarriesG64MetadataAndStopFallbacks() {
+        ngc::BoundedLookaheadTrajectoryPlanner planner({
+            .pathAcceleration = 4.0,
+            .rapidSpeed = 120.0,
+            .arcChordTolerance = 0.0001,
+            .pathJerk = 8.0,
+        });
+        planner.reset(21);
+        require(planner.enqueue({
+            ngc::MoveLine { {}, { 1, 0, 0, 0, 0, 0 }, 60.0 },
+            { ngc::ExecutablePathMode::Continuous, 0.01 },
+        }), "bounded lookahead should accept a G64 motion");
+        require(planner.enqueue({
+            ngc::MoveLine { { 1, 0, 0, 0, 0, 0 }, { 2, 0, 0, 0, 0, 0 }, 60.0 },
+            { ngc::ExecutablePathMode::ExactStop, std::nullopt },
+        }), "bounded lookahead should accept a following exact-stop motion");
+        require(planner.windowSize() == 2,
+                "lookahead should retain canonical inputs in source order");
+
+        const auto first = planner.planOne();
+        require(first.has_value() && *first, first ? "lookahead should produce its first item" : first.error());
+        require((*first)->metadata.pathMode == ngc::ExecutablePathMode::Continuous
+                    && (*first)->metadata.pathTolerance == 0.01,
+                "planned execution should retain its G64 mode and tolerance");
+        const auto *firstChunk = std::get_if<ngc::PlanChunk>(&(*first)->item);
+        require(firstChunk && firstChunk->stopTail.size == 1,
+                "G64 framework output should currently use a verified exact-stop fallback");
+
+        const auto second = planner.planOne();
+        require(second.has_value() && *second, second ? "lookahead should produce its second item" : second.error());
+        require(planner.windowSize() == 0, "lookahead should consume planned inputs in order");
+        const auto &diagnostics = planner.diagnostics();
+        require(diagnostics.commandsPlanned == 2 && diagnostics.continuousModeInputs == 1
+                    && diagnostics.exactStopFallbacks == 1,
+                "lookahead diagnostics should distinguish G64 exact-stop fallback");
+        require(diagnostics.maximumWindowCommands == 2 && diagnostics.maximumStopSpans == 1
+                    && diagnostics.maximumNormalSpans > 0 && diagnostics.plannedDuration > 0.0,
+                "lookahead diagnostics should retain window, span, and duration high-water marks");
+
+        ngc::BoundedLookaheadTrajectoryPlanner bounded;
+        bounded.reset(22);
+        for(std::size_t index = 0; index < ngc::BoundedLookaheadTrajectoryPlanner::MAX_LOOKAHEAD_COMMANDS; ++index)
+            require(bounded.enqueue({ ngc::SpindleStop {}, {} }),
+                    "lookahead should accept every advertised bounded slot");
+        require(!bounded.enqueue({ ngc::SpindleStop {}, {} }),
+                "lookahead should reject input beyond its fixed command bound");
     }
 
     void testMockBackendAdvancesOneFixedServoTick() {
@@ -1805,6 +1938,14 @@ namespace {
                     "logical X minimum should load in machine units");
         requireNear(axis(ngc::Machine::Axis::Z).maximum, 0.001,
                     "logical Z maximum should load in machine units");
+        requireNear(axis(ngc::Machine::Axis::X).maxJerk, 100.0,
+                    "logical axes should load an independent jerk limit");
+        requireNear(configuration->trajectory.axisVelocity.x, axis(ngc::Machine::Axis::X).maxVelocity,
+                    "trajectory limits should retain configured X velocity");
+        requireNear(configuration->trajectory.axisAcceleration.y, axis(ngc::Machine::Axis::Y).maxAcceleration,
+                    "trajectory limits should retain configured Y acceleration");
+        requireNear(configuration->trajectory.axisJerk.z, axis(ngc::Machine::Axis::Z).maxJerk,
+                    "trajectory limits should retain configured Z jerk");
 
         const auto input = [&](const std::string_view name) -> const ngc::DigitalInputConfiguration & {
             const auto found = std::ranges::find(configuration->digitalInputs, name,
@@ -1951,6 +2092,18 @@ namespace {
             .rapidSpeed = 100.0,
             .arcChordTolerance = 0.0001,
             .pathJerk = JERK,
+            .axisVelocity = { std::numeric_limits<double>::infinity(),
+                std::numeric_limits<double>::infinity(), 0.1,
+                std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+                std::numeric_limits<double>::infinity() },
+            .axisAcceleration = { std::numeric_limits<double>::infinity(),
+                std::numeric_limits<double>::infinity(), 0.5,
+                std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+                std::numeric_limits<double>::infinity() },
+            .axisJerk = { std::numeric_limits<double>::infinity(),
+                std::numeric_limits<double>::infinity(), 1.0,
+                std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
+                std::numeric_limits<double>::infinity() },
         });
         planner.reset(3, {});
         const ngc::ProbeMove probeCommand {
@@ -1959,6 +2112,12 @@ namespace {
         require(move.has_value(), move ? "" : move.error());
         require(move->moveId == 77, "triggered move should retain the interpreter probe ID");
         requireNear(move->target.z, -1.0, "triggered move should retain its machine target");
+        requireNear(std::abs(move->limits.velocity.z), 0.1,
+                    "triggered moves should use the limiting physical-axis velocity");
+        requireNear(std::abs(move->limits.acceleration.z), 0.5,
+                    "triggered moves should use the limiting physical-axis acceleration");
+        requireNear(std::abs(move->limits.jerk.z), 1.0,
+                    "triggered moves should use the limiting physical-axis jerk");
 
         ngc::MockMotionBackend backend;
         require(backend.trySubmit(ngc::StartRequest { 1, 3 }) == ngc::SubmitResult::Submitted,
@@ -2107,7 +2266,7 @@ namespace {
 
     void testTrajectoryDriverConnectsInterpreterToMockRtBackend() {
         ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::Simulation);
-        compileSession(session, "G1 F60 X1\nG1 Z-1\nG1 X2\n");
+        compileSession(session, "G64 P0.01\nG1 F60 X1\nG1 Z-1\nG1 X2\n");
         session.begin();
 
         ngc::MockMotionBackend backend;
@@ -2119,12 +2278,18 @@ namespace {
         require(driver.begin(12), "trajectory driver should initialize bounded backend control channels");
 
         int observedCommands = 0;
+        int continuousCommands = 0;
         ngc::ExecutionSnapshot latest;
         bool haveSnapshot = false;
         for(int guard = 0; guard < 10000 && driver.state() == ngc::TrajectoryDriverState::Running; ++guard) {
             for(int fill = 0; fill < 64; ++fill) {
                 if(!driver.pumpOne([](const auto &callback) { callback(); },
-                                   [&](const ngc::MachineCommand &) { ++observedCommands; })) break;
+                                   [&](const ngc::MachineCommand &, const ngc::ExecutionItem &,
+                                       const ngc::TrajectoryPlanningMetadata &metadata) {
+                                       ++observedCommands;
+                                       if(metadata.pathMode == ngc::ExecutablePathMode::Continuous
+                                          && metadata.pathTolerance == 0.01) ++continuousCommands;
+                                   })) break;
             }
             backend.advance(0.01);
             driver.serviceBackend();
@@ -2142,6 +2307,11 @@ namespace {
         require(driver.state() == ngc::TrajectoryDriverState::Completed,
                 driver.error() ? *driver.error() : completionDiagnostic);
         require(observedCommands == 3, "trajectory driver should compile every canonical motion command once");
+        require(continuousCommands == 3,
+                "trajectory driver should capture G64 metadata at each canonical command boundary");
+        require(driver.planningDiagnostics().exactStopFallbacks == 3
+                    && driver.planningDiagnostics().maximumWindowCommands == 1,
+                "driver should expose bounded exact-stop fallback diagnostics before blending is enabled");
         require(haveSnapshot, "mock RT backend should expose execution snapshots through SPSC communication");
         requireNear(latest.commanded.position.x, 2.0, "mock RT execution should reach the final planned X position");
         requireNear(latest.commanded.position.z, -1.0,
@@ -2285,6 +2455,8 @@ int main() {
         testImmediateDrainStopsAtHeldWithStaleDescendants();
         testN70N75PreviewPrefixesCompleteBoundedly();
         testExactStopPlannerCompilesLinesAndArcs();
+        testExactStopPlannerEnforcesIndependentAxisLimits();
+        testBoundedLookaheadCarriesG64MetadataAndStopFallbacks();
         testVerifiedCubicArcSpanCounts();
         testPlannedArcsPreserveCanonicalEndpointContinuity();
         testRoundedRadiusArcPreservesDynamicLimits();

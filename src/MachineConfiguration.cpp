@@ -90,6 +90,18 @@ namespace ngc {
             return "?";
         }
 
+        double &axisComponent(position_t &value, const Machine::Axis axis) {
+            switch(axis) {
+                case Machine::Axis::X: return value.x;
+                case Machine::Axis::Y: return value.y;
+                case Machine::Axis::Z: return value.z;
+                case Machine::Axis::A: return value.a;
+                case Machine::Axis::B: return value.b;
+                case Machine::Axis::C: return value.c;
+            }
+            PANIC("{} missing case statement", __func__);
+        }
+
         std::expected<InputCondition, std::string> parseCondition(
             const std::string_view value, const std::filesystem::path &path, const std::string_view field,
             const toml::node *node = nullptr) {
@@ -227,11 +239,13 @@ namespace ngc {
                 auto maximum = number(*axisTable, "maximum", path);
                 auto maxVelocity = positiveNumber(*axisTable, "max_velocity", path);
                 auto maxAcceleration = positiveNumber(*axisTable, "max_acceleration", path);
+                auto maxJerk = positiveNumber(*axisTable, "max_jerk", path);
                 if(!jointIds) return std::unexpected(jointIds.error());
                 if(!minimum) return std::unexpected(minimum.error());
                 if(!maximum) return std::unexpected(maximum.error());
                 if(!maxVelocity) return std::unexpected(maxVelocity.error());
                 if(!maxAcceleration) return std::unexpected(maxAcceleration.error());
+                if(!maxJerk) return std::unexpected(maxJerk.error());
                 if(*minimum >= *maximum)
                     return std::unexpected(configurationError(path, prefix, "minimum must be less than maximum",
                                                               axisTable));
@@ -240,7 +254,10 @@ namespace ngc {
                         return std::unexpected(configurationError(
                             path, prefix + ".joints", "a joint may belong to only one logical axis", axisTable));
                 result.axes.push_back({ axis, std::move(*jointIds), *minimum, *maximum,
-                                        *maxVelocity, *maxAcceleration });
+                                        *maxVelocity, *maxAcceleration, *maxJerk });
+                axisComponent(result.trajectory.axisVelocity, axis) = *maxVelocity;
+                axisComponent(result.trajectory.axisAcceleration, axis) = *maxAcceleration;
+                axisComponent(result.trajectory.axisJerk, axis) = *maxJerk;
             }
 
             std::unordered_set<DigitalInputId> inputIds;

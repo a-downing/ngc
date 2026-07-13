@@ -1,6 +1,7 @@
 #pragma once
 
 #include <expected>
+#include <limits>
 #include <optional>
 #include <string>
 
@@ -8,12 +9,20 @@
 
 namespace ngc {
     struct TrajectoryLimits {
-        // Machine units per second squared. This is deliberately a configuration
-        // object even though the initial value is hardcoded.
+        static position_t unlimitedAxes() {
+            constexpr auto infinity = std::numeric_limits<double>::infinity();
+            return { infinity, infinity, infinity, infinity, infinity, infinity };
+        }
+
+        // Aggregate path limits remain additional caps. Axis limits are the
+        // final authority for every emitted axis polynomial.
         double pathAcceleration = 10.0;
         double rapidSpeed = 100.0; // Machine units per minute.
         double arcChordTolerance = 0.0001;
         double pathJerk = 100.0;
+        position_t axisVelocity = unlimitedAxes();       // Machine units per second.
+        position_t axisAcceleration = unlimitedAxes();   // Machine units per second squared.
+        position_t axisJerk = unlimitedAxes();           // Machine units per second cubed.
     };
 
     class ExactStopTrajectoryPlanner {

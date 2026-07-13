@@ -1,13 +1,14 @@
 #pragma once
 
 #include <concepts>
+#include <memory>
 #include <optional>
 #include <string>
 #include <type_traits>
 #include <utility>
 
 #include "evaluator/InterpreterSession.h"
-#include "machine/ExactStopTrajectoryPlanner.h"
+#include "machine/BoundedLookaheadTrajectoryPlanner.h"
 #include "machine/MotionBackend.h"
 
 namespace ngc {
@@ -19,9 +20,8 @@ namespace ngc {
     class TrajectoryExecutionDriver {
         InterpreterSession &m_session;
         MotionBackend &m_backend;
-        ExactStopTrajectoryPlanner m_planner;
-        std::optional<ExecutionItem> m_pending;
-        std::optional<MachineCommand> m_pendingCommand;
+        BoundedLookaheadTrajectoryPlanner m_planner;
+        std::unique_ptr<PlannedExecution> m_pending;
         std::optional<std::string> m_error;
         std::size_t m_outstandingChunks = 0;
         bool m_interpretationComplete = false;
@@ -42,7 +42,6 @@ namespace ngc {
             ExecutionEvent staleEvent;
             while(m_backend.tryTakeEvent(staleEvent)) { }
             m_pending.reset();
-            m_pendingCommand.reset();
             m_error.reset();
             m_outstandingChunks = 0;
             m_interpretationComplete = false;
@@ -51,6 +50,7 @@ namespace ngc {
             m_waitingForHeld = false;
             m_backendReady = false;
             m_epoch = epoch;
+            m_planner.clearDiagnostics();
             m_planner.reset(epoch, position);
             if(m_backend.trySubmit(ResetRequest { m_nextRequest++, epoch }) != SubmitResult::Submitted) return false;
             m_startRequest = m_nextRequest++;
@@ -64,24 +64,22 @@ namespace ngc {
             if(m_error || !m_backendReady || m_interpretationComplete || m_waitingForHeld
                || m_synchronizationPending) return false;
             if(m_pending) {
-                const auto publication = m_backend.tryPublish(*m_pending);
+                const auto publication = m_backend.tryPublish(m_pending->item);
                 if(publication == PublishResult::Full) return false;
                 if(publication != PublishResult::Published) {
                     m_error = "trajectory backend rejected a pending planner-produced chunk";
                     return false;
                 }
-                if(!m_pendingCommand) {
-                    m_error = "pending trajectory chunk lost its canonical command";
-                    return false;
-                }
-                if constexpr(std::invocable<Observe, const MachineCommand &, const ExecutionItem &>)
-                    observe(*m_pendingCommand, *m_pending);
+                if constexpr(std::invocable<Observe, const MachineCommand &, const ExecutionItem &,
+                                             const TrajectoryPlanningMetadata &>)
+                    observe(m_pending->command, m_pending->item, m_pending->metadata);
+                else if constexpr(std::invocable<Observe, const MachineCommand &, const ExecutionItem &>)
+                    observe(m_pending->command, m_pending->item);
                 else
-                    observe(*m_pendingCommand);
-                m_probePending = std::holds_alternative<ProbeMove>(*m_pendingCommand);
+                    observe(m_pending->command);
+                m_probePending = std::holds_alternative<ProbeMove>(m_pending->command);
                 ++m_outstandingChunks;
                 m_pending.reset();
-                m_pendingCommand.reset();
                 return true;
             }
             if(m_probePending) return false;
@@ -91,34 +89,38 @@ namespace ngc {
                 if constexpr(!std::same_as<std::remove_cvref_t<ObserveLifecycle>, std::nullptr_t>)
                     observeLifecycle(*lifecycle);
             } else if(auto command = std::get_if<MachineCommand>(&event)) {
-                std::expected<ExecutionItem, std::string> compiled = std::visit([&](const auto &value)
-                        -> std::expected<ExecutionItem, std::string> {
-                    using T = std::decay_t<decltype(value)>;
-                    if constexpr(std::same_as<T, ProbeMove>) {
-                        auto move = m_planner.compileTriggeredMove(value);
-                        if(!move) return std::unexpected(move.error());
-                        return ExecutionItem { *move };
-                    } else {
-                        auto chunk = m_planner.compile(*command);
-                        if(!chunk) return std::unexpected(chunk.error());
-                        return ExecutionItem { *chunk };
-                    }
-                }, *command);
-                if(!compiled) {
-                    m_error = compiled.error();
+                const TrajectoryPlanningMetadata metadata {
+                    .pathMode = m_session.machine().state().modePath == GCPath::G64
+                        ? ExecutablePathMode::Continuous : ExecutablePathMode::ExactStop,
+                    .pathTolerance = m_session.machine().pathTolerance(),
+                };
+                if(!m_planner.enqueue({ *command, metadata })) {
+                    m_error = "bounded trajectory lookahead window is full";
                     return true;
                 }
-                const auto result = m_backend.tryPublish(*compiled);
+                auto planned = m_planner.planOne();
+                if(!planned) {
+                    m_error = planned.error();
+                    return true;
+                }
+                if(!*planned) {
+                    m_error = "trajectory lookahead accepted a command without producing an exact-stop fallback";
+                    return true;
+                }
+                auto compiled = std::move(*planned);
+                const auto result = m_backend.tryPublish(compiled->item);
                 if(result == PublishResult::Published) {
-                    if constexpr(std::invocable<Observe, const MachineCommand &, const ExecutionItem &>)
-                        observe(*command, *compiled);
+                    if constexpr(std::invocable<Observe, const MachineCommand &, const ExecutionItem &,
+                                                 const TrajectoryPlanningMetadata &>)
+                        observe(compiled->command, compiled->item, compiled->metadata);
+                    else if constexpr(std::invocable<Observe, const MachineCommand &, const ExecutionItem &>)
+                        observe(compiled->command, compiled->item);
                     else
-                        observe(*command);
-                    m_probePending = std::holds_alternative<ProbeMove>(*command);
+                        observe(compiled->command);
+                    m_probePending = std::holds_alternative<ProbeMove>(compiled->command);
                     ++m_outstandingChunks;
                 } else if(result == PublishResult::Full) {
-                    m_pending = *compiled;
-                    m_pendingCommand = *command;
+                    m_pending = std::move(compiled);
                 }
                 else m_error = "trajectory backend rejected a planner-produced chunk";
             } else if(std::holds_alternative<InterpreterCompleted>(event)) {
@@ -182,26 +184,22 @@ namespace ngc {
                         m_backendReady = false;
                         m_outstandingChunks = 0;
                         m_planner.reset(m_epoch, held->state.position);
-                        if(m_pendingCommand) {
-                            std::expected<ExecutionItem, std::string> replanned = std::visit([&](const auto &value)
-                                    -> std::expected<ExecutionItem, std::string> {
-                                using T = std::decay_t<decltype(value)>;
-                                if constexpr(std::same_as<T, ProbeMove>) {
-                                    auto move = m_planner.compileTriggeredMove(value);
-                                    if(!move) return std::unexpected(move.error());
-                                    return ExecutionItem { *move };
-                                } else {
-                                    auto chunk = m_planner.compile(*m_pendingCommand);
-                                    if(!chunk) return std::unexpected(chunk.error());
-                                    return ExecutionItem { *chunk };
-                                }
-                            }, *m_pendingCommand);
-                            if(!replanned) {
-                                m_error = replanned.error();
+                        if(m_pending) {
+                            auto pending = std::move(m_pending);
+                            if(!m_planner.enqueue({ pending->command, pending->metadata })) {
+                                m_error = "bounded trajectory lookahead window is full during held-state recovery";
                                 m_pending.reset();
-                                m_pendingCommand.reset();
                             } else {
-                                m_pending = *replanned;
+                                auto replanned = m_planner.planOne();
+                                if(!replanned) {
+                                    m_error = replanned.error();
+                                    m_pending.reset();
+                                } else if(!*replanned) {
+                                    m_error = "trajectory lookahead lost a command during held-state recovery";
+                                    m_pending.reset();
+                                } else {
+                                    m_pending = std::move(*replanned);
+                                }
                             }
                         } else {
                             m_pending.reset();
@@ -223,7 +221,7 @@ namespace ngc {
             }
         }
 
-        bool canPublish() const { return !m_pending.has_value(); }
+        bool canPublish() const { return !m_pending; }
 
         TrajectoryDriverState state() const {
             if(m_error) return TrajectoryDriverState::Error;
@@ -239,5 +237,7 @@ namespace ngc {
         bool synchronizationPending() const { return m_synchronizationPending; }
         EpochId epoch() const { return m_epoch; }
         bool waitingForHeld() const { return m_waitingForHeld; }
+        const TrajectoryPlanningDiagnostics &planningDiagnostics() const { return m_planner.diagnostics(); }
+        std::size_t lookaheadWindowSize() const { return m_planner.windowSize(); }
     };
 }

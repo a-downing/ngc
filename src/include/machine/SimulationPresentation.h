@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "evaluator/InterpreterStatus.h"
+#include "machine/BoundedLookaheadTrajectoryPlanner.h"
 #include "machine/MachineCommand.h"
 #include "machine/MotionBackend.h"
 
@@ -28,6 +29,7 @@ namespace ngc {
         double lastWakeLatenessSeconds = 0.0;
         double maximumWakeLatenessSeconds = 0.0;
         double maximumTickExecutionSeconds = 0.0;
+        TrajectoryPlanningDiagnostics trajectoryPlanning;
         bool hasActiveMotion = false;
         bool jogging = false;
         JointMask homedJoints = 0;

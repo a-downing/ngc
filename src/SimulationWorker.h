@@ -912,6 +912,7 @@ private:
                     filled = true;
                 }
                 m_snapshot.statusMessages = m_session.statusMessages();
+                m_snapshot.trajectoryPlanning = m_driver.planningDiagnostics();
                 state = m_driver.state();
                 if(state == ngc::TrajectoryDriverState::Error) {
                     m_snapshot.status = ngc::SimulationStatus::Error;
