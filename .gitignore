@@ -4,3 +4,4 @@
 .cache/
 imgui.ini
 window_state.ini
+my_LinuxCNC_machine/
