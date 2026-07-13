@@ -1,12 +1,13 @@
 # Values in this file use the configured machine unit and seconds.
 [machine]
 units = "inch"
+coordinates = ["x", "y", "z"]
 
 [trajectory]
 # machine-units / second^2
-path_acceleration = 5.0
+path_acceleration = 20.0
 # machine-units / second^3
-path_jerk = 20.0
+path_jerk = 100.0
 # machine-units / second
 rapid_velocity = 3.33
 # machine-units
@@ -17,3 +18,151 @@ arc_chord_tolerance = 0.0001
 servo_period = 0.001
 # seconds between Windows mock-executor scheduler wakes (100 Hz)
 scheduler_period = 0.01
+
+# Logical machine axes. Multiple joints may map to one axis; Y uses two joints
+# so its gantry can be squared during homing and coupled during normal motion.
+[axes.x]
+joints = [0]
+minimum = -14.0
+maximum = 13.75
+max_velocity = 3.33333333333
+max_acceleration = 100
+
+[axes.y]
+joints = [1, 2]
+minimum = -0.1
+maximum = 33.25
+max_velocity = 3.33333333333
+max_acceleration = 100
+
+[axes.z]
+joints = [3]
+minimum = -8.5
+maximum = 0.001
+max_velocity = 3.33333333333
+max_acceleration = 100
+
+# Stable logical input IDs. A future physical backend will map these names and
+# IDs to hardware; simulation supplies mock transitions without hardware data.
+[digital_inputs]
+tool_probe = 0
+shared_home = 1
+y2_home = 2
+
+[probing]
+input = "tool_probe"
+condition = "active"
+debounce = 0.010
+
+[[joints]]
+id = 0
+name = "x"
+axis = "x"
+coordinate_scale = 1.0
+minimum = -14.0
+maximum = 13.75
+max_velocity = 3.33333333333
+max_acceleration = 20
+max_jerk = 100
+
+[joints.homing]
+input = "shared_home"
+condition = "active"
+home_position = 12.75
+switch_position = 13.85
+search_velocity = 2
+latch_velocity = 0.2
+backoff_distance = 0.25
+debounce = 0.010
+final_velocity = 0.0
+use_index = false
+
+[[joints]]
+id = 1
+name = "y1"
+axis = "y"
+coordinate_scale = 1.0
+minimum = -0.1
+maximum = 33.25
+max_velocity = 3.33333333333
+max_acceleration = 20.0
+max_jerk = 100
+
+[joints.homing]
+input = "shared_home"
+condition = "active"
+home_position = 1
+switch_position = -0.1
+search_velocity = -2
+latch_velocity = -0.2
+backoff_distance = 0.25
+debounce = 0.010
+final_velocity = 0.0
+use_index = false
+
+[[joints]]
+id = 2
+name = "y2"
+axis = "y"
+coordinate_scale = 1.0
+minimum = -0.1
+maximum = 33.25
+max_velocity = 3.33333333333
+max_acceleration = 20.0
+max_jerk = 100
+
+[joints.homing]
+input = "y2_home"
+condition = "active"
+home_position = 1
+switch_position = -0.140
+search_velocity = -2
+latch_velocity = -0.2
+backoff_distance = 0.25
+debounce = 0.010
+final_velocity = 0.0
+use_index = false
+
+[[joints]]
+id = 3
+name = "z"
+axis = "z"
+coordinate_scale = 1.0
+minimum = -8.5
+maximum = 0.001
+max_velocity = 3.33333333333
+max_acceleration = 20.0
+max_jerk = 100
+
+[joints.homing]
+input = "shared_home"
+condition = "active"
+home_position = -1
+switch_position = 0.1
+search_velocity = 2
+latch_velocity = 0.2
+backoff_distance = 0.25
+debounce = 0.010
+final_velocity = 0.0
+use_index = false
+
+[homing]
+require_before_motion = false
+
+[[homing.groups]]
+name = "z"
+sequence = 0
+joints = [3]
+
+[[homing.groups]]
+name = "x"
+sequence = 1
+joints = [0]
+
+[[homing.groups]]
+name = "y_gantry"
+sequence = 2
+joints = [1, 2]
+start_together = true
+stop_each_joint_on_trigger = true
+final_move_together = true

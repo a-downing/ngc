@@ -98,6 +98,7 @@ class ApplicationImpl final {
     std::string m_errorMessage;
 
     ngc::SimulationTiming m_simulationTiming;
+    ngc::Machine::Unit m_machineUnit;
     Worker m_worker;
     SimulationWorker m_simulation;
     int m_simulationTickMultiplier = 1;
@@ -232,12 +233,36 @@ class ApplicationImpl final {
         glLineWidth(1.0f);
     }
 
+    void drawNoToolCrosshair(const ngc::position_t &position) const {
+        const glm::dvec3 center { position.x, position.y, position.z };
+        // World-space size is intentional: the marker grows when the user zooms in.
+        const auto halfSize = m_machineUnit == ngc::Machine::Unit::Inch ? 0.5 : 12.5;
+        const glm::dvec3 x { halfSize, 0.0, 0.0 };
+        const glm::dvec3 y { 0.0, halfSize, 0.0 };
+        const glm::dvec3 z { 0.0, 0.0, halfSize };
+
+        glDisable(GL_DEPTH_TEST);
+        glLineWidth(2.0f);
+        glBegin(GL_LINES);
+        glColor3d(1.0, 0.25, 0.2);
+        glVertex3dv(glm::value_ptr(center - x));
+        glVertex3dv(glm::value_ptr(center + x));
+        glColor3d(0.25, 1.0, 0.3);
+        glVertex3dv(glm::value_ptr(center - y));
+        glVertex3dv(glm::value_ptr(center + y));
+        glColor3d(0.25, 0.55, 1.0);
+        glVertex3dv(glm::value_ptr(center - z));
+        glVertex3dv(glm::value_ptr(center + z));
+        glEnd();
+        glLineWidth(1.0f);
+    }
+
 public:
     ApplicationImpl() = delete;
     ApplicationImpl(GLFWwindow *window, const ngc::MachineConfiguration &configuration)
-        : m_window(window), m_simulationTiming(configuration.simulation),
+        : m_window(window), m_simulationTiming(configuration.simulation), m_machineUnit(configuration.unit),
           m_worker(configuration.unit, configuration.trajectory, configuration.simulation.servoPeriod),
-          m_simulation(configuration.unit, configuration.trajectory, configuration.simulation),
+          m_simulation(configuration),
           m_simulatedRapidSpeed(configuration.trajectory.rapidSpeed) { }
 
     void init() {
@@ -1011,9 +1036,10 @@ public:
         glLineWidth(1.0f);
 
         const auto simulation = m_simulation.snapshot();
-        if(simulation.status != ngc::SimulationStatus::Stopped) {
+        if(simulation.toolPose.geometry.number == 0)
+            drawNoToolCrosshair(simulation.machinePosition);
+        else if(simulation.status != ngc::SimulationStatus::Stopped)
             drawToolWireframe(simulation.toolPose);
-        }
     }
 
     void interpolate(const ngc::MoveArc &arc, int circleResolution, const std::function<void(const glm::dvec3 &start, const glm::dvec3 &end, const bool startPoint, const bool endPoint)> &callback) {
@@ -1113,6 +1139,14 @@ public:
         }
         ImGui::SameLine();
         if(ImGui::Button("Stop")) m_simulation.stop();
+        ImGui::EndDisabled();
+
+        ImGui::SameLine();
+        ImGui::BeginDisabled(simulationActive || !m_simulation.homingAvailable());
+        if(ImGui::Button("Home")) {
+            m_simulation.setTickMultiplier(m_simulationTickMultiplier);
+            m_simulation.home();
+        }
         ImGui::EndDisabled();
 
         ImGui::SameLine();
@@ -1326,8 +1360,14 @@ public:
             }
             return "Unknown";
         }();
-        ImGui::Text("Simulation: %s    Tool XYZ: %.4f, %.4f, %.4f",
-                    statusText, simulation.toolPosition.x, simulation.toolPosition.y, simulation.toolPosition.z);
+        ImGui::Text("Simulation: %s    MCS XYZ: %.4f, %.4f, %.4f",
+                    statusText, simulation.machinePosition.x, simulation.machinePosition.y,
+                    simulation.machinePosition.z);
+        if(simulation.toolPose.geometry.number != 0) {
+            ImGui::SameLine();
+            ImGui::Text("    Tool XYZ: %.4f, %.4f, %.4f",
+                        simulation.toolPosition.x, simulation.toolPosition.y, simulation.toolPosition.z);
+        }
         if(simulation.status != ngc::SimulationStatus::Stopped) {
             ImGui::TextDisabled("Servo %.3f ms    Scheduler %.3f ms (%u ticks) x%u    Ticks %llu    Missed deadlines %llu    Max wake %.1f us    Max tick %.1f us",
                 simulation.servoPeriodSeconds * 1000.0, simulation.schedulerPeriodSeconds * 1000.0,
@@ -1638,8 +1678,9 @@ public:
                     }
                     return "Unknown";
                 }();
-                ImGui::Text("Simulation: %s  XYZ: %.4f, %.4f, %.4f",
-                            statusText, simulation.toolPosition.x, simulation.toolPosition.y, simulation.toolPosition.z);
+                ImGui::Text("Simulation: %s  MCS XYZ: %.4f, %.4f, %.4f",
+                            statusText, simulation.machinePosition.x, simulation.machinePosition.y,
+                            simulation.machinePosition.z);
                 if(!simulation.error.empty()) {
                     ImGui::TextColored(ImVec4_Redish, "%s", simulation.error.c_str());
                 }

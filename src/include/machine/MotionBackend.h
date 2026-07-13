@@ -99,6 +99,9 @@ namespace ngc {
 
     using DigitalInputId = std::uint16_t;
     using TriggeredMoveId = std::uint64_t;
+    using JointId = std::uint8_t;
+    using JointMask = std::uint16_t;
+    inline constexpr std::size_t MAX_JOINTS = 12;
 
     enum class InputCondition : std::uint8_t { Active, Inactive, RisingEdge, FallingEdge };
 
@@ -107,6 +110,34 @@ namespace ngc {
         position_t acceleration{};
         position_t jerk{};
     };
+
+    struct JointVector {
+        std::array<double, MAX_JOINTS> values{};
+
+        constexpr double &operator[](const JointId joint) noexcept { return values[joint]; }
+        constexpr double operator[](const JointId joint) const noexcept { return values[joint]; }
+    };
+
+    struct JointMotionState {
+        JointVector position{};
+        JointVector velocity{};
+        JointVector acceleration{};
+    };
+
+    struct JointMotionLimits {
+        JointVector velocity{};
+        JointVector acceleration{};
+        JointVector jerk{};
+    };
+
+    struct JointTrigger {
+        JointId joint = 0;
+        DigitalInputId input = 0;
+        InputCondition condition = InputCondition::Active;
+        double debounce = 0.0;
+    };
+
+    enum class JointTargetMode : std::uint8_t { Absolute, Relative };
 
     // A bounded executor-owned point-to-point move terminated by a sampled
     // digital-input condition. The executor generates both the approach and the
@@ -125,7 +156,25 @@ namespace ngc {
         ProgramCursor cursor{};
     };
 
-    using ExecutionItem = std::variant<PlanChunk, TriggeredMove>;
+    // Joint-space counterpart used for gantry squaring and other service
+    // operations. Each joint stops independently on its own input transition;
+    // the item completes after every selected joint has stopped or reached target.
+    struct TriggeredJointMove {
+        EpochId epoch = 0;
+        ChunkId id = 0;
+        BranchSequence predecessorBranch = 0;
+        BranchSequence branch = 0;
+        TriggeredMoveId moveId = 0;
+        JointMask joints = 0;
+        JointTargetMode targetMode = JointTargetMode::Absolute;
+        JointVector target{};
+        JointMotionLimits limits{};
+        FixedArray<JointTrigger, MAX_JOINTS> triggers;
+        bool triggerRequired = false;
+        ProgramCursor cursor{};
+    };
+
+    using ExecutionItem = std::variant<PlanChunk, TriggeredMove, TriggeredJointMove>;
     static_assert(std::is_trivially_copyable_v<ExecutionItem>);
 
     enum class BackendState : std::uint8_t { Disabled, Held, Running, Faulted };
@@ -140,8 +189,10 @@ namespace ngc {
     struct ResumeRequest { RequestId id = 0; EpochId epoch = 0; };
     struct AbortRequest { RequestId id = 0; };
     struct ResetRequest { RequestId id = 0; EpochId nextEpoch = 0; };
+    struct SetJointPositionRequest { RequestId id = 0; JointMask joints = 0; JointVector position{}; };
     using ControlRequest = std::variant<EnableRequest, DisableRequest, StartRequest,
-                                        FeedHoldRequest, ResumeRequest, AbortRequest, ResetRequest>;
+                                        FeedHoldRequest, ResumeRequest, AbortRequest, ResetRequest,
+                                        SetJointPositionRequest>;
 
     struct ChunkAccepted { EpochId epoch; ChunkId chunk; };
     struct ChunkRejected { EpochId epoch; ChunkId chunk; };
@@ -155,11 +206,20 @@ namespace ngc {
         MotionState triggerState;
         MotionState stoppedState;
     };
+    struct TriggeredJointMoveCompleted {
+        EpochId epoch;
+        TriggeredMoveId move;
+        TriggeredMoveStatus status;
+        JointMask triggeredJoints;
+        JointMotionState triggerState;
+        JointMotionState stoppedState;
+    };
     struct RequestCompleted { RequestId request; bool succeeded; };
     struct BackendHeld { EpochId epoch; MotionState state; ProgramCursor cursor; };
     struct BackendFault { std::uint32_t code; };
     using ExecutionEvent = std::variant<ChunkAccepted, ChunkRejected, ChunkRetired, BranchSelected,
-                                        TriggeredMoveCompleted, RequestCompleted, BackendHeld, BackendFault>;
+                                        TriggeredMoveCompleted, TriggeredJointMoveCompleted,
+                                        RequestCompleted, BackendHeld, BackendFault>;
 
     struct ExecutionSnapshot {
         BackendState state = BackendState::Disabled;
@@ -170,6 +230,9 @@ namespace ngc {
         BranchSequence lastBranch = 0;
         MotionState commanded{};
         MotionState feedback{};
+        JointMask activeJoints = 0;
+        JointMotionState commandedJoints{};
+        JointMotionState feedbackJoints{};
         std::uint32_t faultCode = 0;
     };
 

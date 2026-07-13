@@ -1,8 +1,10 @@
 #pragma once
 
 #include <expected>
+#include <cstdint>
 #include <filesystem>
 #include <string>
+#include <vector>
 
 #include "machine/ExactStopTrajectoryPlanner.h"
 #include "machine/Machine.h"
@@ -17,10 +19,76 @@ namespace ngc {
         double schedulerPeriod = 0.01;
     };
 
+    struct AxisConfiguration {
+        Machine::Axis axis = Machine::Axis::X;
+        std::vector<JointId> joints;
+        double minimum = 0.0;
+        double maximum = 0.0;
+        double maxVelocity = 0.0;
+        double maxAcceleration = 0.0;
+    };
+
+    struct DigitalInputConfiguration {
+        std::string name;
+        DigitalInputId id = 0;
+    };
+
+    struct ProbingConfiguration {
+        DigitalInputId input = 0;
+        InputCondition condition = InputCondition::Active;
+        double debounce = 0.0;
+    };
+
+    struct JointHomingConfiguration {
+        DigitalInputId input = 0;
+        InputCondition condition = InputCondition::Active;
+        double homePosition = 0.0;
+        double switchPosition = 0.0;
+        double searchVelocity = 0.0;
+        double latchVelocity = 0.0;
+        double backoffDistance = 0.0;
+        double debounce = 0.0;
+        double finalVelocity = 0.0;
+        bool useIndex = false;
+    };
+
+    struct JointConfiguration {
+        JointId id = 0;
+        std::string name;
+        Machine::Axis axis = Machine::Axis::X;
+        double coordinateScale = 1.0;
+        double minimum = 0.0;
+        double maximum = 0.0;
+        double maxVelocity = 0.0;
+        double maxAcceleration = 0.0;
+        double maxJerk = 0.0;
+        JointHomingConfiguration homing;
+    };
+
+    struct HomingGroupConfiguration {
+        std::string name;
+        std::uint32_t sequence = 0;
+        std::vector<JointId> joints;
+        bool startTogether = false;
+        bool stopEachJointOnTrigger = false;
+        bool finalMoveTogether = false;
+    };
+
+    struct HomingConfiguration {
+        bool requireBeforeMotion = false;
+        std::vector<HomingGroupConfiguration> groups;
+    };
+
     struct MachineConfiguration {
         Machine::Unit unit = Machine::Unit::Inch;
+        std::vector<Machine::Axis> coordinates;
         TrajectoryLimits trajectory;
         SimulationTiming simulation;
+        std::vector<AxisConfiguration> axes;
+        std::vector<DigitalInputConfiguration> digitalInputs;
+        ProbingConfiguration probing;
+        std::vector<JointConfiguration> joints;
+        HomingConfiguration homing;
     };
 
     std::expected<MachineConfiguration, std::string>

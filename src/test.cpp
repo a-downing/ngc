@@ -1682,6 +1682,106 @@ namespace {
                     "machine configuration should load the fixed simulation servo period");
         requireNear(configuration->simulation.schedulerPeriod, 0.01,
                     "machine configuration should load the independent scheduler period");
+
+        require(configuration->coordinates == std::vector {
+                    ngc::Machine::Axis::X, ngc::Machine::Axis::Y, ngc::Machine::Axis::Z },
+                "machine configuration should load the logical coordinate order");
+        const auto axis = [&](const ngc::Machine::Axis value) -> const ngc::AxisConfiguration & {
+            const auto found = std::ranges::find(configuration->axes, value, &ngc::AxisConfiguration::axis);
+            require(found != configuration->axes.end(), "configured logical axis should exist");
+            return *found;
+        };
+        require(axis(ngc::Machine::Axis::Y).joints == std::vector<ngc::JointId> { 1, 2 },
+                "Y should load as one logical axis backed by two joints");
+        requireNear(axis(ngc::Machine::Axis::X).minimum, -14.0,
+                    "logical X minimum should load in machine units");
+        requireNear(axis(ngc::Machine::Axis::Z).maximum, 0.001,
+                    "logical Z maximum should load in machine units");
+
+        const auto input = [&](const std::string_view name) -> const ngc::DigitalInputConfiguration & {
+            const auto found = std::ranges::find(configuration->digitalInputs, name,
+                                                 &ngc::DigitalInputConfiguration::name);
+            require(found != configuration->digitalInputs.end(), "configured digital input should exist");
+            return *found;
+        };
+        require(input("tool_probe").id == 0 && input("shared_home").id == 1 && input("y2_home").id == 2,
+                "logical digital input names should resolve to stable backend IDs");
+        require(configuration->probing.input == input("tool_probe").id
+                    && configuration->probing.condition == ngc::InputCondition::Active,
+                "probing should load its resolved input and condition");
+        requireNear(configuration->probing.debounce, 0.010,
+                    "probing should load its debounce duration");
+
+        const auto joint = [&](const ngc::JointId id) -> const ngc::JointConfiguration & {
+            const auto found = std::ranges::find(configuration->joints, id, &ngc::JointConfiguration::id);
+            require(found != configuration->joints.end(), "configured joint should exist");
+            return *found;
+        };
+        require(configuration->joints.size() == 4,
+                "machine configuration should load all four physical joints");
+        require(joint(1).axis == ngc::Machine::Axis::Y && joint(2).axis == ngc::Machine::Axis::Y,
+                "both gantry joints should map to logical Y");
+        require(joint(1).homing.input == input("shared_home").id
+                    && joint(2).homing.input == input("y2_home").id,
+                "each gantry joint should load its own resolved home input");
+        requireNear(joint(2).homing.switchPosition, -0.140,
+                    "the second Y switch calibration should load independently");
+        require(joint(0).homing.searchVelocity > 0.0 && joint(1).homing.searchVelocity < 0.0,
+                "signed homing search directions should load without fixing tunable speeds in the test");
+        require(joint(0).homing.backoffDistance > 0.0,
+                "fixed homing backoff distance should load in machine units");
+        require(joint(0).homing.debounce >= 0.0,
+                "per-joint home switch debounce should load in seconds");
+
+        require(!configuration->homing.requireBeforeMotion,
+                "configured pre-home motion policy should load");
+        const auto group = std::ranges::find(configuration->homing.groups, "y_gantry",
+                                             &ngc::HomingGroupConfiguration::name);
+        require(group != configuration->homing.groups.end(), "Y gantry homing group should load");
+        require(group->sequence == 2 && group->joints == std::vector<ngc::JointId> { 1, 2 }
+                    && group->startTogether && group->stopEachJointOnTrigger && group->finalMoveTogether,
+                "Y gantry homing policy should preserve joint-independent switch stopping");
+    }
+
+    void testConfiguredHomingMovesFromPowerUpPosition() {
+        const auto configuration = ngc::loadMachineConfiguration("machine.toml");
+        require(configuration.has_value(), configuration ? "" : configuration.error());
+        SimulationWorker worker(*configuration);
+        worker.setTickMultiplier(1000);
+        auto snapshot = worker.snapshot();
+        requireNear(snapshot.machinePosition.x, 6.0, "mock machine should power up at X6");
+        requireNear(snapshot.machinePosition.y, 6.0, "mock machine should power up at Y6");
+        requireNear(snapshot.machinePosition.z, -6.0, "mock machine should power up at Z-6");
+        require(worker.home(), "configured simulated homing should start");
+        for(int attempt = 0; attempt < 5000
+            && snapshot.status != ngc::SimulationStatus::Completed
+            && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(snapshot.status == ngc::SimulationStatus::Completed,
+                std::format("configured simulated homing should complete: {}", snapshot.error));
+        const auto configuredHome = [&](const ngc::Machine::Axis axis) {
+            double sum = 0.0;
+            std::size_t count = 0;
+            for(const auto &joint : configuration->joints) if(joint.axis == axis) {
+                sum += joint.homing.homePosition;
+                ++count;
+            }
+            require(count != 0, "homing regression axis should have a configured joint");
+            return sum / count;
+        };
+        requireNear(snapshot.machinePosition.x, configuredHome(ngc::Machine::Axis::X),
+                    "X should finish at its configured home position");
+        requireNear(snapshot.machinePosition.y, configuredHome(ngc::Machine::Axis::Y),
+                    "both Y joints should finish squared at their configured home position");
+        requireNear(snapshot.machinePosition.z, configuredHome(ngc::Machine::Axis::Z),
+                    "Z should finish at its configured home position");
+        require(snapshot.toolPose.geometry.number == 0,
+                "homing without a loaded tool should retain the no-tool presentation state");
+        requireNear(snapshot.toolPosition.x, snapshot.machinePosition.x,
+                    "the no-tool position marker should track the machine position");
+        worker.join();
     }
 
     void testProbeCompilesAsBackendOwnedTriggeredMove() {
@@ -1749,6 +1849,101 @@ namespace {
         const auto diagnostics = backend.trajectorySnapshot();
         require(diagnostics.spans.size() >= 2 && diagnostics.spans.back().stopTail,
                 "triggered stop should be retained in the reusable diagnostic position buffer");
+    }
+
+    void testDualScrewJointMoveStopsEachMotorOnItsOwnSwitch() {
+        ngc::TriggeredJointMove move;
+        move.epoch = 9;
+        move.id = 1;
+        move.branch = 1;
+        move.moveId = 400;
+        move.joints = (ngc::JointMask{1} << 0) | (ngc::JointMask{1} << 1);
+        move.targetMode = ngc::JointTargetMode::Relative;
+        move.target[0] = 2.0;
+        move.target[1] = 2.0;
+        for(const ngc::JointId joint : { ngc::JointId{0}, ngc::JointId{1} }) {
+            move.limits.velocity[joint] = 1.0;
+            move.limits.acceleration[joint] = 2.0;
+            move.limits.jerk[joint] = 10.0;
+        }
+        require(move.triggers.push({ 0, 10, ngc::InputCondition::Active, 0.010 }),
+                "first Y joint trigger should fit");
+        require(move.triggers.push({ 1, 11, ngc::InputCondition::Active, 0.010 }),
+                "second Y joint trigger should fit");
+        move.triggerRequired = true;
+
+        ngc::MockMotionBackend backend;
+        require(backend.trySubmit(ngc::EnableRequest { 1 }) == ngc::SubmitResult::Submitted,
+                "joint backend should enable into held state");
+        backend.advance(0.0);
+        ngc::JointVector initial{};
+        initial[0] = 5.0;
+        initial[1] = 5.0;
+        require(backend.trySubmit(ngc::SetJointPositionRequest { 2, move.joints, initial })
+                    == ngc::SubmitResult::Submitted,
+                "arbitrary pre-home joint coordinates should be accepted while held");
+        backend.advance(0.0);
+        require(backend.trySubmit(ngc::StartRequest { 3, 9 }) == ngc::SubmitResult::Submitted,
+                "joint backend should start");
+        require(backend.configureSyntheticJointInput(move.moveId, 0, 5.7),
+                "first Y home switch should configure");
+        require(backend.configureSyntheticJointInput(move.moveId, 1, 6.0),
+                "second Y home switch should configure");
+        require(backend.tryPublish(ngc::ExecutionItem { move }) == ngc::PublishResult::Published,
+                "joint triggered move should publish");
+
+        bool sawIndependentStop = false;
+        ngc::ExecutionSnapshot latest;
+        for(int tick = 0; tick < 10000; ++tick) {
+            backend.advanceTick(0.001, true);
+            ngc::ExecutionSnapshot snapshot;
+            while(backend.tryTakeSnapshot(snapshot)) {
+                latest = snapshot;
+                if(std::abs(snapshot.commandedJoints.velocity[0]) <= 1e-9
+                   && snapshot.commandedJoints.position[0] > 5.7
+                   && snapshot.commandedJoints.velocity[1] > 1e-6)
+                    sawIndependentStop = true;
+            }
+            if(latest.state == ngc::BackendState::Held) break;
+        }
+
+        bool completed = false;
+        ngc::TriggeredJointMoveCompleted result{};
+        ngc::ExecutionEvent event;
+        while(backend.tryTakeEvent(event))
+            if(const auto *value = std::get_if<ngc::TriggeredJointMoveCompleted>(&event)) {
+                completed = true;
+                result = *value;
+            }
+        require(completed && result.status == ngc::TriggeredMoveStatus::Triggered,
+                "both Y joints should complete from their own switch transitions");
+        require(result.triggeredJoints == move.joints,
+                "joint completion should identify both triggered Y motors");
+        require(sawIndependentStop,
+                "the first Y motor should remain stopped while the second continues toward its switch");
+        require(result.triggerState.position[0] >= 5.7 - 1e-9 && result.triggerState.position[0] < 5.71,
+                std::format("first Y motor should latch its own switch position ({})",
+                            result.triggerState.position[0]));
+        require(result.triggerState.position[1] >= 6.0 - 1e-9 && result.triggerState.position[1] < 6.01,
+                std::format("second Y motor should latch its own switch position ({})",
+                            result.triggerState.position[1]));
+        require(result.stoppedState.position[0] > result.triggerState.position[0]
+               && result.stoppedState.position[1] > result.triggerState.position[1],
+                "each Y motor should decelerate after its switch transition");
+        require(std::abs(result.stoppedState.velocity[0]) <= 1e-12
+               && std::abs(result.stoppedState.velocity[1]) <= 1e-12,
+                "both Y motors should be stationary when joint completion is reported");
+
+        ngc::JointVector squared{};
+        require(backend.trySubmit(ngc::SetJointPositionRequest { 4, move.joints, squared })
+                    == ngc::SubmitResult::Submitted,
+                "held-state joint position request should publish");
+        backend.advance(0.0);
+        bool positionSet = false;
+        while(backend.tryTakeEvent(event))
+            if(const auto *completedRequest = std::get_if<ngc::RequestCompleted>(&event))
+                if(completedRequest->request == 4) positionSet = completedRequest->succeeded;
+        require(positionSet, "squaring offsets should be established only after both joints are held");
     }
 
     void testTrajectoryDriverConnectsInterpreterToMockRtBackend() {
@@ -1848,7 +2043,9 @@ int main() {
         testEndpointExactArcReferenceGeometryVariants();
         testMockDiagnosticPositionsFollowServoPeriod();
         testMachineConfigurationLoadsTrajectoryLimits();
+        testConfiguredHomingMovesFromPowerUpPosition();
         testProbeCompilesAsBackendOwnedTriggeredMove();
+        testDualScrewJointMoveStopsEachMotorOnItsOwnSwitch();
         testTrajectoryDriverConnectsInterpreterToMockRtBackend();
     } catch(const std::exception &error) {
         std::cerr << "ngc_tests failed: " << error.what() << '\n';

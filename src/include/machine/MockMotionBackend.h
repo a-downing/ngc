@@ -30,6 +30,8 @@ namespace ngc {
         // Mock-only signal model. Production backends sample their configured HAL
         // input directly; this data never enters MotionBackend.
         bool configureSyntheticInput(TriggeredMoveId move, const position_t &transitionPosition) noexcept;
+        bool configureSyntheticJointInput(TriggeredMoveId move, JointId joint,
+                                          double transitionPosition) noexcept;
         void clearTrajectoryDiagnostics() override;
         MockTrajectorySnapshot trajectorySnapshot() const override;
 

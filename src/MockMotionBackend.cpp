@@ -24,7 +24,9 @@ namespace ngc {
 
         struct SyntheticInputTransition {
             TriggeredMoveId move = 0;
+            JointId joint = MAX_JOINTS;
             position_t position{};
+            double jointPosition = 0.0;
         };
 
         double magnitude(const position_t &value) {
@@ -97,6 +99,22 @@ namespace ngc {
             MotionState triggerState{};
             ruckig::Trajectory<1> trajectory;
         } m_triggered;
+        struct JointRuntime {
+            double start = 0.0;
+            double target = 0.0;
+            double direction = 0.0;
+            double elapsed = 0.0;
+            bool stopping = false;
+            bool finished = false;
+            bool triggered = false;
+            double triggerPosition = 0.0;
+            double triggerVelocity = 0.0;
+            double triggerAcceleration = 0.0;
+            double debounceElapsed = 0.0;
+            ruckig::Trajectory<1> trajectory;
+        };
+        std::array<JointRuntime, MAX_JOINTS> m_jointRuntime;
+        JointMask m_triggeredJoints = 0;
 
     public:
         PublishResult publish(const ExecutionItem &item) noexcept {
@@ -105,12 +123,31 @@ namespace ngc {
                 if constexpr(std::same_as<T, PlanChunk>)
                     return value.normalMotion.size != 0 && value.stopTail.size != 0
                         && value.epoch != 0 && value.id != 0;
-                else
+                else if constexpr(std::same_as<T, TriggeredMove>)
                     return value.epoch != 0 && value.id != 0 && value.moveId != 0
                         && magnitude(value.target) < std::numeric_limits<double>::infinity()
                         && magnitude(value.limits.velocity) > 0.0
                         && magnitude(value.limits.acceleration) > 0.0
                         && magnitude(value.limits.jerk) > 0.0;
+                else {
+                    if(value.epoch == 0 || value.id == 0 || value.moveId == 0 || value.joints == 0) return false;
+                    for(JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+                        if((value.joints & (JointMask{1} << joint)) == 0) continue;
+                        if(!std::isfinite(value.target[joint]) || value.limits.velocity[joint] <= 0.0
+                           || value.limits.acceleration[joint] <= 0.0 || value.limits.jerk[joint] <= 0.0)
+                            return false;
+                    }
+                    JointMask boundJoints = 0;
+                    for(const auto &trigger : value.triggers) {
+                        if(trigger.joint >= MAX_JOINTS
+                           || (value.joints & (JointMask{1} << trigger.joint)) == 0
+                           || (boundJoints & (JointMask{1} << trigger.joint)) != 0
+                           || !std::isfinite(trigger.debounce) || trigger.debounce < 0.0) return false;
+                        boundJoints |= JointMask{1} << trigger.joint;
+                    }
+                    if(value.triggerRequired && boundJoints != value.joints) return false;
+                    return true;
+                }
             }, item);
             if(!valid) return PublishResult::Invalid;
             for(std::uint8_t index = 0; index < m_planSlots.size(); ++index) {
@@ -140,7 +177,8 @@ namespace ngc {
             SyntheticInputTransition input;
             while(m_syntheticInputs.tryPop(input)) {
                 bool replaced = false;
-                for(auto &pending : m_pendingSyntheticInputs) if(pending.move == input.move) {
+                for(auto &pending : m_pendingSyntheticInputs)
+                    if(pending.move == input.move && pending.joint == input.joint) {
                     pending = input; replaced = true; break;
                 }
                 if(!replaced) (void)m_pendingSyntheticInputs.push(input);
@@ -155,6 +193,10 @@ namespace ngc {
             while(m_active && seconds > 0.0) {
                 if(std::holds_alternative<TriggeredMove>(activeItem())) {
                     advanceTriggered(seconds);
+                    continue;
+                }
+                if(std::holds_alternative<TriggeredJointMove>(activeItem())) {
+                    advanceTriggeredJoints(seconds);
                     continue;
                 }
                 const auto &span = currentSpan();
@@ -382,6 +424,165 @@ namespace ngc {
             }
         }
 
+        std::optional<double> syntheticJointTransition(const TriggeredMoveId move, const JointId joint) const {
+            for(const auto &input : m_pendingSyntheticInputs)
+                if(input.move == move && input.joint == joint) return input.jointPosition;
+            return std::nullopt;
+        }
+
+        double jointTriggerDebounce(const TriggeredJointMove &move, const JointId joint) const {
+            for(const auto &trigger : move.triggers)
+                if(trigger.joint == joint) return trigger.debounce;
+            return 0.0;
+        }
+
+        bool calculateJointApproach(const TriggeredJointMove &move, const JointId joint) {
+            auto &runtime = m_jointRuntime[joint];
+            runtime = {};
+            runtime.start = m_snapshot.commandedJoints.position[joint];
+            runtime.target = move.targetMode == JointTargetMode::Relative
+                ? runtime.start + move.target[joint] : move.target[joint];
+            const auto distance = runtime.target - runtime.start;
+            runtime.direction = distance < 0.0 ? -1.0 : 1.0;
+            if(std::abs(distance) <= 1e-12) { runtime.finished = true; return true; }
+            ruckig::InputParameter<1> input;
+            input.current_position = {runtime.start};
+            input.current_velocity = {m_snapshot.commandedJoints.velocity[joint]};
+            input.current_acceleration = {m_snapshot.commandedJoints.acceleration[joint]};
+            input.target_position = {runtime.target};
+            input.target_velocity = {0.0};
+            input.target_acceleration = {0.0};
+            input.max_velocity = {move.limits.velocity[joint]};
+            input.max_acceleration = {move.limits.acceleration[joint]};
+            input.max_jerk = {move.limits.jerk[joint]};
+            ruckig::Ruckig<1> generator;
+            return generator.calculate(input, runtime.trajectory) == ruckig::Result::Working;
+        }
+
+        bool initializeTriggeredJoints() {
+            const auto &move = std::get<TriggeredJointMove>(activeItem());
+            m_triggeredJoints = 0;
+            m_snapshot.activeJoints = move.joints;
+            for(JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+                if((move.joints & (JointMask{1} << joint)) == 0) continue;
+                if(!calculateJointApproach(move, joint)) return false;
+            }
+            return true;
+        }
+
+        bool beginJointStop(const TriggeredJointMove &move, const JointId joint) {
+            auto &runtime = m_jointRuntime[joint];
+            runtime.stopping = true;
+            runtime.triggered = true;
+            runtime.elapsed = 0.0;
+            runtime.triggerPosition = m_snapshot.commandedJoints.position[joint];
+            runtime.triggerVelocity = m_snapshot.commandedJoints.velocity[joint];
+            runtime.triggerAcceleration = m_snapshot.commandedJoints.acceleration[joint];
+            m_triggeredJoints |= JointMask{1} << joint;
+            if(std::abs(runtime.triggerVelocity) <= 1e-12
+               && std::abs(runtime.triggerAcceleration) <= 1e-12) {
+                runtime.finished = true;
+                return true;
+            }
+            ruckig::InputParameter<1> input;
+            input.control_interface = ruckig::ControlInterface::Velocity;
+            input.current_position = {runtime.triggerPosition};
+            input.current_velocity = {runtime.triggerVelocity};
+            input.current_acceleration = {runtime.triggerAcceleration};
+            input.target_position = {runtime.triggerPosition};
+            input.target_velocity = {0.0};
+            input.target_acceleration = {0.0};
+            input.max_velocity = {std::max(move.limits.velocity[joint], std::abs(runtime.triggerVelocity))};
+            input.max_acceleration = {move.limits.acceleration[joint]};
+            input.max_jerk = {move.limits.jerk[joint]};
+            ruckig::Ruckig<1> generator;
+            return generator.calculate(input, runtime.trajectory) == ruckig::Result::Working;
+        }
+
+        void removeSyntheticJointInputs(const TriggeredMoveId move) {
+            for(std::uint32_t index = 0; index < m_pendingSyntheticInputs.size;) {
+                if(m_pendingSyntheticInputs[index].move != move) { ++index; continue; }
+                m_pendingSyntheticInputs[index] = m_pendingSyntheticInputs[m_pendingSyntheticInputs.size - 1];
+                --m_pendingSyntheticInputs.size;
+            }
+        }
+
+        void completeTriggeredJoints() {
+            const auto move = std::get<TriggeredJointMove>(activeItem());
+            JointMask expectedTriggers = 0;
+            JointMotionState triggerState = m_snapshot.commandedJoints;
+            for(const auto &trigger : move.triggers) expectedTriggers |= JointMask{1} << trigger.joint;
+            for(JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+                if((m_triggeredJoints & (JointMask{1} << joint)) == 0) continue;
+                const auto &runtime = m_jointRuntime[joint];
+                triggerState.position[joint] = runtime.triggerPosition;
+                triggerState.velocity[joint] = runtime.triggerVelocity;
+                triggerState.acceleration[joint] = runtime.triggerAcceleration;
+            }
+            const auto status = expectedTriggers != 0 && (m_triggeredJoints & expectedTriggers) == expectedTriggers
+                ? TriggeredMoveStatus::Triggered : TriggeredMoveStatus::ReachedTarget;
+            emit(TriggeredJointMoveCompleted { move.epoch, move.moveId, status, m_triggeredJoints,
+                                                triggerState, m_snapshot.commandedJoints });
+            emit(BranchSelected { move.epoch, move.branch, BranchChoice::Stop, 0 });
+            emit(ChunkRetired { move.epoch, move.id });
+            m_snapshot.state = BackendState::Held;
+            m_snapshot.lastBranch = move.branch;
+            m_snapshot.activeJoints = 0;
+            emit(BackendHeld { move.epoch, m_snapshot.commanded, move.cursor });
+            removeSyntheticJointInputs(move.moveId);
+            release(*m_active);
+            m_active.reset();
+        }
+
+        void advanceTriggeredJoints(double &seconds) {
+            const auto &move = std::get<TriggeredJointMove>(activeItem());
+            const auto elapsed = seconds;
+            bool allFinished = true;
+            for(JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+                if((move.joints & (JointMask{1} << joint)) == 0) continue;
+                auto &runtime = m_jointRuntime[joint];
+                if(runtime.finished) continue;
+                allFinished = false;
+                const auto duration = runtime.trajectory.get_duration();
+                runtime.elapsed = std::min(runtime.elapsed + elapsed, duration);
+                double position = 0.0, velocity = 0.0, acceleration = 0.0;
+                runtime.trajectory.at_time(runtime.elapsed, position, velocity, acceleration);
+                m_snapshot.commandedJoints.position[joint] = position;
+                m_snapshot.commandedJoints.velocity[joint] = velocity;
+                m_snapshot.commandedJoints.acceleration[joint] = acceleration;
+                if(!runtime.stopping) {
+                    const auto transition = syntheticJointTransition(move.moveId, joint);
+                    const auto crossed = transition && runtime.direction * (position - *transition) >= -1e-12;
+                    if(crossed) {
+                        runtime.debounceElapsed += elapsed;
+                        if(runtime.debounceElapsed + 1e-12 >= jointTriggerDebounce(move, joint)
+                           && !beginJointStop(move, joint)) { faultTriggered(); return; }
+                    } else {
+                        runtime.debounceElapsed = 0.0;
+                        if(runtime.elapsed + 1e-12 >= duration) {
+                            m_snapshot.commandedJoints.position[joint] = runtime.target;
+                            m_snapshot.commandedJoints.velocity[joint] = 0.0;
+                            m_snapshot.commandedJoints.acceleration[joint] = 0.0;
+                            runtime.finished = true;
+                        }
+                    }
+                } else if(runtime.elapsed + 1e-12 >= duration) {
+                    m_snapshot.commandedJoints.velocity[joint] = 0.0;
+                    m_snapshot.commandedJoints.acceleration[joint] = 0.0;
+                    runtime.finished = true;
+                }
+            }
+            m_snapshot.feedbackJoints = m_snapshot.commandedJoints;
+            seconds = 0.0;
+            if(!allFinished) {
+                allFinished = true;
+                for(JointId joint = 0; joint < MAX_JOINTS; ++joint)
+                    if((move.joints & (JointMask{1} << joint)) != 0 && !m_jointRuntime[joint].finished)
+                        allFinished = false;
+            }
+            if(allFinished) completeTriggeredJoints();
+        }
+
         void emit(const ExecutionEvent &event) {
             if(!m_events.tryPush(event)) {
                 m_snapshot.state = BackendState::Faulted;
@@ -408,12 +609,25 @@ namespace ngc {
                         if(m_active) release(*m_active);
                         m_active.reset(); m_snapshot.state = BackendState::Held;
                     } else if constexpr(std::same_as<T, ResetRequest>) {
+                        const auto commandedJoints = m_snapshot.commandedJoints;
+                        const auto feedbackJoints = m_snapshot.feedbackJoints;
                         if(m_active) release(*m_active);
                         m_active.reset();
                         std::uint8_t discarded;
                         while(m_plans.tryPop(discarded)) release(discarded);
                         m_stopping = false; m_span = 0; m_nextEvent = 0; m_spanElapsed = 0.0;
                         m_snapshot = {}; m_snapshot.epoch = value.nextEpoch;
+                        m_snapshot.commandedJoints = commandedJoints;
+                        m_snapshot.feedbackJoints = feedbackJoints;
+                    } else if constexpr(std::same_as<T, SetJointPositionRequest>) {
+                        success = m_snapshot.state == BackendState::Held && !m_active;
+                        if(success) for(JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+                            if((value.joints & (JointMask{1} << joint)) == 0) continue;
+                            m_snapshot.commandedJoints.position[joint] = value.position[joint];
+                            m_snapshot.commandedJoints.velocity[joint] = 0.0;
+                            m_snapshot.commandedJoints.acceleration[joint] = 0.0;
+                            m_snapshot.feedbackJoints = m_snapshot.commandedJoints;
+                        }
                     }
                     emit(RequestCompleted { value.id, success });
                 }, request);
@@ -438,6 +652,7 @@ namespace ngc {
             m_snapshot.activeSpan = 0;
             emit(ChunkAccepted { itemEpoch(item), itemId(item) });
             if(std::holds_alternative<TriggeredMove>(item) && !initializeTriggered()) faultTriggered();
+            if(std::holds_alternative<TriggeredJointMove>(item) && !initializeTriggeredJoints()) faultTriggered();
         }
 
         void completeSpan() {
@@ -475,6 +690,8 @@ namespace ngc {
                 m_snapshot.activeSpan = 0;
                 emit(ChunkAccepted { itemEpoch(continuation), itemId(continuation) });
                 if(std::holds_alternative<TriggeredMove>(continuation) && !initializeTriggered()) faultTriggered();
+                if(std::holds_alternative<TriggeredJointMove>(continuation)
+                   && !initializeTriggeredJoints()) faultTriggered();
             } else {
                 if(hasContinuation) {
                     const auto &continuation = m_planSlots[continuationIndex].item;
@@ -525,7 +742,13 @@ namespace ngc {
     void MockMotionBackend::runUntilIdle(const double tickSeconds) { m_impl->runUntilIdle(tickSeconds); }
     bool MockMotionBackend::configureSyntheticInput(const TriggeredMoveId move,
                                                     const position_t &transitionPosition) noexcept {
-        return m_impl->configureSyntheticInput({ move, transitionPosition });
+        return m_impl->configureSyntheticInput({ .move = move, .joint = MAX_JOINTS,
+                                                  .position = transitionPosition });
+    }
+    bool MockMotionBackend::configureSyntheticJointInput(const TriggeredMoveId move, const JointId joint,
+                                                         const double transitionPosition) noexcept {
+        return m_impl->configureSyntheticInput({ .move = move, .joint = joint,
+                                                  .jointPosition = transitionPosition });
     }
     void MockMotionBackend::clearTrajectoryDiagnostics() { m_impl->clearDiagnostics(); }
     MockTrajectorySnapshot MockMotionBackend::trajectorySnapshot() const { return m_impl->diagnostics(); }
