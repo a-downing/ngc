@@ -44,24 +44,16 @@ namespace ngc {
         MotionState end{};
     };
 
-    struct ProbeEvent {
-        std::uint64_t probeId = 0;
-        bool stopOnContact = true;
-        bool errorIfNotFound = false;
-    };
-
     struct SpindleEvent {
         bool enabled = false;
         Direction direction = Direction::CW;
         double speed = 0.0;
     };
 
-    using TrajectoryEvent = std::variant<ProbeEvent, SpindleEvent>;
+    using TrajectoryEvent = std::variant<SpindleEvent>;
 
     struct ScheduledEvent {
         // The backend activates this event before evaluating the indexed span.
-        // A ProbeEvent remains armed through the rest of the chunk; probe input
-        // is sampled throughout every subsequent span until trigger or endpoint.
         std::uint32_t span = 0;
         TrajectoryEvent value;
     };
@@ -105,6 +97,37 @@ namespace ngc {
 
     static_assert(std::is_trivially_copyable_v<PlanChunk>);
 
+    using DigitalInputId = std::uint16_t;
+    using TriggeredMoveId = std::uint64_t;
+
+    enum class InputCondition : std::uint8_t { Active, Inactive, RisingEdge, FallingEdge };
+
+    struct AxisMotionLimits {
+        position_t velocity{};
+        position_t acceleration{};
+        position_t jerk{};
+    };
+
+    // A bounded executor-owned point-to-point move terminated by a sampled
+    // digital-input condition. The executor generates both the approach and the
+    // constrained stop. This primitive is shared by probing and homing phases.
+    struct TriggeredMove {
+        EpochId epoch = 0;
+        ChunkId id = 0;
+        BranchSequence predecessorBranch = 0;
+        BranchSequence branch = 0;
+        TriggeredMoveId moveId = 0;
+        position_t target{};
+        AxisMotionLimits limits{};
+        DigitalInputId input = 0;
+        InputCondition condition = InputCondition::Active;
+        bool triggerRequired = false;
+        ProgramCursor cursor{};
+    };
+
+    using ExecutionItem = std::variant<PlanChunk, TriggeredMove>;
+    static_assert(std::is_trivially_copyable_v<ExecutionItem>);
+
     enum class BackendState : std::uint8_t { Disabled, Held, Running, Faulted };
     enum class BranchChoice : std::uint8_t { Continue, Stop };
     enum class PublishResult : std::uint8_t { Published, Full, Invalid };
@@ -124,12 +147,19 @@ namespace ngc {
     struct ChunkRejected { EpochId epoch; ChunkId chunk; };
     struct ChunkRetired { EpochId epoch; ChunkId chunk; };
     struct BranchSelected { EpochId epoch; BranchSequence branch; BranchChoice choice; ChunkId continuation; };
-    struct ProbeCompleted { EpochId epoch; ProbeResult result; };
+    enum class TriggeredMoveStatus : std::uint8_t { Triggered, ReachedTarget, Aborted, Fault };
+    struct TriggeredMoveCompleted {
+        EpochId epoch;
+        TriggeredMoveId move;
+        TriggeredMoveStatus status;
+        MotionState triggerState;
+        MotionState stoppedState;
+    };
     struct RequestCompleted { RequestId request; bool succeeded; };
     struct BackendHeld { EpochId epoch; MotionState state; ProgramCursor cursor; };
     struct BackendFault { std::uint32_t code; };
     using ExecutionEvent = std::variant<ChunkAccepted, ChunkRejected, ChunkRetired, BranchSelected,
-                                        ProbeCompleted, RequestCompleted, BackendHeld, BackendFault>;
+                                        TriggeredMoveCompleted, RequestCompleted, BackendHeld, BackendFault>;
 
     struct ExecutionSnapshot {
         BackendState state = BackendState::Disabled;
@@ -148,7 +178,7 @@ namespace ngc {
     class MotionBackend {
     public:
         virtual ~MotionBackend() = default;
-        virtual PublishResult tryPublish(const PlanChunk &chunk) noexcept = 0;
+        virtual PublishResult tryPublish(const ExecutionItem &item) noexcept = 0;
         virtual SubmitResult trySubmit(const ControlRequest &request) noexcept = 0;
         virtual bool tryTakeEvent(ExecutionEvent &event) noexcept = 0;
         virtual bool tryTakeSnapshot(ExecutionSnapshot &snapshot) noexcept = 0;

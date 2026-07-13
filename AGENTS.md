@@ -8,7 +8,7 @@ This repository is a C++23 non-real-time CNC front end. Its current pipeline is:
 lexer -> parser/AST -> InterpreterSession/evaluator -> modal Machine -> MachineCommand stream -> consumer(s)
 ```
 
-`InterpreterSession` incrementally evaluates the program and emits one `MachineCommand` at a time. `TrajectoryExecutionDriver` connects it to `ExactStopTrajectoryPlanner`, which compiles timed axis-polynomial `PlanChunk` values for the generic `MotionBackend` SPSC contract and owns the probe-result barrier handshake. `MockMotionBackend` is the current non-RT implementation of that production-shaped contract. `Worker` runs immediate preview and retains a `ToolpathRecorder`; `SimulationWorker` runs timed playback and exposes NRT `SimulationSnapshot` presentation state to the OpenGL UI.
+`InterpreterSession` incrementally evaluates the program and emits one `MachineCommand` at a time. `TrajectoryExecutionDriver` connects it to `ExactStopTrajectoryPlanner`, publishes ordered `ExecutionItem` values through the generic `MotionBackend` SPSC contract, and owns the probe-result barrier handshake. Ordinary motion is compiled into timed axis-polynomial `PlanChunk` values; probes are compiled into executor-owned `TriggeredMove` values. `MockMotionBackend` is the current non-RT implementation of that production-shaped contract. `Worker` runs immediate preview and retains a `ToolpathRecorder`; `SimulationWorker` runs timed playback and exposes NRT `SimulationSnapshot` presentation state to the OpenGL UI.
 
 The repository now contains an exact-stop trajectory planner and a non-RT mock backend, but not a real-time executor or HAL component. Preserve the separation between interpretation, planning, real-time execution, and hardware access.
 
@@ -76,9 +76,9 @@ Lines and adaptively subdivided circular/helical arcs are emitted through the sa
 
 Arc cubic subdivision is tolerance-verified. Verification preserves ordered association between each polynomial interval and its source-arc interval, recursively subdivides the polynomial Bezier control hull, and accepts it only inside an ordered source-chord capsule after reserving the reference curve's conservative second-derivative chord-error bound from `arc_chord_tolerance`. Do not replace this with unordered nearest-geometry sampling or a constant-radius bound: accepted rounded IJK arcs may have slightly different start and end radii. Consecutive planned commands must meet at their canonical endpoints without synthetic connector spans.
 
-The RT-facing contract contains only bounded, allocation-free plan/control/event/snapshot data transported by SPSC channels. Cubic spans provide position as a function of span time and include cached terminal state. Do not add UI strings, TOML objects, G-code entities, synthetic probe settings, or debug trajectory storage to `MotionBackend`.
+The RT-facing contract contains only bounded, allocation-free execution/control/event/snapshot data transported by SPSC channels. `ExecutionItem` is the ordered forward stream and currently contains `PlanChunk` and `TriggeredMove`. Cubic spans provide position as a function of span time and include cached terminal state. `TriggeredMove` contains a machine target, per-axis velocity/acceleration/jerk limits, a digital-input ID and condition, and no G-code or simulation geometry. Do not add UI strings, TOML objects, G-code entities, synthetic input settings, or debug trajectory storage to `MotionBackend`.
 
-`MockMotionBackend` implements the same contract without claiming real-time behavior. Its separate `MockTrajectoryDiagnostics` interface records actually executed/truncated polynomial spans for the red/white UI development overlay. That diagnostic path is mock-only and must not be added to the production RT interface.
+`MockMotionBackend` implements the same contract without claiming real-time behavior. Its separate `MockTrajectoryDiagnostics` interface records the positions actually calculated on each mock servo tick for the red/white UI development overlay. Normal/approach positions and controlled-stop positions remain distinct diagnostic spans. That diagnostic path is mock-only and must not be added to the production RT interface.
 
 ## Concurrency and lifecycle
 
@@ -86,7 +86,7 @@ The RT-facing contract contains only bounded, allocation-free plan/control/event
 
 Timed simulation fills the executor's bounded queue before advancing so dense short-segment paths are not limited to one command per display/update cycle. Queue filling must stop at a probe barrier and resume only after the matching result is delivered. When the executor drains and interpretation can immediately provide more commands, do not impose the normal 8 ms timed wait.
 
-The Windows mock scheduler is paced independently from the servo tick. Preserve its deadline-miss, maximum-wake-lateness, maximum-tick-execution, and servo-tick counters in NRT presentation state. The red diagnostic trajectory tessellates actually executed polynomial duration at the configured servo period, including truncated probe spans; do not restore a fixed visual sample count or add these diagnostics to `MotionBackend`.
+The Windows mock scheduler is paced independently from the servo tick. Preserve its deadline-miss, maximum-wake-lateness, maximum-tick-execution, and servo-tick counters in NRT presentation state. The red/white diagnostic trajectory draws the backend-recorded servo-position buffers directly; shortening `servo_period` must therefore produce shorter displayed segments. Do not restore a fixed visual sample count, reconstruct samples in the UI, or add these diagnostics to `MotionBackend`.
 
 Program execution must not append to a previous run or start from its final position. Keep the reset regression tests intact.
 
@@ -98,17 +98,22 @@ Timed simulation must stop immediately on an interpreter error and discard activ
 
 A consumer must return a matching `ProbeResult` with `provideProbeResult()` before evaluation can pass a probe barrier.
 
-## Probing direction
+## Triggered motion, probing, and homing
 
 The core rule is that HAL must not call `Machine` directly:
 
 ```text
-Machine emits ProbeMove -> real-time executor/HAL -> executor returns ProbeResult -> Machine resumes
+Machine emits ProbeMove -> driver publishes TriggeredMove -> real-time executor/HAL
+    -> driver translates TriggeredMoveCompleted to ProbeResult -> Machine resumes
 ```
 
-The real-time executor must latch the position at the probe signal transition and report it separately from the final stopped position. The interpreter pauses at a probe barrier because later blocks may read `#5061` through `#5070`.
+`TriggeredMove` is a generic signal-terminated point-to-point primitive intended for both probing and future homing phases. The executor owns jerk-limited approach generation, samples the selected digital input every servo cycle, latches the complete `MotionState` when the requested condition occurs, and then owns the jerk/acceleration-limited stop. `TriggeredMoveCompleted` reports distinct trigger and stopped states, or `ReachedTarget`, `Aborted`, or `Fault`. It must never contain probe-specific tool geometry or interpreter state.
 
-Current preview and timed simulation both use `MockMotionBackend`. Its mock-only synthetic probe configuration accounts for the selected physical tool offset even when G43 is inactive, reports matching trigger/stopped machine positions, and lets the interpreter resume through the same backend event channel. This is simulation behavior and is deliberately absent from `MotionBackend`. A physical backend must sample the probe input during the scheduled probe span, latch the transition position, stop motion, and return a real `ProbeResult`.
+The interpreter pauses at a probe barrier because later blocks may read `#5061` through `#5070`. `TrajectoryExecutionDriver` retains that interpreter concern outside the RT contract and translates generic completion data into the matching `ProbeResult`.
+
+Current preview and timed simulation both use `MockMotionBackend`. Their mock-only synthetic digital-input transition accounts for selected physical tool offset even when G43 is inactive. It changes only the simulated input state; it does not provide a predicted stop point to the executor. The mock backend detects the transition while executing, latches the sampled state, and continues through its constrained stop, so trigger and stopped positions normally differ. This synthetic signal configuration is deliberately absent from `MotionBackend`.
+
+Future homing should sequence the same primitive outside the servo loop: fast switch search, pull-off to the opposite condition, slow re-latch, and optional encoder-index search. Establishing machine coordinates after the axis is stationary belongs in a separate bounded held-state position-setting request; do not add homing policy or coordinate mutation to `TriggeredMove`.
 
 Toolpath preview geometry is canonical program geometry: it is derived from emitted command coordinates plus G53/active work/tool-offset semantics. Do not shift retained toolpath lines using physical tool geometry. Physical tool length and diameter belong to the simulated tool overlay and synthetic contact behavior.
 
@@ -163,7 +168,7 @@ Likely next steps are:
 2. Replace conservative chord-based arc subdivision with tolerance-verified cubic circular/helical approximation, while retaining the existing cubic RT representation.
 3. Design executable G64 as a bounded-look-ahead, non-RT planner. Build tolerance-bounded path blends, calculate curvature/axis velocity ceilings, run forward/backward reachability, and jointly emit time-domain cubic spans with shared position, velocity, and acceleration at boundaries. Published prefixes become immutable; difficult windows must safely slow down or fall back to exact stop.
 4. Instrument planning latency, queue reserve, constraint margins, and planned duration. Later compare representative paths against a development-only offline optimizer before pursuing extra time-optimal complexity.
-5. Add a physical implementation of `MotionBackend` using the existing bounded SPSC plan/control/event/snapshot contract, and define abort, fault, cancellation, and pending-probe behavior before connecting hardware.
+5. Add a physical implementation of `MotionBackend` using the existing bounded SPSC execution/control/event/snapshot contract, including physical digital-input sampling for `TriggeredMove`, and define abort, fault, cancellation, and pending-trigger behavior before connecting hardware.
 6. Expand G38 support beyond G38.3 and test unsuccessful, aborted, and faulted probe results; later add R-form arcs and richer canonical records.
 
 Do not route the experimental preview spline fitter directly into execution. It is useful geometric research, but executable G64 must independently prove ordered path tolerance, per-axis constraints, and C2 time-domain continuity.

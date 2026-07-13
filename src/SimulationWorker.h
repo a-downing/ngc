@@ -154,7 +154,7 @@ private:
             completeBlock(lifecycle.block);
     }
 
-    void observeCommand(const ngc::MachineCommand &command, const ngc::PlanChunk &chunk) {
+    void observeCommand(const ngc::MachineCommand &command, const ngc::ExecutionItem &item) {
         ChunkPresentation presentation;
         presentation.tool = m_session.machine().toolGeometry();
         presentation.activeToolOffset = m_session.machine().toolOffset();
@@ -163,9 +163,12 @@ private:
         presentation.modalGCodes = m_session.machine().activeModalGCodes();
         presentation.activeBlocks = m_interpretedBlocks;
         presentation.command = command;
-        if(const auto *probe = std::get_if<ngc::ProbeMove>(&command))
-            (void)m_backend.configureSyntheticProbe(probe->id(), presentation.tool.offset, presentation.activeToolOffset);
-        const ChunkKey key { chunk.epoch, chunk.id };
+        const auto key = std::visit([](const auto &value) { return ChunkKey { value.epoch, value.id }; }, item);
+        if(std::holds_alternative<ngc::ProbeMove>(command)) {
+            const auto &move = std::get<ngc::TriggeredMove>(item);
+            const auto contact = move.target + presentation.tool.offset - presentation.activeToolOffset;
+            (void)m_backend.configureSyntheticInput(move.moveId, contact);
+        }
         m_chunks.insert_or_assign(key, std::move(presentation));
         m_lastChunk = key;
     }

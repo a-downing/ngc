@@ -2,8 +2,11 @@
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <optional>
 #include <type_traits>
+
+#include <ruckig/ruckig.hpp>
 
 #include "machine/SpscChannel.h"
 
@@ -17,13 +20,27 @@ namespace ngc {
         // worst-case burst so the bounded forward horizon cannot deadlock itself.
         constexpr std::size_t EVENT_CAPACITY = 64;
         constexpr std::size_t SNAPSHOT_CAPACITY = 4;
-        constexpr std::size_t PROBE_CONFIG_CAPACITY = 16;
+        constexpr std::size_t SYNTHETIC_INPUT_CAPACITY = 16;
 
-        struct SyntheticProbeConfig {
-            std::uint64_t probeId = 0;
-            position_t physicalToolOffset{};
-            position_t activeToolOffset{};
+        struct SyntheticInputTransition {
+            TriggeredMoveId move = 0;
+            position_t position{};
         };
+
+        double magnitude(const position_t &value) {
+            return std::sqrt(value.x*value.x + value.y*value.y + value.z*value.z
+                + value.a*value.a + value.b*value.b + value.c*value.c);
+        }
+
+        double dot(const position_t &left, const position_t &right) {
+            return left.x*right.x + left.y*right.y + left.z*right.z
+                + left.a*right.a + left.b*right.b + left.c*right.c;
+        }
+
+        position_t scaled(const position_t &value, const double scale) {
+            return { value.x*scale, value.y*scale, value.z*scale,
+                     value.a*scale, value.b*scale, value.c*scale };
+        }
 
         position_t evaluate(const AxisPolynomialSpan &span, const double u) {
             const auto component = [&](const double position_t::*member) {
@@ -54,15 +71,15 @@ namespace ngc {
     class MockMotionBackend::Impl {
         struct PlanSlot {
             std::atomic<bool> occupied{false};
-            PlanChunk chunk{};
+            ExecutionItem item{};
         };
         std::array<PlanSlot, PLAN_CAPACITY> m_planSlots;
         SpscChannel<std::uint8_t, PLAN_CAPACITY> m_plans;
         SpscChannel<ControlRequest, CONTROL_CAPACITY> m_controls;
         SpscChannel<ExecutionEvent, EVENT_CAPACITY> m_events;
         SpscChannel<ExecutionSnapshot, SNAPSHOT_CAPACITY> m_snapshots;
-        SpscChannel<SyntheticProbeConfig, PROBE_CONFIG_CAPACITY> m_probeConfigs;
-        FixedArray<SyntheticProbeConfig, PROBE_CONFIG_CAPACITY> m_pendingProbeConfigs;
+        SpscChannel<SyntheticInputTransition, SYNTHETIC_INPUT_CAPACITY> m_syntheticInputs;
+        FixedArray<SyntheticInputTransition, SYNTHETIC_INPUT_CAPACITY> m_pendingSyntheticInputs;
         ExecutionSnapshot m_snapshot;
         std::optional<std::uint8_t> m_active;
         bool m_stopping = false;
@@ -70,15 +87,36 @@ namespace ngc {
         std::uint32_t m_nextEvent = 0;
         double m_spanElapsed = 0.0;
         MockTrajectorySnapshot m_trajectoryDiagnostics;
+        struct TriggeredRuntime {
+            position_t start{};
+            position_t direction{};
+            double length = 0.0;
+            double elapsed = 0.0;
+            bool stopping = false;
+            TriggeredMoveStatus completionStatus = TriggeredMoveStatus::ReachedTarget;
+            MotionState triggerState{};
+            ruckig::Trajectory<1> trajectory;
+        } m_triggered;
 
     public:
-        PublishResult publish(const PlanChunk &chunk) noexcept {
-            if(chunk.normalMotion.size == 0 || chunk.stopTail.size == 0 || chunk.epoch == 0 || chunk.id == 0)
-                return PublishResult::Invalid;
+        PublishResult publish(const ExecutionItem &item) noexcept {
+            const auto valid = std::visit([](const auto &value) {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr(std::same_as<T, PlanChunk>)
+                    return value.normalMotion.size != 0 && value.stopTail.size != 0
+                        && value.epoch != 0 && value.id != 0;
+                else
+                    return value.epoch != 0 && value.id != 0 && value.moveId != 0
+                        && magnitude(value.target) < std::numeric_limits<double>::infinity()
+                        && magnitude(value.limits.velocity) > 0.0
+                        && magnitude(value.limits.acceleration) > 0.0
+                        && magnitude(value.limits.jerk) > 0.0;
+            }, item);
+            if(!valid) return PublishResult::Invalid;
             for(std::uint8_t index = 0; index < m_planSlots.size(); ++index) {
                 bool expected = false;
                 if(!m_planSlots[index].occupied.compare_exchange_strong(expected, true, std::memory_order_acquire)) continue;
-                m_planSlots[index].chunk = chunk;
+                m_planSlots[index].item = item;
                 if(m_plans.tryPush(index)) return PublishResult::Published;
                 m_planSlots[index].occupied.store(false, std::memory_order_release);
                 return PublishResult::Full;
@@ -92,16 +130,20 @@ namespace ngc {
 
         bool takeEvent(ExecutionEvent &event) noexcept { return m_events.tryPop(event); }
         bool takeSnapshot(ExecutionSnapshot &snapshot) noexcept { return m_snapshots.tryPop(snapshot); }
-        bool configureProbe(const SyntheticProbeConfig &config) noexcept { return m_probeConfigs.tryPush(config); }
+        bool configureSyntheticInput(const SyntheticInputTransition &input) noexcept {
+            return m_syntheticInputs.tryPush(input);
+        }
         void clearDiagnostics() { m_trajectoryDiagnostics = {}; }
         MockTrajectorySnapshot diagnostics() const { return m_trajectoryDiagnostics; }
         void advance(double seconds, const bool shouldPublishSnapshot = true) {
             serviceControls();
-            SyntheticProbeConfig config;
-            while(m_probeConfigs.tryPop(config)) {
+            SyntheticInputTransition input;
+            while(m_syntheticInputs.tryPop(input)) {
                 bool replaced = false;
-                for(auto &pending : m_pendingProbeConfigs) if(pending.probeId == config.probeId) { pending = config; replaced = true; break; }
-                if(!replaced) (void)m_pendingProbeConfigs.push(config);
+                for(auto &pending : m_pendingSyntheticInputs) if(pending.move == input.move) {
+                    pending = input; replaced = true; break;
+                }
+                if(!replaced) (void)m_pendingSyntheticInputs.push(input);
             }
             seconds = std::max(seconds, 0.0);
             if(m_snapshot.state != BackendState::Running) {
@@ -110,11 +152,13 @@ namespace ngc {
             }
             if(!m_active) activateNext();
             const auto executedActiveMotion = m_active.has_value();
-            while(m_active && (seconds > 0.0 || currentSpan().duration == 0.0)) {
+            while(m_active && seconds > 0.0) {
+                if(std::holds_alternative<TriggeredMove>(activeItem())) {
+                    advanceTriggered(seconds);
+                    continue;
+                }
                 const auto &span = currentSpan();
-                const auto probe = activeProbeContact();
-                const auto completionElapsed = probe ? span.duration * probe->parameter : span.duration;
-                const auto remaining = std::max(completionElapsed - m_spanElapsed, 0.0);
+                const auto remaining = std::max(span.duration - m_spanElapsed, 0.0);
                 const auto consumed = std::min(seconds, remaining);
                 seconds -= consumed;
                 m_spanElapsed += consumed;
@@ -123,7 +167,8 @@ namespace ngc {
                 m_snapshot.spanProgress = u;
                 m_snapshot.commanded = { evaluate(span, u), derivative(span, u), secondDerivative(span, u) };
                 m_snapshot.feedback = m_snapshot.commanded;
-                if(m_spanElapsed + 1e-12 < completionElapsed) break;
+                recordCalculatedPosition();
+                if(m_spanElapsed + 1e-12 < span.duration) break;
                 completeSpan();
             }
             // Always publish terminal/held state even inside a decimated batch so
@@ -134,9 +179,14 @@ namespace ngc {
         }
 
         void runUntilIdle() {
-            for(std::size_t guard = 0; guard < 100000 && m_snapshot.state != BackendState::Faulted
+            runUntilIdle(3600.0);
+        }
+
+        void runUntilIdle(const double tickSeconds) {
+            const auto step = tickSeconds > 0.0 ? tickSeconds : 3600.0;
+            for(std::size_t guard = 0; guard < 100000000 && m_snapshot.state != BackendState::Faulted
                 && (m_active || !m_plans.empty() || !m_controls.empty()); ++guard) {
-                advance(3600.0);
+                advance(step, false);
                 // STOP is irrevocable. Queued descendants are now stale and may
                 // remain in the forward channel until NRT observes HELD and sends
                 // the recovery reset. Spinning on them cannot make progress.
@@ -145,45 +195,191 @@ namespace ngc {
         }
 
     private:
-        struct ActiveProbeContact {
-            std::uint64_t probeId = 0;
-            position_t position{};
-            double parameter = 1.0;
-        };
-
-        const AxisPolynomialSpan &currentSpan() const {
-            const auto &chunk = m_planSlots[*m_active].chunk;
-            return m_stopping ? chunk.stopTail[m_span] : chunk.normalMotion[m_span];
+        ExecutionItem &activeItem() { return m_planSlots[*m_active].item; }
+        const ExecutionItem &activeItem() const { return m_planSlots[*m_active].item; }
+        PlanChunk &activeChunk() { return std::get<PlanChunk>(activeItem()); }
+        const PlanChunk &activeChunk() const { return std::get<PlanChunk>(activeItem()); }
+        static EpochId itemEpoch(const ExecutionItem &item) {
+            return std::visit([](const auto &value) { return value.epoch; }, item);
+        }
+        static ChunkId itemId(const ExecutionItem &item) {
+            return std::visit([](const auto &value) { return value.id; }, item);
+        }
+        static BranchSequence itemPredecessor(const ExecutionItem &item) {
+            return std::visit([](const auto &value) { return value.predecessorBranch; }, item);
+        }
+        static BranchSequence itemBranch(const ExecutionItem &item) {
+            return std::visit([](const auto &value) { return value.branch; }, item);
         }
 
-        PlanChunk &activeChunk() { return m_planSlots[*m_active].chunk; }
-        const PlanChunk &activeChunk() const { return m_planSlots[*m_active].chunk; }
+        const AxisPolynomialSpan &currentSpan() const {
+            const auto &chunk = activeChunk();
+            return m_stopping ? chunk.stopTail[m_span] : chunk.normalMotion[m_span];
+        }
         void release(const std::uint8_t index) { m_planSlots[index].occupied.store(false, std::memory_order_release); }
 
         void publishSnapshot() { (void)m_snapshots.tryPush(m_snapshot); }
 
-        std::optional<ActiveProbeContact> activeProbeContact() const {
-            if(m_stopping || !m_active) return std::nullopt;
-            const auto &chunk = activeChunk();
-            for(std::uint32_t event = 0; event < chunk.events.size; ++event) {
-                if(chunk.events[event].span > m_span) continue;
-                const auto *probe = std::get_if<ProbeEvent>(&chunk.events[event].value);
-                if(!probe) continue;
-                auto contact = evaluate(chunk.normalMotion[chunk.normalMotion.size - 1], 1.0);
-                for(const auto &config : m_pendingProbeConfigs) {
-                    if(config.probeId != probe->probeId) continue;
-                    contact = contact + config.physicalToolOffset - config.activeToolOffset;
-                    break;
-                }
-                const auto parameter = closestParameter(currentSpan(), contact);
-                const auto nearest = evaluate(currentSpan(), parameter);
-                const auto delta = nearest - contact;
-                const auto distanceSquared = delta.x*delta.x + delta.y*delta.y + delta.z*delta.z
-                    + delta.a*delta.a + delta.b*delta.b + delta.c*delta.c;
-                if(distanceSquared <= 1e-12)
-                    return ActiveProbeContact { probe->probeId, contact, parameter };
+        MotionState triggeredStateAt(const double elapsed, const position_t &origin) const {
+            double position = 0.0, velocity = 0.0, acceleration = 0.0;
+            m_triggered.trajectory.at_time(elapsed, position, velocity, acceleration);
+            return { origin + scaled(m_triggered.direction, position),
+                     scaled(m_triggered.direction, velocity),
+                     scaled(m_triggered.direction, acceleration) };
+        }
+
+        bool initializeTriggered() {
+            const auto &move = std::get<TriggeredMove>(activeItem());
+            m_triggered = {};
+            m_triggered.start = m_snapshot.commanded.position;
+            const auto delta = move.target - m_triggered.start;
+            m_triggered.length = magnitude(delta);
+            if(m_triggered.length <= 1e-12) {
+                m_triggered.direction = {};
+                return true;
+            }
+            m_triggered.direction = scaled(delta, 1.0 / m_triggered.length);
+            const auto velocityLimit = magnitude(move.limits.velocity);
+            const auto accelerationLimit = magnitude(move.limits.acceleration);
+            const auto jerkLimit = magnitude(move.limits.jerk);
+            ruckig::InputParameter<1> input;
+            input.current_position = {0.0};
+            input.current_velocity = {dot(m_snapshot.commanded.velocity, m_triggered.direction)};
+            input.current_acceleration = {dot(m_snapshot.commanded.acceleration, m_triggered.direction)};
+            input.target_position = {m_triggered.length};
+            input.target_velocity = {0.0};
+            input.target_acceleration = {0.0};
+            input.max_velocity = {velocityLimit};
+            input.max_acceleration = {accelerationLimit};
+            input.max_jerk = {jerkLimit};
+            ruckig::Ruckig<1> generator;
+            if(generator.calculate(input, m_triggered.trajectory) != ruckig::Result::Working) return false;
+            return true;
+        }
+
+        std::optional<double> syntheticTransitionDistance(const TriggeredMoveId move) const {
+            for(const auto &input : m_pendingSyntheticInputs) {
+                if(input.move == move)
+                    return dot(input.position - m_triggered.start, m_triggered.direction);
             }
             return std::nullopt;
+        }
+
+        void removeSyntheticInput(const TriggeredMoveId move) {
+            for(std::uint32_t index = 0; index < m_pendingSyntheticInputs.size; ++index) {
+                if(m_pendingSyntheticInputs[index].move != move) continue;
+                m_pendingSyntheticInputs[index] = m_pendingSyntheticInputs[m_pendingSyntheticInputs.size - 1];
+                --m_pendingSyntheticInputs.size;
+                return;
+            }
+        }
+
+        bool beginTriggeredStop(const TriggeredMoveStatus status) {
+            const auto &move = std::get<TriggeredMove>(activeItem());
+            m_triggered.triggerState = m_snapshot.commanded;
+            m_triggered.completionStatus = status;
+            m_triggered.stopping = true;
+            m_triggered.elapsed = 0.0;
+            const auto scalarVelocity = dot(m_snapshot.commanded.velocity, m_triggered.direction);
+            const auto scalarAcceleration = dot(m_snapshot.commanded.acceleration, m_triggered.direction);
+            if(std::abs(scalarVelocity) <= 1e-12 && std::abs(scalarAcceleration) <= 1e-12) return true;
+            ruckig::InputParameter<1> input;
+            input.control_interface = ruckig::ControlInterface::Velocity;
+            input.current_position = {0.0};
+            input.current_velocity = {scalarVelocity};
+            input.current_acceleration = {scalarAcceleration};
+            input.target_position = {0.0};
+            input.target_velocity = {0.0};
+            input.target_acceleration = {0.0};
+            input.max_velocity = {std::max(magnitude(move.limits.velocity), std::abs(scalarVelocity))};
+            input.max_acceleration = {magnitude(move.limits.acceleration)};
+            input.max_jerk = {magnitude(move.limits.jerk)};
+            ruckig::Ruckig<1> generator;
+            return generator.calculate(input, m_triggered.trajectory) == ruckig::Result::Working;
+        }
+
+        void completeTriggered(const TriggeredMoveStatus status) {
+            const auto move = std::get<TriggeredMove>(activeItem());
+            const auto stopped = m_snapshot.commanded;
+            const auto trigger = status == TriggeredMoveStatus::Triggered
+                ? m_triggered.triggerState : stopped;
+            emit(TriggeredMoveCompleted { move.epoch, move.moveId, status, trigger, stopped });
+            emit(BranchSelected { move.epoch, move.branch, BranchChoice::Stop, 0 });
+            emit(ChunkRetired { move.epoch, move.id });
+            m_snapshot.state = BackendState::Held;
+            m_snapshot.lastBranch = move.branch;
+            emit(BackendHeld { move.epoch, stopped, move.cursor });
+            removeSyntheticInput(move.moveId);
+            release(*m_active);
+            m_active.reset();
+        }
+
+        void faultTriggered() {
+            m_snapshot.state = BackendState::Faulted;
+            m_snapshot.faultCode = 2;
+            emit(BackendFault { 2 });
+        }
+
+        void recordTriggeredPosition(const bool stopTail) {
+            const auto &move = std::get<TriggeredMove>(activeItem());
+            if(m_trajectoryDiagnostics.spans.empty()
+               || m_trajectoryDiagnostics.spans.back().epoch != move.epoch
+               || m_trajectoryDiagnostics.spans.back().chunk != move.id
+               || m_trajectoryDiagnostics.spans.back().stopTail != stopTail) {
+                ExecutedTrajectorySpan executed { .epoch = move.epoch, .chunk = move.id,
+                    .span = move.id, .stopTail = stopTail, .positions = {} };
+                executed.positions.push_back(stopTail
+                    ? m_triggered.triggerState.position : m_triggered.start);
+                m_trajectoryDiagnostics.spans.push_back(std::move(executed));
+            }
+            m_trajectoryDiagnostics.spans.back().positions.push_back(m_snapshot.commanded.position);
+            ++m_trajectoryDiagnostics.revision;
+        }
+
+        void advanceTriggered(double &seconds) {
+            const auto &move = std::get<TriggeredMove>(activeItem());
+            if(m_triggered.length <= 1e-12 && !m_triggered.stopping) {
+                m_snapshot.commanded.position = move.target;
+                m_snapshot.commanded.velocity = {};
+                m_snapshot.commanded.acceleration = {};
+                m_snapshot.feedback = m_snapshot.commanded;
+                completeTriggered(TriggeredMoveStatus::ReachedTarget);
+                return;
+            }
+            const auto duration = m_triggered.trajectory.get_duration();
+            const auto consumed = std::min(seconds, std::max(duration - m_triggered.elapsed, 0.0));
+            m_triggered.elapsed += consumed;
+            const auto origin = m_triggered.stopping
+                ? m_triggered.triggerState.position : m_triggered.start;
+            m_snapshot.commanded = triggeredStateAt(m_triggered.elapsed, origin);
+            m_snapshot.feedback = m_snapshot.commanded;
+            m_snapshot.spanProgress = duration > 0.0
+                ? std::clamp(m_triggered.elapsed / duration, 0.0, 1.0) : 1.0;
+            recordTriggeredPosition(m_triggered.stopping);
+            seconds -= consumed;
+            if(!m_triggered.stopping) {
+                const auto transition = syntheticTransitionDistance(move.moveId);
+                const auto progress = dot(m_snapshot.commanded.position - m_triggered.start,
+                                          m_triggered.direction);
+                if(transition && progress + 1e-12 >= *transition) {
+                    if(!beginTriggeredStop(TriggeredMoveStatus::Triggered)) { faultTriggered(); return; }
+                    if(m_triggered.trajectory.get_duration() <= 1e-12)
+                        completeTriggered(TriggeredMoveStatus::Triggered);
+                    return;
+                }
+                if(m_triggered.elapsed + 1e-12 >= duration) {
+                    m_snapshot.commanded.position = move.target;
+                    m_snapshot.commanded.velocity = {};
+                    m_snapshot.commanded.acceleration = {};
+                    m_snapshot.feedback = m_snapshot.commanded;
+                    completeTriggered(TriggeredMoveStatus::ReachedTarget);
+                }
+            } else if(m_triggered.elapsed + 1e-12 >= duration) {
+                m_snapshot.commanded.velocity = {};
+                m_snapshot.commanded.acceleration = {};
+                m_snapshot.feedback = m_snapshot.commanded;
+                completeTriggered(m_triggered.completionStatus);
+            }
         }
 
         void emit(const ExecutionEvent &event) {
@@ -227,9 +423,9 @@ namespace ngc {
         void activateNext() {
             std::uint8_t index;
             if(!m_plans.tryPop(index)) return;
-            const auto &chunk = m_planSlots[index].chunk;
-            if(chunk.epoch != m_snapshot.epoch) {
-                emit(ChunkRejected { chunk.epoch, chunk.id });
+            const auto &item = m_planSlots[index].item;
+            if(itemEpoch(item) != m_snapshot.epoch) {
+                emit(ChunkRejected { itemEpoch(item), itemId(item) });
                 release(index);
                 return;
             }
@@ -238,58 +434,14 @@ namespace ngc {
             m_span = 0;
             m_nextEvent = 0;
             m_spanElapsed = 0.0;
-            m_snapshot.activeChunk = chunk.id;
-            emit(ChunkAccepted { chunk.epoch, chunk.id });
+            m_snapshot.activeChunk = itemId(item);
+            m_snapshot.activeSpan = 0;
+            emit(ChunkAccepted { itemEpoch(item), itemId(item) });
+            if(std::holds_alternative<TriggeredMove>(item) && !initializeTriggered()) faultTriggered();
         }
 
         void completeSpan() {
             m_spanElapsed = 0.0;
-            bool probeStopped = false;
-            double executedUntil = 1.0;
-            auto terminalPosition = m_snapshot.commanded.position;
-            const auto triggeredProbe = activeProbeContact();
-            if(!m_stopping) {
-                auto &chunk = activeChunk();
-                while(m_nextEvent < chunk.events.size && chunk.events[m_nextEvent].span <= m_span) {
-                    if(const auto probe = std::get_if<ProbeEvent>(&chunk.events[m_nextEvent].value)) {
-                        if(!triggeredProbe || triggeredProbe->probeId != probe->probeId) break;
-                        auto contact = triggeredProbe && triggeredProbe->probeId == probe->probeId
-                            ? triggeredProbe->position : m_snapshot.commanded.position;
-                        for(std::uint32_t index = 0; index < m_pendingProbeConfigs.size; ++index) {
-                            if(m_pendingProbeConfigs[index].probeId != probe->probeId) continue;
-                            m_pendingProbeConfigs[index] = m_pendingProbeConfigs[m_pendingProbeConfigs.size - 1];
-                            --m_pendingProbeConfigs.size;
-                            break;
-                        }
-                        m_snapshot.commanded.position = contact;
-                        m_snapshot.commanded.velocity = {};
-                        m_snapshot.commanded.acceleration = {};
-                        m_snapshot.feedback = m_snapshot.commanded;
-                        executedUntil = triggeredProbe ? triggeredProbe->parameter : closestParameter(currentSpan(), contact);
-                        terminalPosition = contact;
-                        emit(ProbeCompleted { chunk.epoch, ProbeResult { probe->probeId, ProbeStatus::Triggered,
-                                                                           contact, contact } });
-                        probeStopped = true;
-                    }
-                    ++m_nextEvent;
-                }
-            }
-            recordCurrentSpan(executedUntil, terminalPosition);
-            if(probeStopped) {
-                auto &chunk = activeChunk();
-                emit(BranchSelected { chunk.epoch, chunk.branch, BranchChoice::Stop, 0 });
-                emit(ChunkRetired { chunk.epoch, chunk.id });
-                m_snapshot.state = BackendState::Held;
-                m_snapshot.lastBranch = chunk.branch;
-                auto held = chunk.stopState;
-                held.position = m_snapshot.commanded.position;
-                held.velocity = {};
-                held.acceleration = {};
-                emit(BackendHeld { chunk.epoch, held, chunk.stopCursor });
-                release(*m_active);
-                m_active.reset();
-                return;
-            }
             ++m_span;
             const auto count = m_stopping ? activeChunk().stopTail.size : activeChunk().normalMotion.size;
             if(m_span < count) return;
@@ -308,22 +460,25 @@ namespace ngc {
             const auto hasContinuation = m_plans.tryPop(continuationIndex);
             const auto &current = activeChunk();
             if(hasContinuation
-               && m_planSlots[continuationIndex].chunk.epoch == current.epoch
-               && m_planSlots[continuationIndex].chunk.predecessorBranch == current.branch) {
+               && itemEpoch(m_planSlots[continuationIndex].item) == current.epoch
+               && itemPredecessor(m_planSlots[continuationIndex].item) == current.branch) {
                 const auto oldIndex = *m_active;
-                const auto &continuation = m_planSlots[continuationIndex].chunk;
-                emit(BranchSelected { current.epoch, current.branch, BranchChoice::Continue, continuation.id });
+                const auto &continuation = m_planSlots[continuationIndex].item;
+                emit(BranchSelected { current.epoch, current.branch, BranchChoice::Continue, itemId(continuation) });
                 emit(ChunkRetired { current.epoch, current.id });
                 m_active = continuationIndex;
                 release(oldIndex);
                 m_span = 0;
                 m_nextEvent = 0;
-                m_snapshot.activeChunk = continuation.id;
-                emit(ChunkAccepted { continuation.epoch, continuation.id });
+                m_spanElapsed = 0.0;
+                m_snapshot.activeChunk = itemId(continuation);
+                m_snapshot.activeSpan = 0;
+                emit(ChunkAccepted { itemEpoch(continuation), itemId(continuation) });
+                if(std::holds_alternative<TriggeredMove>(continuation) && !initializeTriggered()) faultTriggered();
             } else {
                 if(hasContinuation) {
-                    const auto &continuation = m_planSlots[continuationIndex].chunk;
-                    emit(ChunkRejected { continuation.epoch, continuation.id });
+                    const auto &continuation = m_planSlots[continuationIndex].item;
+                    emit(ChunkRejected { itemEpoch(continuation), itemId(continuation) });
                     release(continuationIndex);
                 }
                 emit(BranchSelected { current.epoch, current.branch, BranchChoice::Stop, 0 });
@@ -332,49 +487,33 @@ namespace ngc {
             }
         }
 
-        static double closestParameter(const AxisPolynomialSpan &span, const position_t &target) {
-            const auto distanceSquared = [&](const double u) {
-                const auto delta = evaluate(span, u) - target;
-                return delta.x*delta.x + delta.y*delta.y + delta.z*delta.z
-                    + delta.a*delta.a + delta.b*delta.b + delta.c*delta.c;
-            };
-            double best = 0.0;
-            double bestDistance = distanceSquared(0.0);
-            constexpr int SAMPLES = 64;
-            for(int sample = 1; sample <= SAMPLES; ++sample) {
-                const auto u = static_cast<double>(sample) / SAMPLES;
-                const auto distance = distanceSquared(u);
-                if(distance < bestDistance) { best = u; bestDistance = distance; }
-            }
-            auto low = std::max(0.0, best - 1.0/SAMPLES);
-            auto high = std::min(1.0, best + 1.0/SAMPLES);
-            for(int iteration = 0; iteration < 24; ++iteration) {
-                const auto left = std::lerp(low, high, 1.0/3.0);
-                const auto right = std::lerp(low, high, 2.0/3.0);
-                if(distanceSquared(left) <= distanceSquared(right)) high = right;
-                else low = left;
-            }
-            return 0.5*(low+high);
-        }
-
-        void recordCurrentSpan(const double executedUntil, const position_t &terminalPosition) {
+        void recordCalculatedPosition() {
             const auto &chunk = activeChunk();
-            m_trajectoryDiagnostics.spans.push_back({
-                .epoch = chunk.epoch,
-                .chunk = chunk.id,
-                .span = currentSpan().id,
-                .stopTail = m_stopping,
-                .executedUntil = executedUntil,
-                .polynomial = currentSpan(),
-                .terminalPosition = terminalPosition,
-            });
+            const auto stopTail = m_stopping;
+            const auto spanId = currentSpan().id;
+            if(m_trajectoryDiagnostics.spans.empty()
+               || m_trajectoryDiagnostics.spans.back().epoch != chunk.epoch
+               || m_trajectoryDiagnostics.spans.back().chunk != chunk.id
+               || m_trajectoryDiagnostics.spans.back().span != spanId
+               || m_trajectoryDiagnostics.spans.back().stopTail != stopTail) {
+                ExecutedTrajectorySpan executed {
+                    .epoch = chunk.epoch,
+                    .chunk = chunk.id,
+                    .span = spanId,
+                    .stopTail = stopTail,
+                    .positions = {},
+                };
+                executed.positions.push_back(evaluate(currentSpan(), 0.0));
+                m_trajectoryDiagnostics.spans.push_back(std::move(executed));
+            }
+            m_trajectoryDiagnostics.spans.back().positions.push_back(m_snapshot.commanded.position);
             ++m_trajectoryDiagnostics.revision;
         }
     };
 
     MockMotionBackend::MockMotionBackend() : m_impl(std::make_unique<Impl>()) { }
     MockMotionBackend::~MockMotionBackend() = default;
-    PublishResult MockMotionBackend::tryPublish(const PlanChunk &chunk) noexcept { return m_impl->publish(chunk); }
+    PublishResult MockMotionBackend::tryPublish(const ExecutionItem &item) noexcept { return m_impl->publish(item); }
     SubmitResult MockMotionBackend::trySubmit(const ControlRequest &request) noexcept { return m_impl->submit(request); }
     bool MockMotionBackend::tryTakeEvent(ExecutionEvent &event) noexcept { return m_impl->takeEvent(event); }
     bool MockMotionBackend::tryTakeSnapshot(ExecutionSnapshot &snapshot) noexcept { return m_impl->takeSnapshot(snapshot); }
@@ -383,10 +522,10 @@ namespace ngc {
         m_impl->advance(seconds, publishSnapshot);
     }
     void MockMotionBackend::runUntilIdle() { m_impl->runUntilIdle(); }
-    bool MockMotionBackend::configureSyntheticProbe(const std::uint64_t probeId,
-                                                     const position_t &physicalToolOffset,
-                                                     const position_t &activeToolOffset) noexcept {
-        return m_impl->configureProbe({ probeId, physicalToolOffset, activeToolOffset });
+    void MockMotionBackend::runUntilIdle(const double tickSeconds) { m_impl->runUntilIdle(tickSeconds); }
+    bool MockMotionBackend::configureSyntheticInput(const TriggeredMoveId move,
+                                                    const position_t &transitionPosition) noexcept {
+        return m_impl->configureSyntheticInput({ move, transitionPosition });
     }
     void MockMotionBackend::clearTrajectoryDiagnostics() { m_impl->clearDiagnostics(); }
     MockTrajectorySnapshot MockMotionBackend::trajectorySnapshot() const { return m_impl->diagnostics(); }

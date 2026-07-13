@@ -14,7 +14,7 @@ namespace ngc {
         MockMotionBackend(const MockMotionBackend &) = delete;
         MockMotionBackend &operator=(const MockMotionBackend &) = delete;
 
-        PublishResult tryPublish(const PlanChunk &chunk) noexcept override;
+        PublishResult tryPublish(const ExecutionItem &item) noexcept override;
         SubmitResult trySubmit(const ControlRequest &request) noexcept override;
         bool tryTakeEvent(ExecutionEvent &event) noexcept override;
         bool tryTakeSnapshot(ExecutionSnapshot &snapshot) noexcept override;
@@ -24,8 +24,12 @@ namespace ngc {
         // executing every servo update and event transition.
         void advanceTick(double seconds, bool publishSnapshot);
         void runUntilIdle() override;
-        bool configureSyntheticProbe(std::uint64_t probeId, const position_t &physicalToolOffset,
-                                     const position_t &activeToolOffset) noexcept;
+        // Immediate preview still executes at fixed mock-servo intervals so its
+        // diagnostic position buffer reflects the values calculated by the backend.
+        void runUntilIdle(double tickSeconds);
+        // Mock-only signal model. Production backends sample their configured HAL
+        // input directly; this data never enters MotionBackend.
+        bool configureSyntheticInput(TriggeredMoveId move, const position_t &transitionPosition) noexcept;
         void clearTrajectoryDiagnostics() override;
         MockTrajectorySnapshot trajectorySnapshot() const override;
 

@@ -30,11 +30,13 @@ class Worker {
     bool m_doExecute = false;
     bool m_busy = false;
     ngc::EpochId m_nextEpoch = 1;
+    double m_servoPeriod;
 
 public:
     explicit Worker(const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch,
-                    const ngc::TrajectoryLimits limits = {})
-        : m_session(unit, ngc::InterpretationMode::Preview), m_driver(m_session, m_backend, limits) {
+                    const ngc::TrajectoryLimits limits = {}, const double servoPeriod = 0.001)
+        : m_session(unit, ngc::InterpretationMode::Preview), m_driver(m_session, m_backend, limits),
+          m_servoPeriod(servoPeriod) {
         refreshParameterSnapshot();
         m_thread = std::thread(&Worker::work, this);
     }
@@ -194,11 +196,14 @@ private:
                 if(!m_driver.pumpOne([&](const auto &callback) {
                     std::scoped_lock lock(m_mutex);
                     callback();
-                }, [&](const ngc::MachineCommand &command, const ngc::PlanChunk &) {
+                }, [&](const ngc::MachineCommand &command, const ngc::ExecutionItem &item) {
                     std::scoped_lock lock(m_mutex);
-                    if(const auto *probe = std::get_if<ngc::ProbeMove>(&command))
-                        (void)m_backend.configureSyntheticProbe(probe->id(), m_session.machine().toolGeometry().offset,
-                                                                m_session.machine().toolOffset());
+                    if(std::holds_alternative<ngc::ProbeMove>(command)) {
+                        const auto &move = std::get<ngc::TriggeredMove>(item);
+                        const auto contact = move.target + m_session.machine().toolGeometry().offset
+                            - m_session.machine().toolOffset();
+                        (void)m_backend.configureSyntheticInput(move.moveId, contact);
+                    }
                     const ngc::WorkCoordinateSystem workCoordinateSystem {
                         std::string(ngc::name(*m_session.machine().state().modeCoordSys)),
                         m_session.machine().workOffset() };
@@ -219,7 +224,7 @@ private:
                 break;
             }
 
-            m_backend.runUntilIdle();
+            m_backend.runUntilIdle(m_servoPeriod);
             {
                 std::scoped_lock lock(m_mutex);
                 m_driver.serviceBackend();

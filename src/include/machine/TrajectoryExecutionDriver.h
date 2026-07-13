@@ -20,7 +20,7 @@ namespace ngc {
         InterpreterSession &m_session;
         MotionBackend &m_backend;
         ExactStopTrajectoryPlanner m_planner;
-        std::optional<PlanChunk> m_pending;
+        std::optional<ExecutionItem> m_pending;
         std::optional<MachineCommand> m_pendingCommand;
         std::optional<std::string> m_error;
         std::size_t m_outstandingChunks = 0;
@@ -71,7 +71,7 @@ namespace ngc {
                     m_error = "pending trajectory chunk lost its canonical command";
                     return false;
                 }
-                if constexpr(std::invocable<Observe, const MachineCommand &, const PlanChunk &>)
+                if constexpr(std::invocable<Observe, const MachineCommand &, const ExecutionItem &>)
                     observe(*m_pendingCommand, *m_pending);
                 else
                     observe(*m_pendingCommand);
@@ -88,14 +88,26 @@ namespace ngc {
                 if constexpr(!std::same_as<std::remove_cvref_t<ObserveLifecycle>, std::nullptr_t>)
                     observeLifecycle(*lifecycle);
             } else if(auto command = std::get_if<MachineCommand>(&event)) {
-                const auto compiled = m_planner.compile(*command);
+                std::expected<ExecutionItem, std::string> compiled = std::visit([&](const auto &value)
+                        -> std::expected<ExecutionItem, std::string> {
+                    using T = std::decay_t<decltype(value)>;
+                    if constexpr(std::same_as<T, ProbeMove>) {
+                        auto move = m_planner.compileTriggeredMove(value);
+                        if(!move) return std::unexpected(move.error());
+                        return ExecutionItem { *move };
+                    } else {
+                        auto chunk = m_planner.compile(*command);
+                        if(!chunk) return std::unexpected(chunk.error());
+                        return ExecutionItem { *chunk };
+                    }
+                }, *command);
                 if(!compiled) {
                     m_error = compiled.error();
                     return true;
                 }
                 const auto result = m_backend.tryPublish(*compiled);
                 if(result == PublishResult::Published) {
-                    if constexpr(std::invocable<Observe, const MachineCommand &, const PlanChunk &>)
+                    if constexpr(std::invocable<Observe, const MachineCommand &, const ExecutionItem &>)
                         observe(*command, *compiled);
                     else
                         observe(*command);
@@ -123,9 +135,19 @@ namespace ngc {
             ExecutionEvent event;
             while(m_backend.tryTakeEvent(event)) {
                 observe(event);
-                if(const auto *probe = std::get_if<ProbeCompleted>(&event)) {
-                    if(probe->epoch == m_epoch && m_probePending) {
-                        m_session.provideProbeResult(probe->result);
+                if(const auto *move = std::get_if<TriggeredMoveCompleted>(&event)) {
+                    if(move->epoch == m_epoch && m_probePending) {
+                        const auto status = [&] {
+                            switch(move->status) {
+                            case TriggeredMoveStatus::Triggered: return ProbeStatus::Triggered;
+                            case TriggeredMoveStatus::ReachedTarget: return ProbeStatus::ReachedTarget;
+                            case TriggeredMoveStatus::Aborted: return ProbeStatus::Aborted;
+                            case TriggeredMoveStatus::Fault: return ProbeStatus::Fault;
+                            }
+                            return ProbeStatus::Fault;
+                        }();
+                        m_session.provideProbeResult({ move->move, status,
+                            move->triggerState.position, move->stoppedState.position });
                         m_probePending = false;
                     }
                 } else if(const auto *retired = std::get_if<ChunkRetired>(&event)) {
@@ -148,7 +170,19 @@ namespace ngc {
                         m_outstandingChunks = 0;
                         m_planner.reset(m_epoch, held->state.position);
                         if(m_pendingCommand) {
-                            const auto replanned = m_planner.compile(*m_pendingCommand);
+                            std::expected<ExecutionItem, std::string> replanned = std::visit([&](const auto &value)
+                                    -> std::expected<ExecutionItem, std::string> {
+                                using T = std::decay_t<decltype(value)>;
+                                if constexpr(std::same_as<T, ProbeMove>) {
+                                    auto move = m_planner.compileTriggeredMove(value);
+                                    if(!move) return std::unexpected(move.error());
+                                    return ExecutionItem { *move };
+                                } else {
+                                    auto chunk = m_planner.compile(*m_pendingCommand);
+                                    if(!chunk) return std::unexpected(chunk.error());
+                                    return ExecutionItem { *chunk };
+                                }
+                            }, *m_pendingCommand);
                             if(!replanned) {
                                 m_error = replanned.error();
                                 m_pending.reset();

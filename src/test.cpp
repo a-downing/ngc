@@ -1018,7 +1018,7 @@ namespace {
         while(driver.state() == ngc::TrajectoryDriverState::Running) {
             for(int fill = 0; fill < 64; ++fill) {
                 if(!driver.pumpOne([](const auto &callback) { callback(); },
-                    [&](const ngc::MachineCommand &command, const ngc::PlanChunk &) {
+                    [&](const ngc::MachineCommand &command, const ngc::ExecutionItem &) {
                         recorder.consume(command, session.machine().toolOffset(), ngc::WorkCoordinateSystem {
                             std::string(ngc::name(*session.machine().state().modeCoordSys)), session.machine().workOffset() });
                     })) break;
@@ -1111,13 +1111,9 @@ namespace {
         stop.end = {};
         stop.end.position.x = 1.0;
         require(chunk.stopTail.push(stop), "test stop tail should fit in a chunk");
-        require(chunk.events.push({ 0, ngc::ProbeEvent { 42, true, false } }),
-                "test probe event should fit in a chunk");
         chunk.branchState.position.x = 1.0;
         chunk.stopState.position.x = 1.0;
 
-        require(backend.configureSyntheticProbe(42, { -0.25, 0, 0, 0, 0, 0 }, {}),
-                "mock-only probe geometry should publish through its diagnostic configuration channel");
         require(backend.tryPublish(chunk) == ngc::PublishResult::Published,
                 "NRT should publish a validated chunk without invoking execution");
         require(backend.trySubmit(ngc::StartRequest { 1, 7 }) == ngc::SubmitResult::Submitted,
@@ -1130,31 +1126,26 @@ namespace {
         requireNear(snapshot.commanded.position.x, 0.5, "mock RT backend should evaluate the timed polynomial");
 
         backend.runUntilIdle();
-        bool sawProbe = false;
         bool sawStopBranch = false;
         bool sawHeld = false;
         ngc::ExecutionEvent event;
         while(backend.tryTakeEvent(event)) {
-            if(const auto *probe = std::get_if<ngc::ProbeCompleted>(&event)) {
-                sawProbe = probe->result.id == 42;
-                requireNear(probe->result.triggerPosition.x, 0.75,
-                            "mock probing should latch the executed trajectory position");
-            }
             if(const auto *branch = std::get_if<ngc::BranchSelected>(&event)) {
                 sawStopBranch = branch->choice == ngc::BranchChoice::Stop;
             }
             if(std::holds_alternative<ngc::BackendHeld>(event)) sawHeld = true;
         }
-        require(sawProbe, "mock backend should return probe completion through the backend event channel");
         require(sawStopBranch, "backend should irrevocably select its stop tail without a continuation");
         require(sawHeld, "backend should report held only after completing the stop tail");
         const auto trajectory = backend.trajectorySnapshot();
-        require(trajectory.revision == 1 && trajectory.spans.size() == 1,
-                "probe interruption should retain the one actually executed polynomial span");
-        require(trajectory.spans.front().executedUntil > 0.74 && trajectory.spans.front().executedUntil < 0.76,
-                "mock diagnostics should retain the probe-truncated polynomial parameter");
-        requireNear(trajectory.spans.front().terminalPosition.x, 0.75,
-                    "mock diagnostics should retain the latched terminal probe position");
+        require(trajectory.revision > 0 && trajectory.spans.size() == 2,
+                "normal and stop-tail execution should retain backend-calculated position buffers");
+        require(trajectory.spans.front().positions.size() >= 2,
+                "mock diagnostics should retain backend-calculated positions");
+        requireNear(trajectory.spans.front().positions.back().x, 1.0,
+                    "mock diagnostics should end normal motion at its terminal position");
+        require(trajectory.spans.back().stopTail,
+                "mock diagnostics should distinguish the executed stop tail");
     }
 
     void testMockBackendDrainsAFullPlanHorizonWithoutEventOverflow() {
@@ -1276,11 +1267,8 @@ namespace {
         for(; result.loops < 1000 && driver.state() == ngc::TrajectoryDriverState::Running; ++result.loops) {
             for(int fill = 0; fill < 64; ++fill) {
                 if(!driver.pumpOne([](const auto &callback) { callback(); },
-                    [&](const ngc::MachineCommand &command, const ngc::PlanChunk &) {
+                    [&](const ngc::MachineCommand &command, const ngc::ExecutionItem &) {
                         ++result.commands;
-                        if(const auto *probe = std::get_if<ngc::ProbeMove>(&command))
-                            (void)backend.configureSyntheticProbe(probe->id(), session.machine().toolGeometry().offset,
-                                                                  session.machine().toolOffset());
                         recorder.consume(command, session.machine().toolOffset());
                     })) break;
             }
@@ -1642,17 +1630,39 @@ namespace {
         }
     }
 
-    void testMockDiagnosticSegmentsFollowServoPeriod() {
-        ngc::ExecutedTrajectorySpan executed;
-        executed.polynomial.duration = 0.1;
-        executed.executedUntil = 1.0;
-        require(ngc::diagnosticServoSegmentCount(executed, 0.001) == 100,
-                "a 100 ms executed span should display 100 segments at a 1 ms servo period");
-        require(ngc::diagnosticServoSegmentCount(executed, 0.01) == 10,
-                "the diagnostic segment count should change with the servo period");
-        executed.executedUntil = 0.5;
-        require(ngc::diagnosticServoSegmentCount(executed, 0.001) == 50,
-                "truncated probe spans should display only their executed servo intervals");
+    void testMockDiagnosticPositionsFollowServoPeriod() {
+        const auto positionsAtPeriod = [](const double period) {
+            ngc::MockMotionBackend backend;
+            ngc::PlanChunk chunk;
+            chunk.epoch = 4;
+            chunk.id = 8;
+            chunk.branch = 12;
+            require(chunk.normalMotion.push(linearSpan(20, 0.0, 1.0, 0.1)),
+                    "diagnostic normal span should fit in a chunk");
+            require(chunk.stopTail.push(linearSpan(21, 1.0, 1.0, 0.01)),
+                    "diagnostic stop span should fit in a chunk");
+            require(backend.trySubmit(ngc::StartRequest { 1, 4 }) == ngc::SubmitResult::Submitted,
+                    "diagnostic start request should publish");
+            require(backend.tryPublish(chunk) == ngc::PublishResult::Published,
+                    "diagnostic chunk should publish");
+            backend.runUntilIdle(period);
+            const auto trajectory = backend.trajectorySnapshot();
+            require(!trajectory.spans.empty(), "mock backend should retain calculated position buffers");
+            return trajectory.spans.front().positions;
+        };
+
+        const auto coarse = positionsAtPeriod(0.01);
+        const auto fine = positionsAtPeriod(0.001);
+        require(coarse.size() == 11,
+                "a 100 ms span should retain its start and ten calculated 10 ms positions");
+        require(fine.size() == 101,
+                "a 100 ms span should retain its start and one hundred calculated 1 ms positions");
+        require(fine.size() > coarse.size(),
+                "shortening the servo period should produce shorter diagnostic line segments");
+        requireNear(coarse.front().x, 0.0,
+                    "diagnostic position buffer should retain the span start");
+        requireNear(coarse.back().x, 1.0,
+                    "diagnostic position buffer should retain the span end");
     }
 
     void testMachineConfigurationLoadsTrajectoryLimits() {
@@ -1674,44 +1684,76 @@ namespace {
                     "machine configuration should load the independent scheduler period");
     }
 
-    void testExactStopPlannerCompilesProbeAsBackendEvent() {
-        ngc::ExactStopTrajectoryPlanner planner;
-        planner.reset(3, { 0, 0, 1, 0, 0, 0 });
-        const auto chunk = planner.compile(ngc::ProbeMove {
-            77, { 0, 0, 1, 0, 0, 0 }, { 0, 0, 0, 0, 0, 0 }, 10.0, true, false });
-        require(chunk.has_value(), chunk ? "" : chunk.error());
-        require(chunk->events.size == 1, "probe motion should schedule one RT backend event");
-        const auto *probe = std::get_if<ngc::ProbeEvent>(&chunk->events[0].value);
-        require(probe && probe->probeId == 77, "scheduled probe event should retain the interpreter probe ID");
-        require(chunk->events[0].span == 0,
-                "probe input should be armed before the first exact-stop approach span");
+    void testProbeCompilesAsBackendOwnedTriggeredMove() {
+        constexpr double ACCELERATION = 2.0;
+        constexpr double JERK = 10.0;
+        ngc::ExactStopTrajectoryPlanner planner({
+            .pathAcceleration = ACCELERATION,
+            .rapidSpeed = 100.0,
+            .arcChordTolerance = 0.0001,
+            .pathJerk = JERK,
+        });
+        planner.reset(3, {});
+        const ngc::ProbeMove probeCommand {
+            77, {}, { 0, 0, -1, 0, 0, 0 }, 10.0, true, false };
+        const auto move = planner.compileTriggeredMove(probeCommand);
+        require(move.has_value(), move ? "" : move.error());
+        require(move->moveId == 77, "triggered move should retain the interpreter probe ID");
+        requireNear(move->target.z, -1.0, "triggered move should retain its machine target");
 
         ngc::MockMotionBackend backend;
-        require(backend.trySubmit(ngc::ResetRequest { 1, 3 }) == ngc::SubmitResult::Submitted,
-                "multi-span probe reset should publish");
-        require(backend.trySubmit(ngc::StartRequest { 2, 3 }) == ngc::SubmitResult::Submitted,
-                "multi-span probe start should publish");
-        backend.advance(0.0);
-        ngc::ExecutionEvent startup;
-        while(backend.tryTakeEvent(startup)) { }
-        require(backend.configureSyntheticProbe(77, { 0, 0, 0.5, 0, 0, 0 }, {}),
-                "multi-span synthetic probe configuration should publish");
-        require(backend.tryPublish(*chunk) == ngc::PublishResult::Published,
-                "multi-span probe chunk should publish");
-        backend.runUntilIdle();
-        const auto executed = backend.trajectorySnapshot();
-        require(!executed.spans.empty(), "multi-span probe should retain executed diagnostics");
-        for(const auto &span : executed.spans) {
-            require(span.terminalPosition.z >= 0.5 - 1e-8,
-                    "probe backend must never execute below the first synthetic contact");
+        require(backend.trySubmit(ngc::StartRequest { 1, 3 }) == ngc::SubmitResult::Submitted,
+                "triggered-move backend should start");
+        require(backend.configureSyntheticInput(move->moveId, { 0, 0, -0.5, 0, 0, 0 }),
+                "mock input transition should publish outside the production RT interface");
+        require(backend.tryPublish(ngc::ExecutionItem { *move }) == ngc::PublishResult::Published,
+                "triggered move should publish through the unified execution transport");
+        ngc::ExecutionSnapshot previous;
+        bool havePrevious = false;
+        double maximumAcceleration = 0.0;
+        double maximumJerk = 0.0;
+        for(int tick = 0; tick < 100000; ++tick) {
+            backend.advanceTick(0.001, true);
+            ngc::ExecutionSnapshot snapshot;
+            while(backend.tryTakeSnapshot(snapshot)) {
+                const auto norm = [](const ngc::position_t &value) {
+                    return std::sqrt(value.x*value.x + value.y*value.y + value.z*value.z
+                        + value.a*value.a + value.b*value.b + value.c*value.c);
+                };
+                maximumAcceleration = std::max(maximumAcceleration, norm(snapshot.commanded.acceleration));
+                if(havePrevious)
+                    maximumJerk = std::max(maximumJerk,
+                        norm(snapshot.commanded.acceleration - previous.commanded.acceleration) / 0.001);
+                previous = snapshot;
+                havePrevious = true;
+            }
+            if(havePrevious && previous.state == ngc::BackendState::Held) break;
         }
-        requireNear(executed.spans.back().terminalPosition.z, 0.5,
-                    "multi-span probe should stop at physical-tool contact without teleporting");
+        bool completed = false;
+        ngc::TriggeredMoveCompleted result{};
+        ngc::ExecutionEvent event;
+        while(backend.tryTakeEvent(event)) if(const auto *value = std::get_if<ngc::TriggeredMoveCompleted>(&event)) {
+            completed = true;
+            result = *value;
+        }
+        require(completed && result.status == ngc::TriggeredMoveStatus::Triggered,
+                "mock input transition should complete the triggered move");
+        require(result.triggerState.position.z <= -0.5 && result.triggerState.position.z > -0.51,
+                "trigger state should be latched on the first servo sample after contact");
+        require(result.stoppedState.position.z < result.triggerState.position.z,
+                "triggered motion should overshoot contact while stopping within constraints");
+        require(maximumAcceleration <= ACCELERATION * 1.001,
+                "triggered approach and stop should respect the configured acceleration limit");
+        require(maximumJerk <= JERK * 1.02,
+                std::format("triggered approach and stop should respect the configured jerk limit ({})", maximumJerk));
+        const auto diagnostics = backend.trajectorySnapshot();
+        require(diagnostics.spans.size() >= 2 && diagnostics.spans.back().stopTail,
+                "triggered stop should be retained in the reusable diagnostic position buffer");
     }
 
     void testTrajectoryDriverConnectsInterpreterToMockRtBackend() {
         ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::Simulation);
-        compileSession(session, "G1 F60 X1\nG38.3 F30 Z-1\nG1 X2\n");
+        compileSession(session, "G1 F60 X1\nG1 Z-1\nG1 X2\n");
         session.begin();
 
         ngc::MockMotionBackend backend;
@@ -1748,7 +1790,8 @@ namespace {
         require(observedCommands == 3, "trajectory driver should compile every canonical motion command once");
         require(haveSnapshot, "mock RT backend should expose execution snapshots through SPSC communication");
         requireNear(latest.commanded.position.x, 2.0, "mock RT execution should reach the final planned X position");
-        requireNear(latest.commanded.position.z, -1.0, "mock probe execution should preserve its stopped Z position");
+        requireNear(latest.commanded.position.z, -1.0,
+                    "mock RT execution should preserve its final Z position");
     }
 }
 
@@ -1803,9 +1846,9 @@ int main() {
         testPlannedArcsPreserveCanonicalEndpointContinuity();
         testRoundedRadiusArcPreservesDynamicLimits();
         testEndpointExactArcReferenceGeometryVariants();
-        testMockDiagnosticSegmentsFollowServoPeriod();
+        testMockDiagnosticPositionsFollowServoPeriod();
         testMachineConfigurationLoadsTrajectoryLimits();
-        testExactStopPlannerCompilesProbeAsBackendEvent();
+        testProbeCompilesAsBackendOwnedTriggeredMove();
         testTrajectoryDriverConnectsInterpreterToMockRtBackend();
     } catch(const std::exception &error) {
         std::cerr << "ngc_tests failed: " << error.what() << '\n';

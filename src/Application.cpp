@@ -8,6 +8,7 @@
 #include <print>
 #include <string>
 #include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <ranges>
 #include <numbers>
@@ -60,6 +61,13 @@
 #include "gui/tool_table_strings_t.h"
 
 class ApplicationImpl final {
+    using GlGenBuffersProc = void (APIENTRY *)(GLsizei, GLuint *);
+    using GlDeleteBuffersProc = void (APIENTRY *)(GLsizei, const GLuint *);
+    using GlBindBufferProc = void (APIENTRY *)(GLenum, GLuint);
+    using GlBufferDataProc = void (APIENTRY *)(GLenum, std::ptrdiff_t, const void *, GLenum);
+    static constexpr GLenum GL_ARRAY_BUFFER_VALUE = 0x8892;
+    static constexpr GLenum GL_STATIC_DRAW_VALUE = 0x88E4;
+
     GLFWwindow *m_window;
     std::filesystem::path m_path = std::filesystem::absolute(".").lexically_normal();
     ngc::ToolTable m_tools;
@@ -122,9 +130,17 @@ class ApplicationImpl final {
         std::vector<glm::dvec3> g64ControlPoints;
         std::vector<glm::dvec3> backendTrajectoryLines;
         std::vector<glm::dvec3> backendStopTailLines;
+        std::vector<glm::dvec3> backendTrajectoryPoints;
         std::vector<glm::dvec3> darkPoints;
         std::vector<glm::dvec3> lightPoints;
     } m_previewRenderCache;
+    GlGenBuffersProc m_glGenBuffers = nullptr;
+    GlDeleteBuffersProc m_glDeleteBuffers = nullptr;
+    GlBindBufferProc m_glBindBuffer = nullptr;
+    GlBufferDataProc m_glBufferData = nullptr;
+    GLuint m_backendTrajectoryBuffer = 0;
+    GLuint m_backendStopTailBuffer = 0;
+    GLuint m_backendTrajectoryPointBuffer = 0;
     double m_sceneScale = 1.0;
     glm::dvec3 m_modelPivot = { 0.0, 0.0, 0.0 };
 
@@ -190,7 +206,7 @@ class ApplicationImpl final {
 
         glDisable(GL_DEPTH_TEST);
         glLineWidth(2.0f);
-        glColor3f(1.0f, 0.85f, 0.05f);
+        glColor3d(1.0, 0.85, 0.05);
         glBegin(GL_LINES);
         glVertex3dv(glm::value_ptr(edge0));
         glVertex3dv(glm::value_ptr(tip));
@@ -220,11 +236,22 @@ public:
     ApplicationImpl() = delete;
     ApplicationImpl(GLFWwindow *window, const ngc::MachineConfiguration &configuration)
         : m_window(window), m_simulationTiming(configuration.simulation),
-          m_worker(configuration.unit, configuration.trajectory),
+          m_worker(configuration.unit, configuration.trajectory, configuration.simulation.servoPeriod),
           m_simulation(configuration.unit, configuration.trajectory, configuration.simulation),
           m_simulatedRapidSpeed(configuration.trajectory.rapidSpeed) { }
 
     void init() {
+        m_glGenBuffers = reinterpret_cast<GlGenBuffersProc>(glfwGetProcAddress("glGenBuffers"));
+        m_glDeleteBuffers = reinterpret_cast<GlDeleteBuffersProc>(glfwGetProcAddress("glDeleteBuffers"));
+        m_glBindBuffer = reinterpret_cast<GlBindBufferProc>(glfwGetProcAddress("glBindBuffer"));
+        m_glBufferData = reinterpret_cast<GlBufferDataProc>(glfwGetProcAddress("glBufferData"));
+        if(m_glGenBuffers && m_glDeleteBuffers && m_glBindBuffer && m_glBufferData) {
+            GLuint buffers[3]{};
+            m_glGenBuffers(3, buffers);
+            m_backendTrajectoryBuffer = buffers[0];
+            m_backendStopTailBuffer = buffers[1];
+            m_backendTrajectoryPointBuffer = buffers[2];
+        }
         auto result = m_tools.load();
 
         if(!result) {
@@ -258,6 +285,14 @@ public:
     void terminate() {
         m_simulation.join();
         m_worker.join();
+        if(m_glDeleteBuffers) {
+            const GLuint buffers[] = { m_backendTrajectoryBuffer, m_backendStopTailBuffer,
+                                       m_backendTrajectoryPointBuffer };
+            m_glDeleteBuffers(3, buffers);
+            m_backendTrajectoryBuffer = 0;
+            m_backendStopTailBuffer = 0;
+            m_backendTrajectoryPointBuffer = 0;
+        }
     }
 
     void initToolTableStrings() {
@@ -472,6 +507,7 @@ public:
     void rebuildPreviewRenderCache() {
         if(m_worker.busy()) return;
 
+        auto cacheRebuilt = false;
         m_worker.lock([&] {
             const auto &toolpath = m_worker.toolpath();
             const auto &backendTrajectory = m_worker.backendTrajectory();
@@ -491,6 +527,7 @@ public:
             cache.g64ControlPoints.clear();
             cache.backendTrajectoryLines.clear();
             cache.backendStopTailLines.clear();
+            cache.backendTrajectoryPoints.clear();
             cache.darkPoints.clear();
             cache.lightPoints.clear();
 
@@ -669,34 +706,35 @@ public:
             }
             flushSpline();
 
-            const auto evaluatePolynomial = [](const ngc::AxisPolynomialSpan &span, const double u) {
-                const auto component = [&](const double ngc::position_t::*member) {
-                    return ((span.a.*member*u + span.b.*member)*u + span.c.*member)*u + span.d.*member;
-                };
-                return glm::dvec3(component(&ngc::position_t::x), component(&ngc::position_t::y),
-                                  component(&ngc::position_t::z));
-            };
             for(const auto &executed : backendTrajectory.spans) {
-                auto &vertices = executed.stopTail ? cache.backendStopTailLines : cache.backendTrajectoryLines;
-                const auto executedDuration = executed.polynomial.duration * executed.executedUntil;
-                const auto samples = ngc::diagnosticServoSegmentCount(
-                    executed, m_simulationTiming.servoPeriod);
-                auto previous = evaluatePolynomial(executed.polynomial, 0.0);
-                for(std::size_t sample = 1; sample <= samples; ++sample) {
-                    const auto elapsed = std::min(static_cast<double>(sample) * m_simulationTiming.servoPeriod,
-                                                  executedDuration);
-                    const auto u = executed.polynomial.duration > 0.0
-                        ? elapsed * executed.polynomial.inverseDuration : executed.executedUntil;
-                    const auto current = evaluatePolynomial(executed.polynomial, u);
-                    if(glm::length(current - previous) > 1e-12) segment(vertices, previous, current);
-                    previous = current;
+                if(executed.positions.empty()) continue;
+                if(executed.stopTail) {
+                    auto &vertices = cache.backendStopTailLines;
+                    for(std::size_t sample = 1; sample < executed.positions.size(); ++sample)
+                        segment(vertices, point(executed.positions[sample - 1]), point(executed.positions[sample]));
+                } else {
+                    for(const auto &position : executed.positions)
+                        cache.backendTrajectoryLines.push_back(point(position));
+                    for(const auto &position : executed.positions)
+                        cache.backendTrajectoryPoints.push_back(point(position));
                 }
-                const auto terminal = point(executed.terminalPosition);
-                if(glm::length(terminal - previous) > 1e-12) segment(vertices, previous, terminal);
             }
             cache.revision = toolpath.revision();
             cache.backendTrajectoryRevision = backendTrajectory.revision;
+            cacheRebuilt = true;
         });
+        if(!cacheRebuilt || !m_glBindBuffer || !m_glBufferData) return;
+        const auto upload = [&](const GLuint buffer, const std::vector<glm::dvec3> &vertices) {
+            if(buffer == 0) return;
+            m_glBindBuffer(GL_ARRAY_BUFFER_VALUE, buffer);
+            m_glBufferData(GL_ARRAY_BUFFER_VALUE,
+                           static_cast<std::ptrdiff_t>(vertices.size() * sizeof(glm::dvec3)),
+                           vertices.empty() ? nullptr : vertices.data(), GL_STATIC_DRAW_VALUE);
+        };
+        upload(m_backendTrajectoryBuffer, m_previewRenderCache.backendTrajectoryLines);
+        upload(m_backendStopTailBuffer, m_previewRenderCache.backendStopTailLines);
+        upload(m_backendTrajectoryPointBuffer, m_previewRenderCache.backendTrajectoryPoints);
+        m_glBindBuffer(GL_ARRAY_BUFFER_VALUE, 0);
     }
 
     void render3D() {
@@ -817,20 +855,20 @@ public:
             coordinates.active = *simulationCoordinates.activeWorkCoordinateSystem;
         }
 
-        const auto drawTriad = [](const glm::dvec3 &origin, const double length, const bool dashed, const float intensity) {
+        const auto drawTriad = [](const glm::dvec3 &origin, const double length, const bool dashed, const double intensity) {
             if(dashed) {
                 glEnable(GL_LINE_STIPPLE);
                 glLineStipple(1, 0x3333);
             }
 
             glBegin(GL_LINES);
-            glColor3f(intensity, 0.2f * intensity, 0.2f * intensity);
+            glColor3d(intensity, 0.2 * intensity, 0.2 * intensity);
             glVertex3d(origin.x, origin.y, origin.z);
             glVertex3d(origin.x + length, origin.y, origin.z);
-            glColor3f(0.2f * intensity, intensity, 0.2f * intensity);
+            glColor3d(0.2 * intensity, intensity, 0.2 * intensity);
             glVertex3d(origin.x, origin.y, origin.z);
             glVertex3d(origin.x, origin.y + length, origin.z);
-            glColor3f(0.25f * intensity, 0.45f * intensity, intensity);
+            glColor3d(0.25 * intensity, 0.45 * intensity, intensity);
             glVertex3d(origin.x, origin.y, origin.z);
             glVertex3d(origin.x, origin.y, origin.z + length);
             glEnd();
@@ -842,23 +880,23 @@ public:
             glEnable(GL_POINT_SMOOTH);
             glPointSize(dashed ? 7.0f : 9.0f);
             glBegin(GL_POINTS);
-            glColor3f(intensity, (dashed ? 0.75f : 0.95f) * intensity,
-                      (dashed ? 0.15f : 0.95f) * intensity);
+            glColor3d(intensity, (dashed ? 0.75 : 0.95) * intensity,
+                      (dashed ? 0.15 : 0.95) * intensity);
             glVertex3d(origin.x, origin.y, origin.z);
             glEnd();
         };
 
         glLineWidth(2.0f);
-        drawTriad({ 0.0, 0.0, 0.0 }, MACHINE_TRIAD_LENGTH, false, 0.55f);
+        drawTriad({ 0.0, 0.0, 0.0 }, MACHINE_TRIAD_LENGTH, false, 0.55);
         for(const auto &workCoordinateSystem : coordinates.used) {
             if(workCoordinateSystem.name == coordinates.active.name) continue;
             const auto &offset = workCoordinateSystem.offset;
             glLineWidth(2.0f);
-            drawTriad({ offset.x, offset.y, offset.z }, WORK_TRIAD_LENGTH, true, 0.35f);
+            drawTriad({ offset.x, offset.y, offset.z }, WORK_TRIAD_LENGTH, true, 0.35);
         }
         glLineWidth(5.0f);
         drawTriad({ coordinates.active.offset.x, coordinates.active.offset.y, coordinates.active.offset.z },
-                  WORK_TRIAD_LENGTH, true, 1.0f);
+                  WORK_TRIAD_LENGTH, true, 1.0);
         glLineWidth(1.0f);
         glPointSize(1.0f);
 
@@ -905,21 +943,35 @@ public:
         drawList->AddText(fpsPosition, IM_COL32(210, 220, 225, 255), fpsText.c_str());
 
         const auto drawVertices = [](const std::vector<glm::dvec3> &vertices, const GLenum primitive,
-                                     const float red, const float green, const float blue,
+                                     const double red, const double green, const double blue,
                                      const int stippleFactor = 0, const GLushort stipplePattern = 0xFFFF) {
             if(vertices.empty()) return;
             if(stippleFactor > 0) {
                 glEnable(GL_LINE_STIPPLE);
                 glLineStipple(stippleFactor, stipplePattern);
             }
-            glColor3f(red, green, blue);
+            glColor3d(red, green, blue);
             glEnableClientState(GL_VERTEX_ARRAY);
             glVertexPointer(3, GL_DOUBLE, sizeof(glm::dvec3), &vertices.front().x);
             glDrawArrays(primitive, 0, static_cast<GLsizei>(vertices.size()));
             glDisableClientState(GL_VERTEX_ARRAY);
             if(stippleFactor > 0) glDisable(GL_LINE_STIPPLE);
         };
+        const auto drawBufferedVertices = [&](const GLuint buffer, const std::size_t count,
+                                              const GLenum primitive, const double red,
+                                              const double green, const double blue) {
+            if(buffer == 0 || count == 0 || !m_glBindBuffer) return false;
+            glColor3d(red, green, blue);
+            m_glBindBuffer(GL_ARRAY_BUFFER_VALUE, buffer);
+            glEnableClientState(GL_VERTEX_ARRAY);
+            glVertexPointer(3, GL_DOUBLE, sizeof(glm::dvec3), nullptr);
+            glDrawArrays(primitive, 0, static_cast<GLsizei>(count));
+            glDisableClientState(GL_VERTEX_ARRAY);
+            m_glBindBuffer(GL_ARRAY_BUFFER_VALUE, 0);
+            return true;
+        };
 
+        if(m_glBindBuffer) m_glBindBuffer(GL_ARRAY_BUFFER_VALUE, 0);
         glLineWidth(2.0f);
         drawVertices(m_previewRenderCache.feedLines, GL_LINES, 0.4f, 0.4f, 1.0f);
         drawVertices(m_previewRenderCache.g53FeedLines, GL_LINES, 1.0f, 1.0f, 0.4f);
@@ -940,9 +992,22 @@ public:
         glPointSize(3.0f);
         drawVertices(m_previewRenderCache.darkPoints, GL_POINTS, 0.0f, 0.0f, 0.0f);
         drawVertices(m_previewRenderCache.lightPoints, GL_POINTS, 0.1f, 0.55f, 0.1f);
+        glDisable(GL_LINE_SMOOTH);
+        glDisable(GL_POINT_SMOOTH);
         glLineWidth(1.0f);
-        drawVertices(m_previewRenderCache.backendTrajectoryLines, GL_LINES, 1.0f, 0.15f, 0.15f);
-        drawVertices(m_previewRenderCache.backendStopTailLines, GL_LINES, 1.0f, 1.0f, 1.0f);
+        if(!drawBufferedVertices(m_backendTrajectoryBuffer,
+                                m_previewRenderCache.backendTrajectoryLines.size(),
+                                GL_LINE_STRIP, 1.0f, 0.15f, 0.15f))
+            drawVertices(m_previewRenderCache.backendTrajectoryLines, GL_LINE_STRIP, 1.0f, 0.15f, 0.15f);
+        if(!drawBufferedVertices(m_backendStopTailBuffer,
+                                m_previewRenderCache.backendStopTailLines.size(),
+                                GL_LINES, 1.0f, 1.0f, 1.0f))
+            drawVertices(m_previewRenderCache.backendStopTailLines, GL_LINES, 1.0f, 1.0f, 1.0f);
+        glPointSize(1.0f);
+        if(!drawBufferedVertices(m_backendTrajectoryPointBuffer,
+                                m_previewRenderCache.backendTrajectoryPoints.size(),
+                                GL_POINTS, 0.0f, 0.0f, 0.0f))
+            drawVertices(m_previewRenderCache.backendTrajectoryPoints, GL_POINTS, 0.0f, 0.0f, 0.0f);
         glLineWidth(1.0f);
 
         const auto simulation = m_simulation.snapshot();

@@ -213,6 +213,8 @@ namespace ngc {
         if(m_limits.pathAcceleration <= 0.0 || m_limits.pathJerk <= 0.0
            || m_limits.rapidSpeed <= 0.0 || m_limits.arcChordTolerance <= 0.0)
             return std::unexpected("trajectory limits must be positive");
+        if(std::holds_alternative<ProbeMove>(command))
+            return std::unexpected("probe moves must be compiled as executor-owned triggered moves");
 
         PlanChunk chunk;
         chunk.epoch = m_epoch;
@@ -281,32 +283,20 @@ namespace ngc {
 
         auto error = std::visit([&](const auto &value) -> std::optional<std::string> {
             using T = std::decay_t<decltype(value)>;
-            if constexpr(std::same_as<T, MoveLine> || std::same_as<T, ProbeMove>) {
-                const auto source = [&] {
-                    if constexpr(std::same_as<T, MoveLine>) return value.from();
-                    else return value.from();
-                }();
-                const auto target = [&] {
-                    if constexpr(std::same_as<T, MoveLine>) return value.to();
-                    else return value.target();
-                }();
+            if constexpr(std::same_as<T, MoveLine>) {
+                const auto source = value.from();
+                const auto target = value.to();
                 const auto delta = subtract(target, source);
                 auto length = std::sqrt(delta.x*delta.x + delta.y*delta.y + delta.z*delta.z
                     + delta.a*delta.a + delta.b*delta.b + delta.c*delta.c);
                 const auto tangent = length > 1e-12 ? scaled(delta, 1.0 / length) : position_t{};
                 const auto sample = [&](const double distance) { return PathSample { add(source, scaled(tangent, distance)), tangent }; };
-                const auto speed = [&] {
-                    if constexpr(std::same_as<T, MoveLine>) return value.speed() < 0.0 ? m_limits.rapidSpeed : value.speed();
-                    else return value.feed();
-                }();
+                const auto speed = value.speed() < 0.0 ? m_limits.rapidSpeed : value.speed();
                 const auto accept = [](const AxisPolynomialSpan &, double, double, double, double) { return true; };
                 if(auto result = appendMotion(length, speed, sample, accept)) return result;
-                if constexpr(std::same_as<T, ProbeMove>) {
-                    if(!chunk.events.push({ 0,
-                                            ProbeEvent { value.id(), value.stopOnContact(), value.errorIfNotFound() } }))
-                        return "trajectory chunk event capacity exceeded";
-                }
                 m_position = target;
+            } else if constexpr(std::same_as<T, ProbeMove>) {
+                return "unreachable probe compilation path";
             } else if constexpr(std::same_as<T, MoveArc>) {
                 const simulation_detail::ArcReference reference(value);
                 if(!reference.valid()) return value.axis().length() <= 1e-12
@@ -354,5 +344,37 @@ namespace ngc {
         chunk.stopState = chunk.branchState;
         m_previousBranch = chunk.branch;
         return chunk;
+    }
+
+    std::expected<TriggeredMove, std::string> ExactStopTrajectoryPlanner::compileTriggeredMove(
+            const ProbeMove &command, const DigitalInputId input, const InputCondition condition) {
+        if(m_limits.pathAcceleration <= 0.0 || m_limits.pathJerk <= 0.0 || command.feed() <= 0.0)
+            return std::unexpected("triggered-move limits must be positive");
+        const auto delta = subtract(command.target(), command.from());
+        const auto length = std::sqrt(delta.x*delta.x + delta.y*delta.y + delta.z*delta.z
+            + delta.a*delta.a + delta.b*delta.b + delta.c*delta.c);
+        if(length <= 1e-12) return std::unexpected("triggered move must have nonzero length");
+        const auto direction = scaled(delta, 1.0 / length);
+        const auto magnitudes = [&](const double limit) {
+            return position_t { std::abs(direction.x)*limit, std::abs(direction.y)*limit,
+                std::abs(direction.z)*limit, std::abs(direction.a)*limit,
+                std::abs(direction.b)*limit, std::abs(direction.c)*limit };
+        };
+        TriggeredMove move;
+        move.epoch = m_epoch;
+        move.id = m_nextChunk++;
+        move.predecessorBranch = m_previousBranch;
+        move.branch = move.id;
+        move.moveId = command.id();
+        move.target = command.target();
+        move.limits.velocity = magnitudes(command.feed() / 60.0);
+        move.limits.acceleration = magnitudes(m_limits.pathAcceleration);
+        move.limits.jerk = magnitudes(m_limits.pathJerk);
+        move.input = input;
+        move.condition = condition;
+        move.triggerRequired = command.errorIfNotFound();
+        m_position = command.target();
+        m_previousBranch = move.branch;
+        return move;
     }
 }
