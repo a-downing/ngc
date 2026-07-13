@@ -55,6 +55,7 @@ Project warning, optimization, and debug flags are target-scoped. Bundled GLFW a
 - G91.1 uses incremental IJK center coordinates. G90.1 uses absolute center coordinates in the active work coordinate system without changing G90/G91 endpoint mode.
 - IJK arc validation rejects zero radius and radius mismatch beyond `Machine::arcTolerance()`. The tolerance is 0.0005 inch or the equivalent 0.0127 mm.
 - Arc preview uses a directed sweep derived from the signed axis. It supports CW/CCW major arcs, full circles, and helical interpolation. It blends from both radial arms so rounded G-code arcs end exactly at the commanded endpoint.
+- G64 is accepted as a modal path mode. Its optional P word establishes a non-negative path tolerance, converted into configured machine units. G61/G61.1 clear the retained G64 tolerance. G64 currently has no execution or simulation semantics; it only enables the experimental preview spline visualization described below.
 - Rapid `MoveLine` commands currently use speed `-1` as a sentinel; this is not a physical negative feedrate.
 - G1, G2, and G3 require an established positive modal feedrate. A missing/non-positive feedrate must produce an `InterpreterError`; never dereference an absent modal `F` value or terminate the process.
 - `PANIC` is reserved for internal invariants, impossible enum/state combinations, and other program logic errors. Unsupported G/M codes, unsupported words or modes, malformed arcs, missing tools, invalid G10 operations, and other program-input failures must throw through the recoverable interpreter-error path.
@@ -93,6 +94,28 @@ Toolpath preview geometry is canonical program geometry: it is derived from emit
 
 `ExecutionDriver` captures the active WCS name/offset and active modal G-code set with each command. G53 commands retain the modal WCS metadata even though their motion bypasses the work offset. `ToolpathRecorder` retains distinct WCS frames used by preview motion; timed simulation applies WCS/modal metadata only when the corresponding queued command becomes active, not when the interpreter reads ahead.
 
+## Experimental G64 spline preview
+
+The current G64 work is deliberately isolated preview experimentation, not a trajectory planner. `ToolpathRecorder` retains the active G64 flag and optional machine-unit tolerance alongside each command without changing `MachineCommand`. Spline construction occurs only while rebuilding the revision-cached preview geometry. Do not route these preview splines into `SimulationExecutor`, interpretation, or a future real executor.
+
+Preserve exact canonical lines and arcs outside local blend neighborhoods. The experiment has two cases:
+
+- A simple eligible junction between sufficiently long adjacent feed lines/arcs uses one local clamped degree-five B-spline (represented as a quintic Bezier). The transition trims both entities, matches endpoint position, traversal tangent, and geometric curvature, and shrinks its trim distance until its control hull passes tolerance verification.
+- Consecutive entities shorter than `2P` form one cluster with no entity-count limit. The sufficiently long entities immediately before and after the run are trimmed external boundaries; they are not cluster interiors. The cluster fitter recursively creates local quintic spans through every short entity in source order. If the complete cluster cannot be verified, retain exact source geometry instead of displaying a partial fit.
+
+Tolerance verification must preserve ordered source association. A spline-parameter interval may be checked only against its corresponding cumulative-source-length interval; distance to the unordered union of nearby geometry is invalid because it permits reversal, skipping, and shortcuts between spatially close passes. Verification recursively subdivides Bezier control hulls and accepts a subcurve only when its full hull lies in an associated source-segment capsule. Arc/reference sampling consumes a reserved portion of the error budget.
+
+G64 P remains the hard geometric bound, but cluster fitting intentionally targets a much smaller fraction of P to avoid visually excessive yet technically legal lobes. Endpoint derivative scale is bounded by local chord length, and artificial internal cluster boundaries use neutral curvature rather than amplifying segmented-source noise. A remaining experimental safeguard is to reject any transition whose control polygon is nonlocal relative to its assigned source interval, even if it passes the tolerance tube.
+
+The overlay conventions are:
+
+- Simple junction splines are one-pixel magenta.
+- Short-entity cluster splines are one-pixel cyan.
+- Fitted control points are pale magenta and the control polygon is a thin dashed pale-magenta line.
+- G64 arc display tessellation is tolerance-adaptive so an analytically exact spline/arc junction does not appear displaced from a coarse rendered arc.
+
+Rapids, explicit G53 moves, probes, non-G64 motion, tolerance changes, and non-motion commands are protected boundaries and must not be blended across. Simple junction fitting rejects near-zero-length entities and near-180-degree reversals; cluster behavior must still be accepted only through ordered tube verification.
+
 ## UI toolpath conventions
 
 - The primary layout is a top action toolbar, horizontally resizable G-code pane on the left, central OpenGL viewport, and vertically resizable status pane along the bottom. Do not reintroduce the old File menu or separate Program/Messages windows.
@@ -119,7 +142,7 @@ Likely next steps are:
 1. Add a motion/planner consumer that owns bounded command buffering and supplies real probe results to `InterpreterSession`; reuse the `ExecutionDriver` barrier contract without treating `SimulationExecutor` as a real executor.
 2. Define abort, fault, and cancellation behavior for a pending probe and its evaluator thread.
 3. Expand G38 support beyond G38.3 and test unsuccessful, aborted, and faulted probe results.
-4. Later add R-form arcs, G64/path-control semantics, richer canonical records, and trajectory planning.
+4. Later add R-form arcs, executable G64/path-control semantics, richer canonical records, and trajectory planning. Do not mistake the experimental preview fitter for this planner work.
 
 ## Worktree discipline
 

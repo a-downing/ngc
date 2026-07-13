@@ -35,6 +35,7 @@ enum class GCode : std::uint8_t {
     G59_3 = 25,
     G61 = 26,
     G61_1 = 27,
+    G64 = 31,
     G53 = 28,
     G10 = 29,
     G38_3 = 30,
@@ -70,6 +71,7 @@ inline std::string_view name(const GCode code) {
         case GCode::G59_3: return "G59.3";
         case GCode::G61: return "G61";
         case GCode::G61_1: return "G61.1";
+        case GCode::G64: return "G64";
         case GCode::G53: return "G53";
         case GCode::G10: return "G10";
         case GCode::G38_3: return "G38.3";
@@ -215,12 +217,14 @@ inline std::string_view name(const GCCoord code) {
 enum class GCPath : std::uint8_t {
     G61 = 26,
     G61_1 = 27,
+    G64 = 31,
 };
 
 inline std::string_view name(const GCPath code) {
     switch(code) {
         case GCPath::G61: return "G61";
         case GCPath::G61_1: return "G61.1";
+        case GCPath::G64: return "G64";
     }
 
     PANIC("{}() invalid code GCPath::{}", __func__, std::to_underlying(code));
@@ -239,4 +243,3 @@ inline std::string_view name(const GCNonModal code) {
 
     PANIC("{}() invalid code GCNonModal::{}", __func__, std::to_underlying(code));
 }
-

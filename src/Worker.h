@@ -186,7 +186,9 @@ private:
             }, [&](const ngc::MachineCommand &command, const ngc::position_t &toolOffset, const ngc::ToolGeometry &,
                    const ngc::WorkCoordinateSystem &workCoordinateSystem) {
                 std::scoped_lock lock(m_mutex);
-                m_toolpath.consume(command, toolOffset, workCoordinateSystem);
+                m_toolpath.consume(command, toolOffset, workCoordinateSystem,
+                    m_session.machine().state().modePath == ngc::GCPath::G64,
+                    m_session.machine().pathTolerance());
             });
 
             {

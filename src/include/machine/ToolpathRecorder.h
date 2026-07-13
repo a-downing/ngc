@@ -12,14 +12,18 @@
 namespace ngc {
     class ToolpathRecorder {
         std::vector<MachineCommand> m_commands;
+        std::vector<bool> m_g64Commands;
+        std::vector<std::optional<double>> m_g64Tolerances;
         std::vector<WorkCoordinateSystem> m_workCoordinateSystems;
         std::uint64_t m_revision = 0;
 
     public:
-        void clear() { m_commands.clear(); m_workCoordinateSystems.clear(); ++m_revision; }
+        void clear() { m_commands.clear(); m_g64Commands.clear(); m_g64Tolerances.clear(); m_workCoordinateSystems.clear(); ++m_revision; }
 
         void consume(MachineCommand command, const position_t &toolOffset = {},
-                     std::optional<WorkCoordinateSystem> workCoordinateSystem = std::nullopt) {
+                     std::optional<WorkCoordinateSystem> workCoordinateSystem = std::nullopt,
+                     const bool g64Active = false,
+                     std::optional<double> g64Tolerance = std::nullopt) {
             if(workCoordinateSystem) {
                 const auto match = std::ranges::find_if(m_workCoordinateSystems, [&](const WorkCoordinateSystem &value) {
                     return value.name == workCoordinateSystem->name;
@@ -59,10 +63,14 @@ namespace ngc {
                     return std::forward<decltype(value)>(value);
                 }
             }, std::move(command)));
+            m_g64Commands.push_back(g64Active);
+            m_g64Tolerances.push_back(g64Active ? g64Tolerance : std::nullopt);
             ++m_revision;
         }
 
         const std::vector<MachineCommand> &commands() const { return m_commands; }
+        bool g64Active(const std::size_t commandIndex) const { return m_g64Commands.at(commandIndex); }
+        std::optional<double> g64Tolerance(const std::size_t commandIndex) const { return m_g64Tolerances.at(commandIndex); }
         const std::vector<WorkCoordinateSystem> &workCoordinateSystems() const { return m_workCoordinateSystems; }
         std::uint64_t revision() const { return m_revision; }
 

@@ -49,7 +49,7 @@ namespace ngc {
                     });
                     if(match != m_blockStack.end()) m_blockStack.erase(match);
                 }
-                m_executor.consume(SimulatedCommand::lifecycleMarker(*lifecycle));
+                m_executor.consume(SimulatedCommand::lifecycleMarker(*lifecycle, m_session.machine().activeModalGCodes()));
             } else if(auto command = std::get_if<MachineCommand>(&event)) {
                 const auto toolOffset = m_session.machine().toolOffset();
                 const auto tool = m_session.machine().toolGeometry();

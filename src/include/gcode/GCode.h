@@ -240,6 +240,12 @@ namespace ngc {
                 }
 
                 break;
+            case 64:
+                switch(fract) {
+                    case 0: return GCode::G64;
+                }
+
+                break;
             case 90:
                 switch(fract) {
                     case 0: return GCode::G90;
@@ -327,6 +333,7 @@ namespace ngc {
         std::optional<GCTLen> modeToolOffset{};
         std::optional<GCCoord> modeCoordSys{};
         std::optional<GCPath> modePath{};
+        std::optional<double> pathTolerance{};
         std::optional<MCSpindle> modeSpindle{};
 
         std::optional<GCNonModal> nonModal{};
@@ -470,6 +477,7 @@ namespace ngc {
                     return;
                 case GCode::G61:
                 case GCode::G61_1:
+                case GCode::G64:
                     modePath = static_cast<GCPath>(code);
                     return;
                 case GCode::G53:

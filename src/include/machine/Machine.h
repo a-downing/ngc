@@ -38,6 +38,7 @@ namespace ngc {
         const GCodeState &state() const;
         std::vector<std::string> activeModalGCodes() const;
         double arcTolerance() const;
+        std::optional<double> pathTolerance() const;
         std::expected<void, std::string> validateArc(const position_t &from, const position_t &to,
                                                      const vec3_t &center) const;
         void acceptProbeResult(const ProbeResult &result);

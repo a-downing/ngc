@@ -183,6 +183,8 @@ namespace ngc {
             }
         }
 
+        std::optional<double> pathTolerance() const { return m_state.pathTolerance; }
+
     private:
         std::vector<MachineCommand> executeBlockImpl(const Block &block) {
             std::vector<MachineCommand> commands;
@@ -230,6 +232,17 @@ namespace ngc {
 
             if(state.modePath) {
                 m_state.modePath = std::exchange(state.modePath, std::nullopt);
+                if(m_state.modePath == GCPath::G64) {
+                    if(state.P) {
+                        if(*state.P < 0.0) {
+                            throw std::runtime_error(std::format("G64 P tolerance must be non-negative: {}",
+                                                                 block.statement()->text()));
+                        }
+                        m_state.pathTolerance = *std::exchange(state.P, std::nullopt) * linearScale();
+                    }
+                } else {
+                    m_state.pathTolerance.reset();
+                }
             }
 
             if(state.modeMotion) {
@@ -622,6 +635,8 @@ namespace ngc {
     const GCodeState &Machine::state() const { return m_impl->state(); }
     std::vector<std::string> Machine::activeModalGCodes() const { return m_impl->activeModalGCodes(); }
     double Machine::arcTolerance() const { return m_impl->arcTolerance(); }
+
+    std::optional<double> Machine::pathTolerance() const { return m_impl->pathTolerance(); }
     std::expected<void, std::string> Machine::validateArc(const position_t &from, const position_t &to,
                                                           const vec3_t &center) const {
         return m_impl->validateArc(from, to, center);

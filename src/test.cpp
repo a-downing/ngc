@@ -79,6 +79,29 @@ namespace {
         requireNear(feed->to().x, 20.0, "G1 endpoint is incorrect");
     }
 
+    void testG64IsAnInertPathModeFlag() {
+        ngc::Machine machine(UNIT);
+        const auto commands = execute(machine, "G21 G64 P1\nG1 F120 X1\n");
+        require(commands.size() == 1 && std::holds_alternative<ngc::MoveLine>(commands.front()),
+                "G64 should not alter or add machine commands");
+        require(machine.state().modePath == ngc::GCPath::G64, "G64 should become the active path mode");
+        const auto modalCodes = machine.activeModalGCodes();
+        require(std::ranges::find(modalCodes, "G64") != modalCodes.end(),
+                "G64 should be reported in active modal state");
+        require(machine.pathTolerance().has_value(), "G64 P should establish a path tolerance");
+        requireNear(*machine.pathTolerance(), 1.0 / 25.4,
+                    "G64 P should be converted into configured machine units");
+
+        ngc::ToolpathRecorder recorder;
+        recorder.consume(commands.front(), {}, std::nullopt, true, machine.pathTolerance());
+        require(recorder.g64Active(0), "preview recording should retain the command's G64 flag");
+        requireNear(*recorder.g64Tolerance(0), 1.0 / 25.4,
+                    "preview recording should retain the active G64 tolerance");
+
+        execute(machine, "G61\n");
+        require(!machine.pathTolerance(), "leaving G64 should clear its path tolerance");
+    }
+
     void testMemoryStackBounds() {
         ngc::Memory memory;
         const auto address = memory.push(12.5);
@@ -322,15 +345,26 @@ namespace {
             return snapshot;
         };
 
+        tools.set(1, { .number = 1, .x = 0, .y = 0, .z = 0.5, .a = 0, .b = 0, .c = 0, .diameter = 0.25 });
+
         require(worker.start({ { "G0 X1\n", "<MDI>" } }, tools, true),
                 "first persistent simulation command should start");
         requireNear(waitForCompletion("first persistent command should complete").machinePosition.x, 1.0,
                     "first persistent command should end at X1");
 
+        require(worker.start({ { "G43 H1\n", "<MDI>" } }, tools, true),
+                "G43 persistent simulation command should start");
+        const auto afterG43 = waitForCompletion("G43 persistent command should complete");
+        require(std::ranges::find(afterG43.activeModalGCodes, "G43") != afterG43.activeModalGCodes.end(),
+                "simulation should preserve G43 modal G-code after running non-motion command");
+
         require(worker.start({ { "G91 G0 X1\n", "<MDI>" } }, tools, true),
                 "second persistent simulation command should start");
-        requireNear(waitForCompletion("second persistent command should complete").machinePosition.x, 2.0,
+        const auto afterSecond = waitForCompletion("second persistent command should complete");
+        requireNear(afterSecond.machinePosition.x, 2.0,
                     "second command should continue from the prior simulated position");
+        require(std::ranges::find(afterSecond.activeModalGCodes, "G43") != afterSecond.activeModalGCodes.end(),
+                "subsequent commands should preserve G43 modal state");
 
         require(worker.resetSimulation(), "idle simulation should reset");
         const auto reset = worker.snapshot();
@@ -1120,6 +1154,7 @@ int main() {
         testLexerRejectsIncompleteOperators();
         testFileHelpersHandleEmptyAndFailedIo();
         testRapidAndFeedMove();
+        testG64IsAnInertPathModeFlag();
         testFeedMotionRequiresFeedrate();
         testUnsupportedCodesProduceInterpreterErrors();
         testFailedBlockRollsBackMachineState();

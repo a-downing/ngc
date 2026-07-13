@@ -34,10 +34,11 @@ namespace ngc {
               workCoordinateSystem(std::move(activeWorkCoordinateSystem)), modalGCodes(std::move(activeModalGCodes)),
               block(std::move(blockExecution)) { }
 
-        static SimulatedCommand lifecycleMarker(InterpreterBlockLifecycle blockLifecycle) {
+        static SimulatedCommand lifecycleMarker(InterpreterBlockLifecycle blockLifecycle, std::vector<std::string> activeModalGCodes = {}) {
             SimulatedCommand marker { SpindleStop {} };
             marker.command.reset();
             marker.lifecycle = std::move(blockLifecycle);
+            marker.modalGCodes = std::move(activeModalGCodes);
             return marker;
         }
     };

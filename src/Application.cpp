@@ -1,4 +1,5 @@
 #include "Application.h"
+#include "PreviewSpline.h"
 
 #include <filesystem>
 #include <fstream>
@@ -112,6 +113,10 @@ class ApplicationImpl final {
         std::vector<glm::dvec3> g53RapidLines;
         std::vector<glm::dvec3> arcLines;
         std::vector<glm::dvec3> probeLines;
+        std::vector<glm::dvec3> g64SplineLines;
+        std::vector<glm::dvec3> g64ClusterSplineLines;
+        std::vector<glm::dvec3> g64ControlPolygon;
+        std::vector<glm::dvec3> g64ControlPoints;
         std::vector<glm::dvec3> darkPoints;
         std::vector<glm::dvec3> lightPoints;
     } m_previewRenderCache;
@@ -469,6 +474,10 @@ public:
             cache.g53RapidLines.clear();
             cache.arcLines.clear();
             cache.probeLines.clear();
+            cache.g64SplineLines.clear();
+            cache.g64ClusterSplineLines.clear();
+            cache.g64ControlPolygon.clear();
+            cache.g64ControlPoints.clear();
             cache.darkPoints.clear();
             cache.lightPoints.clear();
 
@@ -480,7 +489,121 @@ public:
                 vertices.push_back(to);
             };
 
-            toolpath.foreachCommand([&](const ngc::MachineCommand &command) {
+            std::vector<ngc::experimental::JunctionEntity> splineEntities;
+            std::optional<double> splineTolerance;
+            const auto flushSpline = [&] {
+                if(!splineTolerance) return;
+                std::vector<bool> coveredJunctions(splineEntities.size() > 1 ? splineEntities.size() - 1 : 0, false);
+                std::vector<bool> clusterEntity(splineEntities.size(), false);
+                for(std::size_t i = 0; i < splineEntities.size(); ++i) {
+                    clusterEntity[i] = splineEntities[i].length < 2.0 * *splineTolerance;
+                }
+                for(std::size_t entity = 0; entity < splineEntities.size();) {
+                    if(!clusterEntity[entity]) { ++entity; continue; }
+                    const auto firstShort = entity;
+                    while(entity + 1 < splineEntities.size()
+                          && clusterEntity[entity + 1]) ++entity;
+                    const auto lastShort = entity;
+                    if(firstShort > 0 && lastShort + 1 < splineEntities.size()) {
+                        std::vector<ngc::experimental::JunctionEntity> clusterEntities(
+                            splineEntities.begin() + static_cast<std::ptrdiff_t>(firstShort - 1),
+                            splineEntities.begin() + static_cast<std::ptrdiff_t>(lastShort + 2));
+                        if(const auto cluster = ngc::experimental::fitCluster(clusterEntities, *splineTolerance)) {
+                            for(std::size_t junction = firstShort - 1; junction <= lastShort; ++junction) {
+                                coveredJunctions[junction] = true;
+                            }
+                            for(const auto &span : cluster->spans) {
+                                ngc::experimental::tessellateJunction(span, cache.g64ClusterSplineLines);
+                                cache.g64ControlPoints.insert(cache.g64ControlPoints.end(),
+                                    span.controlPoints.begin(), span.controlPoints.end());
+                                for(std::size_t control = 1; control < span.controlPoints.size(); ++control) {
+                                    segment(cache.g64ControlPolygon,
+                                            span.controlPoints[control - 1], span.controlPoints[control]);
+                                }
+                            }
+                        }
+                    }
+                    ++entity;
+                }
+                for(std::size_t i = 1; i < splineEntities.size(); ++i) {
+                    if(coveredJunctions[i - 1]) continue;
+                    const auto blend = ngc::experimental::fitJunction(
+                        splineEntities[i - 1], splineEntities[i], *splineTolerance);
+                    if(!blend) continue;
+                    const auto &splineControlPoints = blend->controlPoints;
+                    ngc::experimental::tessellateJunction(*blend, cache.g64SplineLines);
+                    cache.g64ControlPoints.insert(cache.g64ControlPoints.end(),
+                                                  splineControlPoints.begin(), splineControlPoints.end());
+                    for(std::size_t i = 1; i < splineControlPoints.size(); ++i) {
+                        segment(cache.g64ControlPolygon, splineControlPoints[i - 1], splineControlPoints[i]);
+                    }
+                }
+                splineEntities.clear();
+                splineTolerance.reset();
+            };
+            const auto beginSpline = [&](const std::optional<double> programmedTolerance) {
+                constexpr double DEFAULT_EXPERIMENTAL_TOLERANCE = 0.001;
+                const auto tolerance = std::max(programmedTolerance.value_or(DEFAULT_EXPERIMENTAL_TOLERANCE), 1e-9);
+                if(splineTolerance && std::abs(*splineTolerance - tolerance) > 1e-12) flushSpline();
+                splineTolerance = tolerance;
+            };
+            const auto lineEntity = [](const glm::dvec3 &from, const glm::dvec3 &to) {
+                const auto delta = to - from;
+                const auto length = glm::length(delta);
+                const auto tangent = length > 1e-12 ? delta / length : glm::dvec3(1.0, 0.0, 0.0);
+                return ngc::experimental::JunctionEntity {
+                    .length = length,
+                    .stateAtDistance = [=](const double distance) {
+                        return ngc::experimental::JunctionState {
+                            .position = from + tangent * std::clamp(distance, 0.0, length),
+                            .tangent = tangent,
+                            .curvature = {},
+                        };
+                    },
+                };
+            };
+            const auto arcEntity = [&](const ngc::MoveArc &arc) {
+                const auto length = ngc::simulation_detail::pathLength(arc);
+                const auto positionAt = [arc, length](const double distance) {
+                    const auto value = ngc::simulation_detail::interpolate(
+                        arc, length > 1e-12 ? std::clamp(distance / length, 0.0, 1.0) : 0.0);
+                    return glm::dvec3(value.x, value.y, value.z);
+                };
+                return ngc::experimental::JunctionEntity {
+                    .length = length,
+                    .stateAtDistance = [=](const double distance) {
+                        const auto s = std::clamp(distance, 0.0, length);
+                        const auto h = std::clamp(length * 1e-4, 1e-7, std::max(length * 0.01, 1e-7));
+                        glm::dvec3 tangent;
+                        glm::dvec3 curvature;
+                        if(s <= h) {
+                            const auto p0 = positionAt(s);
+                            const auto p1 = positionAt(std::min(s + h, length));
+                            const auto p2 = positionAt(std::min(s + 2.0 * h, length));
+                            tangent = glm::normalize(p1 - p0);
+                            curvature = (p2 - 2.0 * p1 + p0) / (h * h);
+                        } else if(s + h >= length) {
+                            const auto p0 = positionAt(s);
+                            const auto p1 = positionAt(std::max(s - h, 0.0));
+                            const auto p2 = positionAt(std::max(s - 2.0 * h, 0.0));
+                            tangent = glm::normalize(p0 - p1);
+                            curvature = (p0 - 2.0 * p1 + p2) / (h * h);
+                        } else {
+                            const auto before = positionAt(s - h);
+                            const auto current = positionAt(s);
+                            const auto after = positionAt(s + h);
+                            tangent = glm::normalize(after - before);
+                            curvature = (after - 2.0 * current + before) / (h * h);
+                        }
+                        return ngc::experimental::JunctionState {
+                            .position = positionAt(s), .tangent = tangent, .curvature = curvature };
+                    },
+                };
+            };
+
+            const auto &commands = toolpath.commands();
+            for(std::size_t commandIndex = 0; commandIndex < commands.size(); ++commandIndex) {
+                const auto &command = commands[commandIndex];
                 if(const auto line = std::get_if<ngc::MoveLine>(&command)) {
                     auto *vertices = &cache.feedLines;
                     const auto rapid = line->speed() == -1.0;
@@ -491,17 +614,47 @@ public:
                     segment(*vertices, from, to);
                     cache.darkPoints.push_back(from);
                     cache.darkPoints.push_back(to);
+                    if(toolpath.g64Active(commandIndex) && !rapid && !line->machineCoordinates()) {
+                        beginSpline(toolpath.g64Tolerance(commandIndex));
+                        splineEntities.push_back(lineEntity(from, to));
+                    } else {
+                        flushSpline();
+                    }
                 } else if(const auto probe = std::get_if<ngc::ProbeMove>(&command)) {
+                    flushSpline();
                     segment(cache.probeLines, point(probe->from()), point(probe->target()));
                 } else if(const auto arc = std::get_if<ngc::MoveArc>(&command)) {
-                    interpolate(*arc, 60, [&](const glm::dvec3 &from, const glm::dvec3 &to,
+                    auto arcRenderResolution = 60;
+                    if(toolpath.g64Active(commandIndex)) {
+                        beginSpline(toolpath.g64Tolerance(commandIndex));
+                        splineEntities.push_back(arcEntity(*arc));
+                        const auto geometry = ngc::simulation_detail::arcGeometry(*arc);
+                        if(geometry) {
+                            const auto radius = std::sqrt(geometry->startArm.x * geometry->startArm.x
+                                + geometry->startArm.y * geometry->startArm.y
+                                + geometry->startArm.z * geometry->startArm.z);
+                            const auto displayTolerance = std::max(*splineTolerance * 0.02, 1e-9);
+                            if(radius > displayTolerance) {
+                                const auto halfAngle = std::acos(std::clamp(
+                                    1.0 - displayTolerance / radius, -1.0, 1.0));
+                                if(halfAngle > 0.0) {
+                                    arcRenderResolution = std::clamp(
+                                        static_cast<int>(std::ceil(std::numbers::pi / halfAngle)), 60, 8192);
+                                }
+                            }
+                        }
+                    } else flushSpline();
+                    interpolate(*arc, arcRenderResolution, [&](const glm::dvec3 &from, const glm::dvec3 &to,
                                               const bool startPoint, const bool endPoint) {
                         segment(cache.arcLines, from, to);
                         if(startPoint) cache.darkPoints.push_back(from);
                         if(endPoint) cache.lightPoints.push_back(to);
                     });
+                } else {
+                    flushSpline();
                 }
-            });
+            }
+            flushSpline();
             cache.revision = toolpath.revision();
         });
     }
@@ -732,6 +885,15 @@ public:
         drawVertices(m_previewRenderCache.g53FeedLines, GL_LINES, 1.0f, 1.0f, 0.4f);
         drawVertices(m_previewRenderCache.arcLines, GL_LINES, 0.4f, 1.0f, 0.4f);
         drawVertices(m_previewRenderCache.probeLines, GL_LINES, 1.0f, 0.4f, 0.2f);
+        glLineWidth(1.0f);
+        drawVertices(m_previewRenderCache.g64SplineLines, GL_LINES, 1.0f, 0.2f, 1.0f);
+        drawVertices(m_previewRenderCache.g64ClusterSplineLines, GL_LINES, 0.1f, 1.0f, 1.0f);
+        glLineWidth(1.0f);
+        drawVertices(m_previewRenderCache.g64ControlPolygon, GL_LINES, 0.95f, 0.65f, 1.0f, 2, 0x3333);
+        glPointSize(6.0f);
+        drawVertices(m_previewRenderCache.g64ControlPoints, GL_POINTS, 1.0f, 0.75f, 1.0f);
+        glPointSize(3.0f);
+        glLineWidth(2.0f);
         drawVertices(m_previewRenderCache.g53RapidLines, GL_LINES, 1.0f, 1.0f, 0.4f, 10, 0x5555);
         drawVertices(m_previewRenderCache.rapidLines, GL_LINES, 0.4f, 0.4f, 1.0f, 4, 0x5555);
         glEnable(GL_POINT_SMOOTH);

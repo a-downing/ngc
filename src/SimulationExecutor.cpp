@@ -285,7 +285,9 @@ namespace ngc {
                             *match = *m_active->workCoordinateSystem;
                         }
                     }
-                    m_snapshot.activeModalGCodes = m_active->modalGCodes;
+                    if(!m_active->modalGCodes.empty()) {
+                        m_snapshot.activeModalGCodes = m_active->modalGCodes;
+                    }
                     m_elapsed = 0.0;
                     m_motionStart = m_snapshot.machinePosition;
                     m_duration = commandDuration(*m_active);
