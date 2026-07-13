@@ -1,5 +1,8 @@
 #pragma once
 
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <cstdint>
 #include <vector>
 
@@ -20,6 +23,12 @@ namespace ngc {
         std::uint64_t revision = 0;
         std::vector<ExecutedTrajectorySpan> spans;
     };
+
+    inline std::size_t diagnosticServoSegmentCount(const ExecutedTrajectorySpan &span,
+                                                   const double servoPeriod) {
+        const auto executedDuration = span.polynomial.duration * span.executedUntil;
+        return std::max<std::size_t>(1, static_cast<std::size_t>(std::ceil(executedDuration / servoPeriod)));
+    }
 
     // Development-only retained diagnostics. This is deliberately separate from
     // MotionBackend and has no physical-RT implementation requirement.

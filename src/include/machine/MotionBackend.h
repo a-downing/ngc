@@ -160,6 +160,5 @@ namespace ngc {
         virtual ~SimulatedClockControl() = default;
         virtual void advance(double seconds) = 0;
         virtual void runUntilIdle() = 0;
-        virtual void setPlaybackRate(double rate) = 0;
     };
 }

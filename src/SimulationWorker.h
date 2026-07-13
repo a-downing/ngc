@@ -1,8 +1,11 @@
 #pragma once
 
 #include <algorithm>
+#include <atomic>
 #include <chrono>
+#include <cmath>
 #include <condition_variable>
+#include <cstdint>
 #include <mutex>
 #include <map>
 #include <ranges>
@@ -13,10 +16,12 @@
 #include <vector>
 
 #include "evaluator/InterpreterSession.h"
+#include "machine/MachineConfiguration.h"
 #include "machine/MockMotionBackend.h"
 #include "machine/SimulationPresentation.h"
 #include "machine/ToolTable.h"
 #include "machine/TrajectoryExecutionDriver.h"
+#include "WindowsServoPacer.h"
 
 class SimulationWorker {
     struct ChunkPresentation {
@@ -50,14 +55,27 @@ class SimulationWorker {
     bool m_paused = false;
     bool m_running = false;
     bool m_preserveState = false;
-    double m_playbackRate = 1.0;
+    double m_servoPeriod;
+    double m_schedulerPeriod;
+    std::uint32_t m_servoTicksPerSchedulerPeriod;
+    std::uint32_t m_tickMultiplier = 1;
+    std::atomic<std::uint32_t> m_executorTickMultiplier{1};
+    std::atomic<bool> m_executorPaused{false};
     ngc::EpochId m_nextEpoch = 1;
 
 public:
     explicit SimulationWorker(const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch,
-                              const ngc::TrajectoryLimits limits = {})
+                              const ngc::TrajectoryLimits limits = {},
+                              const ngc::SimulationTiming timing = {})
         : m_session(unit, ngc::InterpretationMode::Simulation), m_driver(m_session, m_backend, limits),
-          m_limits(limits) { m_thread = std::thread(&SimulationWorker::work, this); }
+          m_limits(limits), m_servoPeriod(timing.servoPeriod), m_schedulerPeriod(timing.schedulerPeriod),
+          m_servoTicksPerSchedulerPeriod(static_cast<std::uint32_t>(
+              std::max(1.0, std::round(timing.schedulerPeriod / timing.servoPeriod)))) {
+        m_snapshot.servoPeriodSeconds = m_servoPeriod;
+        m_snapshot.schedulerPeriodSeconds = m_schedulerPeriod;
+        m_snapshot.servoTicksPerSchedulerPeriod = m_servoTicksPerSchedulerPeriod;
+        m_thread = std::thread(&SimulationWorker::work, this);
+    }
     ~SimulationWorker() { join(); }
     SimulationWorker(const SimulationWorker &) = delete;
     SimulationWorker &operator=(const SimulationWorker &) = delete;
@@ -87,10 +105,15 @@ public:
         return true;
     }
 
-    void pause() { std::scoped_lock lock(m_mutex); if(m_running) m_paused = true; }
-    void resume() { std::scoped_lock lock(m_mutex); if(m_running) { m_paused = false; m_cv.notify_all(); } }
+    void pause() { std::scoped_lock lock(m_mutex); if(m_running) { m_paused = true; m_executorPaused = true; } }
+    void resume() { std::scoped_lock lock(m_mutex); if(m_running) { m_paused = false; m_executorPaused = false; m_cv.notify_all(); } }
     void stop() { std::scoped_lock lock(m_mutex); if(m_running || m_start) { m_stop = true; m_start = false; m_paused = false; m_cv.notify_all(); } }
-    void setPlaybackRate(const double rate) { std::scoped_lock lock(m_mutex); m_playbackRate = std::clamp(rate, 0.01, 1000.0); }
+    void setTickMultiplier(const int multiplier) {
+        std::scoped_lock lock(m_mutex);
+        m_tickMultiplier = static_cast<std::uint32_t>(std::clamp(multiplier, 1, 1000));
+        m_executorTickMultiplier.store(m_tickMultiplier, std::memory_order_relaxed);
+        m_snapshot.tickMultiplier = m_tickMultiplier;
+    }
     void setRapidSpeed(const double speed) {
         std::scoped_lock lock(m_mutex);
         m_limits.rapidSpeed = std::max(speed, 1e-6);
@@ -207,6 +230,17 @@ private:
             m_start = false; m_running = true; m_stop = false;
             if(!preserve) { m_snapshot = {}; clearPresentation(); }
             m_snapshot.status = ngc::SimulationStatus::Running;
+            m_snapshot.servoPeriodSeconds = m_servoPeriod;
+            m_snapshot.schedulerPeriodSeconds = m_schedulerPeriod;
+            m_snapshot.servoTicksPerSchedulerPeriod = m_servoTicksPerSchedulerPeriod;
+            m_snapshot.tickMultiplier = m_tickMultiplier;
+            m_snapshot.servoTicks = 0;
+            m_snapshot.deadlineMisses = 0;
+            m_snapshot.lastWakeLatenessSeconds = 0.0;
+            m_snapshot.maximumWakeLatenessSeconds = 0.0;
+            m_snapshot.maximumTickExecutionSeconds = 0.0;
+            m_executorTickMultiplier.store(m_tickMultiplier, std::memory_order_relaxed);
+            m_executorPaused.store(false, std::memory_order_relaxed);
             lock.unlock();
 
             m_session.setPrograms(programs);
@@ -218,41 +252,112 @@ private:
                 lock.lock(); m_snapshot.status = ngc::SimulationStatus::Error; m_snapshot.error = "motion backend control channel is full"; m_running = false; lock.unlock();
                 continue;
             }
-            auto previous = clock::now();
+
+            std::atomic<bool> stopExecutor{false};
+            std::atomic<std::uint64_t> servoTicks{0};
+            std::atomic<std::uint64_t> deadlineMisses{0};
+            std::atomic<double> lastWakeLateness{0.0};
+            std::atomic<double> maximumWakeLateness{0.0};
+            std::atomic<double> maximumTickExecution{0.0};
+            std::atomic<std::uint32_t> executorError{0};
+            std::atomic<bool> executorBatchActive{false};
+            const auto updateMaximum = [](std::atomic<double> &target, const double value) {
+                auto current = target.load(std::memory_order_relaxed);
+                while(current < value && !target.compare_exchange_weak(
+                    current, value, std::memory_order_relaxed, std::memory_order_relaxed)) { }
+            };
+            std::thread executor([&] {
+                WindowsServoPacer pacer(m_schedulerPeriod);
+                if(!pacer.valid()) {
+                    executorError.store(pacer.errorCode(), std::memory_order_release);
+                    return;
+                }
+                while(!stopExecutor.load(std::memory_order_acquire)) {
+                    WindowsServoPacer::WaitResult timing;
+                    if(!pacer.wait(timing)) {
+                        executorError.store(pacer.errorCode(), std::memory_order_release);
+                        return;
+                    }
+                    lastWakeLateness.store(timing.latenessSeconds, std::memory_order_relaxed);
+                    updateMaximum(maximumWakeLateness, timing.latenessSeconds);
+                    deadlineMisses.fetch_add(timing.missedPeriods, std::memory_order_relaxed);
+                    if(m_executorPaused.load(std::memory_order_relaxed)) {
+                        pacer.reset();
+                        continue;
+                    }
+
+                    const auto multiplier = m_executorTickMultiplier.load(std::memory_order_relaxed);
+                    const auto ticksThisPeriod = static_cast<std::uint64_t>(m_servoTicksPerSchedulerPeriod)
+                        * multiplier;
+                    executorBatchActive.store(true, std::memory_order_release);
+                    for(std::uint64_t tick = 0; tick < ticksThisPeriod
+                        && !stopExecutor.load(std::memory_order_relaxed)
+                        && !m_executorPaused.load(std::memory_order_relaxed); ++tick) {
+                        const auto started = clock::now();
+                        m_backend.advanceTick(m_servoPeriod, tick + 1 == ticksThisPeriod);
+                        const auto duration = std::chrono::duration<double>(clock::now() - started).count();
+                        updateMaximum(maximumTickExecution, duration);
+                        servoTicks.fetch_add(1, std::memory_order_relaxed);
+                    }
+                    executorBatchActive.store(false, std::memory_order_release);
+                }
+            });
+
+            const auto copyTimingSnapshot = [&] {
+                m_snapshot.servoPeriodSeconds = m_servoPeriod;
+                m_snapshot.schedulerPeriodSeconds = m_schedulerPeriod;
+                m_snapshot.servoTicksPerSchedulerPeriod = m_servoTicksPerSchedulerPeriod;
+                m_snapshot.tickMultiplier = m_executorTickMultiplier.load(std::memory_order_relaxed);
+                m_snapshot.servoTicks = servoTicks.load(std::memory_order_relaxed);
+                m_snapshot.deadlineMisses = deadlineMisses.load(std::memory_order_relaxed);
+                m_snapshot.lastWakeLatenessSeconds = lastWakeLateness.load(std::memory_order_relaxed);
+                m_snapshot.maximumWakeLatenessSeconds = maximumWakeLateness.load(std::memory_order_relaxed);
+                m_snapshot.maximumTickExecutionSeconds = maximumTickExecution.load(std::memory_order_relaxed);
+            };
 
             for(;;) {
                 lock.lock();
                 if(m_join || m_stop) {
                     const auto joining = m_join; m_stop = false; m_running = false; m_snapshot.status = ngc::SimulationStatus::Stopped;
-                    lock.unlock(); m_session.stop(); if(joining) return; break;
+                    copyTimingSnapshot();
+                    stopExecutor.store(true, std::memory_order_release);
+                    lock.unlock();
+                    executor.join();
+                    m_session.stop();
+                    if(joining) return;
+                    break;
                 }
                 if(m_paused) {
                     m_snapshot.status = ngc::SimulationStatus::Paused;
+                    copyTimingSnapshot();
                     m_cv.wait(lock, [&] { return m_join || m_stop || !m_paused; });
-                    previous = clock::now(); lock.unlock(); continue;
+                    lock.unlock();
+                    continue;
                 }
                 m_snapshot.status = ngc::SimulationStatus::Running;
-                const auto rate = m_playbackRate;
-                // Keep event headroom: every accepted chunk can produce acceptance,
-                // branch, retirement, and probe/held records before the next drain.
-                for(int fill = 0; fill < 4; ++fill) {
-                    if(!m_driver.pumpOne([](const auto &callback) { callback(); },
-                        [&](const auto &command, const auto &chunk) { observeCommand(command, chunk); },
-                        [&](const auto &lifecycle) { observeLifecycle(lifecycle); })) break;
+                if(executorBatchActive.load(std::memory_order_acquire)) {
+                    copyTimingSnapshot();
+                    lock.unlock();
+                    std::this_thread::yield();
+                    continue;
                 }
-                m_snapshot.statusMessages = m_session.statusMessages();
-                lock.unlock();
-
-                const auto now = clock::now();
-                m_backend.advance(std::chrono::duration<double>(now - previous).count() * rate);
-                previous = now;
-
-                lock.lock();
                 m_driver.serviceBackend([&](const auto &event) { observeBackendEvent(event); });
+                if(executorBatchActive.load(std::memory_order_acquire)) {
+                    copyTimingSnapshot();
+                    lock.unlock();
+                    std::this_thread::yield();
+                    continue;
+                }
                 ngc::ExecutionSnapshot backendSnapshot;
                 while(m_backend.tryTakeSnapshot(backendSnapshot)) applyBackendSnapshot(backendSnapshot);
-                const auto state = m_driver.state();
-                if(m_snapshot.status == ngc::SimulationStatus::Error) {
+                copyTimingSnapshot();
+                auto state = m_driver.state();
+                const auto pacingError = executorError.load(std::memory_order_acquire);
+                if(pacingError != 0) {
+                    m_snapshot.status = ngc::SimulationStatus::Error;
+                    m_snapshot.error = "Windows servo pacer failed with error " + std::to_string(pacingError);
+                    m_running = false;
+                } else if(m_snapshot.status == ngc::SimulationStatus::Error) {
                     m_running = false;
                 } else if(state == ngc::TrajectoryDriverState::Error) {
                     m_snapshot.status = ngc::SimulationStatus::Error;
@@ -265,11 +370,42 @@ private:
                     m_snapshot.toolPose = { tool, m_snapshot.machinePosition, m_snapshot.toolPosition };
                     m_running = false;
                 }
-                lock.unlock();
-                if(state != ngc::TrajectoryDriverState::Running || !m_running) { m_session.stop(); break; }
+                if(state != ngc::TrajectoryDriverState::Running || !m_running) {
+                    stopExecutor.store(true, std::memory_order_release);
+                    lock.unlock();
+                    executor.join();
+                    m_session.stop();
+                    break;
+                }
 
-                lock.lock();
-                m_cv.wait_for(lock, std::chrono::milliseconds(8), [&] { return m_join || m_stop || m_paused; });
+                bool filled = false;
+                for(int fill = 0; fill < 64; ++fill) {
+                    if(!m_driver.pumpOne([](const auto &callback) { callback(); },
+                        [&](const auto &command, const auto &chunk) { observeCommand(command, chunk); },
+                        [&](const auto &lifecycle) { observeLifecycle(lifecycle); })) break;
+                    filled = true;
+                }
+                m_snapshot.statusMessages = m_session.statusMessages();
+                state = m_driver.state();
+                if(state == ngc::TrajectoryDriverState::Error) {
+                    m_snapshot.status = ngc::SimulationStatus::Error;
+                    m_snapshot.error = *m_driver.error();
+                    m_running = false;
+                }
+                if(!m_running) {
+                    stopExecutor.store(true, std::memory_order_release);
+                    lock.unlock();
+                    executor.join();
+                    m_session.stop();
+                    break;
+                }
+                if(filled) {
+                    lock.unlock();
+                    std::this_thread::yield();
+                    continue;
+                }
+                m_cv.wait_for(lock, std::chrono::duration<double>(m_servoPeriod),
+                              [&] { return m_join || m_stop || m_paused; });
                 lock.unlock();
             }
         }

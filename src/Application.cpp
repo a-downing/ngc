@@ -89,9 +89,10 @@ class ApplicationImpl final {
 
     std::string m_errorMessage;
 
+    ngc::SimulationTiming m_simulationTiming;
     Worker m_worker;
     SimulationWorker m_simulation;
-    double m_simulationRate = 1.0;
+    int m_simulationTickMultiplier = 1;
     double m_simulatedRapidSpeed;
 
     double m_time = 0.0;
@@ -218,8 +219,9 @@ class ApplicationImpl final {
 public:
     ApplicationImpl() = delete;
     ApplicationImpl(GLFWwindow *window, const ngc::MachineConfiguration &configuration)
-        : m_window(window), m_worker(configuration.unit, configuration.trajectory),
-          m_simulation(configuration.unit, configuration.trajectory),
+        : m_window(window), m_simulationTiming(configuration.simulation),
+          m_worker(configuration.unit, configuration.trajectory),
+          m_simulation(configuration.unit, configuration.trajectory, configuration.simulation),
           m_simulatedRapidSpeed(configuration.trajectory.rapidSpeed) { }
 
     void init() {
@@ -676,10 +678,15 @@ public:
             };
             for(const auto &executed : backendTrajectory.spans) {
                 auto &vertices = executed.stopTail ? cache.backendStopTailLines : cache.backendTrajectoryLines;
-                constexpr int SAMPLES = 32;
+                const auto executedDuration = executed.polynomial.duration * executed.executedUntil;
+                const auto samples = ngc::diagnosticServoSegmentCount(
+                    executed, m_simulationTiming.servoPeriod);
                 auto previous = evaluatePolynomial(executed.polynomial, 0.0);
-                for(int sample = 1; sample <= SAMPLES; ++sample) {
-                    const auto u = executed.executedUntil * static_cast<double>(sample) / SAMPLES;
+                for(std::size_t sample = 1; sample <= samples; ++sample) {
+                    const auto elapsed = std::min(static_cast<double>(sample) * m_simulationTiming.servoPeriod,
+                                                  executedDuration);
+                    const auto u = executed.polynomial.duration > 0.0
+                        ? elapsed * executed.polynomial.inverseDuration : executed.executedUntil;
                     const auto current = evaluatePolynomial(executed.polynomial, u);
                     if(glm::length(current - previous) > 1e-12) segment(vertices, previous, current);
                     previous = current;
@@ -1027,7 +1034,7 @@ public:
         ImGui::SameLine();
         ImGui::BeginDisabled(!compiledMode || m_programSource.empty() || simulationActive);
         if(ImGui::Button("Simulate")) {
-            m_simulation.setPlaybackRate(m_simulationRate);
+            m_simulation.setTickMultiplier(m_simulationTickMultiplier);
             m_simulation.setRapidSpeed(m_simulatedRapidSpeed);
             m_simulation.start(m_programSource, m_tools, true);
             m_programPaneMode = ProgramPaneMode::Compiled;
@@ -1050,9 +1057,9 @@ public:
 
         ImGui::SameLine();
         ImGui::SetNextItemWidth(90.0f);
-        if(ImGui::InputDouble("Speed", &m_simulationRate, 0.1, 1.0, "%.2fx")) {
-            m_simulationRate = std::clamp(m_simulationRate, 0.01, 1000.0);
-            m_simulation.setPlaybackRate(m_simulationRate);
+        if(ImGui::InputInt("Speed multiplier", &m_simulationTickMultiplier, 1, 10)) {
+            m_simulationTickMultiplier = std::clamp(m_simulationTickMultiplier, 1, 1000);
+            m_simulation.setTickMultiplier(m_simulationTickMultiplier);
         }
         ImGui::SameLine();
         if(ImGui::Button("Parameters")) m_enableMemoryWindow = true;
@@ -1149,7 +1156,7 @@ public:
         auto programs = m_autoloadSource;
         programs.emplace_back(std::move(source), std::string(MDI_SOURCE_NAME));
 
-        m_simulation.setPlaybackRate(m_simulationRate);
+        m_simulation.setTickMultiplier(m_simulationTickMultiplier);
         m_simulation.setRapidSpeed(m_simulatedRapidSpeed);
         if(!m_simulation.start(programs, m_tools, true)) {
             m_mdiInput = std::move(m_mdiHistory.back());
@@ -1174,7 +1181,7 @@ public:
         const auto completedSource = simulation.completedLineFlags.find(std::string(MDI_SOURCE_NAME));
 
         const auto inputHeight = ImGui::GetFrameHeightWithSpacing();
-        if(ImGui::BeginChild("##mdi_history", { 0.0f, -inputHeight }, ImGuiChildFlags_Border)) {
+        if(ImGui::BeginChild("##mdi_history", { 0.0f, -inputHeight }, ImGuiChildFlags_Borders)) {
             ImGuiListClipper clipper;
             clipper.Begin(static_cast<int>(m_mdiHistory.size()));
             while(clipper.Step()) {
@@ -1256,6 +1263,15 @@ public:
         }();
         ImGui::Text("Simulation: %s    Tool XYZ: %.4f, %.4f, %.4f",
                     statusText, simulation.toolPosition.x, simulation.toolPosition.y, simulation.toolPosition.z);
+        if(simulation.status != ngc::SimulationStatus::Stopped) {
+            ImGui::TextDisabled("Servo %.3f ms    Scheduler %.3f ms (%u ticks) x%u    Ticks %llu    Missed deadlines %llu    Max wake %.1f us    Max tick %.1f us",
+                simulation.servoPeriodSeconds * 1000.0, simulation.schedulerPeriodSeconds * 1000.0,
+                simulation.servoTicksPerSchedulerPeriod, simulation.tickMultiplier,
+                static_cast<unsigned long long>(simulation.servoTicks),
+                static_cast<unsigned long long>(simulation.deadlineMisses),
+                simulation.maximumWakeLatenessSeconds * 1.0e6,
+                simulation.maximumTickExecutionSeconds * 1.0e6);
+        }
         auto modalGCodes = m_worker.lock([&] { return m_worker.machine().activeModalGCodes(); });
         const auto simulationHasModalState = simulation.status != ngc::SimulationStatus::Stopped
             && !simulation.activeModalGCodes.empty();
@@ -1500,7 +1516,7 @@ public:
 
     void renderProgramWindow() {
         if(ImGui::Begin("Program", &m_enableProgramWindow)) {
-            if(ImGui::BeginChild("top", { 0, 0 }, ImGuiChildFlags_Border | ImGuiChildFlags_ResizeY)) {
+            if(ImGui::BeginChild("top", { 0, 0 }, ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeY)) {
                 if(ImGui::Button("Compile Programs", {0,0}, m_worker.busy())) {
                     m_worker.compile(m_programSource);
                 }
@@ -1518,7 +1534,7 @@ public:
                 ImGui::SameLine();
                 ImGui::BeginDisabled(m_programSource.empty() || simulationActive);
                 if(ImGui::Button("Run Simulation")) {
-                    m_simulation.setPlaybackRate(m_simulationRate);
+                    m_simulation.setTickMultiplier(m_simulationTickMultiplier);
                     m_simulation.setRapidSpeed(m_simulatedRapidSpeed);
                     m_simulation.start(m_programSource, m_tools, true);
                 }
@@ -1536,9 +1552,9 @@ public:
                 ImGui::EndDisabled();
 
                 ImGui::SetNextItemWidth(120.0f);
-                if(ImGui::InputDouble("Playback rate", &m_simulationRate, 0.1, 1.0, "%.2fx")) {
-                    m_simulationRate = std::clamp(m_simulationRate, 0.01, 1000.0);
-                    m_simulation.setPlaybackRate(m_simulationRate);
+                if(ImGui::InputInt("Speed multiplier", &m_simulationTickMultiplier, 1, 10)) {
+                    m_simulationTickMultiplier = std::clamp(m_simulationTickMultiplier, 1, 1000);
+                    m_simulation.setTickMultiplier(m_simulationTickMultiplier);
                 }
                 ImGui::SameLine();
                 ImGui::SetNextItemWidth(120.0f);
@@ -1577,7 +1593,7 @@ public:
 
             ImGui::EndChild();
 
-            if(ImGui::BeginChild("middle", {0, 0 }, ImGuiChildFlags_Border | ImGuiChildFlags_ResizeY)) {
+            if(ImGui::BeginChild("middle", {0, 0 }, ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeY)) {
                 for(const auto &error : m_worker.parserErrors()) {
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4_Redish);
                     ImGui::Selectable(error.text().c_str());
@@ -1587,7 +1603,7 @@ public:
 
             ImGui::EndChild();
 
-            if(ImGui::BeginChild("bottom", {0, 0 }, ImGuiChildFlags_Border)) {
+            if(ImGui::BeginChild("bottom", {0, 0 }, ImGuiChildFlags_Borders)) {
                 for(const auto &block : m_worker.blockMessages()) {
                     ImGui::PushStyleColor(ImGuiCol_Text, ImVec4_Greenish);
                     ImGui::Selectable(block.c_str());

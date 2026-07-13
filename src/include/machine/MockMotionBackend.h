@@ -20,8 +20,10 @@ namespace ngc {
         bool tryTakeSnapshot(ExecutionSnapshot &snapshot) noexcept override;
 
         void advance(double seconds) override;
+        // Fixed-tick simulation may decimate presentation snapshots while still
+        // executing every servo update and event transition.
+        void advanceTick(double seconds, bool publishSnapshot);
         void runUntilIdle() override;
-        void setPlaybackRate(double rate) override;
         bool configureSyntheticProbe(std::uint64_t probeId, const position_t &physicalToolOffset,
                                      const position_t &activeToolOffset) noexcept;
         void clearTrajectoryDiagnostics() override;

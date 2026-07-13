@@ -41,7 +41,7 @@ Project warning, optimization, and debug flags are target-scoped. Bundled GLFW a
 
 `machine.toml` is loaded and validated once at application startup through the project-owned `MachineConfiguration` layer. toml++ must remain isolated to that loader; planners, workers, and backends receive typed configuration values rather than parsing files. A missing or invalid configuration is a startup error with source location context.
 
-`machine.units` selects the fixed internal `Machine::Unit`. Current `[trajectory]` values use that machine unit and seconds: `path_acceleration`, `path_jerk`, `rapid_velocity`, and `arc_chord_tolerance`. `rapid_velocity` is converted at the loader boundary to the canonical per-minute representation currently expected by the planner. Configuration parsing and disk access must never enter the RT backend.
+`machine.units` selects the fixed internal `Machine::Unit`. Current `[trajectory]` values use that machine unit and seconds: `path_acceleration`, `path_jerk`, `rapid_velocity`, and `arc_chord_tolerance`. `rapid_velocity` is converted at the loader boundary to the canonical per-minute representation currently expected by the planner. `[simulation]` contains seconds-based `servo_period` and `scheduler_period` values; the scheduler period must be an integer multiple of the fixed servo period. Configuration parsing and disk access must never enter the RT backend.
 
 ## Important current decisions
 
@@ -60,7 +60,7 @@ Project warning, optimization, and debug flags are target-scoped. Bundled GLFW a
 - IJK arcs allow either in-plane center word to be omitted; an omitted word means zero. At least one applicable center word is required.
 - G91.1 uses incremental IJK center coordinates. G90.1 uses absolute center coordinates in the active work coordinate system without changing G90/G91 endpoint mode.
 - IJK arc validation rejects zero radius and radius mismatch beyond `Machine::arcTolerance()`. The tolerance is 0.0005 inch or the equivalent 0.0127 mm.
-- Arc preview uses a directed sweep derived from the signed axis. It supports CW/CCW major arcs, full circles, and helical interpolation. It blends from both radial arms so rounded G-code arcs end exactly at the commanded endpoint.
+- Arc preview and exact-stop planning share the project-owned endpoint-exact arc reference. It uses the directed sweep derived from the signed axis, supports CW/CCW major arcs, full circles, helical and non-XY arcs, and blends both radial arms so accepted decimal-IJK radius mismatch still reaches both canonical endpoints exactly.
 - G64 is accepted as a modal path mode. Its optional P word establishes a non-negative path tolerance, converted into configured machine units. G61/G61.1 clear the retained G64 tolerance. G64 currently has no execution or simulation semantics; it only enables the experimental preview spline visualization described below.
 - Rapid `MoveLine` commands currently use speed `-1` as a sentinel; this is not a physical negative feedrate.
 - G1, G2, and G3 require an established positive modal feedrate. A missing/non-positive feedrate must produce an `InterpreterError`; never dereference an absent modal `F` value or terminate the process.
@@ -72,7 +72,9 @@ Project warning, optimization, and debug flags are target-scoped. Bundled GLFW a
 
 `ExactStopTrajectoryPlanner` currently treats every canonical motion as an exact stop. It uses one-degree-of-freedom Ruckig rest-to-rest timing to produce jerk-limited S-curve phases, maps those phases onto axis cubic position polynomials, and validates the emitted axis-space acceleration and jerk. The current limits are aggregate path/vector limits, not yet independent per-axis constraints.
 
-Lines and adaptively subdivided circular/helical arcs are emitted through the same fixed-capacity `PlanChunk` representation. Arc speed receives an up-front curvature/centripetal acceleration cap, followed by polynomial constraint validation and uniform time stretching. `arc_chord_tolerance` currently drives a conservative straight-chord subdivision formula even though the emitted spans are cubic; replace this with verified cubic arc approximation before increasing RT plan density.
+Lines and adaptively subdivided circular/helical arcs are emitted through the same fixed-capacity `PlanChunk` representation. The NRT arc reference adaptively integrates the full XYZABC derivative, inverts path distance to normalized arc parameter, supplies unit tangents, and explicitly preserves the canonical start and end positions. Arc speed receives a conservative curvature/centripetal acceleration cap, followed by emitted polynomial constraint validation and uniform time stretching.
+
+Arc cubic subdivision is tolerance-verified. Verification preserves ordered association between each polynomial interval and its source-arc interval, recursively subdivides the polynomial Bezier control hull, and accepts it only inside an ordered source-chord capsule after reserving the reference curve's conservative second-derivative chord-error bound from `arc_chord_tolerance`. Do not replace this with unordered nearest-geometry sampling or a constant-radius bound: accepted rounded IJK arcs may have slightly different start and end radii. Consecutive planned commands must meet at their canonical endpoints without synthetic connector spans.
 
 The RT-facing contract contains only bounded, allocation-free plan/control/event/snapshot data transported by SPSC channels. Cubic spans provide position as a function of span time and include cached terminal state. Do not add UI strings, TOML objects, G-code entities, synthetic probe settings, or debug trajectory storage to `MotionBackend`.
 
@@ -80,9 +82,11 @@ The RT-facing contract contains only bounded, allocation-free plan/control/event
 
 ## Concurrency and lifecycle
 
-`Worker` and `SimulationWorker` each own a persistent `InterpreterSession` on a background thread. Both use `TrajectoryExecutionDriver` and `MockMotionBackend`; preview drains the mock backend immediately, while timed simulation advances it from a steady clock and playback-rate multiplier. UI-only strings, WCS/modal metadata, tool overlays, and block lifecycle state remain in NRT presentation storage keyed by epoch/chunk ID and never cross the RT contract. Any mutation or traversal shared with the GUI must be protected by the owning worker mutex. Do not hold a GUI-facing mutex while waiting for future physical motion or probe completion.
+`Worker` and `SimulationWorker` each own a persistent `InterpreterSession` on a background thread. Both use `TrajectoryExecutionDriver` and `MockMotionBackend`; preview drains the mock backend immediately. Timed simulation uses a fixed configured servo timestep and a separate steady-clock scheduler period. Its integer speed multiplier changes the number of fixed servo ticks executed per scheduler wake; it must never enlarge the servo timestep. UI-only strings, WCS/modal metadata, tool overlays, and block lifecycle state remain in NRT presentation storage keyed by epoch/chunk ID and never cross the RT contract. Any mutation or traversal shared with the GUI must be protected by the owning worker mutex. Do not hold a GUI-facing mutex while waiting for future physical motion or probe completion.
 
 Timed simulation fills the executor's bounded queue before advancing so dense short-segment paths are not limited to one command per display/update cycle. Queue filling must stop at a probe barrier and resume only after the matching result is delivered. When the executor drains and interpretation can immediately provide more commands, do not impose the normal 8 ms timed wait.
+
+The Windows mock scheduler is paced independently from the servo tick. Preserve its deadline-miss, maximum-wake-lateness, maximum-tick-execution, and servo-tick counters in NRT presentation state. The red diagnostic trajectory tessellates actually executed polynomial duration at the configured servo period, including truncated probe spans; do not restore a fixed visual sample count or add these diagnostics to `MotionBackend`.
 
 Program execution must not append to a previous run or start from its final position. Keep the reset regression tests intact.
 

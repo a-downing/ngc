@@ -9,6 +9,7 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <numbers>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -19,6 +20,7 @@
 #include "evaluator/Preamble.h"
 #include "machine/Machine.h"
 #include "machine/MachineConfiguration.h"
+#include "machine/ArcInterpolation.h"
 #include "machine/ExactStopTrajectoryPlanner.h"
 #include "machine/MockMotionBackend.h"
 #include "machine/SpscChannel.h"
@@ -316,7 +318,7 @@ namespace {
         require(loadedTools.has_value(), loadedTools ? "" : loadedTools.error());
 
         SimulationWorker worker;
-        worker.setPlaybackRate(1000.0);
+        worker.setTickMultiplier(1000);
         require(worker.start({ { *hello, "autoload/hello.ngc" }, { *world, "autoload/world.ngc" },
                                { *toolChange, "autoload/tool_change.ngc" }, { "T2 M6\n", "<MDI>" } }, tools),
                 "MDI tool change should start");
@@ -336,7 +338,7 @@ namespace {
     void testSimulationWorkerPersistsUntilReset() {
         SimulationWorker worker;
         ngc::ToolTable tools;
-        worker.setPlaybackRate(1000.0);
+        worker.setTickMultiplier(1000);
 
         const auto waitForCompletion = [&](const std::string_view message) {
             auto snapshot = worker.snapshot();
@@ -353,8 +355,17 @@ namespace {
 
         require(worker.start({ { "G0 X1\n", "<MDI>" } }, tools, true),
                 "first persistent simulation command should start");
-        requireNear(waitForCompletion("first persistent command should complete").machinePosition.x, 1.0,
-                    "first persistent command should end at X1");
+        const auto afterFirst = waitForCompletion("first persistent command should complete");
+        requireNear(afterFirst.machinePosition.x, 1.0, "first persistent command should end at X1");
+        requireNear(afterFirst.servoPeriodSeconds, 0.001,
+                    "simulation should advance with the configured fixed servo period");
+        require(afterFirst.tickMultiplier == 1000,
+                "simulation should expose the integer ticks-per-period multiplier");
+        require(afterFirst.servoTicks > 0, "timed simulation should report executed fixed servo ticks");
+        requireNear(afterFirst.schedulerPeriodSeconds, 0.01,
+                    "simulation should expose its independent 100 Hz scheduler period");
+        require(afterFirst.servoTicksPerSchedulerPeriod == 10,
+                "each scheduler wake should batch ten 1 ms servo ticks at 1x speed");
 
         require(worker.start({ { "G43 H1\n", "<MDI>" } }, tools, true),
                 "G43 persistent simulation command should start");
@@ -650,6 +661,10 @@ namespace {
         ngc::Machine millimeterMachine(ngc::Machine::Unit::Millimeter);
         requireNear(inchMachine.arcTolerance(), 0.0005, "inch arc tolerance is incorrect");
         requireNear(millimeterMachine.arcTolerance(), 0.0127, "millimeter arc tolerance is incorrect");
+    }
+
+    void testArcRadiusMismatchIsRecoverableInterpreterError() {
+        requireInterpreterError("G3 F1 X1 Y1.001 I1\n", "arc radius mismatch");
     }
 
     void testInterpreterSessionOwnsCompilationAndExecution() {
@@ -1416,6 +1431,230 @@ namespace {
                     "constant-speed line duration should be distance divided by feed");
     }
 
+    void testMockBackendAdvancesOneFixedServoTick() {
+        ngc::MockMotionBackend backend;
+        ngc::PlanChunk chunk;
+        chunk.epoch = 31;
+        chunk.id = 1;
+        chunk.branch = 1;
+        require(chunk.normalMotion.push(linearSpan(1, 0.0, 1.0, 0.01)),
+                "fixed-tick test motion should fit in its chunk");
+        require(chunk.stopTail.push(linearSpan(2, 1.0, 1.0, 1e-6)),
+                "fixed-tick test stop tail should fit in its chunk");
+        chunk.branchState.position.x = 1.0;
+        chunk.stopState.position.x = 1.0;
+        require(backend.tryPublish(chunk) == ngc::PublishResult::Published,
+                "fixed-tick test chunk should publish");
+        require(backend.trySubmit(ngc::StartRequest { 1, 31 }) == ngc::SubmitResult::Submitted,
+                "fixed-tick test backend should start");
+
+        backend.advanceTick(0.001, true);
+        ngc::ExecutionSnapshot snapshot;
+        while(backend.tryTakeSnapshot(snapshot)) { }
+        requireNear(snapshot.commanded.position.x, 0.1,
+                    "one 1 ms servo tick should advance one tenth of a 10 ms linear span");
+
+        for(int tick = 0; tick < 9; ++tick) backend.advanceTick(0.001, tick == 8);
+        while(backend.tryTakeSnapshot(snapshot)) { }
+        requireNear(snapshot.commanded.position.x, 1.0,
+                    "ten fixed servo ticks should complete the 10 ms span exactly");
+    }
+
+    void testVerifiedCubicArcSpanCounts() {
+        constexpr double TOLERANCE = 0.0001;
+        struct ArcCase {
+            std::string_view name;
+            double radius;
+            double sweep;
+            double rise;
+            std::uint32_t expectedSpans;
+        };
+        constexpr std::array cases {
+            ArcCase { "quarter circle", 1.0, std::numbers::pi / 2.0, 0.0, 4 },
+            ArcCase { "half circle", 1.0, std::numbers::pi, 0.0, 8 },
+            ArcCase { "major three-quarter circle", 1.0, 3.0 * std::numbers::pi / 2.0, 0.0, 16 },
+            ArcCase { "full circle", 1.0, 2.0 * std::numbers::pi, 0.0, 16 },
+            ArcCase { "full helical turn", 1.0, 2.0 * std::numbers::pi, 1.0, 16 },
+            ArcCase { "large-radius quarter circle", 10.0, std::numbers::pi / 2.0, 0.0, 8 },
+        };
+
+        for(const auto &test : cases) {
+            const ngc::position_t from { test.radius, 0, 0, 0, 0, 0 };
+            const ngc::position_t to {
+                test.radius * std::cos(test.sweep), test.radius * std::sin(test.sweep), test.rise, 0, 0, 0,
+            };
+            ngc::ExactStopTrajectoryPlanner planner({
+                .pathAcceleration = std::numeric_limits<double>::infinity(),
+                .rapidSpeed = 120.0,
+                .arcChordTolerance = TOLERANCE,
+            });
+            planner.reset(20, from);
+            const auto chunk = planner.compile(ngc::MoveArc { from, to, {}, { 0, 0, 1 }, 60.0 });
+            require(chunk.has_value(), chunk ? "" : chunk.error());
+            require(chunk->normalMotion.size == test.expectedSpans,
+                    std::format("{} should compile to {} verified cubic spans, got {}",
+                                test.name, test.expectedSpans, chunk->normalMotion.size));
+
+            const auto pathLength = std::hypot(test.radius * test.sweep, test.rise);
+            double elapsed = 0.0;
+            double maximumError = 0.0;
+            for(const auto &span : chunk->normalMotion) {
+                for(int sample = 0; sample <= 64; ++sample) {
+                    const auto local = static_cast<double>(sample) / 64.0;
+                    const auto progress = std::clamp((elapsed + local*span.duration) / pathLength, 0.0, 1.0);
+                    const auto actual = evaluateSpan(span, local);
+                    const ngc::position_t expected {
+                        test.radius * std::cos(test.sweep*progress),
+                        test.radius * std::sin(test.sweep*progress),
+                        test.rise * progress, 0, 0, 0,
+                    };
+                    maximumError = std::max(maximumError, ngc::vec3_t {
+                        actual.x-expected.x, actual.y-expected.y, actual.z-expected.z,
+                    }.length());
+                }
+                elapsed += span.duration;
+            }
+            require(maximumError <= TOLERANCE + 1e-10,
+                    std::format("{} cubic error {} exceeds tolerance {}", test.name, maximumError, TOLERANCE));
+        }
+    }
+
+    void testPlannedArcsPreserveCanonicalEndpointContinuity() {
+        constexpr double TOLERANCE = 0.0001;
+        const ngc::position_t start { 1, 0, 0, 0, 0, 0 };
+        const ngc::position_t junction { 0, 1.0004, 0, 0, 0, 0 };
+        const ngc::position_t secondEnd { -1.0002, 0, 0, 0, 0, 0 };
+        const ngc::MoveArc firstArc { start, junction, {}, { 0, 0, 1 }, 60.0 };
+        const ngc::MoveArc secondArc { junction, secondEnd, {}, { 0, 0, 1 }, 60.0 };
+
+        ngc::ExactStopTrajectoryPlanner planner({
+            .pathAcceleration = std::numeric_limits<double>::infinity(),
+            .rapidSpeed = 120.0,
+            .arcChordTolerance = TOLERANCE,
+        });
+        planner.reset(41, start);
+        const auto first = planner.compile(firstArc);
+        const auto second = planner.compile(secondArc);
+        require(first.has_value(), first ? "" : first.error());
+        require(second.has_value(), second ? "" : second.error());
+        const auto firstStart = evaluateSpan(first->normalMotion[0], 0.0);
+        const auto firstEnd = evaluateSpan(first->normalMotion[first->normalMotion.size-1], 1.0);
+        const auto secondStart = evaluateSpan(second->normalMotion[0], 0.0);
+        requireNear(firstStart.x, start.x, "rounded arc polynomial should start at canonical X");
+        requireNear(firstStart.y, start.y, "rounded arc polynomial should start at canonical Y");
+        requireNear(firstEnd.x, junction.x, "rounded arc polynomial should end at canonical X");
+        requireNear(firstEnd.y, junction.y, "rounded arc polynomial should end at canonical Y");
+        requireNear(firstEnd.x, secondStart.x, "consecutive arcs should have continuous X");
+        requireNear(firstEnd.y, secondStart.y, "consecutive arcs should have continuous Y");
+        requireNear(first->normalMotion[first->normalMotion.size-1].end.position.y, junction.y,
+                    "cached arc terminal state should preserve the canonical endpoint");
+
+        const ngc::position_t lineEnd { -2, 0, 0, 0, 0, 0 };
+        const auto lineAfterArc = planner.compile(ngc::MoveLine { secondEnd, lineEnd, 60.0 });
+        require(lineAfterArc.has_value(), lineAfterArc ? "" : lineAfterArc.error());
+        const auto secondFinal = evaluateSpan(second->normalMotion[second->normalMotion.size-1], 1.0);
+        const auto followingLineStart = evaluateSpan(lineAfterArc->normalMotion[0], 0.0);
+        requireNear(secondFinal.x, followingLineStart.x, "arc-to-line junction should have continuous X");
+        requireNear(secondFinal.y, followingLineStart.y, "arc-to-line junction should have continuous Y");
+
+        ngc::ExactStopTrajectoryPlanner lineThenArc({
+            .pathAcceleration = std::numeric_limits<double>::infinity(),
+            .rapidSpeed = 120.0,
+            .arcChordTolerance = TOLERANCE,
+        });
+        const ngc::position_t lineStart { 2, 0, 0, 0, 0, 0 };
+        lineThenArc.reset(42, lineStart);
+        const auto precedingLine = lineThenArc.compile(ngc::MoveLine { lineStart, start, 60.0 });
+        const auto followingArc = lineThenArc.compile(firstArc);
+        require(precedingLine.has_value(), precedingLine ? "" : precedingLine.error());
+        require(followingArc.has_value(), followingArc ? "" : followingArc.error());
+        const auto precedingLineEnd = evaluateSpan(
+            precedingLine->normalMotion[precedingLine->normalMotion.size-1], 1.0);
+        const auto followingArcStart = evaluateSpan(followingArc->normalMotion[0], 0.0);
+        requireNear(precedingLineEnd.x, followingArcStart.x, "line-to-arc junction should have continuous X");
+        requireNear(precedingLineEnd.y, followingArcStart.y, "line-to-arc junction should have continuous Y");
+
+        const ngc::simulation_detail::ArcReference reference(firstArc);
+        double elapsed = 0.0;
+        double maximumError = 0.0;
+        for(const auto &span : first->normalMotion) {
+            for(int index = 0; index <= 128; ++index) {
+                const auto local = static_cast<double>(index)/128.0;
+                const auto actual = evaluateSpan(span, local);
+                const auto expected = reference.positionAtDistance(elapsed + local*span.duration);
+                maximumError = std::max(maximumError, ngc::vec3_t {
+                    actual.x-expected.x, actual.y-expected.y, actual.z-expected.z,
+                }.length());
+            }
+            elapsed += span.duration;
+        }
+        require(maximumError <= TOLERANCE + 1e-10,
+                std::format("rounded-radius arc error {} exceeds tolerance {}", maximumError, TOLERANCE));
+
+    }
+
+    void testRoundedRadiusArcPreservesDynamicLimits() {
+        constexpr double ACCELERATION = 4.0;
+        constexpr double JERK = 8.0;
+        ngc::ExactStopTrajectoryPlanner planner({
+            .pathAcceleration = ACCELERATION,
+            .rapidSpeed = 120.0,
+            .arcChordTolerance = 0.0001,
+            .pathJerk = JERK,
+        });
+        const ngc::position_t start { 1, 0, 0, 0, 0, 0 };
+        planner.reset(43, start);
+        const auto arc = planner.compile(ngc::MoveArc {
+            start, { 0, 1.0004, 0, 0, 0, 0 }, {}, { 0, 0, 1 }, 60.0,
+        });
+        require(arc.has_value(), arc ? "" : arc.error());
+        for(const auto &span : arc->normalMotion) {
+            require(spanAcceleration(span, 0.0) <= ACCELERATION + 1e-8,
+                    "rounded-radius arc should respect acceleration at span start");
+            require(spanAcceleration(span, 1.0) <= ACCELERATION + 1e-8,
+                    "rounded-radius arc should respect acceleration at span end");
+            require(spanJerk(span) <= JERK + 1e-8,
+                    "rounded-radius arc should respect the configured jerk limit");
+        }
+    }
+
+    void testEndpointExactArcReferenceGeometryVariants() {
+        constexpr double MISMATCH = 0.0004;
+        const std::array arcs {
+            ngc::MoveArc { { 1, 0, 0, 0, 0, 0 }, { 0, 1+MISMATCH, 0, 0, 0, 0 }, {}, { 0, 0, 1 }, 60.0 },
+            ngc::MoveArc { { 1, 0, 0, 0, 0, 0 }, { 0, -1-MISMATCH, 0, 0, 0, 0 }, {}, { 0, 0, -1 }, 60.0 },
+            ngc::MoveArc { { 1, 0, 0, 0, 0, 0 }, { 0, -1-MISMATCH, 0, 0, 0, 0 }, {}, { 0, 0, 1 }, 60.0 },
+            ngc::MoveArc { { 1, 0, 0, 0, 0, 0 }, { 1, 0, 0, 0, 0, 0 }, {}, { 0, 0, 1 }, 60.0 },
+            ngc::MoveArc { { 1, 0, 0, 0, 0, 0 }, { 0, 1+MISMATCH, 2, 0, 0, 0 }, {}, { 0, 0, 1 }, 60.0 },
+            ngc::MoveArc { { 1, 0, 0, 0, 0, 0 }, { 0, 0, 1+MISMATCH, 0, 0, 0 }, {}, { 0, -1, 0 }, 60.0 },
+        };
+        for(const auto &arc : arcs) {
+            const ngc::simulation_detail::ArcReference reference(arc);
+            require(reference.valid(), "arc reference geometry variant should be valid");
+            const auto from = reference.positionAtDistance(0.0);
+            const auto to = reference.positionAtDistance(reference.length());
+            requireNear(from.x, arc.from().x, "arc reference should preserve start X");
+            requireNear(from.y, arc.from().y, "arc reference should preserve start Y");
+            requireNear(from.z, arc.from().z, "arc reference should preserve start Z");
+            requireNear(to.x, arc.to().x, "arc reference should preserve end X");
+            requireNear(to.y, arc.to().y, "arc reference should preserve end Y");
+            requireNear(to.z, arc.to().z, "arc reference should preserve end Z");
+        }
+    }
+
+    void testMockDiagnosticSegmentsFollowServoPeriod() {
+        ngc::ExecutedTrajectorySpan executed;
+        executed.polynomial.duration = 0.1;
+        executed.executedUntil = 1.0;
+        require(ngc::diagnosticServoSegmentCount(executed, 0.001) == 100,
+                "a 100 ms executed span should display 100 segments at a 1 ms servo period");
+        require(ngc::diagnosticServoSegmentCount(executed, 0.01) == 10,
+                "the diagnostic segment count should change with the servo period");
+        executed.executedUntil = 0.5;
+        require(ngc::diagnosticServoSegmentCount(executed, 0.001) == 50,
+                "truncated probe spans should display only their executed servo intervals");
+    }
+
     void testMachineConfigurationLoadsTrajectoryLimits() {
         const auto configuration = ngc::loadMachineConfiguration("machine.toml");
         require(configuration.has_value(), configuration ? "" : configuration.error());
@@ -1429,6 +1668,10 @@ namespace {
                 "machine configuration should load and convert a validated rapid velocity");
         require(configuration->trajectory.arcChordTolerance > 0.0,
                 "machine configuration should load a validated arc chord tolerance");
+        requireNear(configuration->simulation.servoPeriod, 0.001,
+                    "machine configuration should load the fixed simulation servo period");
+        requireNear(configuration->simulation.schedulerPeriod, 0.01,
+                    "machine configuration should load the independent scheduler period");
     }
 
     void testExactStopPlannerCompilesProbeAsBackendEvent() {
@@ -1539,6 +1782,7 @@ int main() {
         testG53BypassesWorkOffsetButRetainsToolOffset();
         testArcAllowsOmittedZeroCenterOffsets();
         testArcGeometryValidation();
+        testArcRadiusMismatchIsRecoverableInterpreterError();
         testInterpreterSessionOwnsCompilationAndExecution();
         testInterpreterTaskVariable();
         testIncrementalSessionControlFlow();
@@ -1550,10 +1794,16 @@ int main() {
         testToolpathRecorderAppliesPerCommandToolOffset();
         testSpscChannelIsBoundedAndOrdered();
         testMockMotionBackendUsesProductionTransportContract();
+        testMockBackendAdvancesOneFixedServoTick();
         testMockBackendDrainsAFullPlanHorizonWithoutEventOverflow();
         testImmediateDrainStopsAtHeldWithStaleDescendants();
         testN70N75PreviewPrefixesCompleteBoundedly();
         testExactStopPlannerCompilesLinesAndArcs();
+        testVerifiedCubicArcSpanCounts();
+        testPlannedArcsPreserveCanonicalEndpointContinuity();
+        testRoundedRadiusArcPreservesDynamicLimits();
+        testEndpointExactArcReferenceGeometryVariants();
+        testMockDiagnosticSegmentsFollowServoPeriod();
         testMachineConfigurationLoadsTrajectoryLimits();
         testExactStopPlannerCompilesProbeAsBackendEvent();
         testTrajectoryDriverConnectsInterpreterToMockRtBackend();

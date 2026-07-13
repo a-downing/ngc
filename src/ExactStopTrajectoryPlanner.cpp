@@ -1,9 +1,11 @@
 #include "machine/ExactStopTrajectoryPlanner.h"
+#include "machine/ArcInterpolation.h"
 
 #include <algorithm>
 #include <cmath>
 #include <format>
 #include <numbers>
+#include <numeric>
 #include <type_traits>
 #include <vector>
 
@@ -12,15 +14,7 @@
 namespace ngc {
     namespace {
         double dot(const vec3_t &a, const vec3_t &b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
-        vec3_t cross(const vec3_t &a, const vec3_t &b) {
-            return { a.y*b.z - a.z*b.y, a.z*b.x - a.x*b.z, a.x*b.y - a.y*b.x };
-        }
         vec3_t scale(const vec3_t &v, const double amount) { return { v.x*amount, v.y*amount, v.z*amount }; }
-        vec3_t normalized(const vec3_t &v) { return scale(v, 1.0 / v.length()); }
-        vec3_t rotate(const vec3_t &v, const double angle, const vec3_t &axis) {
-            return scale(v, std::cos(angle)) + scale(cross(axis, v), std::sin(angle))
-                + scale(axis, dot(axis, v) * (1.0 - std::cos(angle)));
-        }
         position_t scaled(const position_t &value, const double amount) {
             return { value.x*amount, value.y*amount, value.z*amount,
                      value.a*amount, value.b*amount, value.c*amount };
@@ -28,8 +22,76 @@ namespace ngc {
         position_t add(const position_t &a, const position_t &b) { return a + b; }
         position_t subtract(const position_t &a, const position_t &b) { return a - b; }
 
+        position_t midpoint(const position_t &a, const position_t &b) {
+            return scaled(add(a, b), 0.5);
+        }
+
+        template<typename T>
+        std::pair<std::array<T, 4>, std::array<T, 4>> splitBezier(const std::array<T, 4> &control) {
+            const auto middle = [](const T &a, const T &b) {
+                if constexpr(std::same_as<T, double>) return std::midpoint(a, b);
+                else return midpoint(a, b);
+            };
+            const auto p01 = middle(control[0], control[1]);
+            const auto p12 = middle(control[1], control[2]);
+            const auto p23 = middle(control[2], control[3]);
+            const auto p012 = middle(p01, p12);
+            const auto p123 = middle(p12, p23);
+            const auto p0123 = middle(p012, p123);
+            return {{ control[0], p01, p012, p0123 }, { p0123, p123, p23, control[3] }};
+        }
+
+        std::array<position_t, 4> bezierControls(const AxisPolynomialSpan &span) {
+            return {
+                span.d,
+                add(span.d, scaled(span.c, 1.0 / 3.0)),
+                add(span.d, add(scaled(span.c, 2.0 / 3.0), scaled(span.b, 1.0 / 3.0))),
+                add(span.d, add(span.c, add(span.b, span.a))),
+            };
+        }
+
+        double distanceToSegment(const position_t &point, const position_t &from, const position_t &to) {
+            const vec3_t p { point.x, point.y, point.z };
+            const vec3_t a { from.x, from.y, from.z };
+            const vec3_t delta { to.x - from.x, to.y - from.y, to.z - from.z };
+            const auto lengthSquared = dot(delta, delta);
+            const auto parameter = lengthSquared > 0.0
+                ? std::clamp(dot(p - a, delta) / lengthSquared, 0.0, 1.0) : 0.0;
+            return (p - (a + scale(delta, parameter))).length();
+        }
+
         struct PathSample { position_t position; position_t tangent; };
         struct TimeBoundary { double time; double distance; double velocity; };
+
+        struct ScalarPhase {
+            double a;
+            double b;
+            double c;
+            double d;
+            double duration;
+
+            TimeBoundary at(const double u) const {
+                return {
+                    .time = duration * u,
+                    .distance = ((a*u + b)*u + c)*u + d,
+                    .velocity = (3.0*a*u*u + 2.0*b*u + c) / duration,
+                };
+            }
+        };
+
+        ScalarPhase scalarPhase(const TimeBoundary &from, const TimeBoundary &to) {
+            const auto duration = to.time - from.time;
+            const auto delta = to.distance - from.distance;
+            const auto c = from.velocity * duration;
+            const auto endDerivative = to.velocity * duration;
+            return {
+                .a = -2.0*delta + c + endDerivative,
+                .b = 3.0*delta - 2.0*c - endDerivative,
+                .c = c,
+                .d = from.distance,
+                .duration = duration,
+            };
+        }
 
         AxisPolynomialSpan hermite(const SpanId id, const PathSample &from, const PathSample &to,
                                    const double fromVelocity, const double toVelocity, const double duration) {
@@ -51,6 +113,42 @@ namespace ngc {
             const auto secondAtEnd = add(scaled(result.a, 6.0), scaled(result.b, 2.0));
             result.end.acceleration = scaled(secondAtEnd, result.inverseDurationSquared);
             return result;
+        }
+
+        template<typename PositionAt>
+        bool verifiesArcTolerance(const AxisPolynomialSpan &span, const double distance0, const double distance1,
+                                  const double velocity0, const double velocity1, const double tolerance,
+                                  const PositionAt &positionAt, const auto &referenceErrorAt) {
+            // The scalar controls retain the time law's ordered association between this
+            // polynomial and its source-arc interval as both curves are subdivided.
+            const std::array<double, 4> scalarControl {
+                distance0,
+                distance0 + velocity0*span.duration / 3.0,
+                distance1 - velocity1*span.duration / 3.0,
+                distance1,
+            };
+
+            const auto verify = [&](const auto &self, const std::array<position_t, 4> &curve,
+                                    const std::array<double, 4> &distance, const unsigned depth) -> bool {
+                const auto source0 = positionAt(distance[0]);
+                const auto source1 = positionAt(distance[3]);
+                const auto referenceError = referenceErrorAt(distance[0], distance[3]);
+                const auto availableError = tolerance - referenceError;
+                // A segment capsule is convex. If every polynomial control point is in
+                // this capsule, its entire hull is within availableError of the chord;
+                // the circular/helical source interval is within referenceError of it.
+                if(availableError >= 0.0
+                   && std::ranges::all_of(curve, [&](const position_t &control) {
+                       return distanceToSegment(control, source0, source1) <= availableError;
+                   })) return true;
+
+                if(depth == 20) return false;
+                const auto [leftCurve, rightCurve] = splitBezier(curve);
+                const auto [leftDistance, rightDistance] = splitBezier(distance);
+                return self(self, leftCurve, leftDistance, depth + 1)
+                    && self(self, rightCurve, rightDistance, depth + 1);
+            };
+            return verify(verify, bezierControls(span), scalarControl, 0);
         }
 
         double maximumLinearAcceleration(const AxisPolynomialSpan &span) {
@@ -123,7 +221,7 @@ namespace ngc {
         chunk.branch = chunk.id;
 
         auto appendMotion = [&](const double length, const double speedPerMinute,
-                                const auto &sample, const std::size_t geometricSegments) -> std::optional<std::string> {
+                                const auto &sample, const auto &verify) -> std::optional<std::string> {
             if(length <= 1e-12) {
                 auto hold = hermite(m_nextSpan++, sample(0.0), sample(length), 0.0, 0.0, 1e-6);
                 if(!chunk.normalMotion.push(hold)) return "trajectory chunk span capacity exceeded";
@@ -138,20 +236,25 @@ namespace ngc {
                 const auto &begin = boundaries[phase - 1];
                 const auto &end = boundaries[phase];
                 if(end.time - begin.time <= 1e-12) continue;
-                const auto fraction = (end.distance - begin.distance) / length;
-                const auto subdivisions = std::max<std::size_t>(1, static_cast<std::size_t>(std::ceil(geometricSegments * fraction)));
-                for(std::size_t part = 0; part < subdivisions; ++part) {
-                    const auto f0 = static_cast<double>(part) / subdivisions;
-                    const auto f1 = static_cast<double>(part + 1) / subdivisions;
-                    const auto distance0 = std::lerp(begin.distance, end.distance, f0);
-                    const auto distance1 = std::lerp(begin.distance, end.distance, f1);
-                    const auto velocity0 = std::lerp(begin.velocity, end.velocity, f0);
-                    const auto velocity1 = std::lerp(begin.velocity, end.velocity, f1);
-                    const auto duration = (end.time - begin.time) / subdivisions;
-                    if(!chunk.normalMotion.push(hermite(m_nextSpan++, sample(distance0), sample(distance1),
-                                                        velocity0, velocity1, duration)))
-                        return "trajectory chunk span capacity exceeded";
-                }
+                const auto scalar = scalarPhase(begin, end);
+                const auto emit = [&](const auto &self, const double u0, const double u1,
+                                      const unsigned depth) -> std::optional<std::string> {
+                    const auto from = scalar.at(u0);
+                    const auto to = scalar.at(u1);
+                    const auto duration = scalar.duration * (u1 - u0);
+                    auto span = hermite(m_nextSpan++, sample(from.distance), sample(to.distance),
+                                        from.velocity, to.velocity, duration);
+                    if(!verify(span, from.distance, to.distance, from.velocity, to.velocity)) {
+                        --m_nextSpan;
+                        if(depth == 20) return "arc cubic tolerance verification did not converge";
+                        const auto middle = std::midpoint(u0, u1);
+                        if(auto result = self(self, u0, middle, depth + 1)) return result;
+                        return self(self, middle, u1, depth + 1);
+                    }
+                    if(!chunk.normalMotion.push(span)) return "trajectory chunk span capacity exceeded";
+                    return std::nullopt;
+                };
+                if(auto result = emit(emit, 0.0, 1.0, 0)) return result;
             }
 
             double maximumAcceleration = 0.0;
@@ -196,7 +299,8 @@ namespace ngc {
                     if constexpr(std::same_as<T, MoveLine>) return value.speed() < 0.0 ? m_limits.rapidSpeed : value.speed();
                     else return value.feed();
                 }();
-                if(auto result = appendMotion(length, speed, sample, 1)) return result;
+                const auto accept = [](const AxisPolynomialSpan &, double, double, double, double) { return true; };
+                if(auto result = appendMotion(length, speed, sample, accept)) return result;
                 if constexpr(std::same_as<T, ProbeMove>) {
                     if(!chunk.events.push({ 0,
                                             ProbeEvent { value.id(), value.stopOnContact(), value.errorIfNotFound() } }))
@@ -204,52 +308,27 @@ namespace ngc {
                 }
                 m_position = target;
             } else if constexpr(std::same_as<T, MoveArc>) {
-                const auto source = value.from();
-                const vec3_t start { source.x, source.y, source.z };
-                const vec3_t end { value.to().x, value.to().y, value.to().z };
-                if(value.axis().length() <= 1e-12) return "arc axis must be nonzero";
-                const auto axis = normalized(value.axis());
-                const auto startDelta = start - value.center();
-                const auto endDelta = end - value.center();
-                const auto startArm = startDelta - scale(axis, dot(startDelta, axis));
-                const auto endArm = endDelta - scale(axis, dot(endDelta, axis));
-                const auto radius = startArm.length();
-                if(radius <= 1e-12) return "arc radius must be nonzero";
-                auto sweep = std::atan2(dot(axis, cross(normalized(startArm), normalized(endArm))),
-                                        dot(normalized(startArm), normalized(endArm)));
-                if(sweep < 0.0) sweep += 2.0 * std::numbers::pi;
-                if((startArm - endArm).length() < 1e-9) sweep = 2.0 * std::numbers::pi;
-                const auto axial = scale(axis, dot(end - start, axis));
-                const auto rotaryDelta = position_t { 0, 0, 0, value.to().a-source.a,
-                                                       value.to().b-source.b, value.to().c-source.c };
-                const auto xyzLength = std::hypot(radius*sweep, axial.length());
-                const auto length = std::hypot(xyzLength, std::sqrt(rotaryDelta.a*rotaryDelta.a
-                    + rotaryDelta.b*rotaryDelta.b + rotaryDelta.c*rotaryDelta.c));
-                const auto halfAngle = std::acos(std::clamp(1.0 - m_limits.arcChordTolerance / radius, -1.0, 1.0));
-                const auto segments = halfAngle > 0.0
-                    ? std::max<std::size_t>(1, static_cast<std::size_t>(std::ceil(sweep / (2.0*halfAngle)))) : 1;
-                const auto positionAt = [&](const double distance) {
-                    const auto u = length > 0.0 ? std::clamp(distance / length, 0.0, 1.0) : 1.0;
-                    const auto arm = rotate(startArm, sweep*u, axis);
-                    const auto xyz = value.center() + arm + scale(axial, u);
-                    auto result = add(source, scaled(subtract(value.to(), source), u));
-                    result.x = xyz.x; result.y = xyz.y; result.z = xyz.z;
-                    return result;
-                };
+                const simulation_detail::ArcReference reference(value);
+                if(!reference.valid()) return value.axis().length() <= 1e-12
+                    ? "arc axis must be nonzero" : "arc radius must be nonzero";
+                const auto length = reference.length();
+                const auto positionAt = [&](const double distance) { return reference.positionAtDistance(distance); };
                 const auto sample = [&](const double distance) {
-                    const auto h = std::max(length * 1e-6, 1e-9);
-                    const auto before = positionAt(std::max(0.0, distance-h));
-                    const auto after = positionAt(std::min(length, distance+h));
-                    const auto denominator = std::min(length, distance+h) - std::max(0.0, distance-h);
-                    return PathSample { positionAt(distance), scaled(subtract(after, before), 1.0/denominator) };
+                    return PathSample { positionAt(distance), reference.tangentAtDistance(distance) };
                 };
                 auto arcSpeed = value.speed();
                 if(!std::isinf(m_limits.pathAcceleration) && length > 1e-12) {
-                    const auto curvature = radius * (sweep / length) * (sweep / length);
+                    const auto curvature = reference.curvatureAccelerationBound();
                     if(curvature > 1e-15)
                         arcSpeed = std::min(arcSpeed, 60.0 * std::sqrt(m_limits.pathAcceleration / curvature));
                 }
-                if(auto result = appendMotion(length, arcSpeed, sample, segments)) return result;
+                const auto accept = [&](const AxisPolynomialSpan &span, const double distance0,
+                                        const double distance1, const double velocity0, const double velocity1) {
+                    return verifiesArcTolerance(span, distance0, distance1, velocity0, velocity1,
+                        m_limits.arcChordTolerance, positionAt,
+                        [&](const double from, const double to) { return reference.chordErrorBound(from, to); });
+                };
+                if(auto result = appendMotion(length, arcSpeed, sample, accept)) return result;
                 m_position = value.to();
             } else if constexpr(std::same_as<T, SpindleStart> || std::same_as<T, SpindleStop>) {
                 const PathSample held { m_position, {} };

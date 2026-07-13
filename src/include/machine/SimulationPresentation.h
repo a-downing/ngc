@@ -18,6 +18,15 @@ namespace ngc {
         position_t toolPosition{};
         ToolPose toolPose{};
         double commandProgress = 0.0;
+        double servoPeriodSeconds = 0.001;
+        double schedulerPeriodSeconds = 0.01;
+        std::uint32_t servoTicksPerSchedulerPeriod = 10;
+        std::uint32_t tickMultiplier = 1;
+        std::uint64_t servoTicks = 0;
+        std::uint64_t deadlineMisses = 0;
+        double lastWakeLatenessSeconds = 0.0;
+        double maximumWakeLatenessSeconds = 0.0;
+        double maximumTickExecutionSeconds = 0.0;
         bool hasActiveMotion = false;
         bool spindleRunning = false;
         double spindleSpeed = 0.0;

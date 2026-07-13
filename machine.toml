@@ -11,3 +11,9 @@ path_jerk = 20.0
 rapid_velocity = 3.33
 # machine-units
 arc_chord_tolerance = 0.0001
+
+[simulation]
+# seconds per mock executor servo tick
+servo_period = 0.001
+# seconds between Windows mock-executor scheduler wakes (100 Hz)
+scheduler_period = 0.01

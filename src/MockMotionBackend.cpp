@@ -69,7 +69,6 @@ namespace ngc {
         std::uint32_t m_span = 0;
         std::uint32_t m_nextEvent = 0;
         double m_spanElapsed = 0.0;
-        double m_playbackRate = 1.0;
         MockTrajectorySnapshot m_trajectoryDiagnostics;
 
     public:
@@ -96,9 +95,7 @@ namespace ngc {
         bool configureProbe(const SyntheticProbeConfig &config) noexcept { return m_probeConfigs.tryPush(config); }
         void clearDiagnostics() { m_trajectoryDiagnostics = {}; }
         MockTrajectorySnapshot diagnostics() const { return m_trajectoryDiagnostics; }
-        void setPlaybackRate(const double rate) { m_playbackRate = std::clamp(rate, 0.0, 1000.0); }
-
-        void advance(double seconds) {
+        void advance(double seconds, const bool shouldPublishSnapshot = true) {
             serviceControls();
             SyntheticProbeConfig config;
             while(m_probeConfigs.tryPop(config)) {
@@ -106,12 +103,13 @@ namespace ngc {
                 for(auto &pending : m_pendingProbeConfigs) if(pending.probeId == config.probeId) { pending = config; replaced = true; break; }
                 if(!replaced) (void)m_pendingProbeConfigs.push(config);
             }
-            seconds = std::max(seconds, 0.0) * m_playbackRate;
+            seconds = std::max(seconds, 0.0);
             if(m_snapshot.state != BackendState::Running) {
-                publishSnapshot();
+                if(shouldPublishSnapshot) publishSnapshot();
                 return;
             }
             if(!m_active) activateNext();
+            const auto executedActiveMotion = m_active.has_value();
             while(m_active && (seconds > 0.0 || currentSpan().duration == 0.0)) {
                 const auto &span = currentSpan();
                 const auto probe = activeProbeContact();
@@ -128,7 +126,11 @@ namespace ngc {
                 if(m_spanElapsed + 1e-12 < completionElapsed) break;
                 completeSpan();
             }
-            publishSnapshot();
+            // Always publish terminal/held state even inside a decimated batch so
+            // NRT cannot observe completion before its matching final snapshot.
+            if(shouldPublishSnapshot || (executedActiveMotion && !m_active)
+               || m_snapshot.state != BackendState::Running)
+                publishSnapshot();
         }
 
         void runUntilIdle() {
@@ -377,8 +379,10 @@ namespace ngc {
     bool MockMotionBackend::tryTakeEvent(ExecutionEvent &event) noexcept { return m_impl->takeEvent(event); }
     bool MockMotionBackend::tryTakeSnapshot(ExecutionSnapshot &snapshot) noexcept { return m_impl->takeSnapshot(snapshot); }
     void MockMotionBackend::advance(const double seconds) { m_impl->advance(seconds); }
+    void MockMotionBackend::advanceTick(const double seconds, const bool publishSnapshot) {
+        m_impl->advance(seconds, publishSnapshot);
+    }
     void MockMotionBackend::runUntilIdle() { m_impl->runUntilIdle(); }
-    void MockMotionBackend::setPlaybackRate(const double rate) { m_impl->setPlaybackRate(rate); }
     bool MockMotionBackend::configureSyntheticProbe(const std::uint64_t probeId,
                                                      const position_t &physicalToolOffset,
                                                      const position_t &activeToolOffset) noexcept {
