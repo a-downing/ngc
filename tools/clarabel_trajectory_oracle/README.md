@@ -23,3 +23,18 @@ cargo run --release --manifest-path tools\clarabel_trajectory_oracle\Cargo.toml 
 ```
 
 The optional CSV contains the solved interval speeds, scalar acceleration, duration, and coupled acceleration norm for inspection.
+
+## Recorded comparisons
+
+These are development measurements, not executable trajectories or guaranteed lower bounds. The complete-program tests temporarily isolated their first compatible G64 feed/arc horizon. `adaptive_pockets.ngc` additionally used a temporary 64-pass local-correction ceiling because the committed 12-pass ceiling stops at its previously reported near-limit path-jerk failure.
+
+| Program/model | Motions | Intervals | Planner duration | Clarabel duration | Gap versus planner | Solve time |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Dense fixture, 16/piece | 22 | 688 | 2.424964579 s | 1.767305546 s | 27.120% | about 0.070 s |
+| `1001.ngc`, 16/piece | 242 | 5,504 | 95.447292693 s | 81.535928748 s | 14.575% | 0.619791 s |
+| `adaptive_pockets.ngc`, 4/piece | 5,164 | 38,640 | 622.540851901 s | 463.583039019 s | 25.534% | 10.052023 s |
+| `adaptive_pockets.ngc`, 16/piece | 5,164 | 154,560 | 622.540851901 s | 447.064353307 s | 28.187% | 35.462374 s |
+
+The adaptive result changed by 16.518685712 seconds between four and sixteen intervals per piece, so the four-interval model is too coarse. Sixteen intervals have not yet been proven converged. The refined result makes the current adaptive trajectory about 39.25% longer than the acceleration-only oracle, but dynamic jerk and discretization error prevent treating that entire difference as recoverable production time.
+
+Temporarily allowing up to 64 local correction passes let the existing planner compile all 5,164 adaptive-pocket motions and verify a 622.540851901-second trajectory. This indicates that the old 12-pass failure is an iteration-ceiling problem, not demonstrated path infeasibility. The source was restored afterward; these recorded measurements do not change planner behavior.

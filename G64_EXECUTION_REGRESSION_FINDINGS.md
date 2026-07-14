@@ -430,6 +430,20 @@ optimistic duration gap:              0.657659033 s (27.120%)
 Clarabel iterations / solve time:     22 / about 0.070 s
 ```
 
+Additional one-off measurements isolated the first compatible G64 feed/arc horizon from complete programs. The exporter source was restored afterward. `adaptive_pockets.ngc` also required temporarily raising `MAX_LOCAL_CORRECTION_PASSES` from 12 to 64 so the existing local correction algorithm could finish instead of returning its previously observed near-limit jerk failure.
+
+| Program/model | G64 motions | Oracle intervals | Current planner duration | Clarabel duration | Optimistic gap | Clarabel solve |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `1001.ngc`, 16 intervals/piece | 242 | 5,504 | 95.447292693 s | 81.535928748 s | 13.911363945 s (14.575%) | 0.619791 s |
+| `adaptive_pockets.ngc`, 4 intervals/piece | 5,164 | 38,640 | 622.540851901 s | 463.583039019 s | 158.957812883 s (25.534%) | 10.052023 s |
+| `adaptive_pockets.ngc`, 16 intervals/piece | 5,164 | 154,560 | 622.540851901 s | 447.064353307 s | 175.476498594 s (28.187%) | 35.462374 s |
+
+The corresponding planner/export wall times were about 17.3 seconds for `1001.ngc`, 56.4 seconds for the four-interval adaptive model, and 60.3 seconds for the sixteen-interval adaptive model. Relative to the Clarabel result, the current trajectory was about 17.1% longer on `1001.ngc` and 39.25% longer on the refined adaptive model.
+
+Increasing adaptive-pocket resolution from four to sixteen intervals per piece reduced the oracle duration by 16.518685712 seconds, or about 3.56% of the four-interval result. Four intervals are therefore demonstrably too coarse. Sixteen intervals are more informative but have not been shown converged; future comparisons should refine adaptively and stop only when duration and active constraints stabilize.
+
+The correction-pass experiment is also important. The 12-pass production ceiling failed with the last reported path-jerk excess already near the limit, while the otherwise unchanged algorithm completed the entire 5,164-motion horizon under a temporary 64-pass ceiling and produced the 622.540851901-second verified trajectory. This shows that the reported adaptive-pocket failure is a correction-iteration ceiling rather than proof that the path is infeasible. Merely raising the ceiling is not the intended near-time-optimal solution: it still repeats expensive whole-horizon reachability, Ruckig timing, polynomial emission, and exact verification, as reflected in the roughly one-minute export. The source was restored to 12 passes after measurement; no planner behavior was changed by this documentation-only checkpoint.
+
 The solver reaches the programmed 2.0 unit/s station speed and the configured 20.0 unit/s^2 aggregate acceleration boundary. The result is not executable and is not a safety proof: midpoint discretization needs refinement/convergence checks, and the SOCP omits dynamic jerk terms, especially `q'(s) s_jerk + 3 q''(s) s_dot s_ddot`. Geometry-derived `q'''(s) s_dot^3` velocity caps are retained, but the remaining jerk coupling means the 27.12% gap is an optimistic upper estimate of recoverable improvement. Ruckig construction and exact emitted-polynomial extrema remain the only execution authority.
 
 Use the oracle next as a diagnostic target: refine its stations until its acceleration-only duration converges, compare its station envelope against the current Ruckig boundaries, then add jerk-feasible `(s,v,a)` reachability toward that envelope. Do not copy the Clarabel profile directly into `PlanChunk`, do not call the solver from RT code, and do not weaken fatal post-generation verification.
@@ -438,7 +452,7 @@ Use the oracle next as a diagnostic target: refine its stations until its accele
 
 The C2 precision, fatal-error visibility, held-recovery, NRT span staging, multi-packet publication, moving packet stop-tail, command-activation ownership, local geometry caps, forward/backward velocity reachability, and first acceleration-carrying local Ruckig timing stage above are implemented. Continue in this order:
 
-1. Refine the Clarabel acceleration-only model adaptively until the dense fixture's duration and active acceleration constraints converge. Use it to distinguish discretization artifacts from real planner loss; retain the fixed short analytic regression.
+1. Refine the Clarabel acceleration-only model adaptively until duration and active acceleration constraints converge on the dense fixture and representative full-program horizons. The adaptive-pocket four-versus-sixteen result proves that four intervals per piece are insufficient. Retain the fixed short analytic regression.
 2. Replace the velocity-only station reachability envelope with acceleration-aware forward/backward `(s,v,a)` reachability. Maximize locally reachable station velocity/acceleration with Ruckig feasibility toward the Clarabel envelope, while preserving the zero-acceleration comparison and exact emitted-polynomial authority.
 3. Add adaptive production timing stations only where geometry/constraint variation requires them. Do not create a fixed multiplier of spans per G-code entity and do not treat timing stations as semantic stops. The oracle's fixed 16-way diagnostic subdivision is not the production strategy.
 4. Use the dense fixture to distinguish algorithmic loss from hard `q'''(s)v^3` blend limits. Add at least one fixture whose constraint transition genuinely benefits from acceleration carry and assert a measured duration reduction.
