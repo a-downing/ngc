@@ -132,7 +132,7 @@ add_executable(binary_to_compressed_c ${IMGUI_DIR}/misc/fonts/binary_to_compress
 
 add_executable(ngc_tests src/test.cpp)
 target_include_directories(ngc_tests PRIVATE src)
-target_link_libraries(ngc_tests PRIVATE ngc_core)
+target_link_libraries(ngc_tests PRIVATE ngc_core glm::glm-header-only)
 ngc_target_defaults(ngc_tests)
 add_test(NAME ngc_tests COMMAND ngc_tests)
 set_tests_properties(ngc_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})

@@ -65,7 +65,7 @@ The loader also owns the typed axis/joint topology, logical digital-input map, p
 - G91.1 uses incremental IJK center coordinates. G90.1 uses absolute center coordinates in the active work coordinate system without changing G90/G91 endpoint mode.
 - IJK arc validation rejects zero radius and radius mismatch beyond `Machine::arcTolerance()`. The tolerance is 0.0005 inch or the equivalent 0.0127 mm.
 - Arc preview and exact-stop planning share the project-owned endpoint-exact arc reference. It uses the directed sweep derived from the signed axis, supports CW/CCW major arcs, full circles, helical and non-XY arcs, and blends both radial arms so accepted decimal-IJK radius mismatch still reaches both canonical endpoints exactly.
-- G64 is accepted as a modal path mode. Its optional P word establishes a non-negative path tolerance, converted into configured machine units. G61/G61.1 clear the retained G64 tolerance. The execution driver now captures this mode and tolerance in an NRT planner envelope, but executable blending is not enabled: G64 commands deliberately compile through verified exact-stop fallback. G64 also enables the separate experimental preview spline visualization described below.
+- G64 is accepted as a modal path mode. Its optional P word establishes a non-negative machine-unit blend scale for the current preview experiment. G61/G61.1 clear the retained G64 P value. G64 currently has no execution or simulation semantics: every canonical motion remains exact-stop. It enables only the clamped six-control degree-three B-spline preview described below.
 - Rapid `MoveLine` commands currently use speed `-1` as a sentinel; this is not a physical negative feedrate.
 - G1, G2, and G3 require an established positive modal feedrate. A missing/non-positive feedrate must produce an `InterpreterError`; never dereference an absent modal `F` value or terminate the process.
 - `PANIC` is reserved for internal invariants, impossible enum/state combinations, and other program logic errors. Unsupported G/M codes, unsupported words or modes, malformed arcs, missing tools, invalid G10 operations, and other program-input failures must throw through the recoverable interpreter-error path.
@@ -80,9 +80,9 @@ Lines and adaptively subdivided circular/helical arcs are emitted through the sa
 
 Arc cubic subdivision is tolerance-verified. Verification preserves ordered association between each polynomial interval and its source-arc interval, recursively subdivides the polynomial Bezier control hull, and accepts it only inside an ordered source-chord capsule after reserving the reference curve's conservative second-derivative chord-error bound from `arc_chord_tolerance`. Do not replace this with unordered nearest-geometry sampling or a constant-radius bound: accepted rounded IJK arcs may have slightly different start and end radii. Consecutive planned commands must meet at their canonical endpoints without synthetic connector spans.
 
-`BoundedLookaheadTrajectoryPlanner` is the NRT executable-G64 foundation. It owns a hard 32-command canonical-input window and carries `ExecutablePathMode` plus the optional machine-unit tolerance outside `MachineCommand` and the RT contract. The current driver commits each entry immediately through exact-stop fallback, so its live window high-water mark remains one until complete command-boundary presentation metadata can safely accompany deeper interpreter read-ahead. The window API itself is bounded and order-preserving.
+`BoundedLookaheadTrajectoryPlanner` carries `ExecutablePathMode`, the optional machine-unit tolerance, and complete NRT command-boundary presentation outside `MachineCommand` and the RT contract, but executable lookahead is deliberately disabled. The driver plans and publishes one exact-stop command at a time. It still captures tool, tool-offset, WCS, modal, and active-block state at the command boundary so timed simulation never displays future interpreter read-ahead state.
 
-Every planner-produced `PlanChunk` passes a stop-branch gate before publication. The stop tail must be non-empty, continuous in position/velocity/acceleration from the immutable branch state through every span, respect aggregate and per-axis limits, match its declared terminal state, and finish stationary. Stop-tail insertion must check fixed-capacity failure explicitly. Today an exact-stop chunk uses one stationary tail span; the 16-span capacity is not a proof for future moving-state G64 stops. Difficult blends must slow earlier or fall back to exact stop if a verified stop continuation cannot fit.
+Every planner-produced `PlanChunk` passes a stop-branch gate before publication. The stop tail must be non-empty, continuous in position/velocity/acceleration from the immutable branch state through every span, respect aggregate and per-axis limits, match its declared terminal state, and finish stationary. Do not route preview spline geometry into execution or revive the discarded whole-window cubic refit. Future executable G64 must start from the approved piecewise geometry and add a separate time law.
 
 Planning diagnostics are NRT-only and report command/G64/fallback counts, lookahead and span high-water marks, planned duration, and last/maximum planning latency. Timed simulation exposes them through `SimulationSnapshot`; do not add them to `MotionBackend`.
 
@@ -96,7 +96,7 @@ Jogging uses the bounded `MotionBackend` control/event channel rather than synth
 
 ## Concurrency and lifecycle
 
-`Worker` and `SimulationWorker` each own a persistent `InterpreterSession` on a background thread. Both use `TrajectoryExecutionDriver` and `MockMotionBackend`; preview drains the mock backend immediately. Timed simulation uses a fixed configured servo timestep and a separate steady-clock scheduler period. Its integer speed multiplier changes the number of fixed servo ticks executed per scheduler wake; it must never enlarge the servo timestep. UI-only strings, WCS/modal metadata, tool overlays, and block lifecycle state remain in NRT presentation storage keyed by epoch/chunk ID and never cross the RT contract. Any mutation or traversal shared with the GUI must be protected by the owning worker mutex. Do not hold a GUI-facing mutex while waiting for future physical motion or probe completion.
+`Worker` and `SimulationWorker` each own a persistent `InterpreterSession` on a background thread. Both use `TrajectoryExecutionDriver` and `MockMotionBackend`; preview drains the mock backend immediately. Timed simulation uses a fixed configured servo timestep and a separate steady-clock scheduler period. Its integer speed multiplier changes the number of fixed servo ticks executed per scheduler wake; it must never enlarge the servo timestep. UI-only strings, WCS/modal metadata, tool overlays, and block lifecycle state remain in NRT presentation storage keyed by epoch/chunk and epoch/span ID and never cross the RT contract. Block completion discovered during lookahead is deferred to the chunk that owns the captured active block. Any mutation or traversal shared with the GUI must be protected by the owning worker mutex. Do not hold a GUI-facing mutex while waiting for future physical motion or probe completion.
 
 Timed simulation fills the executor's bounded queue before advancing so dense short-segment paths are not limited to one command per display/update cycle. Queue filling must stop at a probe barrier and resume only after the matching result is delivered. When the executor drains and interpretation can immediately provide more commands, do not impose the normal 8 ms timed wait.
 
@@ -139,27 +139,30 @@ Toolpath preview geometry is canonical program geometry: it is derived from emit
 
 `TrajectoryExecutionDriver` associates command presentation metadata with epoch/chunk identity outside the RT contract. G53 commands retain the modal WCS metadata even though their motion bypasses the work offset. `ToolpathRecorder` retains distinct WCS frames used by preview motion; timed simulation applies WCS/modal metadata only when the corresponding queued command becomes active, not when the interpreter reads ahead.
 
-## Experimental G64 spline preview
+## G64 spline preview and shared geometric research
 
-The preview spline work remains deliberately isolated experimentation, not executable trajectory planning. `ToolpathRecorder` retains the active G64 flag and optional machine-unit tolerance alongside each command without changing `MachineCommand`. Spline construction occurs only while rebuilding the revision-cached preview geometry. Do not route these preview splines into `MotionBackend`; the bounded executable planner independently carries G64 metadata but currently emits exact-stop fallback.
+`ToolpathRecorder` retains the active G64 flag and optional machine-unit P value alongside each command without changing `MachineCommand`. Preview spline construction occurs only while rebuilding revision-cached preview geometry. It is not executable trajectory planning and must never enter `MotionBackend`.
 
-Preserve exact canonical lines and arcs outside local blend neighborhoods. The experiment has two cases:
+Preserve exact canonical lines and arcs outside local blend neighborhoods. G64 P is a control-spacing/blend-scale parameter for this experiment, not a strict maximum-deviation tolerance. Each compatible entity receives the local scale
 
-- A simple eligible junction between sufficiently long adjacent feed lines/arcs uses one local clamped degree-five B-spline (represented as a quintic Bezier). The transition trims both entities, matches endpoint position, traversal tangent, and geometric curvature, and shrinks its trim distance until its control hull passes tolerance verification.
-- Consecutive entities shorter than `2P` form one cluster with no entity-count limit. The sufficiently long entities immediately before and after the run are trimmed external boundaries; they are not cluster interiors. The cluster fitter recursively creates local quintic spans through every short entity in source order. If the complete cluster cannot be verified, retain exact source geometry instead of displaying a partial fit.
+```text
+p_entity = min(P, entity_arc_length / 6)
+```
 
-Tolerance verification must preserve ordered source association. A spline-parameter interval may be checked only against its corresponding cumulative-source-length interval; distance to the unordered union of nearby geometry is invalid because it permits reversal, skipping, and shortcuts between spatially close passes. Verification recursively subdivides Bezier control hulls and accepts a subcurve only when its full hull lies in an associated source-segment capsule. Arc/reference sampling consumes a reserved portion of the error budget.
+Every compatible junction uses one clamped spline with exactly six controls. Its clamped endpoints are sampled `3*p_incoming` before and `3*p_outgoing` after the junction. On lines, its remaining controls lie exactly at incoming `2*p_incoming` and `p_incoming`, then outgoing `p_outgoing` and `2*p_outgoing`. For arcs, the interior controls are positioned from the clamped endpoint tangent and curvature so the spline is curvature-continuous with the retained arc. The tangent-handle length is fitted from the entity position two control steps into the blend, reducing unnecessary departure from the retained arc without sacrificing endpoint curvature. The junction itself is not a control point. Adjacent junction blends use the same local scale on their shared entity.
 
-G64 P remains the hard geometric bound, but cluster fitting intentionally targets a much smaller fraction of P to avoid visually excessive yet technically legal lobes. Endpoint derivative scale is bounded by local chord length, and artificial internal cluster boundaries use neutral curvature rather than amplifying segmented-source noise. A remaining experimental safeguard is to reject any transition whose control polygon is nonlocal relative to its assigned source interval, even if it passes the tolerance tube.
+An entity longer than `6P` retains an exact middle section. For an entity of arc length at most `6P`, the two trims meet at its arc-length midpoint, so the neighboring junction splines replace it continuously without a separate cluster fitter. Different incoming and outgoing entities may and normally do contribute different local scales to one junction.
+
+Every displayed junction spline is a clamped degree-three B-spline with exactly six controls and knot vector `[0,0,0,0,1,2,3,3,3,3]`. Do not evaluate the six controls as a degree-five Bezier curve, expose knot-inserted Bezier controls, or restore tolerance fitting or recursive cluster fitting.
 
 The overlay conventions are:
 
 - Simple junction splines are one-pixel magenta.
-- Short-entity cluster splines are one-pixel cyan.
+- Junction splines involving at least one entity of length `<= 6P` are one-pixel cyan.
 - Fitted control points are pale magenta and the control polygon is a thin dashed pale-magenta line.
-- G64 arc display tessellation is tolerance-adaptive so an analytically exact spline/arc junction does not appear displaced from a coarse rendered arc.
+- G64 arc display tessellation is scale-adaptive so an analytically C2 spline/arc junction does not appear displaced from a coarse rendered arc.
 
-Rapids, explicit G53 moves, probes, non-G64 motion, tolerance changes, and non-motion commands are protected boundaries and must not be blended across. Simple junction fitting rejects near-zero-length entities and near-180-degree reversals; cluster behavior must still be accepted only through ordered tube verification.
+Rapids, explicit G53 moves, probes, non-G64 motion, P changes, and non-motion commands are protected boundaries and must not be blended across. Reject only zero-length entities or discontinuous adjacent endpoints in this preview experiment; do not add angle, curvature, or locality rejection without a demonstrated failing path.
 
 ## UI toolpath conventions
 
@@ -173,7 +176,7 @@ Rapids, explicit G53 moves, probes, non-G64 motion, tolerance changes, and non-m
 - Explicit G53 line moves are yellow.
 - Rapid G0 lines use the normal coordinate-system color. Blue rapid lines use four-pixel dash/gap runs; yellow G53 rapid lines use ten-pixel runs. Yellow rapids render before blue rapids so blue remains visible where they overlap; rapid batches render after solid geometry.
 - Toolpath lines are two pixels wide with line/point smoothing and alpha blending enabled. Line endpoints and dark-green arc endpoints are three pixels.
-- Preview rendering is revision-cached. After `ToolpathRecorder` settles, commands are converted once into batched CPU vertex arrays for feed, rapid, G53, arc, probe, and endpoint geometry; arcs are tessellated once. Normal frames use a small number of `glDrawArrays` calls and must not traverse the command stream, retessellate arcs, or hold the worker mutex while drawing.
+- Preview rendering is revision-cached. After `ToolpathRecorder` settles, commands are converted once into batched vertex arrays for feed, rapid, G53, arc, probe, spline/control, and endpoint geometry; arcs are tessellated once and the combined static preview data is uploaded to a GPU buffer. Normal frames use a small number of buffered `glDrawArrays` calls and must not traverse the command stream, retessellate arcs, stream the complete preview repeatedly from CPU memory, or hold the worker mutex while drawing.
 - MCS is always shown. The final/current WCS is prominent; other WCS frames actually used by retained preview motion are dimmed and labeled. Timed simulation emphasizes the WCS captured with the active playback command.
 - The viewport FPS overlay is anchored to the bottom-right of the resizable 3D viewport, not the application window.
 - The simulated tool is a yellow wireframe cone with its diameter circle and center point at the wide spindle end and its tip at the physical cutter position.
@@ -185,14 +188,14 @@ MDI is currently connected only to simulated execution. Preserve a target-select
 
 Likely next steps are:
 
-1. Extend the bounded executable planner with the first tolerance-bounded G64 feed line-to-line blend. Retain eligible inputs long enough to plan a window, capture complete command-boundary presentation metadata before deeper interpreter read-ahead, and preserve exact-stop fallback at every protected or failed junction.
-2. Add moving-boundary time planning: curvature/axis velocity ceilings, forward/backward reachability, C2 time-domain cubic emission, and a verified capacity-bounded stop continuation for every immutable published prefix.
-3. Replace conservative chord-based arc subdivision with tolerance-verified cubic circular/helical approximation, while retaining the existing cubic RT representation; then extend executable G64 to arcs and short-entity clusters independently of the preview fitter.
+1. Finish visually validating the preview-only piecewise geometry: exact retained lines/arcs plus local scale-constructed six-control clamped degree-three B-spline blends.
+2. Design a separate time law over that approved geometry using curvature/axis velocity ceilings and forward/backward reachability. Do not refit the complete geometric path merely to obtain timing.
+3. Introduce moving-boundary immutable prefixes with a capacity-proven stop continuation, then bound planning horizon duration and feed-hold latency.
 4. Extend planning diagnostics with queue reserve and constraint margins. Later compare representative paths against a development-only offline optimizer before pursuing extra time-optimal complexity.
 5. Add a physical implementation of `MotionBackend` using the existing bounded SPSC execution/control/event/snapshot contract, including physical digital-input sampling for `TriggeredMove`, and define abort, fault, cancellation, and pending-trigger behavior before connecting hardware.
 6. Expand G38 support beyond G38.3 and test unsuccessful, aborted, and faulted probe results; later add R-form arcs and richer canonical records.
 
-Do not route the experimental preview spline fitter directly into execution. It is useful geometric research, but executable G64 must independently prove ordered path tolerance, per-axis constraints, and C2 time-domain continuity.
+Shared geometric fitting does not reduce executable proof obligations: executable G64 must independently prove ordered path tolerance, per-axis constraints, C2 time-domain continuity, bounded capacity, and stop safety.
 
 ## Worktree discipline
 

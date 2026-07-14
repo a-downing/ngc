@@ -1,0 +1,54 @@
+(G64 cubic blend-scale geometry test)
+(P2 means long entities retain their middle when length is greater than 12)
+G21 G17 G90
+G64 P2
+F600
+
+(Long line corners with varied angles)
+G0 X0 Y0
+G1 X20 Y0
+G1 X30 Y5
+G1 X42 Y5
+G1 X48 Y18
+G1 X65 Y18
+
+(Short unequal lines: lengths 3, 6, 9, and 4)
+G0 X0 Y40
+G1 X20 Y40
+G1 X23 Y40
+G1 X23 Y46
+G1 X32 Y46
+G1 X32 Y50
+G1 X50 Y50
+
+(Long line-arc and arc-line junctions)
+G0 X0 Y70
+G1 X20 Y70
+G3 X30 Y80 I0 J10
+G1 X45 Y80
+G3 X55 Y70 I10 J0
+G1 X72 Y70
+
+(Two short arcs with different neighboring side lengths)
+G0 X70 Y40
+G1 X85 Y40
+G3 X88 Y43 I0 J3
+G2 X91 Y46 I3 J0
+G1 X108 Y46
+
+(Arc-arc curvature reversal)
+G0 X0 Y100
+G1 X20 Y100
+G3 X30 Y110 I0 J10
+G2 X40 Y120 I10 J0
+G1 X58 Y120
+
+(Near and exact reversals)
+G0 X0 Y140
+G1 X20 Y140
+G1 X2 Y141
+G1 X20 Y142
+G1 X2 Y142
+G1 X20 Y142
+
+M2

@@ -12,8 +12,10 @@
 #include <string>
 #include <type_traits>
 #include <utility>
+#include <vector>
 
 #include "machine/ExactStopTrajectoryPlanner.h"
+#include "evaluator/InterpreterSession.h"
 
 namespace ngc {
     enum class ExecutablePathMode { ExactStop, Continuous };
@@ -23,21 +25,42 @@ namespace ngc {
         std::optional<double> pathTolerance;
     };
 
+    struct TrajectoryCommandPresentation {
+        ToolGeometry tool{};
+        position_t activeToolOffset{};
+        std::optional<WorkCoordinateSystem> workCoordinateSystem;
+        std::vector<std::string> modalGCodes;
+        std::vector<BlockExecution> activeBlocks;
+    };
+
     struct TrajectoryPlannerInput {
         MachineCommand command;
         TrajectoryPlanningMetadata metadata;
+        TrajectoryCommandPresentation presentation;
     };
 
     struct PlannedExecution {
         MachineCommand command;
         TrajectoryPlanningMetadata metadata;
         ExecutionItem item;
+        std::vector<TrajectoryPlannerInput> inputs;
+        std::vector<SpanId> activationSpans;
+
+        template<typename Item>
+        PlannedExecution(MachineCommand commandValue, TrajectoryPlanningMetadata metadataValue,
+                         Item &&itemValue, std::vector<TrajectoryPlannerInput> inputValues,
+                         std::vector<SpanId> activationSpanValues = {})
+            : command(std::move(commandValue)), metadata(std::move(metadataValue)),
+              item(std::forward<Item>(itemValue)), inputs(std::move(inputValues)),
+              activationSpans(std::move(activationSpanValues)) { }
     };
 
     struct TrajectoryPlanningDiagnostics {
         std::uint64_t commandsPlanned = 0;
         std::uint64_t continuousModeInputs = 0;
         std::uint64_t exactStopFallbacks = 0;
+        std::uint64_t blendedWindows = 0;
+        std::uint64_t blendedCommands = 0;
         std::size_t maximumWindowCommands = 0;
         std::uint32_t maximumNormalSpans = 0;
         std::uint32_t maximumStopSpans = 0;
@@ -46,10 +69,9 @@ namespace ngc {
         double maximumPlanningSeconds = 0.0;
     };
 
-    // NRT-only bounded command window. The first implementation deliberately
-    // commits every entry through the exact-stop planner. Future executable G64
-    // may retain eligible entries in this window, but every emitted PlanChunk
-    // must continue to pass the stop-branch gate below before publication.
+    // NRT-only bounded command window. Executable G64 is deliberately disabled
+    // while degree-three blend geometry is evaluated in preview; every command
+    // currently follows the verified exact-stop publication path.
     class BoundedLookaheadTrajectoryPlanner {
     public:
         static constexpr std::size_t MAX_LOOKAHEAD_COMMANDS = 32;
@@ -73,8 +95,37 @@ namespace ngc {
             if(input.metadata.pathMode != ExecutablePathMode::Continuous) return false;
             return std::visit([](const auto &command) {
                 using T = std::decay_t<decltype(command)>;
-                return std::same_as<T, MoveLine> || std::same_as<T, MoveArc>;
+                if constexpr(std::same_as<T,MoveLine>)
+                    return command.speed()>0.0&&!command.machineCoordinates();
+                else if constexpr(std::same_as<T,MoveArc>) return command.speed()>0.0;
+                else return false;
             }, input.command);
+        }
+
+        static bool samePosition(const position_t &left,const position_t &right) {
+            return (left-right).length()<=1e-12;
+        }
+
+        static bool sameProtectedPresentation(const TrajectoryCommandPresentation &left,
+                                               const TrajectoryCommandPresentation &right) {
+            if(!samePosition(left.activeToolOffset,right.activeToolOffset)) return false;
+            if(left.tool.number!=right.tool.number||left.tool.diameter!=right.tool.diameter
+               ||!samePosition(left.tool.offset,right.tool.offset)) return false;
+            if(left.workCoordinateSystem.has_value()!=right.workCoordinateSystem.has_value()) return false;
+            if(left.workCoordinateSystem&&
+               (left.workCoordinateSystem->name!=right.workCoordinateSystem->name
+                ||!samePosition(left.workCoordinateSystem->offset,right.workCoordinateSystem->offset))) return false;
+            const auto protectedModes=[](const std::vector<std::string> &modes) {
+                std::vector<std::string_view> result;
+                for(const auto &mode:modes) {
+                    if(mode=="G0"||mode=="G1"||mode=="G2"||mode=="G3"
+                       ||mode=="G38.2"||mode=="G38.3"||mode=="G38.4"||mode=="G38.5") continue;
+                    result.push_back(mode);
+                }
+                return result;
+            };
+            if(protectedModes(left.modalGCodes)!=protectedModes(right.modalGCodes)) return false;
+            return true;
         }
 
         static double maximumAxisVelocity(const AxisPolynomialSpan &span,
@@ -152,8 +203,9 @@ namespace ngc {
             return {};
         }
 
-        void record(const ExecutionItem &item, const double planningSeconds) {
-            ++m_diagnostics.commandsPlanned;
+        void record(const ExecutionItem &item, const double planningSeconds,
+                    const std::size_t commandCount=1) {
+            m_diagnostics.commandsPlanned+=commandCount;
             m_diagnostics.lastPlanningSeconds = planningSeconds;
             m_diagnostics.maximumPlanningSeconds = std::max(
                 m_diagnostics.maximumPlanningSeconds, planningSeconds);
@@ -182,12 +234,23 @@ namespace ngc {
         const TrajectoryPlanningDiagnostics &diagnostics() const { return m_diagnostics; }
         std::size_t windowSize() const { return m_window.size(); }
         bool full() const { return m_window.size() == MAX_LOOKAHEAD_COMMANDS; }
+        static bool eligibleForLookahead(const TrajectoryPlannerInput &input) {
+            (void)input;
+            return false;
+        }
+
+        bool canAppend(const TrajectoryPlannerInput &input) const {
+            if(full()) return false;
+            if(m_window.empty()) return true;
+            return continuousMotion(input) && continuousMotion(m_window.front())
+                && input.metadata.pathTolerance == m_window.front().metadata.pathTolerance
+                &&sameProtectedPresentation(input.presentation,m_window.back().presentation);
+        }
 
         bool enqueue(TrajectoryPlannerInput input) {
             if(full()) return false;
             if(continuousMotion(input)) {
                 ++m_diagnostics.continuousModeInputs;
-                ++m_diagnostics.exactStopFallbacks;
             }
             m_window.push_back(std::move(input));
             m_diagnostics.maximumWindowCommands = std::max(
@@ -200,6 +263,7 @@ namespace ngc {
             const auto started = std::chrono::steady_clock::now();
             auto input = std::move(m_window.front());
             m_window.pop_front();
+            if(continuousMotion(input)) ++m_diagnostics.exactStopFallbacks;
             auto item = std::visit([&](const auto &command) -> std::expected<ExecutionItem, std::string> {
                 using T = std::decay_t<decltype(command)>;
                 if constexpr(std::same_as<T, ProbeMove>) {
@@ -218,8 +282,21 @@ namespace ngc {
             const auto planningSeconds = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - started).count();
             record(*item, planningSeconds);
-            return std::make_unique<PlannedExecution>(PlannedExecution {
-                std::move(input.command), std::move(input.metadata), std::move(*item) });
+            const auto activation=std::visit([](const auto &value) -> SpanId {
+                using T=std::decay_t<decltype(value)>;
+                if constexpr(std::same_as<T,PlanChunk>) return value.normalMotion[0].id;
+                else return 0;
+            },*item);
+            return std::make_unique<PlannedExecution>(
+                input.command, input.metadata, std::move(*item),
+                std::vector<TrajectoryPlannerInput>{std::move(input)},
+                std::vector<SpanId>{activation});
+        }
+
+        std::expected<std::unique_ptr<PlannedExecution>, std::string> planWindow() {
+            // Preview-only G64 experiment: execution remains exact-stop until
+            // the cubic geometric path and a separate time law are ready.
+            return planOne();
         }
     };
 }

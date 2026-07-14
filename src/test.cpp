@@ -29,7 +29,9 @@
 #include "machine/TrajectoryExecutionDriver.h"
 #include "memory/Memory.h"
 #include "parser/Program.h"
+#include "PreviewSpline.h"
 #include "SimulationWorker.h"
+#include "Worker.h"
 
 namespace {
     constexpr double EPSILON = 1e-9;
@@ -106,6 +108,17 @@ namespace {
 
         execute(machine, "G61\n");
         require(!machine.pathTolerance(), "leaving G64 should clear its path tolerance");
+    }
+
+    void testG64BlendScaleGeometryProgramIsValid() {
+        const auto source=ngc::readFile("g64_blend_scale_test.ngc");
+        require(source.has_value(),source ? "" : source.error().what());
+        ngc::Machine machine(UNIT);
+        const auto commands=execute(machine,*source);
+        require(commands.size()>=30,"G64 blend-scale test should retain all geometry sections");
+        require(std::ranges::any_of(commands,[](const auto &command) {
+            return std::holds_alternative<ngc::MoveArc>(command);
+        }),"G64 blend-scale test should exercise arc junctions");
     }
 
     void testMemoryStackBounds() {
@@ -304,6 +317,49 @@ namespace {
         const auto message = std::format("adaptive-pockets simulation did not publish block lifecycle: status {} error '{}'",
                                          static_cast<int>(snapshot.status), snapshot.error);
         require(!snapshot.activeBlocks.empty() || !snapshot.completedLineFlags.empty(), message);
+        worker.join();
+    }
+
+    void test1001PreviewCompletesBoundedly() {
+        const auto hello = ngc::readFile("autoload/hello.ngc");
+        const auto world = ngc::readFile("autoload/world.ngc");
+        const auto toolChange = ngc::readFile("autoload/tool_change.ngc");
+        auto main = ngc::readFile("1001.ngc");
+        require(hello && world && toolChange && main, "1001 preview inputs should load");
+        const auto toolChangeBlock = main->find("N25 T13 M6");
+        require(toolChangeBlock != std::string::npos, "1001 should retain its expected tool-change block");
+        main->replace(toolChangeBlock, std::string_view("N25 T13 M6").size(), "N25 T13");
+
+        ngc::ToolTable tools;
+        const auto loadedTools = tools.load();
+        require(loadedTools.has_value(), loadedTools ? "" : loadedTools.error());
+
+        // A coarse mock tick keeps this regression focused on NRT G64 planning
+        // rather than the duration of immediate simulated playback.
+        Worker worker(UNIT, {}, 0.1);
+        require(worker.setToolTable(tools), "1001 preview should accept the tool table");
+        require(worker.compile({ { *hello, "autoload/hello.ngc" }, { *world, "autoload/world.ngc" },
+                                 { *toolChange, "autoload/tool_change.ngc" }, { *main, "1001.ngc" } }),
+                "1001 preview should start compilation");
+        for(int attempt = 0; attempt < 3000 && !worker.compiled(); ++attempt)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        require(worker.compiled(), "1001 preview should compile");
+
+        const auto initialRevision = worker.lock([&] { return worker.toolpath().revision(); });
+        const auto started = std::chrono::steady_clock::now();
+        require(worker.execute(), "1001 preview should start execution");
+        auto revision = initialRevision;
+        for(int attempt = 0; attempt < 5000; ++attempt) {
+            revision = worker.lock([&] { return worker.toolpath().revision(); });
+            if(revision > initialRevision && !worker.busy()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        const auto elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+        require(revision > initialRevision && !worker.busy(),
+                std::format("1001 preview did not finish in {:.3f} seconds", elapsed));
+        require(worker.lock([&] { return !worker.toolpath().commands().empty(); }),
+                "1001 preview should retain displayable canonical geometry");
         worker.join();
     }
 
@@ -1619,10 +1675,12 @@ namespace {
         require(planner.enqueue({
             ngc::MoveLine { {}, { 1, 0, 0, 0, 0, 0 }, 60.0 },
             { ngc::ExecutablePathMode::Continuous, 0.01 },
+            {},
         }), "bounded lookahead should accept a G64 motion");
         require(planner.enqueue({
             ngc::MoveLine { { 1, 0, 0, 0, 0, 0 }, { 2, 0, 0, 0, 0, 0 }, 60.0 },
             { ngc::ExecutablePathMode::ExactStop, std::nullopt },
+            {},
         }), "bounded lookahead should accept a following exact-stop motion");
         require(planner.windowSize() == 2,
                 "lookahead should retain canonical inputs in source order");
@@ -1650,10 +1708,31 @@ namespace {
         ngc::BoundedLookaheadTrajectoryPlanner bounded;
         bounded.reset(22);
         for(std::size_t index = 0; index < ngc::BoundedLookaheadTrajectoryPlanner::MAX_LOOKAHEAD_COMMANDS; ++index)
-            require(bounded.enqueue({ ngc::SpindleStop {}, {} }),
+            require(bounded.enqueue({ ngc::SpindleStop {}, {}, {} }),
                     "lookahead should accept every advertised bounded slot");
-        require(!bounded.enqueue({ ngc::SpindleStop {}, {} }),
+        require(!bounded.enqueue({ ngc::SpindleStop {}, {}, {} }),
                 "lookahead should reject input beyond its fixed command bound");
+
+        ngc::BoundedLookaheadTrajectoryPlanner protectedPlanner;
+        protectedPlanner.reset(23);
+        ngc::TrajectoryPlannerInput g54 {
+            ngc::MoveLine{{},{1,0,0,0,0,0},60.0},
+            {ngc::ExecutablePathMode::Continuous,0.1},
+            {},
+        };
+        g54.presentation.workCoordinateSystem=ngc::WorkCoordinateSystem{"G54",{}};
+        auto g55=g54;
+        g55.command=ngc::MoveLine{{1,0,0,0,0,0},{1,1,0,0,0,0},60.0};
+        g55.presentation.workCoordinateSystem=ngc::WorkCoordinateSystem{"G55",{}};
+        require(protectedPlanner.enqueue(g54),"protected-boundary test should enqueue its first motion");
+        require(!protectedPlanner.canAppend(g55),
+                "work-coordinate changes should remain protected G64 boundaries");
+        ngc::TrajectoryPlannerInput rapid {
+            ngc::MoveLine{{1,0,0,0,0,0},{2,0,0,0,0,0},-1.0},
+            {ngc::ExecutablePathMode::Continuous,0.1}, {},
+        };
+        require(!ngc::BoundedLookaheadTrajectoryPlanner::eligibleForLookahead(rapid),
+                "rapid moves should remain protected from G64 preview blending");
     }
 
     void testMockBackendAdvancesOneFixedServoTick() {
@@ -1683,6 +1762,175 @@ namespace {
         while(backend.tryTakeSnapshot(snapshot)) { }
         requireNear(snapshot.commanded.position.x, 1.0,
                     "ten fixed servo ticks should complete the 10 ms span exactly");
+    }
+
+    void testPreviewJunctionUsesOneSixControlSpline() {
+        const ngc::experimental::JunctionEntity incoming {
+            .length = 10.0,
+            .stateAtDistance = [](const double distance) {
+                return ngc::experimental::JunctionState {
+                    .position={distance,0.0,0.0},.tangent={1.0,0.0,0.0},.curvature={} };
+            },
+        };
+        const ngc::experimental::JunctionEntity outgoing {
+            .length = 10.0,
+            .stateAtDistance = [](const double distance) {
+                return ngc::experimental::JunctionState {
+                    .position={10.0,distance,0.0},.tangent={0.0,1.0,0.0},.curvature={} };
+            },
+        };
+        constexpr double scale=1.0;
+        const auto blend=ngc::experimental::fitJunction(incoming,outgoing,scale);
+        require(blend.has_value(),"preview corner should fit a single clamped spline");
+        require(blend->controlPoints.size()==6,
+                "a preview blend should have two clamped endpoint and four interior controls");
+        requireNear(blend->incomingTrim,3.0,
+                    "a long incoming entity should be trimmed by three times P");
+        requireNear(blend->outgoingTrim,3.0,
+                    "a long outgoing entity should be trimmed by three times P");
+        const auto &controls=blend->controlPoints;
+        const std::array expectedControls {
+            glm::dvec3(7,0,0),glm::dvec3(8,0,0),glm::dvec3(9,0,0),
+            glm::dvec3(10,1,0),glm::dvec3(10,2,0),glm::dvec3(10,3,0),
+        };
+        for(std::size_t control=0;control<expectedControls.size();++control)
+            require(glm::length(controls[control]-expectedControls[control])<1e-9,
+                    "line blend controls should be sampled at 3P, 2P, P / P, 2P, 3P");
+        require(std::ranges::none_of(controls,[](const auto &control) {
+            return glm::length(control-glm::dvec3(10,0,0))<1e-9;
+        }),"the junction should not be a spline control point");
+        require(glm::length(controls[1]-controls[0]-glm::dvec3(scale,0,0))<1e-9,
+                "incoming line controls should be spaced by its local P");
+        require(glm::length(controls[2]-controls[1]-glm::dvec3(scale,0,0))<1e-9,
+                "the first three incoming controls should remain equally spaced");
+        require(glm::length(controls[5]-controls[4]-glm::dvec3(0,scale,0))<1e-9,
+                "outgoing line controls should be spaced by its local P");
+        require(glm::length(controls[4]-controls[3]-glm::dvec3(0,scale,0))<1e-9,
+                "the last three outgoing controls should remain equally spaced");
+
+        const ngc::experimental::JunctionEntity curvedIncoming {
+            .length=10.0,
+            .stateAtDistance=[](const double distance) {
+                constexpr double radius=5.0;
+                const auto angle=(distance-10.0)/radius;
+                return ngc::experimental::JunctionState {
+                    .position={radius*std::sin(angle),radius*(1.0-std::cos(angle)),0.0},
+                    .tangent={std::cos(angle),std::sin(angle),0.0},
+                    .curvature={-std::sin(angle)/radius,std::cos(angle)/radius,0.0} };
+            },
+        };
+        const ngc::experimental::JunctionEntity curvedOutgoing {
+            .length=10.0,
+            .stateAtDistance=[](const double distance) {
+                constexpr double radius=5.0;
+                const auto angle=distance/radius;
+                return ngc::experimental::JunctionState {
+                    .position={radius*std::sin(angle),radius*(1.0-std::cos(angle)),0.0},
+                    .tangent={std::cos(angle),std::sin(angle),0.0},
+                    .curvature={-std::sin(angle)/radius,std::cos(angle)/radius,0.0} };
+            },
+        };
+        const auto curvedBlend=ngc::experimental::fitJunction(curvedIncoming,curvedOutgoing,scale);
+        require(curvedBlend.has_value(),"curved neighboring entities should produce a blend");
+        const auto geometricCurvature=[](const glm::dvec3 velocity,const glm::dvec3 acceleration) {
+            const auto speed=glm::length(velocity);
+            const auto tangent=velocity/speed;
+            return (acceleration-tangent*glm::dot(acceleration,tangent))/(speed*speed);
+        };
+        const auto &curvedControls=curvedBlend->controlPoints;
+        const auto incomingVelocity=3.0*(curvedControls[1]-curvedControls[0]);
+        const auto incomingAcceleration=3.0*curvedControls[2]-9.0*curvedControls[1]
+            +6.0*curvedControls[0];
+        const auto outgoingVelocity=3.0*(curvedControls[5]-curvedControls[4]);
+        const auto outgoingAcceleration=6.0*curvedControls[5]-9.0*curvedControls[4]
+            +3.0*curvedControls[3];
+        require(glm::length(geometricCurvature(incomingVelocity,incomingAcceleration)
+                            -curvedIncoming.stateAtDistance(7.0).curvature)<1e-9,
+                "incoming cubic B-spline endpoint should match arc curvature");
+        require(glm::length(geometricCurvature(outgoingVelocity,outgoingAcceleration)
+                            -curvedOutgoing.stateAtDistance(3.0).curvature)<1e-9,
+                "outgoing cubic B-spline endpoint should match arc curvature");
+        require(glm::length(curvedControls[1]-curvedControls[0])<scale
+                    &&glm::length(curvedControls[5]-curvedControls[4])<scale,
+                "arc geometry should shorten tangent handles when that better follows the arc");
+        require(glm::length(curvedControls[2]-curvedIncoming.stateAtDistance(9.0).position)<1e-9
+                    &&glm::length(curvedControls[3]-curvedOutgoing.stateAtDistance(1.0).position)<1e-9,
+                "circular-arc interior controls should use the curvature-matched nearby geometry");
+
+        const auto lineEntity=[](const glm::dvec3 from,const glm::dvec3 tangent,const double length) {
+            return ngc::experimental::JunctionEntity {
+                .length=length,
+                .stateAtDistance=[=](const double distance) {
+                    return ngc::experimental::JunctionState {
+                        .position=from+tangent*distance,.tangent=tangent,.curvature={} };
+                },
+            };
+        };
+        const auto longBefore=lineEntity({0,0,0},{1,0,0},12.0);
+        const auto shortEntity=lineEntity({12,0,0},{0,1,0},3.0);
+        const auto longAfter=lineEntity({12,3,0},{1,0,0},12.0);
+        const auto intoShort=ngc::experimental::fitJunction(longBefore,shortEntity,scale);
+        const auto outOfShort=ngc::experimental::fitJunction(shortEntity,longAfter,scale);
+        require(intoShort&&outOfShort,"both sides of a short entity should produce local blends");
+        requireNear(intoShort->outgoingScale,0.5,"a short entity should use length divided by six");
+        requireNear(outOfShort->incomingScale,0.5,"both sides should use the same short-entity scale");
+        const auto &leftMidpoint=intoShort->controlPoints;
+        const auto &rightMidpoint=outOfShort->controlPoints;
+        require(glm::length(leftMidpoint[5]-rightMidpoint[0])<1e-9,
+                "neighboring blends should meet at the short entity midpoint");
+        require(glm::length((leftMidpoint[5]-leftMidpoint[4])
+                            -(rightMidpoint[1]-rightMidpoint[0]))<1e-9,
+                "neighboring short-entity blends should share their midpoint tangent scale");
+        require(glm::length((leftMidpoint[5]-2.0*leftMidpoint[4]+leftMidpoint[3])
+                            -(rightMidpoint[2]-2.0*rightMidpoint[1]+rightMidpoint[0]))<1e-8,
+                "neighboring short-entity blends should be C2 at the midpoint");
+
+        const auto differentShort=lineEntity({12,3,0},{1,0,0},6.0);
+        const auto unequal=ngc::experimental::fitJunction(shortEntity,differentShort,scale);
+        require(unequal.has_value(),"unequal short sides should produce a blend");
+        requireNear(unequal->incomingScale,0.5,"incoming side should retain its own local scale");
+        requireNear(unequal->outgoingScale,1.0,"outgoing side should retain its own local scale");
+    }
+
+    void testBoundedPlannerUsesExactStopWhileG64IsPreviewOnly() {
+        ngc::BoundedLookaheadTrajectoryPlanner planner({
+            .pathAcceleration=5.0, .rapidSpeed=120.0, .arcChordTolerance=0.001, .pathJerk=20.0,
+            .axisVelocity={10,10,10,10,10,10},
+            .axisAcceleration={10,10,10,10,10,10},
+            .axisJerk={50,50,50,50,50,50},
+        });
+        const ngc::position_t p0{0,0,0,0,0,0}, p1{5,0,0,0,0,0}, p2{5,5,0,0,0,0};
+        planner.reset(70,p0);
+        const ngc::TrajectoryPlanningMetadata g64 {
+            .pathMode=ngc::ExecutablePathMode::Continuous, .pathTolerance=0.1,
+        };
+        require(planner.enqueue({ngc::MoveLine{p0,p1,120.0},g64,{}}), "first G64 line should enter lookahead");
+        require(planner.enqueue({ngc::MoveLine{p1,p2,120.0},g64,{}}), "second G64 line should enter lookahead");
+        const auto planned=planner.planWindow();
+        require(planned.has_value() && *planned, planned ? "G64 window produced no plan" : planned.error());
+        require((*planned)->inputs.size()==1, "preview-only G64 should plan one exact-stop command");
+        const auto *chunk=std::get_if<ngc::PlanChunk>(&(*planned)->item);
+        require(chunk && chunk->stopTail.size==1 && planner.diagnostics().exactStopFallbacks==1,
+                "preview-only G64 should retain the verified exact-stop execution path");
+    }
+
+    void testG64ArcExecutionRemainsExactStop() {
+        const ngc::TrajectoryPlanningMetadata g64 {
+            .pathMode=ngc::ExecutablePathMode::Continuous,.pathTolerance=0.1,
+        };
+        ngc::BoundedLookaheadTrajectoryPlanner arcPlanner({
+            .pathAcceleration=5.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,.pathJerk=20.0,
+        });
+        const ngc::position_t a0{-2,0,0,0,0,0},a1{-1,0,0,0,0,0},a2{0,-1,0,0,0,0};
+        arcPlanner.reset(71,a0);
+        require(arcPlanner.enqueue({ngc::MoveLine{a0,a1,60.0},g64,{}}),"G64 line should enter arc window");
+        require(arcPlanner.enqueue({ngc::MoveArc{a1,a2,{}, {0,0,1},60.0},g64,{}}),
+                "G64 arc should enter arc window");
+        const auto arcPlan=arcPlanner.planWindow();
+        require(arcPlan.has_value()&&*arcPlan,arcPlan?"arc G64 window produced no plan":arcPlan.error());
+        require((*arcPlan)->inputs.size()==1&&arcPlanner.diagnostics().exactStopFallbacks==1
+                    &&arcPlanner.diagnostics().blendedWindows==0,
+                "line/arc G64 should remain exact-stop while cubic blends are preview-only");
     }
 
     void testVerifiedCubicArcSpanCounts() {
@@ -2279,14 +2527,20 @@ namespace {
 
         int observedCommands = 0;
         int continuousCommands = 0;
+        std::vector<ngc::SpanId> activationSpans;
         ngc::ExecutionSnapshot latest;
         bool haveSnapshot = false;
         for(int guard = 0; guard < 10000 && driver.state() == ngc::TrajectoryDriverState::Running; ++guard) {
             for(int fill = 0; fill < 64; ++fill) {
                 if(!driver.pumpOne([](const auto &callback) { callback(); },
                                    [&](const ngc::MachineCommand &, const ngc::ExecutionItem &,
-                                       const ngc::TrajectoryPlanningMetadata &metadata) {
+                                       const ngc::TrajectoryPlanningMetadata &metadata,
+                                       const ngc::TrajectoryCommandPresentation &presentation,
+                                       const ngc::SpanId activationSpan) {
                                        ++observedCommands;
+                                       activationSpans.push_back(activationSpan);
+                                       require(!presentation.modalGCodes.empty(),
+                                               "lookahead should capture command-boundary modal presentation");
                                        if(metadata.pathMode == ngc::ExecutablePathMode::Continuous
                                           && metadata.pathTolerance == 0.01) ++continuousCommands;
                                    })) break;
@@ -2309,9 +2563,18 @@ namespace {
         require(observedCommands == 3, "trajectory driver should compile every canonical motion command once");
         require(continuousCommands == 3,
                 "trajectory driver should capture G64 metadata at each canonical command boundary");
+        require(std::ranges::is_sorted(activationSpans)&&std::ranges::all_of(activationSpans,
+                    [](const auto span) { return span!=0; }),
+                "combined G64 commands should retain ordered activation span identities");
         require(driver.planningDiagnostics().exactStopFallbacks == 3
+                    && driver.planningDiagnostics().blendedWindows == 0
+                    && driver.planningDiagnostics().blendedCommands == 0
                     && driver.planningDiagnostics().maximumWindowCommands == 1,
-                "driver should expose bounded exact-stop fallback diagnostics before blending is enabled");
+                std::format("driver G64 diagnostics mismatch (fallback={}, windows={}, commands={}, window={})",
+                    driver.planningDiagnostics().exactStopFallbacks,
+                    driver.planningDiagnostics().blendedWindows,
+                    driver.planningDiagnostics().blendedCommands,
+                    driver.planningDiagnostics().maximumWindowCommands));
         require(haveSnapshot, "mock RT backend should expose execution snapshots through SPSC communication");
         requireNear(latest.commanded.position.x, 2.0, "mock RT execution should reach the final planned X position");
         requireNear(latest.commanded.position.z, -1.0,
@@ -2417,12 +2680,14 @@ int main() {
         testFileHelpersHandleEmptyAndFailedIo();
         testRapidAndFeedMove();
         testG64IsAnInertPathModeFlag();
+        testG64BlendScaleGeometryProgramIsValid();
         testFeedMotionRequiresFeedrate();
         testUnsupportedCodesProduceInterpreterErrors();
         testFailedBlockRollsBackMachineState();
         testInterpreterCancellationInterruptsEvaluation();
         testSimulationWorkerStartsPlayback();
         testAdaptivePocketsStartsSimulation();
+        test1001PreviewCompletesBoundedly();
         testMdiToolChangeUsesAutoloadPrograms();
         testSimulationWorkerPersistsUntilReset();
         testInterpreterStatusMessagesPreserveOrder();
@@ -2457,6 +2722,9 @@ int main() {
         testExactStopPlannerCompilesLinesAndArcs();
         testExactStopPlannerEnforcesIndependentAxisLimits();
         testBoundedLookaheadCarriesG64MetadataAndStopFallbacks();
+        testPreviewJunctionUsesOneSixControlSpline();
+        testBoundedPlannerUsesExactStopWhileG64IsPreviewOnly();
+        testG64ArcExecutionRemainsExactStop();
         testVerifiedCubicArcSpanCounts();
         testPlannedArcsPreserveCanonicalEndpointContinuity();
         testRoundedRadiusArcPreservesDynamicLimits();

@@ -13,6 +13,7 @@
 #include <cstdint>
 #include <ranges>
 #include <numbers>
+#include <numeric>
 #include <limits>
 #include <optional>
 #include <utility>
@@ -131,6 +132,16 @@ class ApplicationImpl final {
     glm::dvec2 m_viewPan { 0.0, 0.0 };
     double m_viewHalfHeight = 6.0;
 
+    enum class PreviewBatch : std::size_t {
+        Feed, Rapid, G53Feed, G53Rapid, Arc, Probe, G64Spline, G64Cluster,
+        G64ControlPolygon, G64ControlPoints, DarkPoints, LightPoints, Count,
+    };
+
+    struct BufferedRange {
+        std::size_t first = 0;
+        std::size_t count = 0;
+    };
+
     struct PreviewRenderCache {
         std::optional<std::uint64_t> revision;
         std::optional<std::uint64_t> backendTrajectoryRevision;
@@ -149,11 +160,13 @@ class ApplicationImpl final {
         std::vector<glm::dvec3> backendTrajectoryPoints;
         std::vector<glm::dvec3> darkPoints;
         std::vector<glm::dvec3> lightPoints;
+        std::array<BufferedRange, static_cast<std::size_t>(PreviewBatch::Count)> bufferedRanges{};
     } m_previewRenderCache;
     GlGenBuffersProc m_glGenBuffers = nullptr;
     GlDeleteBuffersProc m_glDeleteBuffers = nullptr;
     GlBindBufferProc m_glBindBuffer = nullptr;
     GlBufferDataProc m_glBufferData = nullptr;
+    GLuint m_previewGeometryBuffer = 0;
     GLuint m_backendTrajectoryBuffer = 0;
     GLuint m_backendStopTailBuffer = 0;
     GLuint m_backendTrajectoryPointBuffer = 0;
@@ -288,11 +301,12 @@ public:
         m_glBindBuffer = reinterpret_cast<GlBindBufferProc>(glfwGetProcAddress("glBindBuffer"));
         m_glBufferData = reinterpret_cast<GlBufferDataProc>(glfwGetProcAddress("glBufferData"));
         if(m_glGenBuffers && m_glDeleteBuffers && m_glBindBuffer && m_glBufferData) {
-            GLuint buffers[3]{};
-            m_glGenBuffers(3, buffers);
-            m_backendTrajectoryBuffer = buffers[0];
-            m_backendStopTailBuffer = buffers[1];
-            m_backendTrajectoryPointBuffer = buffers[2];
+            GLuint buffers[4]{};
+            m_glGenBuffers(4, buffers);
+            m_previewGeometryBuffer = buffers[0];
+            m_backendTrajectoryBuffer = buffers[1];
+            m_backendStopTailBuffer = buffers[2];
+            m_backendTrajectoryPointBuffer = buffers[3];
         }
         auto result = m_tools.load();
 
@@ -328,9 +342,10 @@ public:
         m_simulation.join();
         m_worker.join();
         if(m_glDeleteBuffers) {
-            const GLuint buffers[] = { m_backendTrajectoryBuffer, m_backendStopTailBuffer,
-                                       m_backendTrajectoryPointBuffer };
-            m_glDeleteBuffers(3, buffers);
+            const GLuint buffers[] = { m_previewGeometryBuffer, m_backendTrajectoryBuffer,
+                                       m_backendStopTailBuffer, m_backendTrajectoryPointBuffer };
+            m_glDeleteBuffers(4, buffers);
+            m_previewGeometryBuffer = 0;
             m_backendTrajectoryBuffer = 0;
             m_backendStopTailBuffer = 0;
             m_backendTrajectoryPointBuffer = 0;
@@ -582,62 +597,33 @@ public:
             };
 
             std::vector<ngc::experimental::JunctionEntity> splineEntities;
-            std::optional<double> splineTolerance;
+            std::optional<double> splineScale;
             const auto flushSpline = [&] {
-                if(!splineTolerance) return;
-                std::vector<bool> coveredJunctions(splineEntities.size() > 1 ? splineEntities.size() - 1 : 0, false);
-                std::vector<bool> clusterEntity(splineEntities.size(), false);
-                for(std::size_t i = 0; i < splineEntities.size(); ++i) {
-                    clusterEntity[i] = splineEntities[i].length < 2.0 * *splineTolerance;
-                }
-                for(std::size_t entity = 0; entity < splineEntities.size();) {
-                    if(!clusterEntity[entity]) { ++entity; continue; }
-                    const auto firstShort = entity;
-                    while(entity + 1 < splineEntities.size()
-                          && clusterEntity[entity + 1]) ++entity;
-                    const auto lastShort = entity;
-                    if(firstShort > 0 && lastShort + 1 < splineEntities.size()) {
-                        std::vector<ngc::experimental::JunctionEntity> clusterEntities(
-                            splineEntities.begin() + static_cast<std::ptrdiff_t>(firstShort - 1),
-                            splineEntities.begin() + static_cast<std::ptrdiff_t>(lastShort + 2));
-                        if(const auto cluster = ngc::experimental::fitCluster(clusterEntities, *splineTolerance)) {
-                            for(std::size_t junction = firstShort - 1; junction <= lastShort; ++junction) {
-                                coveredJunctions[junction] = true;
-                            }
-                            for(const auto &span : cluster->spans) {
-                                ngc::experimental::tessellateJunction(span, cache.g64ClusterSplineLines);
-                                cache.g64ControlPoints.insert(cache.g64ControlPoints.end(),
-                                    span.controlPoints.begin(), span.controlPoints.end());
-                                for(std::size_t control = 1; control < span.controlPoints.size(); ++control) {
-                                    segment(cache.g64ControlPolygon,
-                                            span.controlPoints[control - 1], span.controlPoints[control]);
-                                }
-                            }
-                        }
-                    }
-                    ++entity;
-                }
+                if(!splineScale) return;
                 for(std::size_t i = 1; i < splineEntities.size(); ++i) {
-                    if(coveredJunctions[i - 1]) continue;
                     const auto blend = ngc::experimental::fitJunction(
-                        splineEntities[i - 1], splineEntities[i], *splineTolerance);
+                        splineEntities[i - 1], splineEntities[i], *splineScale);
                     if(!blend) continue;
-                    const auto &splineControlPoints = blend->controlPoints;
-                    ngc::experimental::tessellateJunction(*blend, cache.g64SplineLines);
+                    const auto shortEntity = splineEntities[i - 1].length <= 6.0 * *splineScale
+                        || splineEntities[i].length <= 6.0 * *splineScale;
+                    auto &splineLines = shortEntity
+                        ? cache.g64ClusterSplineLines : cache.g64SplineLines;
+                    ngc::experimental::tessellateJunction(*blend, splineLines);
                     cache.g64ControlPoints.insert(cache.g64ControlPoints.end(),
-                                                  splineControlPoints.begin(), splineControlPoints.end());
-                    for(std::size_t i = 1; i < splineControlPoints.size(); ++i) {
-                        segment(cache.g64ControlPolygon, splineControlPoints[i - 1], splineControlPoints[i]);
+                                                  blend->controlPoints.begin(), blend->controlPoints.end());
+                    for(std::size_t control = 1; control < blend->controlPoints.size(); ++control) {
+                        segment(cache.g64ControlPolygon, blend->controlPoints[control - 1],
+                                blend->controlPoints[control]);
                     }
                 }
                 splineEntities.clear();
-                splineTolerance.reset();
+                splineScale.reset();
             };
-            const auto beginSpline = [&](const std::optional<double> programmedTolerance) {
-                constexpr double DEFAULT_EXPERIMENTAL_TOLERANCE = 0.001;
-                const auto tolerance = std::max(programmedTolerance.value_or(DEFAULT_EXPERIMENTAL_TOLERANCE), 1e-9);
-                if(splineTolerance && std::abs(*splineTolerance - tolerance) > 1e-12) flushSpline();
-                splineTolerance = tolerance;
+            const auto beginSpline = [&](const std::optional<double> programmedScale) {
+                constexpr double DEFAULT_EXPERIMENTAL_SCALE = 0.001;
+                const auto scale = std::max(programmedScale.value_or(DEFAULT_EXPERIMENTAL_SCALE), 1e-9);
+                if(splineScale && std::abs(*splineScale - scale) > 1e-12) flushSpline();
+                splineScale = scale;
             };
             const auto lineEntity = [](const glm::dvec3 &from, const glm::dvec3 &to) {
                 const auto delta = to - from;
@@ -666,27 +652,36 @@ public:
                     .stateAtDistance = [=](const double distance) {
                         const auto s = std::clamp(distance, 0.0, length);
                         const auto h = std::clamp(length * 1e-4, 1e-7, std::max(length * 0.01, 1e-7));
-                        glm::dvec3 tangent;
-                        glm::dvec3 curvature;
+                        glm::dvec3 p0, p1, p2;
+                        bool useFirstTangent = false;
+                        bool useLastTangent = false;
                         if(s <= h) {
-                            const auto p0 = positionAt(s);
-                            const auto p1 = positionAt(std::min(s + h, length));
-                            const auto p2 = positionAt(std::min(s + 2.0 * h, length));
-                            tangent = glm::normalize(p1 - p0);
-                            curvature = (p2 - 2.0 * p1 + p0) / (h * h);
+                            p0 = positionAt(s);
+                            p1 = positionAt(std::min(s + h, length));
+                            p2 = positionAt(std::min(s + 2.0 * h, length));
+                            useFirstTangent = true;
                         } else if(s + h >= length) {
-                            const auto p0 = positionAt(s);
-                            const auto p1 = positionAt(std::max(s - h, 0.0));
-                            const auto p2 = positionAt(std::max(s - 2.0 * h, 0.0));
-                            tangent = glm::normalize(p0 - p1);
-                            curvature = (p0 - 2.0 * p1 + p2) / (h * h);
+                            p0 = positionAt(std::max(s - 2.0 * h, 0.0));
+                            p1 = positionAt(std::max(s - h, 0.0));
+                            p2 = positionAt(s);
+                            useLastTangent = true;
                         } else {
-                            const auto before = positionAt(s - h);
-                            const auto current = positionAt(s);
-                            const auto after = positionAt(s + h);
-                            tangent = glm::normalize(after - before);
-                            curvature = (after - 2.0 * current + before) / (h * h);
+                            p0 = positionAt(s - h);
+                            p1 = positionAt(s);
+                            p2 = positionAt(s + h);
                         }
+                        const auto firstDelta = p1 - p0;
+                        const auto secondDelta = p2 - p1;
+                        const auto firstLength = glm::length(firstDelta);
+                        const auto secondLength = glm::length(secondDelta);
+                        const auto firstTangent = firstDelta / std::max(firstLength, 1e-15);
+                        const auto secondTangent = secondDelta / std::max(secondLength, 1e-15);
+                        auto tangent = useFirstTangent ? firstTangent
+                                     : useLastTangent ? secondTangent
+                                     : glm::normalize(firstTangent + secondTangent);
+                        auto curvature = (secondTangent - firstTangent)
+                            / std::max(0.5 * (firstLength + secondLength), 1e-15);
+                        curvature -= tangent * glm::dot(curvature, tangent);
                         return ngc::experimental::JunctionState {
                             .position = positionAt(s), .tangent = tangent, .curvature = curvature };
                     },
@@ -725,7 +720,7 @@ public:
                             const auto radius = std::sqrt(geometry->startArm.x * geometry->startArm.x
                                 + geometry->startArm.y * geometry->startArm.y
                                 + geometry->startArm.z * geometry->startArm.z);
-                            const auto displayTolerance = std::max(*splineTolerance * 0.02, 1e-9);
+                            const auto displayTolerance = std::max(*splineScale * 0.02, 1e-9);
                             if(radius > displayTolerance) {
                                 const auto halfAngle = std::acos(std::clamp(
                                     1.0 - displayTolerance / radius, -1.0, 1.0));
@@ -773,6 +768,31 @@ public:
                            static_cast<std::ptrdiff_t>(vertices.size() * sizeof(glm::dvec3)),
                            vertices.empty() ? nullptr : vertices.data(), GL_STATIC_DRAW_VALUE);
         };
+        std::vector<glm::dvec3> previewVertices;
+        const std::array previewBatches {
+            std::pair {PreviewBatch::Feed, &m_previewRenderCache.feedLines},
+            std::pair {PreviewBatch::Rapid, &m_previewRenderCache.rapidLines},
+            std::pair {PreviewBatch::G53Feed, &m_previewRenderCache.g53FeedLines},
+            std::pair {PreviewBatch::G53Rapid, &m_previewRenderCache.g53RapidLines},
+            std::pair {PreviewBatch::Arc, &m_previewRenderCache.arcLines},
+            std::pair {PreviewBatch::Probe, &m_previewRenderCache.probeLines},
+            std::pair {PreviewBatch::G64Spline, &m_previewRenderCache.g64SplineLines},
+            std::pair {PreviewBatch::G64Cluster, &m_previewRenderCache.g64ClusterSplineLines},
+            std::pair {PreviewBatch::G64ControlPolygon, &m_previewRenderCache.g64ControlPolygon},
+            std::pair {PreviewBatch::G64ControlPoints, &m_previewRenderCache.g64ControlPoints},
+            std::pair {PreviewBatch::DarkPoints, &m_previewRenderCache.darkPoints},
+            std::pair {PreviewBatch::LightPoints, &m_previewRenderCache.lightPoints},
+        };
+        const auto previewVertexCount = std::accumulate(
+            previewBatches.begin(), previewBatches.end(), std::size_t{},
+            [](const std::size_t count, const auto &batch) { return count + batch.second->size(); });
+        previewVertices.reserve(previewVertexCount);
+        for(const auto &[batch, vertices] : previewBatches) {
+            auto &range = m_previewRenderCache.bufferedRanges[static_cast<std::size_t>(batch)];
+            range = { previewVertices.size(), vertices->size() };
+            previewVertices.insert(previewVertices.end(), vertices->begin(), vertices->end());
+        }
+        upload(m_previewGeometryBuffer, previewVertices);
         upload(m_backendTrajectoryBuffer, m_previewRenderCache.backendTrajectoryLines);
         upload(m_backendStopTailBuffer, m_previewRenderCache.backendStopTailLines);
         upload(m_backendTrajectoryPointBuffer, m_previewRenderCache.backendTrajectoryPoints);
@@ -999,54 +1019,80 @@ public:
             glDisableClientState(GL_VERTEX_ARRAY);
             if(stippleFactor > 0) glDisable(GL_LINE_STIPPLE);
         };
-        const auto drawBufferedVertices = [&](const GLuint buffer, const std::size_t count,
+        const auto drawBufferedVertices = [&](const GLuint buffer, const std::size_t first,
+                                              const std::size_t count,
                                               const GLenum primitive, const double red,
-                                              const double green, const double blue) {
+                                              const double green, const double blue,
+                                              const int stippleFactor = 0,
+                                              const GLushort stipplePattern = 0xFFFF) {
             if(buffer == 0 || count == 0 || !m_glBindBuffer) return false;
+            if(stippleFactor > 0) {
+                glEnable(GL_LINE_STIPPLE);
+                glLineStipple(stippleFactor, stipplePattern);
+            }
             glColor3d(red, green, blue);
             m_glBindBuffer(GL_ARRAY_BUFFER_VALUE, buffer);
             glEnableClientState(GL_VERTEX_ARRAY);
-            glVertexPointer(3, GL_DOUBLE, sizeof(glm::dvec3), nullptr);
+            glVertexPointer(3, GL_DOUBLE, sizeof(glm::dvec3),
+                            reinterpret_cast<const void *>(first * sizeof(glm::dvec3)));
             glDrawArrays(primitive, 0, static_cast<GLsizei>(count));
             glDisableClientState(GL_VERTEX_ARRAY);
             m_glBindBuffer(GL_ARRAY_BUFFER_VALUE, 0);
+            if(stippleFactor > 0) glDisable(GL_LINE_STIPPLE);
             return true;
+        };
+        const auto drawPreview = [&](const PreviewBatch batch,
+                                     const std::vector<glm::dvec3> &fallback,
+                                     const GLenum primitive, const double red,
+                                     const double green, const double blue,
+                                     const int stippleFactor = 0,
+                                     const GLushort stipplePattern = 0xFFFF) {
+            const auto &range = m_previewRenderCache.bufferedRanges[static_cast<std::size_t>(batch)];
+            if(!drawBufferedVertices(m_previewGeometryBuffer, range.first, range.count,
+                                     primitive, red, green, blue, stippleFactor, stipplePattern))
+                drawVertices(fallback, primitive, red, green, blue, stippleFactor, stipplePattern);
         };
 
         if(m_glBindBuffer) m_glBindBuffer(GL_ARRAY_BUFFER_VALUE, 0);
         glLineWidth(2.0f);
-        drawVertices(m_previewRenderCache.feedLines, GL_LINES, 0.4f, 0.4f, 1.0f);
-        drawVertices(m_previewRenderCache.g53FeedLines, GL_LINES, 1.0f, 1.0f, 0.4f);
-        drawVertices(m_previewRenderCache.arcLines, GL_LINES, 0.4f, 1.0f, 0.4f);
-        drawVertices(m_previewRenderCache.probeLines, GL_LINES, 1.0f, 0.4f, 0.2f);
+        drawPreview(PreviewBatch::Feed, m_previewRenderCache.feedLines, GL_LINES, 0.4f, 0.4f, 1.0f);
+        drawPreview(PreviewBatch::G53Feed, m_previewRenderCache.g53FeedLines, GL_LINES, 1.0f, 1.0f, 0.4f);
+        drawPreview(PreviewBatch::Arc, m_previewRenderCache.arcLines, GL_LINES, 0.4f, 1.0f, 0.4f);
+        drawPreview(PreviewBatch::Probe, m_previewRenderCache.probeLines, GL_LINES, 1.0f, 0.4f, 0.2f);
         glLineWidth(1.0f);
-        drawVertices(m_previewRenderCache.g64SplineLines, GL_LINES, 1.0f, 0.2f, 1.0f);
-        drawVertices(m_previewRenderCache.g64ClusterSplineLines, GL_LINES, 0.1f, 1.0f, 1.0f);
+        drawPreview(PreviewBatch::G64Spline, m_previewRenderCache.g64SplineLines, GL_LINES, 1.0f, 0.2f, 1.0f);
+        drawPreview(PreviewBatch::G64Cluster, m_previewRenderCache.g64ClusterSplineLines, GL_LINES, 0.1f, 1.0f, 1.0f);
         glLineWidth(1.0f);
-        drawVertices(m_previewRenderCache.g64ControlPolygon, GL_LINES, 0.95f, 0.65f, 1.0f, 2, 0x3333);
+        drawPreview(PreviewBatch::G64ControlPolygon, m_previewRenderCache.g64ControlPolygon,
+                    GL_LINES, 0.95f, 0.65f, 1.0f, 2, 0x3333);
         glPointSize(6.0f);
-        drawVertices(m_previewRenderCache.g64ControlPoints, GL_POINTS, 1.0f, 0.75f, 1.0f);
+        drawPreview(PreviewBatch::G64ControlPoints, m_previewRenderCache.g64ControlPoints,
+                    GL_POINTS, 1.0f, 0.75f, 1.0f);
         glPointSize(3.0f);
         glLineWidth(2.0f);
-        drawVertices(m_previewRenderCache.g53RapidLines, GL_LINES, 1.0f, 1.0f, 0.4f, 10, 0x5555);
-        drawVertices(m_previewRenderCache.rapidLines, GL_LINES, 0.4f, 0.4f, 1.0f, 4, 0x5555);
+        drawPreview(PreviewBatch::G53Rapid, m_previewRenderCache.g53RapidLines,
+                    GL_LINES, 1.0f, 1.0f, 0.4f, 10, 0x5555);
+        drawPreview(PreviewBatch::Rapid, m_previewRenderCache.rapidLines,
+                    GL_LINES, 0.4f, 0.4f, 1.0f, 4, 0x5555);
         glEnable(GL_POINT_SMOOTH);
         glPointSize(3.0f);
-        drawVertices(m_previewRenderCache.darkPoints, GL_POINTS, 0.0f, 0.0f, 0.0f);
-        drawVertices(m_previewRenderCache.lightPoints, GL_POINTS, 0.1f, 0.55f, 0.1f);
+        drawPreview(PreviewBatch::DarkPoints, m_previewRenderCache.darkPoints,
+                    GL_POINTS, 0.0f, 0.0f, 0.0f);
+        drawPreview(PreviewBatch::LightPoints, m_previewRenderCache.lightPoints,
+                    GL_POINTS, 0.1f, 0.55f, 0.1f);
         glDisable(GL_LINE_SMOOTH);
         glDisable(GL_POINT_SMOOTH);
         glLineWidth(1.0f);
-        if(!drawBufferedVertices(m_backendTrajectoryBuffer,
+        if(!drawBufferedVertices(m_backendTrajectoryBuffer, 0,
                                 m_previewRenderCache.backendTrajectoryLines.size(),
                                 GL_LINE_STRIP, 1.0f, 0.15f, 0.15f))
             drawVertices(m_previewRenderCache.backendTrajectoryLines, GL_LINE_STRIP, 1.0f, 0.15f, 0.15f);
-        if(!drawBufferedVertices(m_backendStopTailBuffer,
+        if(!drawBufferedVertices(m_backendStopTailBuffer, 0,
                                 m_previewRenderCache.backendStopTailLines.size(),
                                 GL_LINES, 1.0f, 1.0f, 1.0f))
             drawVertices(m_previewRenderCache.backendStopTailLines, GL_LINES, 1.0f, 1.0f, 1.0f);
         glPointSize(1.0f);
-        if(!drawBufferedVertices(m_backendTrajectoryPointBuffer,
+        if(!drawBufferedVertices(m_backendTrajectoryPointBuffer, 0,
                                 m_previewRenderCache.backendTrajectoryPoints.size(),
                                 GL_POINTS, 0.0f, 0.0f, 0.0f))
             drawVertices(m_previewRenderCache.backendTrajectoryPoints, GL_POINTS, 0.0f, 0.0f, 0.0f);

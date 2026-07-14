@@ -196,18 +196,18 @@ private:
                     std::scoped_lock lock(m_mutex);
                     callback();
                 }, [&](const ngc::MachineCommand &command, const ngc::ExecutionItem &item,
-                       const ngc::TrajectoryPlanningMetadata &planning) {
+                       const ngc::TrajectoryPlanningMetadata &planning,
+                       const ngc::TrajectoryCommandPresentation &presentation, const ngc::SpanId) {
                     std::scoped_lock lock(m_mutex);
                     if(std::holds_alternative<ngc::ProbeMove>(command)) {
                         const auto &move = std::get<ngc::TriggeredMove>(item);
-                        const auto contact = move.target + m_session.machine().toolGeometry().offset
-                            - m_session.machine().toolOffset();
+                        const auto contact = move.target + presentation.tool.offset
+                            - presentation.activeToolOffset;
                         (void)m_backend.configureSyntheticInput(move.moveId, contact);
                     }
-                    const ngc::WorkCoordinateSystem workCoordinateSystem {
-                        std::string(ngc::name(*m_session.machine().state().modeCoordSys)),
-                        m_session.machine().workOffset() };
-                    m_toolpath.consume(command, m_session.machine().toolOffset(), workCoordinateSystem,
+                    const auto workCoordinateSystem=presentation.workCoordinateSystem.value_or(
+                        ngc::WorkCoordinateSystem{"G54",{}});
+                    m_toolpath.consume(command, presentation.activeToolOffset, workCoordinateSystem,
                         planning.pathMode == ngc::ExecutablePathMode::Continuous,
                         planning.pathTolerance);
                 })) break;

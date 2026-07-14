@@ -46,7 +46,12 @@ class SimulationWorker {
     ngc::TrajectoryLimits m_limits;
     ngc::SimulationSnapshot m_snapshot;
     using ChunkKey = std::pair<ngc::EpochId, ngc::ChunkId>;
+    using SpanKey = std::pair<ngc::EpochId, ngc::SpanId>;
     std::map<ChunkKey, ChunkPresentation> m_chunks;
+    std::map<SpanKey, ChunkPresentation> m_spanPresentations;
+    std::map<ChunkKey, ngc::SpanId> m_chunkFirstSpan;
+    std::map<std::uint64_t, ChunkKey> m_blockChunks;
+    std::map<std::uint64_t, ngc::BlockExecution> m_deferredCompletedBlocks;
     std::set<ChunkKey> m_retiredChunks;
     std::vector<ngc::BlockExecution> m_interpretedBlocks;
     std::optional<ChunkKey> m_lastChunk;
@@ -229,6 +234,10 @@ public:
 private:
     void clearPresentation() {
         m_chunks.clear();
+        m_spanPresentations.clear();
+        m_chunkFirstSpan.clear();
+        m_blockChunks.clear();
+        m_deferredCompletedBlocks.clear();
         m_retiredChunks.clear();
         m_interpretedBlocks.clear();
         m_lastChunk.reset();
@@ -248,35 +257,54 @@ private:
         }
         const auto match = std::ranges::find_if(m_interpretedBlocks, [&](const auto &block) { return block.id == lifecycle.block.id; });
         if(match != m_interpretedBlocks.end()) m_interpretedBlocks.erase(match);
-        if(m_lastChunk && !m_retiredChunks.contains(*m_lastChunk))
-            m_chunks[*m_lastChunk].completedBlocks.push_back(lifecycle.block);
-        else
-            completeBlock(lifecycle.block);
+        if(const auto owner=m_blockChunks.find(lifecycle.block.id);owner!=m_blockChunks.end()) {
+            if(m_retiredChunks.contains(owner->second)) completeBlock(lifecycle.block);
+            else m_chunks[owner->second].completedBlocks.push_back(lifecycle.block);
+        } else m_deferredCompletedBlocks.insert_or_assign(lifecycle.block.id,lifecycle.block);
     }
 
-    void observeCommand(const ngc::MachineCommand &command, const ngc::ExecutionItem &item) {
+    void observeCommand(const ngc::MachineCommand &command, const ngc::ExecutionItem &item,
+                        const ngc::TrajectoryCommandPresentation &captured,
+                        const ngc::SpanId activationSpan) {
         ChunkPresentation presentation;
-        presentation.tool = m_session.machine().toolGeometry();
-        presentation.activeToolOffset = m_session.machine().toolOffset();
-        presentation.workCoordinateSystem = ngc::WorkCoordinateSystem {
-            std::string(ngc::name(*m_session.machine().state().modeCoordSys)), m_session.machine().workOffset() };
-        presentation.modalGCodes = m_session.machine().activeModalGCodes();
-        presentation.activeBlocks = m_interpretedBlocks;
+        presentation.tool = captured.tool;
+        presentation.activeToolOffset = captured.activeToolOffset;
+        presentation.workCoordinateSystem = captured.workCoordinateSystem;
+        presentation.modalGCodes = captured.modalGCodes;
+        presentation.activeBlocks = captured.activeBlocks;
         presentation.command = command;
         const auto key = std::visit([](const auto &value) { return ChunkKey { value.epoch, value.id }; }, item);
+        for(const auto &block:captured.activeBlocks) {
+            m_blockChunks.insert_or_assign(block.id,key);
+            if(const auto completed=m_deferredCompletedBlocks.find(block.id);
+               completed!=m_deferredCompletedBlocks.end()) {
+                presentation.completedBlocks.push_back(completed->second);
+                m_deferredCompletedBlocks.erase(completed);
+            }
+        }
         if(std::holds_alternative<ngc::ProbeMove>(command)) {
             const auto &move = std::get<ngc::TriggeredMove>(item);
             const auto contact = move.target + presentation.tool.offset - presentation.activeToolOffset;
             (void)m_backend.configureSyntheticInput(move.moveId, contact);
         }
+        if(activationSpan!=0) {
+            m_spanPresentations.insert_or_assign({key.first,activationSpan},presentation);
+            m_chunkFirstSpan.try_emplace(key,activationSpan);
+        }
+        if(const auto existing=m_chunks.find(key);existing!=m_chunks.end())
+            presentation.completedBlocks.insert(presentation.completedBlocks.end(),
+                existing->second.completedBlocks.begin(),existing->second.completedBlocks.end());
         m_chunks.insert_or_assign(key, std::move(presentation));
         m_lastChunk = key;
     }
 
     void observeBackendEvent(const ngc::ExecutionEvent &event) {
         if(const auto *accepted = std::get_if<ngc::ChunkAccepted>(&event)) {
-            const auto found = m_chunks.find({ accepted->epoch, accepted->chunk });
-            if(found != m_chunks.end()) applyPresentation(found->second);
+            const ChunkKey key{accepted->epoch,accepted->chunk};
+            if(const auto first=m_chunkFirstSpan.find(key);first!=m_chunkFirstSpan.end()) {
+                const auto found=m_spanPresentations.find({accepted->epoch,first->second});
+                if(found!=m_spanPresentations.end()) applyPresentation(found->second);
+            }
         } else if(const auto *retired = std::get_if<ngc::ChunkRetired>(&event)) {
             const ChunkKey key { retired->epoch, retired->chunk };
             const auto found = m_chunks.find(key);
@@ -314,10 +342,18 @@ private:
         m_snapshot.machinePosition = backend.commanded.position;
         m_snapshot.commandProgress = backend.spanProgress;
         m_snapshot.hasActiveMotion = backend.state == ngc::BackendState::Running && backend.activeSpan != 0;
-        const auto found = m_chunks.find({ backend.epoch, backend.activeChunk });
-        if(found == m_chunks.end()) return;
-        const auto &presentation = found->second;
-        applyPresentation(presentation);
+        if(backend.activeSpan!=0) {
+            auto found=m_spanPresentations.upper_bound({backend.epoch,backend.activeSpan});
+            if(found!=m_spanPresentations.begin()) {
+                --found;
+                if(found->first.first==backend.epoch) {
+                    applyPresentation(found->second);
+                    return;
+                }
+            }
+        }
+        const auto found=m_chunks.find({backend.epoch,backend.activeChunk});
+        if(found!=m_chunks.end()) applyPresentation(found->second);
     }
 
     static double &axisComponent(ngc::position_t &position, const ngc::Machine::Axis axis) {
@@ -889,6 +925,11 @@ private:
                     m_snapshot.status = ngc::SimulationStatus::Error;
                     m_snapshot.error = *m_driver.error(); m_running = false;
                 } else if(state == ngc::TrajectoryDriverState::Completed) {
+                    for(const auto &[id,block]:m_deferredCompletedBlocks) {
+                        (void)id;
+                        completeBlock(block);
+                    }
+                    m_deferredCompletedBlocks.clear();
                     m_snapshot.status = ngc::SimulationStatus::Completed;
                     m_snapshot.activeModalGCodes = m_session.machine().activeModalGCodes();
                     const auto tool = m_session.machine().toolGeometry();
@@ -907,7 +948,10 @@ private:
                 bool filled = false;
                 for(int fill = 0; fill < 64; ++fill) {
                     if(!m_driver.pumpOne([](const auto &callback) { callback(); },
-                        [&](const auto &command, const auto &chunk) { observeCommand(command, chunk); },
+                        [&](const auto &command, const auto &chunk, const auto &,
+                            const auto &presentation, const ngc::SpanId activationSpan) {
+                            observeCommand(command,chunk,presentation,activationSpan);
+                        },
                         [&](const auto &lifecycle) { observeLifecycle(lifecycle); })) break;
                     filled = true;
                 }
