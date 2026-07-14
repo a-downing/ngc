@@ -1892,7 +1892,7 @@ namespace {
         requireNear(unequal->outgoingScale,1.0,"outgoing side should retain its own local scale");
     }
 
-    void testBoundedPlannerUsesExactStopWhileG64IsPreviewOnly() {
+    void testBoundedPlannerExecutesPiecewiseG64Geometry() {
         ngc::BoundedLookaheadTrajectoryPlanner planner({
             .pathAcceleration=5.0, .rapidSpeed=120.0, .arcChordTolerance=0.001, .pathJerk=20.0,
             .axisVelocity={10,10,10,10,10,10},
@@ -1908,13 +1908,43 @@ namespace {
         require(planner.enqueue({ngc::MoveLine{p1,p2,120.0},g64,{}}), "second G64 line should enter lookahead");
         const auto planned=planner.planWindow();
         require(planned.has_value() && *planned, planned ? "G64 window produced no plan" : planned.error());
-        require((*planned)->inputs.size()==1, "preview-only G64 should plan one exact-stop command");
+        require((*planned)->inputs.size()==2, "G64 should plan both compatible commands in one window");
         const auto *chunk=std::get_if<ngc::PlanChunk>(&(*planned)->item);
-        require(chunk && chunk->stopTail.size==1 && planner.diagnostics().exactStopFallbacks==1,
-                "preview-only G64 should retain the verified exact-stop execution path");
+        require(chunk&&chunk->normalMotion.size>2&&chunk->stopTail.size==1,
+                "G64 should emit bounded normal motion and a verified terminal stop branch");
+        require(planner.diagnostics().exactStopFallbacks==0
+                    &&planner.diagnostics().blendedWindows==1
+                    &&planner.diagnostics().blendedCommands==2,
+                "compatible G64 commands should use executable blending");
+        require((*planned)->activationSpans.size()==2
+                    &&(*planned)->activationSpans[0]!=0&&(*planned)->activationSpans[1]!=0
+                    &&(*planned)->activationSpans[0]<(*planned)->activationSpans[1],
+                "blended commands should retain ordered activation spans");
+        require(std::ranges::none_of(chunk->normalMotion,[&](const auto &span) {
+            return (span.end.position-p1).length()<1e-8;
+        }),"local G64 geometry should round the junction instead of stopping on it");
+        for(std::size_t span=1;span<chunk->normalMotion.size;++span) {
+            const auto &previous=chunk->normalMotion[span-1];
+            const auto &current=chunk->normalMotion[span];
+            const auto scaled=[](const ngc::position_t &value,const double amount) {
+                return ngc::position_t{value.x*amount,value.y*amount,value.z*amount,
+                    value.a*amount,value.b*amount,value.c*amount};
+            };
+            const auto currentVelocity=scaled(current.c,current.inverseDuration);
+            const auto currentAcceleration=scaled(current.b,2.0*current.inverseDurationSquared);
+            require((previous.end.position-current.d).length()<1e-8,
+                    "G64 polynomial spans should be position-continuous");
+            require((previous.end.velocity-currentVelocity).length()<1e-7,
+                    "G64 polynomial spans should be velocity-continuous");
+            require((previous.end.acceleration-currentAcceleration).length()<1e-7,
+                std::format("G64 polynomial spans should be acceleration-continuous (jump {})",
+                    (previous.end.acceleration-currentAcceleration).length()));
+        }
+        requireAxisLimits(*chunk,&ngc::position_t::x,10,10,50,"G64 X motion");
+        requireAxisLimits(*chunk,&ngc::position_t::y,10,10,50,"G64 Y motion");
     }
 
-    void testG64ArcExecutionRemainsExactStop() {
+    void testG64ExecutesRetainedArcAndLocalSpline() {
         const ngc::TrajectoryPlanningMetadata g64 {
             .pathMode=ngc::ExecutablePathMode::Continuous,.pathTolerance=0.1,
         };
@@ -1928,9 +1958,54 @@ namespace {
                 "G64 arc should enter arc window");
         const auto arcPlan=arcPlanner.planWindow();
         require(arcPlan.has_value()&&*arcPlan,arcPlan?"arc G64 window produced no plan":arcPlan.error());
-        require((*arcPlan)->inputs.size()==1&&arcPlanner.diagnostics().exactStopFallbacks==1
-                    &&arcPlanner.diagnostics().blendedWindows==0,
-                "line/arc G64 should remain exact-stop while cubic blends are preview-only");
+        require((*arcPlan)->inputs.size()==2&&arcPlanner.diagnostics().exactStopFallbacks==0
+                    &&arcPlanner.diagnostics().blendedWindows==1,
+                "line/arc G64 should execute as one piecewise blended window");
+        const auto *chunk=std::get_if<ngc::PlanChunk>(&(*arcPlan)->item);
+        require(chunk&&chunk->normalMotion.size>3,
+                "line/arc G64 should retain adaptively verified curved geometry");
+        requireNear(chunk->normalMotion[0].d.x,a0.x,
+                    "line/arc G64 should begin at the canonical line endpoint");
+        requireNear(chunk->normalMotion[chunk->normalMotion.size-1].end.position.x,a2.x,
+                    "line/arc G64 should finish at the canonical arc endpoint");
+        requireNear(chunk->normalMotion[chunk->normalMotion.size-1].end.position.y,a2.y,
+                    "line/arc G64 should retain the canonical arc endpoint");
+    }
+
+    void testExecutableG64RetainsExactPrimitiveMiddles() {
+        ngc::BoundedLookaheadTrajectoryPlanner planner({
+            .pathAcceleration=5.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,.pathJerk=20.0,
+        });
+        const ngc::position_t p0{0,0,0,0,0,0},p1{10,0,0,0,0,0};
+        const ngc::position_t p2{10,10,0,0,0,0},p3{20,10,0,0,0,0};
+        const ngc::TrajectoryPlanningMetadata g64 {
+            .pathMode=ngc::ExecutablePathMode::Continuous,.pathTolerance=1.0,
+        };
+        planner.reset(72,p0);
+        require(planner.enqueue({ngc::MoveLine{p0,p1,120.0},g64,{}}),"first retained line should enqueue");
+        require(planner.enqueue({ngc::MoveLine{p1,p2,120.0},g64,{}}),"middle retained line should enqueue");
+        require(planner.enqueue({ngc::MoveLine{p2,p3,120.0},g64,{}}),"last retained line should enqueue");
+        const auto planned=planner.planWindow();
+        require(planned&&*planned,planned?"retained-line G64 produced no plan":planned.error());
+        require((*planned)->inputs.size()==3,
+                std::format("retained-line G64 should blend all commands (fallbacks={}, spans={})",
+                    planner.diagnostics().exactStopFallbacks,
+                    std::get<ngc::PlanChunk>((*planned)->item).normalMotion.size));
+        const auto *chunk=std::get_if<ngc::PlanChunk>(&(*planned)->item);
+        require(chunk,"retained-line G64 should produce a plan chunk");
+        bool foundExactMiddle=false;
+        for(const auto &span:chunk->normalMotion) {
+            const auto midpoint=evaluateSpan(span,0.5);
+            if(midpoint.y>3.25&&midpoint.y<6.75&&std::abs(midpoint.x-10.0)<1e-10) {
+                require(std::abs(span.a.x)<1e-10&&std::abs(span.b.x)<1e-10
+                            &&std::abs(span.c.x)<1e-10&&std::abs(span.d.x-10.0)<1e-10,
+                        std::format("the middle of a long entity should remain its exact source line ({}, {}, {}, {})",
+                            span.a.x,span.b.x,span.c.x,span.d.x));
+                foundExactMiddle=true;
+            }
+        }
+        require(foundExactMiddle,
+                "G64 should retain an exact middle section instead of refitting the whole window");
     }
 
     void testVerifiedCubicArcSpanCounts() {
@@ -2566,10 +2641,10 @@ namespace {
         require(std::ranges::is_sorted(activationSpans)&&std::ranges::all_of(activationSpans,
                     [](const auto span) { return span!=0; }),
                 "combined G64 commands should retain ordered activation span identities");
-        require(driver.planningDiagnostics().exactStopFallbacks == 3
-                    && driver.planningDiagnostics().blendedWindows == 0
-                    && driver.planningDiagnostics().blendedCommands == 0
-                    && driver.planningDiagnostics().maximumWindowCommands == 1,
+        require(driver.planningDiagnostics().exactStopFallbacks == 0
+                    && driver.planningDiagnostics().blendedWindows == 1
+                    && driver.planningDiagnostics().blendedCommands == 3
+                    && driver.planningDiagnostics().maximumWindowCommands == 3,
                 std::format("driver G64 diagnostics mismatch (fallback={}, windows={}, commands={}, window={})",
                     driver.planningDiagnostics().exactStopFallbacks,
                     driver.planningDiagnostics().blendedWindows,
@@ -2723,8 +2798,9 @@ int main() {
         testExactStopPlannerEnforcesIndependentAxisLimits();
         testBoundedLookaheadCarriesG64MetadataAndStopFallbacks();
         testPreviewJunctionUsesOneSixControlSpline();
-        testBoundedPlannerUsesExactStopWhileG64IsPreviewOnly();
-        testG64ArcExecutionRemainsExactStop();
+        testBoundedPlannerExecutesPiecewiseG64Geometry();
+        testG64ExecutesRetainedArcAndLocalSpline();
+        testExecutableG64RetainsExactPrimitiveMiddles();
         testVerifiedCubicArcSpanCounts();
         testPlannedArcsPreserveCanonicalEndpointContinuity();
         testRoundedRadiusArcPreservesDynamicLimits();

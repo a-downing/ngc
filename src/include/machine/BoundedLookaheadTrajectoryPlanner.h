@@ -69,9 +69,8 @@ namespace ngc {
         double maximumPlanningSeconds = 0.0;
     };
 
-    // NRT-only bounded command window. Executable G64 is deliberately disabled
-    // while degree-three blend geometry is evaluated in preview; every command
-    // currently follows the verified exact-stop publication path.
+    // NRT-only bounded command window. Compatible G64 lines and arcs are planned
+    // as exact retained primitives joined by local degree-three B-spline blends.
     class BoundedLookaheadTrajectoryPlanner {
     public:
         static constexpr std::size_t MAX_LOOKAHEAD_COMMANDS = 32;
@@ -104,6 +103,22 @@ namespace ngc {
 
         static bool samePosition(const position_t &left,const position_t &right) {
             return (left-right).length()<=1e-12;
+        }
+
+        static std::optional<position_t> motionStart(const MachineCommand &command) {
+            return std::visit([](const auto &value) -> std::optional<position_t> {
+                using T=std::decay_t<decltype(value)>;
+                if constexpr(std::same_as<T,MoveLine>||std::same_as<T,MoveArc>) return value.from();
+                else return std::nullopt;
+            },command);
+        }
+
+        static std::optional<position_t> motionEnd(const MachineCommand &command) {
+            return std::visit([](const auto &value) -> std::optional<position_t> {
+                using T=std::decay_t<decltype(value)>;
+                if constexpr(std::same_as<T,MoveLine>||std::same_as<T,MoveArc>) return value.to();
+                else return std::nullopt;
+            },command);
         }
 
         static bool sameProtectedPresentation(const TrajectoryCommandPresentation &left,
@@ -203,6 +218,53 @@ namespace ngc {
             return {};
         }
 
+        std::expected<void,std::string> verifyContinuousNormalMotion(const PlanChunk &chunk) const {
+            if(chunk.normalMotion.size==0)
+                return std::unexpected("continuous plan has no normal motion");
+            const auto discontinuity=[](const position_t &left,const position_t &right,const double tolerance) {
+                return (left-right).length()>tolerance;
+            };
+            const auto &limits=m_exactStop.limits();
+            std::optional<MotionState> previous;
+            for(const auto &span:chunk.normalMotion) {
+                if(!std::isfinite(span.duration)||span.duration<=0.0)
+                    return std::unexpected("continuous plan has an invalid span duration");
+                const MotionState start {
+                    span.d,
+                    scalePosition(span.c,span.inverseDuration),
+                    scalePosition(span.b,2.0*span.inverseDurationSquared),
+                };
+                if(previous&&(discontinuity(previous->position,start.position,1e-8)
+                    ||discontinuity(previous->velocity,start.velocity,1e-7)
+                    ||discontinuity(previous->acceleration,start.acceleration,1e-7)))
+                    return std::unexpected("continuous plan is not C2 at a polynomial boundary");
+                for(const auto component:AXIS_COMPONENTS) {
+                    if(exceeds(maximumAxisVelocity(span,component),limits.axisVelocity.*component)
+                       ||exceeds(maximumAxisAcceleration(span,component),limits.axisAcceleration.*component)
+                       ||exceeds(maximumAxisJerk(span,component),limits.axisJerk.*component))
+                        return std::unexpected("continuous plan exceeds a configured axis limit");
+                }
+                const auto acceleration0=start.acceleration.length();
+                const auto acceleration1=span.end.acceleration.length();
+                const auto jerk=scalePosition(span.a,6.0*span.inverseDurationCubed).length();
+                if(exceeds(std::max(acceleration0,acceleration1),limits.pathAcceleration)
+                   ||exceeds(jerk,limits.pathJerk))
+                    return std::unexpected("continuous plan exceeds a configured path limit");
+                previous=span.end;
+            }
+            const MotionState first {
+                chunk.normalMotion[0].d,
+                scalePosition(chunk.normalMotion[0].c,chunk.normalMotion[0].inverseDuration),
+                scalePosition(chunk.normalMotion[0].b,
+                              2.0*chunk.normalMotion[0].inverseDurationSquared),
+            };
+            if(first.velocity.length()>1e-8||first.acceleration.length()>1e-8
+               ||chunk.normalMotion[chunk.normalMotion.size-1].end.velocity.length()>1e-8
+               ||chunk.normalMotion[chunk.normalMotion.size-1].end.acceleration.length()>1e-8)
+                return std::unexpected("continuous plan is not rest-to-rest at its protected boundaries");
+            return {};
+        }
+
         void record(const ExecutionItem &item, const double planningSeconds,
                     const std::size_t commandCount=1) {
             m_diagnostics.commandsPlanned+=commandCount;
@@ -235,16 +297,18 @@ namespace ngc {
         std::size_t windowSize() const { return m_window.size(); }
         bool full() const { return m_window.size() == MAX_LOOKAHEAD_COMMANDS; }
         static bool eligibleForLookahead(const TrajectoryPlannerInput &input) {
-            (void)input;
-            return false;
+            return continuousMotion(input);
         }
 
         bool canAppend(const TrajectoryPlannerInput &input) const {
             if(full()) return false;
             if(m_window.empty()) return true;
+            const auto previousEnd=motionEnd(m_window.back().command);
+            const auto nextStart=motionStart(input.command);
             return continuousMotion(input) && continuousMotion(m_window.front())
                 && input.metadata.pathTolerance == m_window.front().metadata.pathTolerance
-                &&sameProtectedPresentation(input.presentation,m_window.back().presentation);
+                &&sameProtectedPresentation(input.presentation,m_window.back().presentation)
+                &&previousEnd&&nextStart&&samePosition(*previousEnd,*nextStart);
         }
 
         bool enqueue(TrajectoryPlannerInput input) {
@@ -294,9 +358,39 @@ namespace ngc {
         }
 
         std::expected<std::unique_ptr<PlannedExecution>, std::string> planWindow() {
-            // Preview-only G64 experiment: execution remains exact-stop until
-            // the cubic geometric path and a separate time law are ready.
-            return planOne();
+            if(m_window.size()<2||!std::ranges::all_of(m_window,continuousMotion)) return planOne();
+            const auto started=std::chrono::steady_clock::now();
+            std::vector<MachineCommand> commands;
+            commands.reserve(m_window.size());
+            for(const auto &input:m_window) commands.push_back(input.command);
+            constexpr double DEFAULT_BLEND_SCALE=0.001;
+            const auto blendScale=std::max(
+                m_window.front().metadata.pathTolerance.value_or(DEFAULT_BLEND_SCALE),1e-9);
+            auto continuous=m_exactStop.compileContinuous(commands,blendScale);
+            if(!continuous) return planOne();
+            if(auto verified=verifyContinuousNormalMotion((*continuous)->chunk);!verified)
+                return std::unexpected(verified.error());
+            if(auto verified=verifyStopBranch((*continuous)->chunk);!verified)
+                return std::unexpected(verified.error());
+
+            std::vector<TrajectoryPlannerInput> inputs;
+            inputs.reserve(m_window.size());
+            while(!m_window.empty()) {
+                inputs.push_back(std::move(m_window.front()));
+                m_window.pop_front();
+            }
+            const auto planningSeconds=std::chrono::duration<double>(
+                std::chrono::steady_clock::now()-started).count();
+            ++m_diagnostics.blendedWindows;
+            m_diagnostics.blendedCommands+=inputs.size();
+            auto representativeCommand=inputs.front().command;
+            auto representativeMetadata=inputs.front().metadata;
+            auto planned=std::make_unique<PlannedExecution>(
+                std::move(representativeCommand),std::move(representativeMetadata),
+                std::move((*continuous)->chunk),std::move(inputs),
+                std::move((*continuous)->activationSpans));
+            record(planned->item,planningSeconds,planned->inputs.size());
+            return planned;
         }
     };
 }

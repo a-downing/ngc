@@ -2,12 +2,20 @@
 
 #include <expected>
 #include <limits>
+#include <memory>
 #include <optional>
+#include <span>
 #include <string>
+#include <vector>
 
 #include "machine/MotionBackend.h"
 
 namespace ngc {
+    struct ContinuousTrajectoryPlan {
+        PlanChunk chunk;
+        std::vector<SpanId> activationSpans;
+    };
+
     struct TrajectoryLimits {
         static position_t unlimitedAxes() {
             constexpr auto infinity = std::numeric_limits<double>::infinity();
@@ -42,6 +50,8 @@ namespace ngc {
         const position_t &plannedPosition() const { return m_position; }
 
         std::expected<PlanChunk, std::string> compile(const MachineCommand &command);
+        std::expected<std::unique_ptr<ContinuousTrajectoryPlan>, std::string> compileContinuous(
+            std::span<const MachineCommand> commands, double blendScale);
         std::expected<TriggeredMove, std::string> compileTriggeredMove(
             const ProbeMove &command, DigitalInputId input = 0,
             InputCondition condition = InputCondition::Active);
