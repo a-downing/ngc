@@ -124,52 +124,152 @@ namespace ngc {
             position_t acceleration{};
         };
 
-        AxisPolynomialSpan bezierSpan(const SpanId id,const std::array<position_t,4> &control,
-                                      const double duration) {
+        std::array<AxisPolynomialSpan,3> c2CubicChain(const SpanId firstId,
+                                                      const KinematicPathState &from,
+                                                      const KinematicPathState &to,
+                                                      const double duration) {
+            const auto h=duration/3.0;
+            const auto inverseH=1.0/h;
+            const auto accelerationDelta=scaled(subtract(to.acceleration,from.acceleration),inverseH);
+            const auto velocityDelta=scaled(subtract(subtract(to.velocity,from.velocity),
+                scaled(from.acceleration,3.0*h)),1.0/(h*h));
+            const auto positionDelta=scaled(subtract(subtract(subtract(to.position,from.position),
+                scaled(from.velocity,3.0*h)),scaled(from.acceleration,4.5*h*h)),1.0/(h*h*h));
+            const auto velocityEquation=subtract(velocityDelta,scaled(accelerationDelta,0.5));
+            const auto positionEquation=subtract(positionDelta,scaled(accelerationDelta,1.0/6.0));
+            const auto jerk0=subtract(positionEquation,velocityEquation);
+            const auto jerk1=subtract(velocityEquation,scaled(jerk0,2.0));
+            const auto jerk2=subtract(subtract(accelerationDelta,jerk0),jerk1);
+            const std::array jerks{jerk0,jerk1,jerk2};
+
+            std::array<AxisPolynomialSpan,3> result;
+            KinematicPathState state=from;
+            for(std::size_t index=0;index<result.size();++index) {
+                auto &span=result[index];
+                span.id=firstId+index;
+                span.duration=h;
+                span.inverseDuration=inverseH;
+                span.inverseDurationSquared=inverseH*inverseH;
+                span.inverseDurationCubed=span.inverseDurationSquared*inverseH;
+                span.a=scaled(jerks[index],h*h*h/6.0);
+                span.b=scaled(state.acceleration,h*h/2.0);
+                span.c=scaled(state.velocity,h);
+                span.d=state.position;
+                KinematicPathState terminal {
+                    .position=add(state.position,add(add(span.a,span.b),span.c)),
+                    .velocity=add(state.velocity,add(scaled(state.acceleration,h),
+                        scaled(jerks[index],h*h/2.0))),
+                    .acceleration=add(state.acceleration,scaled(jerks[index],h)),
+                };
+                if(index+1==result.size()) terminal=to;
+                span.end={terminal.position,terminal.velocity,terminal.acceleration};
+                state=terminal;
+            }
+            return result;
+        }
+
+        ScalarPhase localScalarPhase(const TimeBoundary &from,const TimeBoundary &to) {
+            const auto duration=to.time-from.time;
+            return {
+                .a=(to.acceleration-from.acceleration)*duration*duration/6.0,
+                .b=from.acceleration*duration*duration/2.0,
+                .c=from.velocity*duration,
+                .d=from.distance,
+                .duration=duration,
+            };
+        }
+
+        std::array<double,6> axisArray(const position_t &value) {
+            return {value.x,value.y,value.z,value.a,value.b,value.c};
+        }
+
+        position_t axisPosition(const std::array<double,6> &value) {
+            return {value[0],value[1],value[2],value[3],value[4],value[5]};
+        }
+
+        AxisPolynomialSpan constantJerkSpan(const SpanId id,const MotionState &from,
+                                            const position_t &jerk,const MotionState &to,
+                                            const double duration) {
             AxisPolynomialSpan result;
             result.id=id;
             result.duration=duration;
             result.inverseDuration=1.0/duration;
             result.inverseDurationSquared=result.inverseDuration*result.inverseDuration;
             result.inverseDurationCubed=result.inverseDurationSquared*result.inverseDuration;
-            result.d=control[0];
-            result.c=scaled(subtract(control[1],control[0]),3.0);
-            result.b=scaled(add(subtract(control[2],scaled(control[1],2.0)),control[0]),3.0);
-            result.a=add(subtract(control[3],scaled(control[2],3.0)),
-                         add(scaled(control[1],3.0),scaled(control[0],-1.0)));
-            result.end.position=control[3];
-            result.end.velocity=scaled(subtract(control[3],control[2]),3.0/duration);
-            result.end.acceleration=scaled(
-                add(subtract(control[3],scaled(control[2],2.0)),control[1]),
-                6.0/(duration*duration));
+            result.a=scaled(jerk,duration*duration*duration/6.0);
+            result.b=scaled(from.acceleration,duration*duration/2.0);
+            result.c=scaled(from.velocity,duration);
+            result.d=from.position;
+            result.end=to;
             return result;
         }
 
-        std::array<AxisPolynomialSpan,3> c2CubicChain(const SpanId firstId,
-                                                      const KinematicPathState &from,
-                                                      const KinematicPathState &to,
-                                                      const double duration) {
-            const auto spanDuration=duration/3.0;
-            const auto a0=from.position;
-            const auto a1=add(a0,scaled(from.velocity,spanDuration/3.0));
-            const auto a2=add(subtract(scaled(a1,2.0),a0),
-                              scaled(from.acceleration,spanDuration*spanDuration/6.0));
-            const auto c3=to.position;
-            const auto c2=subtract(c3,scaled(to.velocity,spanDuration/3.0));
-            const auto c1=add(subtract(scaled(c2,2.0),c3),
-                              scaled(to.acceleration,spanDuration*spanDuration/6.0));
-            const auto a3=scaled(add(subtract(scaled(a2,7.0),scaled(a1,2.0)),
-                                     subtract(scaled(c1,2.0),c2)),1.0/6.0);
-            const auto b0=a3;
-            const auto b1=subtract(scaled(a3,2.0),a2);
-            const auto b2=add(subtract(scaled(a3,4.0),scaled(a2,4.0)),a1);
-            const auto b3=add(c1,scaled(subtract(b1,c2),0.25));
-            const auto c0=b3;
-            return {
-                bezierSpan(firstId,{a0,a1,a2,a3},spanDuration),
-                bezierSpan(firstId+1,{b0,b1,b2,b3},spanDuration),
-                bezierSpan(firstId+2,{c0,c1,c2,c3},spanDuration),
-            };
+        std::expected<std::vector<AxisPolynomialSpan>,std::string> stoppingSpans(
+                const MotionState &from,const TrajectoryLimits &limits,SpanId &nextSpan) {
+            ruckig::InputParameter<6> input;
+            input.control_interface=ruckig::ControlInterface::Velocity;
+            input.current_position=axisArray(from.position);
+            input.current_velocity=axisArray(from.velocity);
+            input.current_acceleration=axisArray(from.acceleration);
+            input.target_velocity={0.0,0.0,0.0,0.0,0.0,0.0};
+            input.target_acceleration={0.0,0.0,0.0,0.0,0.0,0.0};
+            const auto conservative=1.0/std::sqrt(6.0);
+            const auto acceleration=axisArray(limits.axisAcceleration);
+            const auto jerk=axisArray(limits.axisJerk);
+            for(std::size_t axis=0;axis<6;++axis) {
+                input.max_acceleration[axis]=std::min(acceleration[axis],
+                    limits.pathAcceleration*conservative);
+                input.max_jerk[axis]=std::min(jerk[axis],limits.pathJerk*conservative);
+            }
+            ruckig::Ruckig<6> generator;
+            ruckig::Trajectory<6> trajectory;
+            if(generator.calculate(input,trajectory)!=ruckig::Result::Working)
+                return std::unexpected("Ruckig failed to calculate a moving-boundary stop trajectory");
+
+            std::vector<double> times{0.0,trajectory.get_duration()};
+            const auto profiles=trajectory.get_profiles().front();
+            for(const auto &profile:profiles) {
+                auto elapsed=0.0;
+                for(const auto duration:profile.brake.t) {
+                    elapsed+=duration;
+                    if(elapsed>1e-12&&elapsed<trajectory.get_duration()-1e-12)
+                        times.push_back(elapsed);
+                }
+                for(const auto cumulative:profile.t_sum) {
+                    const auto time=profile.brake.duration+cumulative;
+                    if(time>1e-12&&time<trajectory.get_duration()-1e-12)
+                        times.push_back(time);
+                }
+            }
+            std::ranges::sort(times);
+            times.erase(std::unique(times.begin(),times.end(),[](const double left,const double right) {
+                return std::abs(left-right)<=1e-11;
+            }),times.end());
+
+            std::vector<AxisPolynomialSpan> result;
+            result.reserve(times.size()-1);
+            MotionState previous=from;
+            for(std::size_t boundary=1;boundary<times.size();++boundary) {
+                const auto start=times[boundary-1];
+                const auto end=times[boundary];
+                const auto duration=end-start;
+                if(duration<=1e-12) continue;
+                std::array<double,6> position{},velocity{},acceleration{},jerkAtMiddle{};
+                std::size_t section=0;
+                trajectory.at_time(end,position,velocity,acceleration);
+                std::array<double,6> ignoredPosition{},ignoredVelocity{},ignoredAcceleration{};
+                trajectory.at_time(std::midpoint(start,end),ignoredPosition,ignoredVelocity,
+                    ignoredAcceleration,jerkAtMiddle,section);
+                MotionState terminal{axisPosition(position),axisPosition(velocity),axisPosition(acceleration)};
+                result.push_back(constantJerkSpan(nextSpan++,previous,axisPosition(jerkAtMiddle),
+                    terminal,duration));
+                previous=terminal;
+            }
+            if(result.empty())
+                return std::unexpected("moving-boundary stop trajectory produced no polynomial spans");
+            result.back().end.velocity={};
+            result.back().end.acceleration={};
+            return result;
         }
 
         template<typename PositionAt>
@@ -249,6 +349,7 @@ namespace ngc {
             &position_t::x, &position_t::y, &position_t::z,
             &position_t::a, &position_t::b, &position_t::c,
         };
+        constexpr std::array AXIS_NAMES {"X","Y","Z","A","B","C"};
 
         bool positiveAxisLimits(const position_t &limits) {
             return std::ranges::all_of(AXIS_COMPONENTS, [&](const auto component) {
@@ -291,35 +392,114 @@ namespace ngc {
             return std::abs(6.0*span.a.*component * span.inverseDurationCubed);
         }
 
-        std::expected<std::vector<TimeBoundary>, std::string> timeLaw(
-                const double length, const double requestedVelocity, const double acceleration, const double jerk) {
+        std::expected<std::vector<TimeBoundary>, std::string> timeLawBetween(
+                const double length,const double fromVelocity,const double fromAcceleration,
+                const double toVelocity,const double toAcceleration,
+                const double requestedVelocity,const double acceleration,const double jerk) {
+            if(length<=0.0||fromVelocity<0.0||toVelocity<0.0||requestedVelocity<=0.0
+               ||std::abs(fromAcceleration)>acceleration*(1.0+1e-10)
+               ||std::abs(toAcceleration)>acceleration*(1.0+1e-10)
+               ||acceleration<=0.0||jerk<=0.0)
+                return std::unexpected("local time law received invalid distance, state, or limits");
             if(std::isinf(acceleration)) {
+                if(std::abs(fromVelocity-toVelocity)>1e-12||fromVelocity<=0.0
+                   ||std::abs(fromAcceleration)>1e-12||std::abs(toAcceleration)>1e-12)
+                    return std::unexpected(
+                        "unbounded-acceleration local time law requires equal positive speeds and zero acceleration");
                 return std::vector<TimeBoundary> {
-                    { 0.0, 0.0, requestedVelocity, 0.0 },
-                    { length / requestedVelocity, length, requestedVelocity, 0.0 },
+                    {0.0,0.0,fromVelocity,0.0},
+                    {length/fromVelocity,length,toVelocity,0.0},
                 };
             }
             ruckig::InputParameter<1> input;
-            input.current_position = {0.0}; input.current_velocity = {0.0}; input.current_acceleration = {0.0};
-            input.target_position = {length}; input.target_velocity = {0.0}; input.target_acceleration = {0.0};
+            input.current_position={0.0};
+            input.current_velocity={fromVelocity};
+            input.current_acceleration={fromAcceleration};
+            input.target_position={length};
+            input.target_velocity={toVelocity};
+            input.target_acceleration={toAcceleration};
             input.max_velocity = {requestedVelocity}; input.max_acceleration = {acceleration}; input.max_jerk = {jerk};
             ruckig::Ruckig<1> generator;
             ruckig::Trajectory<1> trajectory;
             if(generator.calculate(input, trajectory) != ruckig::Result::Working)
-                return std::unexpected("Ruckig failed to calculate exact-stop timing");
+                return std::unexpected(std::format(
+                    "Ruckig failed local position timing: length={} state (v={}, a={}) -> "
+                    "(v={}, a={}) limits v={} a={} j={}",length,fromVelocity,fromAcceleration,
+                    toVelocity,toAcceleration,requestedVelocity,acceleration,jerk));
             std::vector<double> times {0.0};
             for(const auto duration : trajectory.get_profiles().front().front().t) {
                 const auto next = times.back() + duration;
                 if(next > times.back() + 1e-12) times.push_back(next);
             }
+            if(times.back()<trajectory.get_duration()-1e-12)
+                times.push_back(trajectory.get_duration());
             std::vector<TimeBoundary> result;
             for(const auto time : times) {
                 double position, velocity, scalarAcceleration;
                 trajectory.at_time(time, position, velocity, scalarAcceleration);
                 result.push_back({time, position, velocity, scalarAcceleration});
             }
-            result.back() = {trajectory.get_duration(), length, 0.0, 0.0};
+            result.front()={0.0,0.0,fromVelocity,fromAcceleration};
+            result.back()={trajectory.get_duration(),length,toVelocity,toAcceleration};
+            const auto distanceTolerance=std::max(1e-12,length*1e-9);
+            for(std::size_t boundary=0;boundary<result.size();++boundary) {
+                const auto &state=result[boundary];
+                if(!std::isfinite(state.time)||!std::isfinite(state.distance)
+                   ||!std::isfinite(state.velocity)||!std::isfinite(state.acceleration)
+                   ||state.distance < -distanceTolerance
+                   ||state.distance > length+distanceTolerance
+                   ||state.velocity < -distanceTolerance
+                   ||(boundary>0&&(state.time<=result[boundary-1].time
+                       ||state.distance<result[boundary-1].distance-distanceTolerance)))
+                    return std::unexpected(std::format(
+                        "Ruckig produced a non-monotone local path law at boundary {} of {}: "
+                        "time={} distance={} velocity={} acceleration={} previous time={} "
+                        "previous distance={} length={} tolerance={}",boundary,result.size(),
+                        state.time,state.distance,state.velocity,state.acceleration,
+                        boundary?result[boundary-1].time:0.0,
+                        boundary?result[boundary-1].distance:0.0,length,distanceTolerance));
+            }
             return result;
+        }
+
+        std::expected<std::vector<TimeBoundary>, std::string> timeLaw(
+                const double length, const double requestedVelocity, const double acceleration, const double jerk) {
+            if(std::isinf(acceleration)) return std::vector<TimeBoundary>{
+                {0.0,0.0,requestedVelocity,0.0},
+                {length/requestedVelocity,length,requestedVelocity,0.0},
+            };
+            return timeLawBetween(length,0.0,0.0,0.0,0.0,
+                                  requestedVelocity,acceleration,jerk);
+        }
+
+        double velocityTransitionDistance(const double fromVelocity,const double toVelocity,
+                                          const double acceleration,const double jerk) {
+            const auto change=std::abs(toVelocity-fromVelocity);
+            if(change<=1e-15) return 0.0;
+            const auto threshold=acceleration*acceleration/jerk;
+            const auto duration=change<=threshold
+                ? 2.0*std::sqrt(change/jerk)
+                : change/acceleration+acceleration/jerk;
+            return std::midpoint(fromVelocity,toVelocity)*duration;
+        }
+
+        double reachableVelocity(const double fixedVelocity,const double cap,const double length,
+                                 const double acceleration,const double jerk) {
+            if(cap<=fixedVelocity) return cap;
+            // Leave a small positive cruise-distance reserve. Asking Ruckig for
+            // a transition at the exact minimum-distance boundary is numerically
+            // ambiguous and can select a much longer reversing profile.
+            const auto available=std::max(0.0,length-std::max(1e-12,length*1e-6));
+            if(velocityTransitionDistance(fixedVelocity,cap,acceleration,jerk)<=available) return cap;
+            auto low=fixedVelocity;
+            auto high=cap;
+            for(unsigned iteration=0;iteration<52;++iteration) {
+                const auto middle=std::midpoint(low,high);
+                if(velocityTransitionDistance(fixedVelocity,middle,acceleration,jerk)<=available)
+                    low=middle;
+                else high=middle;
+            }
+            return low;
         }
 
         double positionDot(const position_t &left, const position_t &right) {
@@ -393,6 +573,7 @@ namespace ngc {
             std::array<position_t,6> m_controls{};
             std::array<position_t,5> m_derivativeControls{};
             std::array<position_t,4> m_secondControls{};
+            std::array<position_t,3> m_thirdControls{};
             struct LengthNode { double parameter=0.0; double distance=0.0; };
             std::array<LengthNode,LENGTH_INTERVALS+1> m_nodes{};
             double m_length=0.0;
@@ -418,6 +599,12 @@ namespace ngc {
                         subtract(m_derivativeControls[index+1],m_derivativeControls[index]),
                         2.0/denominator);
                 }
+                for(std::size_t index=0;index<m_thirdControls.size();++index) {
+                    const auto denominator=SECOND_KNOTS[index+2]-SECOND_KNOTS[index+1];
+                    m_thirdControls[index]=scaled(
+                        subtract(m_secondControls[index+1],m_secondControls[index]),
+                        1.0/denominator);
+                }
                 for(std::size_t index=1;index<=LENGTH_INTERVALS;++index) {
                     const auto from=3.0*static_cast<double>(index-1)/LENGTH_INTERVALS;
                     const auto to=3.0*static_cast<double>(index)/LENGTH_INTERVALS;
@@ -435,6 +622,11 @@ namespace ngc {
             }
             position_t secondDerivative(const double parameter) const {
                 return evaluateBSpline(m_secondControls,SECOND_KNOTS,1,parameter);
+            }
+            position_t thirdDerivative(const double parameter) const {
+                const auto segment=std::min<std::size_t>(m_thirdControls.size()-1,
+                    static_cast<std::size_t>(std::floor(std::clamp(parameter,0.0,3.0))));
+                return m_thirdControls[segment];
             }
             double parameterAtDistance(const double requestedDistance) const {
                 if(!std::isfinite(requestedDistance)||!std::isfinite(m_length)||m_length<=1e-15)
@@ -473,6 +665,26 @@ namespace ngc {
                 return scaled(subtract(acceleration,
                     scaled(tangent,positionDot(acceleration,tangent))),1.0/(speed*speed));
             }
+            position_t curvatureDerivativeAtDistance(const double distance) const {
+                const auto parameter=parameterAtDistance(distance);
+                const auto first=derivative(parameter);
+                const auto second=secondDerivative(parameter);
+                const auto third=thirdDerivative(parameter);
+                const auto speed=first.length();
+                if(speed<=1e-15) return {};
+                const auto firstSecond=positionDot(first,second);
+                const auto firstThird=positionDot(first,third);
+                const auto secondSquared=positionDot(second,second);
+                const auto inverseSpeed2=1.0/(speed*speed);
+                const auto inverseSpeed4=inverseSpeed2*inverseSpeed2;
+                const auto inverseSpeed6=inverseSpeed4*inverseSpeed2;
+                auto parameterDerivative=add(
+                    scaled(third,inverseSpeed2),
+                    add(scaled(second,-3.0*firstSecond*inverseSpeed4),
+                        add(scaled(first,-(secondSquared+firstThird)*inverseSpeed4),
+                            scaled(first,4.0*firstSecond*firstSecond*inverseSpeed6))));
+                return scaled(parameterDerivative,1.0/speed);
+            }
             double chordErrorBound(const double fromDistance,const double toDistance) const {
                 const auto from=parameterAtDistance(fromDistance);
                 const auto to=parameterAtDistance(toDistance);
@@ -488,17 +700,22 @@ namespace ngc {
             std::size_t input=0;
             double length=0.0;
             double speed=0.0;
+            bool linear=false;
             std::function<position_t(double)> positionAt;
             std::function<position_t(double)> tangentAt;
             std::function<position_t(double)> curvatureAt;
+            std::function<position_t(double)> curvatureDerivativeAt;
             std::function<double(double,double)> chordErrorBound;
         };
 
         struct GeometryPiece {
             std::size_t input=0;
             double length=0.0;
+            double speed=0.0;
+            bool linear=false;
             std::function<PathSample(double)> sampleAt;
             std::function<position_t(double)> curvatureAt;
+            std::function<position_t(double)> curvatureDerivativeAt;
             std::function<position_t(double)> positionAt;
             std::function<double(double,double)> chordErrorBound;
         };
@@ -683,7 +900,8 @@ namespace ngc {
 
     std::expected<std::unique_ptr<ContinuousTrajectoryPlan>, std::string>
     ExactStopTrajectoryPlanner::compileContinuous(
-            const std::span<const MachineCommand> commands, const double blendScale) {
+            const std::span<const MachineCommand> commands, const double blendScale,
+            ContinuousAccelerationOracleModel *oracleModel) {
         if(commands.empty()) return std::unexpected("continuous trajectory window is empty");
         if(blendScale<=0.0) return std::unexpected("continuous trajectory blend scale must be positive");
         if(m_limits.pathAcceleration<=0.0||m_limits.pathJerk<=0.0
@@ -701,50 +919,76 @@ namespace ngc {
                 if constexpr(std::same_as<T,MoveLine>) {
                     if(command.speed()<=0.0||command.machineCoordinates())
                         return std::unexpected("continuous line must be a positive-feed non-G53 move");
-                    if(subtract(command.from(),expectedStart).length()>1e-8)
-                        return std::unexpected("continuous line does not begin at the planned position");
+                    if(const auto mismatch=subtract(command.from(),expectedStart).length();mismatch>1e-8)
+                        return std::unexpected(std::format(
+                            "continuous line input {} does not begin at the planned position: "
+                            "command start [X={} Y={} Z={} A={} B={} C={}], planned [X={} Y={} Z={} A={} B={} C={}], "
+                            "distance={} tolerance=1e-8",input,command.from().x,command.from().y,
+                            command.from().z,command.from().a,command.from().b,command.from().c,
+                            expectedStart.x,expectedStart.y,expectedStart.z,expectedStart.a,
+                            expectedStart.b,expectedStart.c,mismatch));
                     const auto delta=subtract(command.to(),command.from());
                     const auto length=delta.length();
                     if(length<=1e-12) return std::unexpected("continuous path contains a zero-length line");
                     const auto tangent=scaled(delta,1.0/length);
                     return ContinuousEntity {
                         .input=input,.length=length,.speed=command.speed(),
+                        .linear=true,
                         .positionAt=[from=command.from(),tangent,length](const double distance) {
                             return add(from,scaled(tangent,std::clamp(distance,0.0,length)));
                         },
                         .tangentAt=[tangent](double) { return tangent; },
                         .curvatureAt=[](double) { return position_t{}; },
+                        .curvatureDerivativeAt=[](double) { return position_t{}; },
                         .chordErrorBound=[](double,double) { return 0.0; },
                     };
                 } else if constexpr(std::same_as<T,MoveArc>) {
                     if(command.speed()<=0.0)
                         return std::unexpected("continuous arc must have a positive feed");
-                    if(subtract(command.from(),expectedStart).length()>1e-8)
-                        return std::unexpected("continuous arc does not begin at the planned position");
+                    if(const auto mismatch=subtract(command.from(),expectedStart).length();mismatch>1e-8)
+                        return std::unexpected(std::format(
+                            "continuous arc input {} does not begin at the planned position: "
+                            "command start [X={} Y={} Z={} A={} B={} C={}], planned [X={} Y={} Z={} A={} B={} C={}], "
+                            "distance={} tolerance=1e-8",input,command.from().x,command.from().y,
+                            command.from().z,command.from().a,command.from().b,command.from().c,
+                            expectedStart.x,expectedStart.y,expectedStart.z,expectedStart.a,
+                            expectedStart.b,expectedStart.c,mismatch));
                     auto reference=std::make_shared<simulation_detail::ArcReference>(command);
                     if(!reference->valid()||reference->length()<=1e-12)
                         return std::unexpected("continuous path contains an invalid arc");
+                    const std::function<position_t(double)> curvatureAt=[reference](const double distance) {
+                        const auto length=reference->length();
+                        const auto local=std::clamp(distance,0.0,length);
+                        const auto step=std::clamp(length*1e-5,1e-8,
+                            std::max(length*1e-3,1e-8));
+                        const auto from=std::max(0.0,local-step);
+                        const auto to=std::min(length,local+step);
+                        if(to-from<=1e-15) return position_t{};
+                        const auto tangent=reference->tangentAtDistance(local);
+                        auto curvature=scaled(subtract(reference->tangentAtDistance(to),
+                            reference->tangentAtDistance(from)),1.0/(to-from));
+                        return subtract(curvature,
+                            scaled(tangent,positionDot(curvature,tangent)));
+                    };
                     return ContinuousEntity {
                         .input=input,.length=reference->length(),.speed=command.speed(),
+                        .linear=false,
                         .positionAt=[reference](const double distance) {
                             return reference->positionAtDistance(distance);
                         },
                         .tangentAt=[reference](const double distance) {
                             return reference->tangentAtDistance(distance);
                         },
-                        .curvatureAt=[reference](const double distance) {
+                        .curvatureAt=curvatureAt,
+                        .curvatureDerivativeAt=[reference,curvatureAt](const double distance) {
                             const auto length=reference->length();
+                            const auto step=std::clamp(length*1e-3,1e-7,
+                                std::max(length*1e-2,1e-7));
                             const auto local=std::clamp(distance,0.0,length);
-                            const auto step=std::clamp(length*1e-5,1e-8,
-                                std::max(length*1e-3,1e-8));
                             const auto from=std::max(0.0,local-step);
                             const auto to=std::min(length,local+step);
                             if(to-from<=1e-15) return position_t{};
-                            const auto tangent=reference->tangentAtDistance(local);
-                            auto curvature=scaled(subtract(reference->tangentAtDistance(to),
-                                reference->tangentAtDistance(from)),1.0/(to-from));
-                            return subtract(curvature,
-                                scaled(tangent,positionDot(curvature,tangent)));
+                            return scaled(subtract(curvatureAt(to),curvatureAt(from)),1.0/(to-from));
                         },
                         .chordErrorBound=[reference](const double from,const double to) {
                             return reference->chordErrorBound(from,to);
@@ -768,13 +1012,17 @@ namespace ngc {
         const auto trimmedPiece=[](const ContinuousEntity &entity,const double from,const double to) {
             const auto length=std::max(0.0,to-from);
             return GeometryPiece {
-                .input=entity.input,.length=length,
+                .input=entity.input,.length=length,.speed=entity.speed/60.0,
+                .linear=entity.linear,
                 .sampleAt=[entity,from,length](const double distance) {
                     const auto source=from+std::clamp(distance,0.0,length);
                     return PathSample{entity.positionAt(source),entity.tangentAt(source)};
                 },
                 .curvatureAt=[entity,from,length](const double distance) {
                     return entity.curvatureAt(from+std::clamp(distance,0.0,length));
+                },
+                .curvatureDerivativeAt=[entity,from,length](const double distance) {
+                    return entity.curvatureDerivativeAt(from+std::clamp(distance,0.0,length));
                 },
                 .positionAt=[entity,from,length](const double distance) {
                     return entity.positionAt(from+std::clamp(distance,0.0,length));
@@ -844,14 +1092,25 @@ namespace ngc {
             auto spline=std::make_shared<CubicBSplineReference>(controls);
             if(!std::isfinite(spline->length())||spline->length()<=1e-12)
                 return std::unexpected("continuous path produced a zero-length B-spline blend");
+            const auto linear=incoming.linear&&outgoing.linear
+                &&subtract(start.tangent,end.tangent).length()<=1e-12;
             pieces.push_back({
                 .input=index+1,.length=spline->length(),
-                .sampleAt=[spline](const double distance) {
+                .speed=(incoming.speed+outgoing.speed)/120.0,
+                .linear=linear,
+                .sampleAt=[spline,start,end](const double distance) {
+                    if(distance<=1e-10) return start;
+                    if(spline->length()-distance<=1e-10) return end;
                     return PathSample{spline->positionAtDistance(distance),
                                       spline->tangentAtDistance(distance)};
                 },
-                .curvatureAt=[spline](const double distance) {
+                .curvatureAt=[spline,startCurvature,endCurvature](const double distance) {
+                    if(distance<=1e-10) return startCurvature;
+                    if(spline->length()-distance<=1e-10) return endCurvature;
                     return spline->curvatureAtDistance(distance);
+                },
+                .curvatureDerivativeAt=[spline](const double distance) {
+                    return spline->curvatureDerivativeAtDistance(distance);
                 },
                 .positionAt=[spline](const double distance) {
                     return spline->positionAtDistance(distance);
@@ -863,51 +1122,66 @@ namespace ngc {
         }
         if(pieces.empty()) return std::unexpected("continuous path produced no geometry");
 
-        std::vector<double> offsets{0.0};
-        offsets.reserve(pieces.size()+1);
-        for(const auto &piece:pieces) offsets.push_back(offsets.back()+piece.length);
-        const auto totalLength=offsets.back();
-        const auto pieceIndexAt=[&](const double distance) {
-            if(distance>=totalLength) return pieces.size()-1;
-            const auto upper=std::upper_bound(offsets.begin(),offsets.end(),std::max(0.0,distance));
-            return std::min<std::size_t>(pieces.size()-1,
-                static_cast<std::size_t>(std::distance(offsets.begin(),upper)-1));
-        };
-        position_t maximumTangent{};
-        for(const auto &piece:pieces) {
-            constexpr unsigned SAMPLES=64;
-            for(unsigned sample=0;sample<=SAMPLES;++sample) {
-                const auto tangent=piece.sampleAt(piece.length*static_cast<double>(sample)/SAMPLES).tangent;
-                for(const auto component:AXIS_COMPONENTS)
-                    maximumTangent.*component=std::max(maximumTangent.*component,
-                        std::abs(tangent.*component));
-            }
-        }
-        auto requestedVelocity=std::numeric_limits<double>::infinity();
-        for(const auto &entity:entities) requestedVelocity=std::min(requestedVelocity,entity.speed/60.0);
-        requestedVelocity=std::min(requestedVelocity,pathLimit(maximumTangent,m_limits.axisVelocity));
-        if(requestedVelocity<=0.0||!std::isfinite(requestedVelocity))
-            return std::unexpected("continuous path has no valid velocity");
-        const auto timing=timeLaw(totalLength,requestedVelocity,m_limits.pathAcceleration,m_limits.pathJerk);
-        if(!timing) return std::unexpected(timing.error());
-
         auto result=std::make_unique<ContinuousTrajectoryPlan>();
-        auto &chunk=result->chunk;
-        chunk.epoch=m_epoch;
-        chunk.id=m_nextChunk;
-        chunk.predecessorBranch=m_previousBranch;
-        chunk.branch=chunk.id;
+        std::vector<AxisPolynomialSpan> normalSpans;
+        std::vector<std::size_t> normalSpanPieces;
+        auto nextChunk=m_nextChunk;
         auto nextSpan=m_nextSpan;
         std::vector<SpanId> activationSpans(commands.size(),0);
-        const auto kinematicAt=[&](const TimeBoundary &boundary) {
-            auto distance=boundary.distance;
-            const auto nearby=std::lower_bound(offsets.begin(),offsets.end(),distance);
-            if(nearby!=offsets.end()&&std::abs(*nearby-distance)<1e-9) distance=*nearby;
-            else if(nearby!=offsets.begin()&&std::abs(*std::prev(nearby)-distance)<1e-9)
-                distance=*std::prev(nearby);
-            const auto pieceIndex=pieceIndexAt(distance);
+
+        struct LocalLimits { double velocity; double acceleration; double jerk; };
+        std::vector<LocalLimits> localLimits;
+        localLimits.reserve(pieces.size());
+        for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
             const auto &piece=pieces[pieceIndex];
-            auto local=std::clamp(distance-offsets[pieceIndex],0.0,piece.length);
+            LocalLimits limits{piece.speed,m_limits.pathAcceleration,m_limits.pathJerk};
+            constexpr unsigned SAMPLES=64;
+            for(unsigned sampleIndex=0;sampleIndex<=SAMPLES;++sampleIndex) {
+                const auto distance=piece.length*static_cast<double>(sampleIndex)/SAMPLES;
+                const auto sample=piece.sampleAt(distance);
+                const auto curvature=piece.curvatureAt(distance);
+                const auto curvatureDerivative=piece.curvatureDerivativeAt(distance);
+                for(const auto component:AXIS_COMPONENTS) {
+                    const auto tangent=std::abs(sample.tangent.*component);
+                    if(tangent>1e-15) {
+                        limits.velocity=std::min(limits.velocity,
+                            m_limits.axisVelocity.*component/tangent);
+                        limits.acceleration=std::min(limits.acceleration,
+                            m_limits.axisAcceleration.*component/tangent);
+                        limits.jerk=std::min(limits.jerk,m_limits.axisJerk.*component/tangent);
+                    }
+                    const auto axisCurvature=std::abs(curvature.*component);
+                    if(axisCurvature>1e-15)
+                        limits.velocity=std::min(limits.velocity,std::sqrt(
+                            m_limits.axisAcceleration.*component/axisCurvature));
+                }
+                const auto curvatureMagnitude=curvature.length();
+                if(curvatureMagnitude>1e-15)
+                    limits.velocity=std::min(limits.velocity,
+                        std::sqrt(m_limits.pathAcceleration/curvatureMagnitude));
+                const auto derivativeMagnitude=curvatureDerivative.length();
+                if(derivativeMagnitude>1e-15)
+                    limits.velocity=std::min(limits.velocity,
+                        std::cbrt(m_limits.pathJerk/derivativeMagnitude));
+                for(const auto component:AXIS_COMPONENTS) {
+                    const auto axisDerivative=std::abs(curvatureDerivative.*component);
+                    if(axisDerivative>1e-15)
+                        limits.velocity=std::min(limits.velocity,std::cbrt(
+                            m_limits.axisJerk.*component/axisDerivative));
+                }
+            }
+            if(limits.velocity<=0.0||limits.acceleration<=0.0||limits.jerk<=0.0
+               ||!std::isfinite(limits.velocity)||!std::isfinite(limits.acceleration)
+               ||!std::isfinite(limits.jerk))
+                return std::unexpected(std::format(
+                    "continuous piece {} for input {} has invalid local limits v={} a={} j={}",
+                    pieceIndex,piece.input,limits.velocity,limits.acceleration,limits.jerk));
+            localLimits.push_back(limits);
+        }
+
+        const auto kinematicAt=[&](const std::size_t pieceIndex,const TimeBoundary &boundary) {
+            const auto &piece=pieces[pieceIndex];
+            auto local=std::clamp(boundary.distance,0.0,piece.length);
             if(local<1e-10) local=0.0;
             else if(piece.length-local<1e-10) local=piece.length;
             const auto sample=piece.sampleAt(local);
@@ -919,111 +1193,407 @@ namespace ngc {
                                   scaled(curvature,boundary.velocity*boundary.velocity)),
             };
         };
-        const auto &boundaries=*timing;
-        for(std::size_t phase=1;phase<boundaries.size();++phase) {
-            const auto scalar=scalarPhase(boundaries[phase-1],boundaries[phase]);
-            std::vector<double> cuts{0.0,1.0};
-            for(std::size_t boundary=1;boundary+1<offsets.size();++boundary) {
-                if(offsets[boundary]<=boundaries[phase-1].distance+1e-12
-                   ||offsets[boundary]>=boundaries[phase].distance-1e-12) continue;
-                auto from=0.0,to=1.0;
-                for(unsigned iteration=0;iteration<52;++iteration) {
-                    const auto middle=std::midpoint(from,to);
-                    if(scalar.at(middle).distance<offsets[boundary]) from=middle;
-                    else to=middle;
+
+        constexpr unsigned MAX_LOCAL_CORRECTION_PASSES=12;
+        bool constraintsVerified=false;
+        std::string correctionHistory;
+        for(unsigned correctionPass=0;correctionPass<MAX_LOCAL_CORRECTION_PASSES;++correctionPass) {
+            std::vector<double> stationCaps(pieces.size()+1,std::numeric_limits<double>::infinity());
+            stationCaps.front()=0.0;
+            stationCaps.back()=0.0;
+            for(std::size_t station=1;station<pieces.size();++station)
+                stationCaps[station]=std::min(localLimits[station-1].velocity,
+                                              localLimits[station].velocity);
+            std::vector<double> stationVelocity=stationCaps;
+            for(unsigned reachabilityPass=0;reachabilityPass<8;++reachabilityPass) {
+                auto maximumChange=0.0;
+                for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
+                    const auto reachable=reachableVelocity(stationVelocity[pieceIndex],
+                        std::min(stationCaps[pieceIndex+1],localLimits[pieceIndex].velocity),
+                        pieces[pieceIndex].length,localLimits[pieceIndex].acceleration,
+                        localLimits[pieceIndex].jerk);
+                    const auto reduced=std::min(stationVelocity[pieceIndex+1],reachable);
+                    maximumChange=std::max(maximumChange,stationVelocity[pieceIndex+1]-reduced);
+                    stationVelocity[pieceIndex+1]=reduced;
                 }
-                cuts.push_back(std::midpoint(from,to));
+                for(std::size_t pieceIndex=pieces.size();pieceIndex-->0;) {
+                    const auto reachable=reachableVelocity(stationVelocity[pieceIndex+1],
+                        std::min(stationCaps[pieceIndex],localLimits[pieceIndex].velocity),
+                        pieces[pieceIndex].length,localLimits[pieceIndex].acceleration,
+                        localLimits[pieceIndex].jerk);
+                    const auto reduced=std::min(stationVelocity[pieceIndex],reachable);
+                    maximumChange=std::max(maximumChange,stationVelocity[pieceIndex]-reduced);
+                    stationVelocity[pieceIndex]=reduced;
+                }
+                if(maximumChange<=1e-11) break;
             }
-            std::ranges::sort(cuts);
-            for(std::size_t cut=1;cut<cuts.size();++cut) {
-                const auto emit=[&](const auto &self,const double u0,const double u1,
+
+            const auto zeroAccelerationStationVelocity=stationVelocity;
+            std::vector<double> stationAcceleration(pieces.size()+1,0.0);
+            // Estimate one shared scalar
+            // acceleration from adjacent spatial velocity slopes.  The minmod
+            // choice carries acceleration only while both sides agree on its
+            // direction and returns to zero at speed peaks and valleys.
+            for(std::size_t station=1;station<pieces.size();++station) {
+                const auto left=(stationVelocity[station]*stationVelocity[station]
+                    -stationVelocity[station-1]*stationVelocity[station-1])
+                    /(2.0*pieces[station-1].length);
+                const auto right=(stationVelocity[station+1]*stationVelocity[station+1]
+                    -stationVelocity[station]*stationVelocity[station])
+                    /(2.0*pieces[station].length);
+                const auto atCap=stationCaps[station]-stationVelocity[station]
+                    <=std::max(1e-10,stationCaps[station]*1e-9);
+                if(!atCap&&left*right>0.0) {
+                    const auto magnitude=std::min(std::abs(left),std::abs(right));
+                    const auto limit=0.95*std::min(localLimits[station-1].acceleration,
+                                                   localLimits[station].acceleration);
+                    stationAcceleration[station]=std::copysign(std::min(magnitude,limit),left);
+                }
+            }
+
+            // Ruckig remains the exact local feasibility authority.  If the
+            // conservative slope estimate still makes an adjacent position solve
+            // infeasible, reduce all internal station accelerations together.  The
+            // zero-acceleration profile is the proven baseline and must succeed;
+            // reaching it without a solve is a fatal planning error.
+            std::vector<std::vector<TimeBoundary>> pieceTiming(pieces.size());
+            std::string timingFailure;
+            bool timingSolved=false;
+            unsigned accelerationReductions=0;
+            for(unsigned accelerationAttempt=0;accelerationAttempt<16;++accelerationAttempt) {
+                timingFailure.clear();
+                timingSolved=true;
+                for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
+                    auto timing=timeLawBetween(pieces[pieceIndex].length,
+                        stationVelocity[pieceIndex],stationAcceleration[pieceIndex],
+                        stationVelocity[pieceIndex+1],stationAcceleration[pieceIndex+1],
+                        localLimits[pieceIndex].velocity,localLimits[pieceIndex].acceleration,
+                        localLimits[pieceIndex].jerk);
+                    if(!timing) {
+                        timingFailure=std::format("piece {} input {}: {}",pieceIndex,
+                            pieces[pieceIndex].input,timing.error());
+                        timingSolved=false;
+                        break;
+                    }
+                    pieceTiming[pieceIndex]=std::move(*timing);
+                }
+                if(timingSolved) {
+                    accelerationReductions=accelerationAttempt;
+                    break;
+                }
+                for(std::size_t station=1;station+1<stationAcceleration.size();++station)
+                    stationAcceleration[station]*=0.5;
+            }
+            if(!timingSolved) return std::unexpected(std::format(
+                "continuous acceleration-carrying timing failed after 16 reductions; {}",
+                timingFailure));
+            std::vector<std::vector<TimeBoundary>> zeroAccelerationTiming(pieces.size());
+            auto carriedDuration=0.0;
+            auto zeroAccelerationDuration=0.0;
+            for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
+                carriedDuration+=pieceTiming[pieceIndex].back().time;
+                auto timing=timeLawBetween(pieces[pieceIndex].length,
+                    zeroAccelerationStationVelocity[pieceIndex],0.0,
+                    zeroAccelerationStationVelocity[pieceIndex+1],0.0,
+                    localLimits[pieceIndex].velocity,localLimits[pieceIndex].acceleration,
+                    localLimits[pieceIndex].jerk);
+                if(!timing) return std::unexpected(std::format(
+                    "continuous zero-acceleration comparison timing failed at piece {} input {}: {}",
+                    pieceIndex,pieces[pieceIndex].input,timing.error()));
+                zeroAccelerationDuration+=timing->back().time;
+                zeroAccelerationTiming[pieceIndex]=std::move(*timing);
+            }
+            // Carrying acceleration is an optimization, never permission to make
+            // the already-feasible profile slower.  Compare complete scalar
+            // horizons and retain the proven zero-acceleration timing when the
+            // estimated shared accelerations do not reduce traversal time.
+            const auto accelerationCandidateSelected=
+                carriedDuration<zeroAccelerationDuration-1e-12;
+            if(carriedDuration>=zeroAccelerationDuration-1e-12) {
+                stationVelocity=zeroAccelerationStationVelocity;
+                std::ranges::fill(stationAcceleration,0.0);
+                pieceTiming=std::move(zeroAccelerationTiming);
+            }
+            auto maximumStationAcceleration=0.0;
+            for(const auto value:stationAcceleration)
+                maximumStationAcceleration=std::max(maximumStationAcceleration,std::abs(value));
+            result->pieceTiming.clear();
+            result->pieceTiming.reserve(pieces.size());
+            for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
+                result->pieceTiming.push_back({
+                    .input=pieces[pieceIndex].input,
+                    .length=pieces[pieceIndex].length,
+                    .velocityLimit=localLimits[pieceIndex].velocity,
+                    .accelerationLimit=localLimits[pieceIndex].acceleration,
+                    .jerkLimit=localLimits[pieceIndex].jerk,
+                    .entryVelocity=stationVelocity[pieceIndex],
+                    .entryAcceleration=stationAcceleration[pieceIndex],
+                    .exitVelocity=stationVelocity[pieceIndex+1],
+                    .exitAcceleration=stationAcceleration[pieceIndex+1],
+                    .duration=pieceTiming[pieceIndex].back().time,
+                });
+            }
+
+            normalSpans.clear();
+            normalSpanPieces.clear();
+            std::ranges::fill(activationSpans,SpanId{});
+            nextSpan=m_nextSpan;
+            for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
+                const auto &piece=pieces[pieceIndex];
+                const auto &boundaries=pieceTiming[pieceIndex];
+                const auto emit=[&](const auto &self,const auto &stateAt,
+                                    const double totalDuration,const std::size_t interval,
+                                    const double u0,const double u1,
                                     const unsigned depth) -> std::optional<std::string> {
-                    const auto from=scalar.at(u0);
-                    const auto to=scalar.at(u1);
-                    const auto duration=scalar.duration*(u1-u0);
-                    if(duration<=1e-12) return std::nullopt;
-                    const auto middleDistance=scalar.at(std::midpoint(u0,u1)).distance;
-                    const auto pieceIndex=pieceIndexAt(middleDistance);
-                    const auto localFrom=std::clamp(from.distance-offsets[pieceIndex],0.0,pieces[pieceIndex].length);
-                    const auto localTo=std::clamp(to.distance-offsets[pieceIndex],0.0,pieces[pieceIndex].length);
-                    const auto chain=c2CubicChain(nextSpan,kinematicAt(from),kinematicAt(to),duration);
-                    auto verified=true;
-                    for(std::size_t chainSpan=0;chainSpan<chain.size();++chainSpan) {
-                        const auto fraction0=static_cast<double>(chainSpan)/chain.size();
-                        const auto fraction1=static_cast<double>(chainSpan+1)/chain.size();
-                        const auto source0=scalar.at(std::lerp(u0,u1,fraction0)).distance-offsets[pieceIndex];
-                        const auto source1=scalar.at(std::lerp(u0,u1,fraction1)).distance-offsets[pieceIndex];
-                        if(!verifiesOrderedCurveTolerance(chain[chainSpan],
-                            std::clamp(source0,localFrom,localTo),std::clamp(source1,localFrom,localTo),
-                            m_limits.arcChordTolerance,pieces[pieceIndex].positionAt,
-                            pieces[pieceIndex].chordErrorBound)) {
-                            verified=false;
-                            break;
+                        auto from=stateAt(u0);
+                        auto to=stateAt(u1);
+                        const auto duration=totalDuration*(u1-u0);
+                        if(duration<=1e-12) return std::nullopt;
+                        const auto localFrom=std::clamp(from.distance,0.0,piece.length);
+                        const auto localTo=std::clamp(to.distance,0.0,piece.length);
+                        std::vector<AxisPolynomialSpan> chain;
+                        if(piece.linear) {
+                            const auto start=piece.sampleAt(localFrom);
+                            const auto finish=piece.sampleAt(localTo);
+                            AxisPolynomialSpan span;
+                            span.id=nextSpan;
+                            span.duration=duration;
+                            span.inverseDuration=1.0/duration;
+                            span.inverseDurationSquared=span.inverseDuration*span.inverseDuration;
+                            span.inverseDurationCubed=span.inverseDurationSquared*span.inverseDuration;
+                            span.a=scaled(start.tangent,
+                                (to.acceleration-from.acceleration)*duration*duration/6.0);
+                            span.b=scaled(start.tangent,from.acceleration*duration*duration/2.0);
+                            span.c=scaled(start.tangent,from.velocity*duration);
+                            span.d=start.position;
+                            span.end.position=finish.position;
+                            span.end.velocity=scaled(finish.tangent,to.velocity);
+                            span.end.acceleration=scaled(finish.tangent,to.acceleration);
+                            chain.push_back(span);
+                        } else {
+                            const auto curved=c2CubicChain(nextSpan,kinematicAt(pieceIndex,from),
+                                kinematicAt(pieceIndex,to),duration);
+                            chain.assign(curved.begin(),curved.end());
                         }
-                    }
-                    if(!verified) {
-                        if(depth>=20) return "continuous cubic tolerance verification did not converge";
-                        const auto middle=std::midpoint(u0,u1);
-                        if(auto error=self(self,u0,middle,depth+1)) return error;
-                        return self(self,middle,u1,depth+1);
-                    }
-                    if(chunk.normalMotion.size+chain.size()>MAX_NORMAL_SPANS_PER_CHUNK)
-                        return "continuous trajectory chunk span capacity exceeded";
-                    for(const auto &span:chain) (void)chunk.normalMotion.push(span);
-                    if(activationSpans[pieces[pieceIndex].input]==0)
-                        activationSpans[pieces[pieceIndex].input]=chain.front().id;
-                    nextSpan+=chain.size();
-                    return std::nullopt;
+                        auto verified=true;
+                        for(std::size_t chainSpan=0;chainSpan<chain.size();++chainSpan) {
+                            const auto fraction0=static_cast<double>(chainSpan)/chain.size();
+                            const auto fraction1=static_cast<double>(chainSpan+1)/chain.size();
+                            const auto source0=stateAt(std::lerp(u0,u1,fraction0)).distance;
+                            const auto source1=stateAt(std::lerp(u0,u1,fraction1)).distance;
+                            if(!verifiesOrderedCurveTolerance(chain[chainSpan],
+                                std::clamp(source0,localFrom,localTo),
+                                std::clamp(source1,localFrom,localTo),m_limits.arcChordTolerance,
+                                piece.positionAt,piece.chordErrorBound)) {
+                                verified=false;
+                                break;
+                            }
+                        }
+                        if(!verified) {
+                            if(depth>=20) return std::format(
+                                "continuous local cubic tolerance verification did not converge at "
+                                "piece {} source input {} phase {} recursion depth {} scalar u=[{},{}] "
+                                "local distance=[{},{}] duration={} tolerance={}",pieceIndex,piece.input,
+                                interval,depth,u0,u1,localFrom,localTo,duration,m_limits.arcChordTolerance);
+                            const auto middle=std::midpoint(u0,u1);
+                            if(auto error=self(self,stateAt,totalDuration,interval,u0,middle,depth+1))
+                                return error;
+                            return self(self,stateAt,totalDuration,interval,middle,u1,depth+1);
+                        }
+                        normalSpans.insert(normalSpans.end(),chain.begin(),chain.end());
+                        normalSpanPieces.insert(normalSpanPieces.end(),chain.size(),pieceIndex);
+                        if(activationSpans[piece.input]==0)
+                            activationSpans[piece.input]=chain.front().id;
+                        nextSpan+=chain.size();
+                        return std::nullopt;
                 };
-                if(auto error=emit(emit,cuts[cut-1],cuts[cut],0)) return std::unexpected(*error);
+                if(piece.linear) {
+                    for(std::size_t phase=1;phase<boundaries.size();++phase) {
+                        const auto scalar=localScalarPhase(boundaries[phase-1],boundaries[phase]);
+                        const auto stateAt=[&](const double u) { return scalar.at(u); };
+                        if(auto error=emit(emit,stateAt,scalar.duration,phase,0.0,1.0,0))
+                            return std::unexpected(*error);
+                    }
+                } else {
+                    const auto totalDuration=boundaries.back().time;
+                    const auto stateAt=[&](const double u) {
+                        if(u<=0.0) return boundaries.front();
+                        if(u>=1.0) return boundaries.back();
+                        const auto time=totalDuration*u;
+                        const auto upper=std::ranges::upper_bound(boundaries,time,{},&TimeBoundary::time);
+                        const auto index=std::clamp<std::size_t>(upper-boundaries.begin(),1,
+                            boundaries.size()-1);
+                        const auto scalar=localScalarPhase(boundaries[index-1],boundaries[index]);
+                        return scalar.at(std::clamp((time-boundaries[index-1].time)/scalar.duration,
+                            0.0,1.0));
+                    };
+                    if(auto error=emit(emit,stateAt,totalDuration,0,0.0,1.0,0))
+                        return std::unexpected(*error);
+                }
             }
-        }
-        if(chunk.normalMotion.size==0) return std::unexpected("continuous trajectory emitted no motion spans");
+            if(normalSpans.empty())
+                return std::unexpected("continuous locally timed trajectory emitted no motion spans");
 
-        double maximumAcceleration=0.0;
-        double maximumJerk=0.0;
-        auto axisScaleFactor=1.0;
-        for(const auto &span:chunk.normalMotion) {
-            maximumAcceleration=std::max(maximumAcceleration,maximumLinearAcceleration(span));
-            maximumJerk=std::max(maximumJerk,maximumLinearJerk(span));
-            for(const auto component:AXIS_COMPONENTS) {
-                axisScaleFactor=std::max(axisScaleFactor,
-                    maximumAxisVelocity(span,component)/(m_limits.axisVelocity.*component));
-                axisScaleFactor=std::max(axisScaleFactor,std::sqrt(
-                    maximumAxisAcceleration(span,component)/(m_limits.axisAcceleration.*component)));
-                axisScaleFactor=std::max(axisScaleFactor,std::cbrt(
-                    maximumAxisJerk(span,component)/(m_limits.axisJerk.*component)));
+            struct ConstraintViolationDiagnostic {
+                double factor=1.0;
+                std::size_t stagedSpan=0;
+                SpanId spanId=0;
+                const char *constraint="none";
+                const char *axis="path";
+                double measured=0.0;
+                double limit=0.0;
+                double ratio=1.0;
+                double duration=0.0;
+            };
+            std::vector<double> correction(pieces.size(),1.0);
+            std::vector<ConstraintViolationDiagnostic> violation(pieces.size());
+            for(std::size_t spanIndex=0;spanIndex<normalSpans.size();++spanIndex) {
+                const auto &span=normalSpans[spanIndex];
+                const auto pieceIndex=normalSpanPieces[spanIndex];
+                const auto consider=[&](const double factor,const char *constraint,
+                                        const char *axis,const double measured,const double limit) {
+                    if(factor<=correction[pieceIndex]) return;
+                    correction[pieceIndex]=factor;
+                    violation[pieceIndex]={
+                        .factor=factor,.stagedSpan=spanIndex,.spanId=span.id,
+                        .constraint=constraint,.axis=axis,.measured=measured,.limit=limit,
+                        .ratio=measured/limit,.duration=span.duration,
+                    };
+                };
+                const auto pathAcceleration=maximumLinearAcceleration(span);
+                consider(std::sqrt(pathAcceleration/m_limits.pathAcceleration),
+                    "path_acceleration","path",pathAcceleration,m_limits.pathAcceleration);
+                const auto pathJerk=maximumLinearJerk(span);
+                consider(std::cbrt(pathJerk/m_limits.pathJerk),
+                    "path_jerk","path",pathJerk,m_limits.pathJerk);
+                for(std::size_t axis=0;axis<AXIS_COMPONENTS.size();++axis) {
+                    const auto component=AXIS_COMPONENTS[axis];
+                    const auto velocity=maximumAxisVelocity(span,component);
+                    consider(velocity/(m_limits.axisVelocity.*component),"axis_velocity",
+                        AXIS_NAMES[axis],velocity,m_limits.axisVelocity.*component);
+                    const auto acceleration=maximumAxisAcceleration(span,component);
+                    consider(std::sqrt(acceleration/(m_limits.axisAcceleration.*component)),
+                        "axis_acceleration",AXIS_NAMES[axis],acceleration,
+                        m_limits.axisAcceleration.*component);
+                    const auto jerk=maximumAxisJerk(span,component);
+                    consider(std::cbrt(jerk/(m_limits.axisJerk.*component)),"axis_jerk",
+                        AXIS_NAMES[axis],jerk,m_limits.axisJerk.*component);
+                }
+            }
+            const auto worstIterator=std::ranges::max_element(correction);
+            const auto worst=*worstIterator;
+            const auto worstPiece=static_cast<std::size_t>(worstIterator-correction.begin());
+            const auto &worstViolation=violation[worstPiece];
+            correctionHistory+=std::format(
+                "{}pass {}: factor={} piece={} input={} geometry={} piece_length={} "
+                "span_id={} staged_span={} span_duration={} constraint={} axis={} measured={} "
+                "limit={} measured_over_limit={} timing_candidate={} carried_duration={} "
+                "zero_acceleration_duration={} selected_duration={} acceleration_reductions={} "
+                "max_station_acceleration={} station_state=[v={} a={} -> v={} a={}] "
+                "local_limits=[v={} a={} j={}]",
+                correctionHistory.empty()?"":"; ",correctionPass,worst,worstPiece,
+                pieces[worstPiece].input,pieces[worstPiece].linear?"linear":"curved",
+                pieces[worstPiece].length,worstViolation.spanId,worstViolation.stagedSpan,
+                worstViolation.duration,worstViolation.constraint,worstViolation.axis,
+                worstViolation.measured,worstViolation.limit,worstViolation.ratio,
+                accelerationCandidateSelected?"acceleration-carrying":"zero-acceleration",
+                carriedDuration,zeroAccelerationDuration,
+                accelerationCandidateSelected?carriedDuration:zeroAccelerationDuration,
+                accelerationReductions,maximumStationAcceleration,
+                stationVelocity[worstPiece],stationAcceleration[worstPiece],
+                stationVelocity[worstPiece+1],stationAcceleration[worstPiece+1],
+                localLimits[worstPiece].velocity,
+                localLimits[worstPiece].acceleration,localLimits[worstPiece].jerk);
+            if(worst<=1.0+1e-9) {
+                constraintsVerified=true;
+                break;
+            }
+            for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
+                if(correction[pieceIndex]<=1.0+1e-9) continue;
+                const auto factor=correction[pieceIndex]*1.001;
+                localLimits[pieceIndex].velocity/=factor;
+                localLimits[pieceIndex].acceleration/=factor*factor;
+                localLimits[pieceIndex].jerk/=factor*factor*factor;
             }
         }
-        const auto scaleFactor=std::max({1.0,axisScaleFactor,
-            std::sqrt(maximumAcceleration/m_limits.pathAcceleration),
-            std::cbrt(maximumJerk/m_limits.pathJerk)});
-        if(scaleFactor>1.0+1e-9) {
-            for(auto &span:chunk.normalMotion) {
-                span.duration*=scaleFactor;
-                span.inverseDuration/=scaleFactor;
-                span.inverseDurationSquared=span.inverseDuration*span.inverseDuration;
-                span.inverseDurationCubed=span.inverseDurationSquared*span.inverseDuration;
-                span.end.velocity=scaled(span.end.velocity,1.0/scaleFactor);
-                span.end.acceleration=scaled(span.end.acceleration,1.0/(scaleFactor*scaleFactor));
+        if(!constraintsVerified)
+            return std::unexpected(std::format(
+                "continuous local constraint correction did not converge after {} passes: {}",
+                MAX_LOCAL_CORRECTION_PASSES,correctionHistory));
+
+        if(oracleModel) {
+            ContinuousAccelerationOracleModel model;
+            model.pathAcceleration=m_limits.pathAcceleration;
+            model.axisAcceleration=m_limits.axisAcceleration;
+            for(const auto &timing:result->pieceTiming) model.plannerDuration+=timing.duration;
+            for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
+                const auto &piece=pieces[pieceIndex];
+                // Sixteen intervals per geometry piece let the oracle represent
+                // acceleration, cruise, and braking inside long retained lines,
+                // while also exposing curved-piece acceleration cones. This work
+                // exists only when the optional development model is requested.
+                constexpr std::size_t subdivisions=16;
+                const auto length=piece.length/static_cast<double>(subdivisions);
+                for(std::size_t subdivision=0;subdivision<subdivisions;++subdivision) {
+                    const auto distance=length*(static_cast<double>(subdivision)+0.5);
+                    const auto sample=piece.sampleAt(distance);
+                    model.segments.push_back({
+                        .piece=pieceIndex,
+                        .input=piece.input,
+                        .length=length,
+                        .velocityLimit=localLimits[pieceIndex].velocity,
+                        .tangent=sample.tangent,
+                        .curvature=piece.curvatureAt(distance),
+                    });
+                }
             }
+            *oracleModel=std::move(model);
         }
 
-        chunk.branchState=chunk.normalMotion[chunk.normalMotion.size-1].end;
-        chunk.branchState.velocity={};
-        chunk.branchState.acceleration={};
-        const PathSample held{chunk.branchState.position,{}};
-        auto stop=hermite(nextSpan++,held,held,0.0,0.0,1e-6);
-        stop.end=chunk.branchState;
-        if(!chunk.stopTail.push(stop))
-            return std::unexpected("continuous trajectory stop-tail capacity exceeded");
-        chunk.stopState=chunk.branchState;
+        result->chunks.reserve((normalSpans.size()+MAX_NORMAL_SPANS_PER_CHUNK-1)
+            /MAX_NORMAL_SPANS_PER_CHUNK);
+        auto predecessor=m_previousBranch;
+        for(std::size_t first=0;first<normalSpans.size();first+=MAX_NORMAL_SPANS_PER_CHUNK) {
+            auto &chunk=result->chunks.emplace_back();
+            chunk.epoch=m_epoch;
+            chunk.id=nextChunk++;
+            chunk.predecessorBranch=predecessor;
+            chunk.branch=chunk.id;
+            const auto last=std::min(first+MAX_NORMAL_SPANS_PER_CHUNK,normalSpans.size());
+            for(std::size_t span=first;span<last;++span) (void)chunk.normalMotion.push(normalSpans[span]);
+            chunk.branchState=chunk.normalMotion[chunk.normalMotion.size-1].end;
+            if(last==normalSpans.size()) {
+                chunk.branchState.velocity={};
+                chunk.branchState.acceleration={};
+                const PathSample held{chunk.branchState.position,{}};
+                auto stop=hermite(nextSpan++,held,held,0.0,0.0,1e-6);
+                stop.end=chunk.branchState;
+                if(!chunk.stopTail.push(stop))
+                    return std::unexpected("continuous trajectory terminal stop-tail capacity exceeded");
+                chunk.stopState=chunk.branchState;
+            } else {
+                auto stop=stoppingSpans(chunk.branchState,m_limits,nextSpan);
+                if(!stop) return std::unexpected(std::format(
+                    "continuous trajectory failed to generate stop tail for packet {} at staged span {}: {}",
+                    result->chunks.size()-1,last,stop.error()));
+                if(stop->size()>MAX_STOP_SPANS_PER_CHUNK)
+                    return std::unexpected(std::format(
+                        "continuous trajectory moving stop tail exceeds fixed capacity for packet {} at "
+                        "staged span {}: required spans={} capacity={}",result->chunks.size()-1,last,
+                        stop->size(),MAX_STOP_SPANS_PER_CHUNK));
+                for(const auto &span:*stop) (void)chunk.stopTail.push(span);
+                chunk.stopState=chunk.stopTail[chunk.stopTail.size-1].end;
+                chunk.stopState.velocity={};
+                chunk.stopState.acceleration={};
+            }
+            predecessor=chunk.branch;
+        }
 
         for(std::size_t input=1;input<activationSpans.size();++input)
             if(activationSpans[input]==0) activationSpans[input]=activationSpans[input-1];
-        m_nextChunk++;
+        m_nextChunk=nextChunk;
         m_nextSpan=nextSpan;
-        m_previousBranch=chunk.branch;
+        m_previousBranch=result->chunks.back().branch;
         m_position=expectedStart;
         result->activationSpans=std::move(activationSpans);
         return result;

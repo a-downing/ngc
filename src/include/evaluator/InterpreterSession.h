@@ -6,6 +6,7 @@
 #include <memory>
 #include <mutex>
 #include <optional>
+#include <print>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -110,6 +111,11 @@ namespace ngc {
         template<typename Self> auto &statusMessages(this Self &&self) { return std::forward<Self>(self).m_statusMessages; }
         template<typename Self> auto &blockMessages(this Self &&self) { return std::forward<Self>(self).m_blockMessages; }
 
+        void reportError(std::string text) {
+            std::println(stderr, "ERROR: {}", text);
+            m_statusMessages.push_back({ InterpreterStatusKind::Error, std::move(text) });
+        }
+
         bool compiled() const { return m_compiled; }
 
         void setPrograms(const std::vector<std::tuple<std::string, std::string>> &programs) {
@@ -137,6 +143,8 @@ namespace ngc {
                     errors.emplace_back(std::move(result.error()));
                 }
             }
+
+            for(const auto &error:errors) std::println(stderr,"ERROR: {}",error.text());
 
             synchronize([&] {
                 m_parserErrors = std::move(errors);
@@ -269,12 +277,12 @@ namespace ngc {
                     } catch(const std::exception &error) {
                         const auto text = statusErrorText(*message, error.what());
                         stop();
-                        m_statusMessages.push_back({ InterpreterStatusKind::Error, text });
+                        reportError(text);
                         return InterpreterError { text };
                     } catch(...) {
                         const auto text = statusErrorText(*message, "unknown interpreter error");
                         stop();
-                        m_statusMessages.push_back({ InterpreterStatusKind::Error, text });
+                        reportError(text);
                         return InterpreterError { text };
                     }
                     continue;
@@ -285,7 +293,7 @@ namespace ngc {
                 finishExecutionThread();
 
                 if(error) {
-                    m_statusMessages.push_back({ InterpreterStatusKind::Error, *error });
+                    reportError(*error);
                     return InterpreterError { *error };
                 }
 

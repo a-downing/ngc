@@ -11,9 +11,42 @@
 #include "machine/MotionBackend.h"
 
 namespace ngc {
+    struct ContinuousPieceTimingDiagnostic {
+        std::size_t input = 0;
+        double length = 0.0;
+        double velocityLimit = 0.0;
+        double accelerationLimit = 0.0;
+        double jerkLimit = 0.0;
+        double entryVelocity = 0.0;
+        double entryAcceleration = 0.0;
+        double exitVelocity = 0.0;
+        double exitAcceleration = 0.0;
+        double duration = 0.0;
+    };
+
+    struct ContinuousAccelerationOracleSegment {
+        std::size_t piece = 0;
+        std::size_t input = 0;
+        double length = 0.0;
+        double velocityLimit = 0.0;
+        position_t tangent{};
+        position_t curvature{};
+    };
+
+    // Optional NRT-only data for the standalone Clarabel comparison tool.
+    // This is deliberately not part of PlanChunk or MotionBackend.
+    struct ContinuousAccelerationOracleModel {
+        double pathAcceleration = 0.0;
+        position_t axisAcceleration{};
+        double plannerDuration = 0.0;
+        std::vector<ContinuousAccelerationOracleSegment> segments;
+    };
+
     struct ContinuousTrajectoryPlan {
-        PlanChunk chunk;
+        std::vector<PlanChunk> chunks;
         std::vector<SpanId> activationSpans;
+        // NRT-only development evidence; never crosses MotionBackend.
+        std::vector<ContinuousPieceTimingDiagnostic> pieceTiming;
     };
 
     struct TrajectoryLimits {
@@ -51,7 +84,8 @@ namespace ngc {
 
         std::expected<PlanChunk, std::string> compile(const MachineCommand &command);
         std::expected<std::unique_ptr<ContinuousTrajectoryPlan>, std::string> compileContinuous(
-            std::span<const MachineCommand> commands, double blendScale);
+            std::span<const MachineCommand> commands, double blendScale,
+            ContinuousAccelerationOracleModel *oracleModel = nullptr);
         std::expected<TriggeredMove, std::string> compileTriggeredMove(
             const ProbeMove &command, DigitalInputId input = 0,
             InputCondition condition = InputCondition::Active);

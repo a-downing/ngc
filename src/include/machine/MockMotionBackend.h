@@ -22,7 +22,10 @@ namespace ngc {
         void advance(double seconds) override;
         // Fixed-tick simulation may decimate presentation snapshots while still
         // executing every servo update and event transition.
-        void advanceTick(double seconds, bool publishSnapshot);
+        // Returns true when this tick continued across at least one PlanChunk
+        // boundary. Timed simulation uses this mock-only signal to give its NRT
+        // producer a refill opportunity during accelerated scheduler batches.
+        bool advanceTick(double seconds, bool publishSnapshot);
         void runUntilIdle() override;
         // Immediate preview still executes at fixed mock-servo intervals so its
         // diagnostic position buffer reflects the values calculated by the backend.

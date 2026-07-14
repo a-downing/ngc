@@ -811,6 +811,8 @@ private:
             if(preserve) m_session.beginContinuation(); else m_session.begin();
             m_driver.setLimits(m_limits);
             if(!m_driver.begin(m_nextEpoch++, startingPosition)) {
+                m_session.reportError("simulation trajectory driver failed to initialize its backend control channels");
+                m_session.stop();
                 lock.lock(); m_snapshot.status = ngc::SimulationStatus::Error; m_snapshot.error = "motion backend control channel is full"; m_running = false; lock.unlock();
                 continue;
             }
@@ -823,6 +825,7 @@ private:
             std::atomic<double> maximumTickExecution{0.0};
             std::atomic<std::uint32_t> executorError{0};
             std::atomic<bool> executorBatchActive{false};
+            std::atomic<bool> executorRefillRequested{false};
             const auto updateMaximum = [](std::atomic<double> &target, const double value) {
                 auto current = target.load(std::memory_order_relaxed);
                 while(current < value && !target.compare_exchange_weak(
@@ -856,10 +859,27 @@ private:
                         && !stopExecutor.load(std::memory_order_relaxed)
                         && !m_executorPaused.load(std::memory_order_relaxed); ++tick) {
                         const auto started = clock::now();
-                        m_backend.advanceTick(m_servoPeriod, tick + 1 == ticksThisPeriod);
+                        const auto crossedChunk=m_backend.advanceTick(
+                            m_servoPeriod,tick+1==ticksThisPeriod);
                         const auto duration = std::chrono::duration<double>(clock::now() - started).count();
                         updateMaximum(maximumTickExecution, duration);
                         servoTicks.fetch_add(1, std::memory_order_relaxed);
+                        if(crossedChunk&&tick+1<ticksThisPeriod) {
+                            // Accelerated mock playback can consume multiple RT
+                            // packets inside one scheduler batch. Yield at each
+                            // continuation so the sole NRT producer can replace
+                            // the freed queue slot before the bounded horizon
+                            // drains and legitimately selects a stop branch.
+                            executorRefillRequested.store(true,std::memory_order_release);
+                            executorBatchActive.store(false,std::memory_order_release);
+                            while(executorRefillRequested.load(std::memory_order_acquire)
+                                  &&!stopExecutor.load(std::memory_order_relaxed)
+                                  &&!m_executorPaused.load(std::memory_order_relaxed))
+                                std::this_thread::yield();
+                            if(stopExecutor.load(std::memory_order_relaxed)
+                               ||m_executorPaused.load(std::memory_order_relaxed)) break;
+                            executorBatchActive.store(true,std::memory_order_release);
+                        }
                     }
                     executorBatchActive.store(false, std::memory_order_release);
                 }
@@ -883,6 +903,7 @@ private:
                     const auto joining = m_join; m_stop = false; m_running = false; m_snapshot.status = ngc::SimulationStatus::Stopped;
                     copyTimingSnapshot();
                     stopExecutor.store(true, std::memory_order_release);
+                    executorRefillRequested.store(false,std::memory_order_release);
                     lock.unlock();
                     executor.join();
                     m_session.stop();
@@ -892,6 +913,7 @@ private:
                 if(m_paused) {
                     m_snapshot.status = ngc::SimulationStatus::Paused;
                     copyTimingSnapshot();
+                    executorRefillRequested.store(false,std::memory_order_release);
                     m_cv.wait(lock, [&] { return m_join || m_stop || !m_paused; });
                     lock.unlock();
                     continue;
@@ -913,6 +935,7 @@ private:
                 ngc::ExecutionSnapshot backendSnapshot;
                 while(m_backend.tryTakeSnapshot(backendSnapshot)) applyBackendSnapshot(backendSnapshot);
                 copyTimingSnapshot();
+                m_snapshot.statusMessages=m_session.statusMessages();
                 auto state = m_driver.state();
                 const auto pacingError = executorError.load(std::memory_order_acquire);
                 if(pacingError != 0) {
@@ -939,6 +962,7 @@ private:
                 }
                 if(state != ngc::TrajectoryDriverState::Running || !m_running) {
                     stopExecutor.store(true, std::memory_order_release);
+                    executorRefillRequested.store(false,std::memory_order_release);
                     lock.unlock();
                     executor.join();
                     m_session.stop();
@@ -957,6 +981,7 @@ private:
                 }
                 m_snapshot.statusMessages = m_session.statusMessages();
                 m_snapshot.trajectoryPlanning = m_driver.planningDiagnostics();
+                executorRefillRequested.store(false,std::memory_order_release);
                 state = m_driver.state();
                 if(state == ngc::TrajectoryDriverState::Error) {
                     m_snapshot.status = ngc::SimulationStatus::Error;
@@ -965,6 +990,7 @@ private:
                 }
                 if(!m_running) {
                     stopExecutor.store(true, std::memory_order_release);
+                    executorRefillRequested.store(false,std::memory_order_release);
                     lock.unlock();
                     executor.join();
                     m_session.stop();

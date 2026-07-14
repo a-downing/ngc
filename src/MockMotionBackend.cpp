@@ -88,6 +88,7 @@ namespace ngc {
         std::uint32_t m_span = 0;
         std::uint32_t m_nextEvent = 0;
         double m_spanElapsed = 0.0;
+        std::uint64_t m_continuationSequence = 0;
         MockTrajectorySnapshot m_trajectoryDiagnostics;
         struct TriggeredRuntime {
             position_t start{};
@@ -246,6 +247,12 @@ namespace ngc {
             if(shouldPublishSnapshot || (executedActiveMotion && !m_active)
                || m_snapshot.state != BackendState::Running)
                 publishSnapshot();
+        }
+
+        bool advanceTick(const double seconds,const bool shouldPublishSnapshot) {
+            const auto before=m_continuationSequence;
+            advance(seconds,shouldPublishSnapshot);
+            return m_continuationSequence!=before;
         }
 
         void runUntilIdle() {
@@ -969,6 +976,7 @@ namespace ngc {
                 const auto oldIndex = *m_active;
                 const auto &continuation = m_planSlots[continuationIndex].item;
                 emit(BranchSelected { current.epoch, current.branch, BranchChoice::Continue, itemId(continuation) });
+                ++m_continuationSequence;
                 emit(ChunkRetired { current.epoch, current.id });
                 m_active = continuationIndex;
                 release(oldIndex);
@@ -1015,6 +1023,7 @@ namespace ngc {
             m_trajectoryDiagnostics.spans.back().positions.push_back(m_snapshot.commanded.position);
             ++m_trajectoryDiagnostics.revision;
         }
+
     };
 
     MockMotionBackend::MockMotionBackend() : m_impl(std::make_unique<Impl>()) { }
@@ -1024,8 +1033,8 @@ namespace ngc {
     bool MockMotionBackend::tryTakeEvent(ExecutionEvent &event) noexcept { return m_impl->takeEvent(event); }
     bool MockMotionBackend::tryTakeSnapshot(ExecutionSnapshot &snapshot) noexcept { return m_impl->takeSnapshot(snapshot); }
     void MockMotionBackend::advance(const double seconds) { m_impl->advance(seconds); }
-    void MockMotionBackend::advanceTick(const double seconds, const bool publishSnapshot) {
-        m_impl->advance(seconds, publishSnapshot);
+    bool MockMotionBackend::advanceTick(const double seconds, const bool publishSnapshot) {
+        return m_impl->advanceTick(seconds,publishSnapshot);
     }
     void MockMotionBackend::runUntilIdle() { m_impl->runUntilIdle(); }
     void MockMotionBackend::runUntilIdle(const double tickSeconds) { m_impl->runUntilIdle(tickSeconds); }

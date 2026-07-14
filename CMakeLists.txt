@@ -136,3 +136,8 @@ target_link_libraries(ngc_tests PRIVATE ngc_core glm::glm-header-only)
 ngc_target_defaults(ngc_tests)
 add_test(NAME ngc_tests COMMAND ngc_tests)
 set_tests_properties(ngc_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
+add_executable(ngc_g64_oracle_export tools/ngc_g64_oracle_export.cpp)
+target_include_directories(ngc_g64_oracle_export PRIVATE src)
+target_link_libraries(ngc_g64_oracle_export PRIVATE ngc_core)
+ngc_target_defaults(ngc_g64_oracle_export)

@@ -20,6 +20,16 @@ namespace ngc {
     public:
         void clear() { m_commands.clear(); m_g64Commands.clear(); m_g64Tolerances.clear(); m_workCoordinateSystems.clear(); ++m_revision; }
 
+        // Publish a geometry-only preview assembled off to the side without
+        // exposing thousands of intermediate revisions to the GUI cache.
+        void replace(ToolpathRecorder recorder) {
+            m_commands=std::move(recorder.m_commands);
+            m_g64Commands=std::move(recorder.m_g64Commands);
+            m_g64Tolerances=std::move(recorder.m_g64Tolerances);
+            m_workCoordinateSystems=std::move(recorder.m_workCoordinateSystems);
+            ++m_revision;
+        }
+
         void consume(MachineCommand command, const position_t &toolOffset = {},
                      std::optional<WorkCoordinateSystem> workCoordinateSystem = std::nullopt,
                      const bool g64Active = false,

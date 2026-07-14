@@ -7,6 +7,7 @@
 #include <cstddef>
 #include <deque>
 #include <expected>
+#include <format>
 #include <memory>
 #include <optional>
 #include <string>
@@ -42,23 +43,37 @@ namespace ngc {
     struct PlannedExecution {
         MachineCommand command;
         TrajectoryPlanningMetadata metadata;
-        ExecutionItem item;
+        std::vector<ExecutionItem> items;
         std::vector<TrajectoryPlannerInput> inputs;
         std::vector<SpanId> activationSpans;
+        std::vector<std::size_t> activationItems;
 
         template<typename Item>
         PlannedExecution(MachineCommand commandValue, TrajectoryPlanningMetadata metadataValue,
                          Item &&itemValue, std::vector<TrajectoryPlannerInput> inputValues,
                          std::vector<SpanId> activationSpanValues = {})
             : command(std::move(commandValue)), metadata(std::move(metadataValue)),
-              item(std::forward<Item>(itemValue)), inputs(std::move(inputValues)),
-              activationSpans(std::move(activationSpanValues)) { }
+              items{ExecutionItem{std::forward<Item>(itemValue)}}, inputs(std::move(inputValues)),
+              activationSpans(std::move(activationSpanValues)),activationItems(inputs.size(),0) { }
+
+        PlannedExecution(MachineCommand commandValue,TrajectoryPlanningMetadata metadataValue,
+                         std::vector<ExecutionItem> itemValues,
+                         std::vector<TrajectoryPlannerInput> inputValues,
+                         std::vector<SpanId> activationSpanValues,
+                         std::vector<std::size_t> activationItemValues)
+            : command(std::move(commandValue)),metadata(std::move(metadataValue)),
+              items(std::move(itemValues)),inputs(std::move(inputValues)),
+              activationSpans(std::move(activationSpanValues)),
+              activationItems(std::move(activationItemValues)) { }
+
+        const ExecutionItem &primaryItem() const { return items.front(); }
     };
 
     struct TrajectoryPlanningDiagnostics {
         std::uint64_t commandsPlanned = 0;
+        std::uint64_t planChunks = 0;
         std::uint64_t continuousModeInputs = 0;
-        std::uint64_t exactStopFallbacks = 0;
+        std::uint64_t continuousExactStops = 0;
         std::uint64_t blendedWindows = 0;
         std::uint64_t blendedCommands = 0;
         std::size_t maximumWindowCommands = 0;
@@ -69,12 +84,10 @@ namespace ngc {
         double maximumPlanningSeconds = 0.0;
     };
 
-    // NRT-only bounded command window. Compatible G64 lines and arcs are planned
-    // as exact retained primitives joined by local degree-three B-spline blends.
+    // NRT-only compatible command horizon. RT capacity is imposed later while
+    // the verified polynomial stream is packetized into PlanChunk values; it is
+    // deliberately not expressed as an arbitrary G-code command count.
     class BoundedLookaheadTrajectoryPlanner {
-    public:
-        static constexpr std::size_t MAX_LOOKAHEAD_COMMANDS = 32;
-
     private:
         ExactStopTrajectoryPlanner m_exactStop;
         std::deque<TrajectoryPlannerInput> m_window;
@@ -88,6 +101,30 @@ namespace ngc {
         static position_t scalePosition(const position_t &value, const double amount) {
             return { value.x*amount, value.y*amount, value.z*amount,
                      value.a*amount, value.b*amount, value.c*amount };
+        }
+
+        static std::string formatPosition(const position_t &value) {
+            return std::format("[X={} Y={} Z={} A={} B={} C={}]",
+                value.x,value.y,value.z,value.a,value.b,value.c);
+        }
+
+        static std::string inputLocation(const TrajectoryPlannerInput &input) {
+            if(input.presentation.activeBlocks.empty()) return "<no active source block>";
+            const auto &block=input.presentation.activeBlocks.back();
+            return std::format("{}:{} block {} '{}'",block.source,block.line,block.id,block.text);
+        }
+
+        std::string continuousWindowContext() const {
+            if(m_window.empty()) return "empty G64 window";
+            const auto start=motionStart(m_window.front().command);
+            const auto end=motionEnd(m_window.back().command);
+            return std::format(
+                "G64 window commands={} P={} first={} last={} start={} end={}",
+                m_window.size(),m_window.front().metadata.pathTolerance
+                    ? std::format("{}",*m_window.front().metadata.pathTolerance) : std::string("<default>"),
+                inputLocation(m_window.front()),inputLocation(m_window.back()),
+                start?formatPosition(*start):std::string("<none>"),
+                end?formatPosition(*end):std::string("<none>"));
         }
 
         static bool continuousMotion(const TrajectoryPlannerInput &input) {
@@ -181,6 +218,11 @@ namespace ngc {
             const auto discontinuity = [](const position_t &a, const position_t &b) {
                 return (a-b).length() > 1e-8;
             };
+            const auto &normalEnd=chunk.normalMotion[chunk.normalMotion.size-1].end;
+            if(discontinuity(normalEnd.position,chunk.branchState.position)
+               ||discontinuity(normalEnd.velocity,chunk.branchState.velocity)
+               ||discontinuity(normalEnd.acceleration,chunk.branchState.acceleration))
+                return std::unexpected("planned chunk branch state does not match normal-motion terminal state");
             auto previous = chunk.branchState;
             const auto &limits = m_exactStop.limits();
             for(const auto &span : chunk.stopTail) {
@@ -221,11 +263,10 @@ namespace ngc {
         std::expected<void,std::string> verifyContinuousNormalMotion(const PlanChunk &chunk) const {
             if(chunk.normalMotion.size==0)
                 return std::unexpected("continuous plan has no normal motion");
-            const auto discontinuity=[](const position_t &left,const position_t &right,const double tolerance) {
-                return (left-right).length()>tolerance;
-            };
             const auto &limits=m_exactStop.limits();
             std::optional<MotionState> previous;
+            SpanId previousSpan=0;
+            std::size_t spanIndex=0;
             for(const auto &span:chunk.normalMotion) {
                 if(!std::isfinite(span.duration)||span.duration<=0.0)
                     return std::unexpected("continuous plan has an invalid span duration");
@@ -234,10 +275,25 @@ namespace ngc {
                     scalePosition(span.c,span.inverseDuration),
                     scalePosition(span.b,2.0*span.inverseDurationSquared),
                 };
-                if(previous&&(discontinuity(previous->position,start.position,1e-8)
-                    ||discontinuity(previous->velocity,start.velocity,1e-7)
-                    ||discontinuity(previous->acceleration,start.acceleration,1e-7)))
-                    return std::unexpected("continuous plan is not C2 at a polynomial boundary");
+                if(previous) {
+                    const auto positionJump=(previous->position-start.position).length();
+                    const auto velocityJump=(previous->velocity-start.velocity).length();
+                    const auto accelerationJump=(previous->acceleration-start.acceleration).length();
+                    if(positionJump>1e-8||velocityJump>1e-7||accelerationJump>1e-7) {
+                        const auto boundaryType=spanIndex%3==0
+                            ? "between emitted three-span chains" : "inside one emitted three-span chain";
+                        return std::unexpected(std::format(
+                            "continuous plan C2 verification failed {} at normal span index {} "
+                            "(span {} -> {}): position jump={} tolerance=1e-8; velocity jump={} "
+                            "tolerance=1e-7; acceleration jump={} tolerance=1e-7; previous end "
+                            "position={} velocity={} acceleration={}; current start position={} "
+                            "velocity={} acceleration={}",boundaryType,spanIndex,previousSpan,span.id,
+                            positionJump,velocityJump,accelerationJump,
+                            formatPosition(previous->position),formatPosition(previous->velocity),
+                            formatPosition(previous->acceleration),formatPosition(start.position),
+                            formatPosition(start.velocity),formatPosition(start.acceleration)));
+                    }
+                }
                 for(const auto component:AXIS_COMPONENTS) {
                     if(exceeds(maximumAxisVelocity(span,component),limits.axisVelocity.*component)
                        ||exceeds(maximumAxisAcceleration(span,component),limits.axisAcceleration.*component)
@@ -251,17 +307,52 @@ namespace ngc {
                    ||exceeds(jerk,limits.pathJerk))
                     return std::unexpected("continuous plan exceeds a configured path limit");
                 previous=span.end;
+                previousSpan=span.id;
+                ++spanIndex;
             }
-            const MotionState first {
-                chunk.normalMotion[0].d,
-                scalePosition(chunk.normalMotion[0].c,chunk.normalMotion[0].inverseDuration),
-                scalePosition(chunk.normalMotion[0].b,
-                              2.0*chunk.normalMotion[0].inverseDurationSquared),
-            };
-            if(first.velocity.length()>1e-8||first.acceleration.length()>1e-8
-               ||chunk.normalMotion[chunk.normalMotion.size-1].end.velocity.length()>1e-8
-               ||chunk.normalMotion[chunk.normalMotion.size-1].end.acceleration.length()>1e-8)
-                return std::unexpected("continuous plan is not rest-to-rest at its protected boundaries");
+            return {};
+        }
+
+        std::expected<void,std::string> verifyContinuousPlan(
+                const std::vector<PlanChunk> &chunks) const {
+            if(chunks.empty()) return std::unexpected("continuous plan produced no RT chunks");
+            std::optional<MotionState> previous;
+            BranchSequence predecessor=chunks.front().predecessorBranch;
+            for(std::size_t chunkIndex=0;chunkIndex<chunks.size();++chunkIndex) {
+                const auto &chunk=chunks[chunkIndex];
+                if(chunk.predecessorBranch!=predecessor)
+                    return std::unexpected(std::format(
+                        "continuous chunk {} predecessor branch {} does not match expected {}",
+                        chunkIndex,chunk.predecessorBranch,predecessor));
+                if(auto verified=verifyContinuousNormalMotion(chunk);!verified)
+                    return std::unexpected(std::format("chunk {}: {}",chunkIndex,verified.error()));
+                const MotionState start {
+                    chunk.normalMotion[0].d,
+                    scalePosition(chunk.normalMotion[0].c,chunk.normalMotion[0].inverseDuration),
+                    scalePosition(chunk.normalMotion[0].b,
+                        2.0*chunk.normalMotion[0].inverseDurationSquared),
+                };
+                if(previous) {
+                    const auto positionJump=(previous->position-start.position).length();
+                    const auto velocityJump=(previous->velocity-start.velocity).length();
+                    const auto accelerationJump=(previous->acceleration-start.acceleration).length();
+                    if(positionJump>1e-8||velocityJump>1e-7||accelerationJump>1e-7)
+                        return std::unexpected(std::format(
+                            "continuous packet boundary {} -> {} is not C2: position jump={} "
+                            "velocity jump={} acceleration jump={}",chunkIndex-1,chunkIndex,
+                            positionJump,velocityJump,accelerationJump));
+                } else if(start.velocity.length()>1e-8||start.acceleration.length()>1e-8) {
+                    return std::unexpected(std::format(
+                        "continuous plan does not start at rest: velocity={} acceleration={}",
+                        formatPosition(start.velocity),formatPosition(start.acceleration)));
+                }
+                previous=chunk.normalMotion[chunk.normalMotion.size-1].end;
+                predecessor=chunk.branch;
+            }
+            if(previous->velocity.length()>1e-8||previous->acceleration.length()>1e-8)
+                return std::unexpected(std::format(
+                    "continuous plan does not end at rest: velocity={} acceleration={}",
+                    formatPosition(previous->velocity),formatPosition(previous->acceleration)));
             return {};
         }
 
@@ -272,6 +363,7 @@ namespace ngc {
             m_diagnostics.maximumPlanningSeconds = std::max(
                 m_diagnostics.maximumPlanningSeconds, planningSeconds);
             if(const auto *chunk = std::get_if<PlanChunk>(&item)) {
+                ++m_diagnostics.planChunks;
                 m_diagnostics.maximumNormalSpans = std::max(
                     m_diagnostics.maximumNormalSpans, chunk->normalMotion.size);
                 m_diagnostics.maximumStopSpans = std::max(
@@ -290,18 +382,20 @@ namespace ngc {
             m_exactStop.reset(epoch, position);
         }
 
+        void rebase(const EpochId epoch, const position_t &position) {
+            m_exactStop.reset(epoch,position);
+        }
+
         void clearDiagnostics() { m_diagnostics = {}; }
         void setLimits(const TrajectoryLimits &limits) { m_exactStop.setLimits(limits); }
         const TrajectoryLimits &limits() const { return m_exactStop.limits(); }
         const TrajectoryPlanningDiagnostics &diagnostics() const { return m_diagnostics; }
         std::size_t windowSize() const { return m_window.size(); }
-        bool full() const { return m_window.size() == MAX_LOOKAHEAD_COMMANDS; }
         static bool eligibleForLookahead(const TrajectoryPlannerInput &input) {
             return continuousMotion(input);
         }
 
         bool canAppend(const TrajectoryPlannerInput &input) const {
-            if(full()) return false;
             if(m_window.empty()) return true;
             const auto previousEnd=motionEnd(m_window.back().command);
             const auto nextStart=motionStart(input.command);
@@ -312,7 +406,6 @@ namespace ngc {
         }
 
         bool enqueue(TrajectoryPlannerInput input) {
-            if(full()) return false;
             if(continuousMotion(input)) {
                 ++m_diagnostics.continuousModeInputs;
             }
@@ -327,7 +420,7 @@ namespace ngc {
             const auto started = std::chrono::steady_clock::now();
             auto input = std::move(m_window.front());
             m_window.pop_front();
-            if(continuousMotion(input)) ++m_diagnostics.exactStopFallbacks;
+            if(continuousMotion(input)) ++m_diagnostics.continuousExactStops;
             auto item = std::visit([&](const auto &command) -> std::expected<ExecutionItem, std::string> {
                 using T = std::decay_t<decltype(command)>;
                 if constexpr(std::same_as<T, ProbeMove>) {
@@ -366,12 +459,22 @@ namespace ngc {
             constexpr double DEFAULT_BLEND_SCALE=0.001;
             const auto blendScale=std::max(
                 m_window.front().metadata.pathTolerance.value_or(DEFAULT_BLEND_SCALE),1e-9);
+            const auto context=continuousWindowContext();
             auto continuous=m_exactStop.compileContinuous(commands,blendScale);
-            if(!continuous) return planOne();
-            if(auto verified=verifyContinuousNormalMotion((*continuous)->chunk);!verified)
-                return std::unexpected(verified.error());
-            if(auto verified=verifyStopBranch((*continuous)->chunk);!verified)
-                return std::unexpected(verified.error());
+            if(!continuous) return std::unexpected(std::format(
+                "fatal continuous-motion compilation failure: {}; cause: {}",context,continuous.error()));
+            if(auto verified=verifyContinuousPlan((*continuous)->chunks);!verified)
+                return std::unexpected(std::format(
+                    "fatal continuous-motion verification failure: {}; packets={}; cause: {}",
+                    context,(*continuous)->chunks.size(),verified.error()));
+            for(std::size_t chunk=0;chunk<(*continuous)->chunks.size();++chunk)
+                if(auto verified=verifyStopBranch((*continuous)->chunks[chunk]);!verified)
+                    return std::unexpected(std::format(
+                        "fatal continuous-motion stop-branch verification failure: {}; packet={} chunk={} "
+                        "normal spans={} stop spans={}; cause: {}",context,chunk,
+                        (*continuous)->chunks[chunk].id,
+                        (*continuous)->chunks[chunk].normalMotion.size,
+                        (*continuous)->chunks[chunk].stopTail.size,verified.error()));
 
             std::vector<TrajectoryPlannerInput> inputs;
             inputs.reserve(m_window.size());
@@ -385,11 +488,33 @@ namespace ngc {
             m_diagnostics.blendedCommands+=inputs.size();
             auto representativeCommand=inputs.front().command;
             auto representativeMetadata=inputs.front().metadata;
+            std::vector<ExecutionItem> items;
+            items.reserve((*continuous)->chunks.size());
+            for(auto &chunk:(*continuous)->chunks) items.emplace_back(std::move(chunk));
+            std::vector<std::size_t> activationItems((*continuous)->activationSpans.size(),0);
+            for(std::size_t input=0;input<(*continuous)->activationSpans.size();++input) {
+                const auto activation=(*continuous)->activationSpans[input];
+                const auto owner=std::ranges::find_if(items,[&](const auto &item) {
+                    const auto &chunk=std::get<PlanChunk>(item);
+                    return std::ranges::any_of(chunk.normalMotion,[&](const auto &span) {
+                        return span.id==activation;
+                    });
+                });
+                if(owner==items.end()) return std::unexpected(std::format(
+                    "fatal continuous-motion metadata failure: {}; activation span {} for input {} "
+                    "does not belong to any packet",context,activation,input));
+                activationItems[input]=static_cast<std::size_t>(std::distance(items.begin(),owner));
+            }
             auto planned=std::make_unique<PlannedExecution>(
                 std::move(representativeCommand),std::move(representativeMetadata),
-                std::move((*continuous)->chunk),std::move(inputs),
-                std::move((*continuous)->activationSpans));
-            record(planned->item,planningSeconds,planned->inputs.size());
+                std::move(items),std::move(inputs),std::move((*continuous)->activationSpans),
+                std::move(activationItems));
+            for(std::size_t item=0;item<planned->items.size();++item)
+                record(planned->items[item],item==0?planningSeconds:0.0,
+                    item==0?planned->inputs.size():0);
+            m_diagnostics.lastPlanningSeconds=planningSeconds;
+            m_diagnostics.maximumPlanningSeconds=std::max(
+                m_diagnostics.maximumPlanningSeconds,planningSeconds);
             return planned;
         }
     };

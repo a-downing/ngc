@@ -144,7 +144,6 @@ class ApplicationImpl final {
 
     struct PreviewRenderCache {
         std::optional<std::uint64_t> revision;
-        std::optional<std::uint64_t> backendTrajectoryRevision;
         std::vector<glm::dvec3> feedLines;
         std::vector<glm::dvec3> rapidLines;
         std::vector<glm::dvec3> g53FeedLines;
@@ -155,9 +154,6 @@ class ApplicationImpl final {
         std::vector<glm::dvec3> g64ClusterSplineLines;
         std::vector<glm::dvec3> g64ControlPolygon;
         std::vector<glm::dvec3> g64ControlPoints;
-        std::vector<glm::dvec3> backendTrajectoryLines;
-        std::vector<glm::dvec3> backendStopTailLines;
-        std::vector<glm::dvec3> backendTrajectoryPoints;
         std::vector<glm::dvec3> darkPoints;
         std::vector<glm::dvec3> lightPoints;
         std::array<BufferedRange, static_cast<std::size_t>(PreviewBatch::Count)> bufferedRanges{};
@@ -167,9 +163,6 @@ class ApplicationImpl final {
     GlBindBufferProc m_glBindBuffer = nullptr;
     GlBufferDataProc m_glBufferData = nullptr;
     GLuint m_previewGeometryBuffer = 0;
-    GLuint m_backendTrajectoryBuffer = 0;
-    GLuint m_backendStopTailBuffer = 0;
-    GLuint m_backendTrajectoryPointBuffer = 0;
     double m_sceneScale = 1.0;
     glm::dvec3 m_modelPivot = { 0.0, 0.0, 0.0 };
 
@@ -291,7 +284,7 @@ public:
         : m_window(window), m_simulationTiming(configuration.simulation),
           m_joggingConfiguration(configuration.jogging), m_machineUnit(configuration.unit),
           m_axes(configuration.axes), m_joints(configuration.joints),
-          m_worker(configuration.unit, configuration.trajectory, configuration.simulation.servoPeriod),
+          m_worker(configuration.unit),
           m_simulation(configuration),
           m_simulatedRapidSpeed(configuration.trajectory.rapidSpeed) { }
 
@@ -301,12 +294,7 @@ public:
         m_glBindBuffer = reinterpret_cast<GlBindBufferProc>(glfwGetProcAddress("glBindBuffer"));
         m_glBufferData = reinterpret_cast<GlBufferDataProc>(glfwGetProcAddress("glBufferData"));
         if(m_glGenBuffers && m_glDeleteBuffers && m_glBindBuffer && m_glBufferData) {
-            GLuint buffers[4]{};
-            m_glGenBuffers(4, buffers);
-            m_previewGeometryBuffer = buffers[0];
-            m_backendTrajectoryBuffer = buffers[1];
-            m_backendStopTailBuffer = buffers[2];
-            m_backendTrajectoryPointBuffer = buffers[3];
+            m_glGenBuffers(1, &m_previewGeometryBuffer);
         }
         auto result = m_tools.load();
 
@@ -342,13 +330,8 @@ public:
         m_simulation.join();
         m_worker.join();
         if(m_glDeleteBuffers) {
-            const GLuint buffers[] = { m_previewGeometryBuffer, m_backendTrajectoryBuffer,
-                                       m_backendStopTailBuffer, m_backendTrajectoryPointBuffer };
-            m_glDeleteBuffers(4, buffers);
+            m_glDeleteBuffers(1, &m_previewGeometryBuffer);
             m_previewGeometryBuffer = 0;
-            m_backendTrajectoryBuffer = 0;
-            m_backendStopTailBuffer = 0;
-            m_backendTrajectoryPointBuffer = 0;
         }
     }
 
@@ -567,9 +550,7 @@ public:
         auto cacheRebuilt = false;
         m_worker.lock([&] {
             const auto &toolpath = m_worker.toolpath();
-            const auto &backendTrajectory = m_worker.backendTrajectory();
-            if(m_previewRenderCache.revision == toolpath.revision()
-               && m_previewRenderCache.backendTrajectoryRevision == backendTrajectory.revision) return;
+            if(m_previewRenderCache.revision == toolpath.revision()) return;
 
             auto &cache = m_previewRenderCache;
             cache.feedLines.clear();
@@ -582,9 +563,6 @@ public:
             cache.g64ClusterSplineLines.clear();
             cache.g64ControlPolygon.clear();
             cache.g64ControlPoints.clear();
-            cache.backendTrajectoryLines.clear();
-            cache.backendStopTailLines.clear();
-            cache.backendTrajectoryPoints.clear();
             cache.darkPoints.clear();
             cache.lightPoints.clear();
 
@@ -743,21 +721,7 @@ public:
             }
             flushSpline();
 
-            for(const auto &executed : backendTrajectory.spans) {
-                if(executed.positions.empty()) continue;
-                if(executed.stopTail) {
-                    auto &vertices = cache.backendStopTailLines;
-                    for(std::size_t sample = 1; sample < executed.positions.size(); ++sample)
-                        segment(vertices, point(executed.positions[sample - 1]), point(executed.positions[sample]));
-                } else {
-                    for(const auto &position : executed.positions)
-                        cache.backendTrajectoryLines.push_back(point(position));
-                    for(const auto &position : executed.positions)
-                        cache.backendTrajectoryPoints.push_back(point(position));
-                }
-            }
             cache.revision = toolpath.revision();
-            cache.backendTrajectoryRevision = backendTrajectory.revision;
             cacheRebuilt = true;
         });
         if(!cacheRebuilt || !m_glBindBuffer || !m_glBufferData) return;
@@ -793,9 +757,6 @@ public:
             previewVertices.insert(previewVertices.end(), vertices->begin(), vertices->end());
         }
         upload(m_previewGeometryBuffer, previewVertices);
-        upload(m_backendTrajectoryBuffer, m_previewRenderCache.backendTrajectoryLines);
-        upload(m_backendStopTailBuffer, m_previewRenderCache.backendStopTailLines);
-        upload(m_backendTrajectoryPointBuffer, m_previewRenderCache.backendTrajectoryPoints);
         m_glBindBuffer(GL_ARRAY_BUFFER_VALUE, 0);
     }
 
@@ -1082,20 +1043,6 @@ public:
                     GL_POINTS, 0.1f, 0.55f, 0.1f);
         glDisable(GL_LINE_SMOOTH);
         glDisable(GL_POINT_SMOOTH);
-        glLineWidth(1.0f);
-        if(!drawBufferedVertices(m_backendTrajectoryBuffer, 0,
-                                m_previewRenderCache.backendTrajectoryLines.size(),
-                                GL_LINE_STRIP, 1.0f, 0.15f, 0.15f))
-            drawVertices(m_previewRenderCache.backendTrajectoryLines, GL_LINE_STRIP, 1.0f, 0.15f, 0.15f);
-        if(!drawBufferedVertices(m_backendStopTailBuffer, 0,
-                                m_previewRenderCache.backendStopTailLines.size(),
-                                GL_LINES, 1.0f, 1.0f, 1.0f))
-            drawVertices(m_previewRenderCache.backendStopTailLines, GL_LINES, 1.0f, 1.0f, 1.0f);
-        glPointSize(1.0f);
-        if(!drawBufferedVertices(m_backendTrajectoryPointBuffer, 0,
-                                m_previewRenderCache.backendTrajectoryPoints.size(),
-                                GL_POINTS, 0.0f, 0.0f, 0.0f))
-            drawVertices(m_previewRenderCache.backendTrajectoryPoints, GL_POINTS, 0.0f, 0.0f, 0.0f);
         glLineWidth(1.0f);
 
         const auto simulation = m_simulation.snapshot();

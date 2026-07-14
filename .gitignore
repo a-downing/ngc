@@ -5,3 +5,4 @@
 imgui.ini
 window_state.ini
 my_LinuxCNC_machine/
+tools/clarabel_trajectory_oracle/target/

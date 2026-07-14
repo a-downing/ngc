@@ -296,9 +296,11 @@ namespace {
         const auto hello = ngc::readFile("autoload/hello.ngc");
         const auto world = ngc::readFile("autoload/world.ngc");
         const auto toolChange = ngc::readFile("autoload/tool_change.ngc");
-        const auto main = ngc::readFile("adaptive_pockets.ngc");
+        auto main = ngc::readFile("adaptive_pockets.ngc");
         require(hello && world && toolChange && main, "adaptive-pockets simulation inputs should load");
-
+        const auto g64=main->find("N40 G64 P0.001");
+        require(g64!=std::string::npos,"adaptive-pockets startup fixture should contain its G64 block");
+        main->replace(g64,std::string_view("N40 G64 P0.001").size(),"N40 G61");
         ngc::ToolTable tools;
         const auto loadedTools = tools.load();
         require(loadedTools.has_value(), loadedTools ? "" : loadedTools.error());
@@ -320,6 +322,195 @@ namespace {
         worker.join();
     }
 
+    void testTimedSimulationRefillsMultiPacketContinuousBatch() {
+        std::string source="G64 P0.001\n";
+        constexpr int COMMANDS=800;
+        for(int command=1;command<=COMMANDS;++command)
+            source+=std::format("G1 F60 X{:.6f}\n",static_cast<double>(command)*0.001);
+
+        SimulationWorker worker;
+        worker.setTickMultiplier(1000);
+        ngc::ToolTable tools;
+        require(worker.start({{source,"multi-packet-refill.ngc"}},tools),
+                "multi-packet refill simulation should start");
+        auto snapshot=worker.snapshot();
+        for(int attempt=0;attempt<10000&&snapshot.status!=ngc::SimulationStatus::Completed
+            &&snapshot.status!=ngc::SimulationStatus::Error;++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot=worker.snapshot();
+        }
+        require(snapshot.status==ngc::SimulationStatus::Completed,std::format(
+            "timed simulation should refill a continuous batch larger than its eight-slot queue: {}",
+            snapshot.error));
+        require(snapshot.trajectoryPlanning.planChunks>8
+                    &&snapshot.trajectoryPlanning.maximumWindowCommands==COMMANDS
+                    &&snapshot.trajectoryPlanning.maximumNormalSpans==ngc::MAX_NORMAL_SPANS_PER_CHUNK,
+                std::format("multi-packet refill regression should exceed both old command and RT packet boundaries: "
+                            "chunks={} commands={} maximum spans={}",
+                            snapshot.trajectoryPlanning.planChunks,
+                            snapshot.trajectoryPlanning.maximumWindowCommands,
+                            snapshot.trajectoryPlanning.maximumNormalSpans));
+        require(std::ranges::none_of(snapshot.statusMessages,[](const auto &entry) {
+            return entry.kind==ngc::InterpreterStatusKind::Error;
+        }),"successful multi-packet refill should not publish a GUI error");
+        worker.join();
+    }
+
+    void testImmediatePreviewBuildsGeometryWithoutTrajectoryExecution() {
+        std::string source="G64 P0.001\n";
+        constexpr int COMMANDS=800;
+        for(int command=1;command<=COMMANDS;++command)
+            source+=std::format("G1 F60 X{:.6f}\n",static_cast<double>(command)*0.001);
+
+        // This is deliberately larger than the former G-code and RT packet
+        // boundaries. Geometry preview must not depend on either one.
+        Worker worker(UNIT);
+        require(worker.compile({{source,"preview-multi-packet-refill.ngc"}}),
+                "multi-packet immediate preview should start compilation");
+        for(int attempt=0;attempt<3000&&!worker.compiled();++attempt)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        require(worker.compiled(),"multi-packet immediate preview should compile");
+        const auto initialRevision=worker.lock([&] { return worker.toolpath().revision(); });
+        require(worker.execute(),"multi-packet immediate preview should start execution");
+        bool finished=false;
+        for(int attempt=0;attempt<10000;++attempt) {
+            const auto revision=worker.lock([&] { return worker.toolpath().revision(); });
+            if(revision>initialRevision&&!worker.busy()) {
+                finished=true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(finished,"multi-packet immediate preview should finish");
+        const auto messages=worker.statusMessages();
+        const auto error=std::ranges::find_if(messages,[](const auto &message) {
+            return message.kind==ngc::InterpreterStatusKind::Error;
+        });
+        require(error==messages.end(),error==messages.end()?"":
+                "multi-packet immediate preview failed: "+error->text);
+        require(worker.lock([&] { return worker.toolpath().commands().size()==COMMANDS; }),
+                "multi-packet immediate preview should retain every canonical command");
+        require(worker.lock([&] {
+            const auto &toolpath=worker.toolpath();
+            for(std::size_t index=0;index<toolpath.commands().size();++index)
+                if(!toolpath.g64Active(index)||toolpath.g64Tolerance(index)!=0.001) return false;
+            return true;
+        }),"geometry-only preview should retain G64/P metadata for display blending");
+        worker.join();
+    }
+
+    void testGeometryPreviewResolvesProbeAtCanonicalTarget() {
+        ngc::ToolTable tools;
+        const ngc::ToolTable::tool_entry_t tool{
+            1,0.0,0.0,2.0,0.0,0.0,0.0,0.25,"preview probe tool"};
+        tools.set(tool.number,tool);
+        Worker worker(UNIT);
+        require(worker.setToolTable(tools),"probe preview should accept its tool table");
+        require(worker.compile({{
+            "G43 H1\nG38.3 F5 Z-1\nG1 Z0\n","geometry-probe.ngc"}}),
+            "geometry probe preview should start compilation");
+        for(int attempt=0;attempt<3000&&!worker.compiled();++attempt)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        require(worker.compiled(),"geometry probe preview should compile");
+        const auto initialRevision=worker.lock([&] { return worker.toolpath().revision(); });
+        require(worker.execute(),"geometry probe preview should start");
+        bool finished=false;
+        for(int attempt=0;attempt<3000;++attempt) {
+            const auto revision=worker.lock([&] { return worker.toolpath().revision(); });
+            if(revision>initialRevision&&!worker.busy()) {
+                finished=true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(finished,"geometry probe preview should finish without a backend result");
+        const auto messages=worker.statusMessages();
+        require(std::ranges::none_of(messages,[](const auto &message) {
+            return message.kind==ngc::InterpreterStatusKind::Error;
+        }),"canonical-target probe preview should not report an execution error");
+        worker.lock([&] {
+            const auto &commands=worker.toolpath().commands();
+            require(commands.size()==2,"probe preview should retain the probe and following line");
+            const auto *probe=std::get_if<ngc::ProbeMove>(&commands[0]);
+            require(probe!=nullptr,"probe preview should retain canonical probe geometry");
+            requireNear(probe->target().z,-1.0,
+                        "probe preview endpoint should be the commanded probe target");
+        });
+        worker.join();
+    }
+
+    void testAdaptivePocketsGeometryPreviewAvoidsTrajectoryExecution() {
+        const auto hello=ngc::readFile("autoload/hello.ngc");
+        const auto world=ngc::readFile("autoload/world.ngc");
+        const auto toolChange=ngc::readFile("autoload/tool_change.ngc");
+        const auto main=ngc::readFile("adaptive_pockets.ngc");
+        require(hello&&world&&toolChange&&main,
+                "adaptive-pockets geometry preview inputs should load");
+        ngc::ToolTable tools;
+        const auto loadedTools=tools.load();
+        require(loadedTools.has_value(),loadedTools?"":loadedTools.error());
+
+        Worker worker(UNIT);
+        require(worker.setToolTable(tools),
+                "adaptive-pockets geometry preview should accept the tool table");
+        require(worker.compile({{*hello,"autoload/hello.ngc"},{*world,"autoload/world.ngc"},
+                                {*toolChange,"autoload/tool_change.ngc"},
+                                {*main,"adaptive_pockets.ngc"}}),
+                "adaptive-pockets geometry preview should start compilation");
+        for(int attempt=0;attempt<5000&&!worker.compiled();++attempt)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        require(worker.compiled(),"adaptive-pockets geometry preview should compile");
+        const auto initialRevision=worker.lock([&] { return worker.toolpath().revision(); });
+        const auto started=std::chrono::steady_clock::now();
+        require(worker.execute(),"adaptive-pockets geometry preview should start");
+        bool finished=false;
+        for(int attempt=0;attempt<10000;++attempt) {
+            const auto revision=worker.lock([&] { return worker.toolpath().revision(); });
+            if(revision>initialRevision&&!worker.busy()) {
+                finished=true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        const auto elapsed=std::chrono::duration<double>(
+            std::chrono::steady_clock::now()-started).count();
+        require(finished,std::format(
+            "adaptive-pockets geometry preview did not finish in {:.3f} seconds",elapsed));
+        const auto messages=worker.statusMessages();
+        const auto error=std::ranges::find_if(messages,[](const auto &message) {
+            return message.kind==ngc::InterpreterStatusKind::Error;
+        });
+        require(error==messages.end(),error==messages.end()?"":
+                "adaptive-pockets geometry preview failed: "+error->text);
+        require(worker.lock([&] {
+            const auto &toolpath=worker.toolpath();
+            return !toolpath.commands().empty()&&std::ranges::any_of(
+                std::views::iota(std::size_t{0},toolpath.commands().size()),
+                [&](const auto index) { return toolpath.g64Active(index); });
+        }),"adaptive-pockets preview should retain canonical motion and G64 display metadata");
+        worker.join();
+    }
+
+    void testSimulationDriverFailureAppearsInGuiStatusStream() {
+        SimulationWorker worker(UNIT,{
+            .pathAcceleration=0.0,.rapidSpeed=100.0,.arcChordTolerance=0.0001,.pathJerk=10.0,
+        });
+        ngc::ToolTable tools;
+        require(worker.start({{"G64 P0.01\nG1 F60 X1\nG1 Y1\n","simulation-error.ngc"}},tools),
+                "simulation GUI error regression should start");
+        auto snapshot=worker.snapshot();
+        for(int attempt=0;attempt<3000&&snapshot.status!=ngc::SimulationStatus::Error;++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot=worker.snapshot();
+        }
+        require(snapshot.status==ngc::SimulationStatus::Error,
+                "fatal simulation planning failure should reach GUI presentation state");
+        require(!snapshot.error.empty()&&std::ranges::any_of(snapshot.statusMessages,[&](const auto &entry) {
+            return entry.kind==ngc::InterpreterStatusKind::Error&&entry.text==snapshot.error;
+        }),"fatal simulation driver error should appear in the GUI chronological status stream");
+        worker.join();
+    }
+
     void test1001PreviewCompletesBoundedly() {
         const auto hello = ngc::readFile("autoload/hello.ngc");
         const auto world = ngc::readFile("autoload/world.ngc");
@@ -336,7 +527,7 @@ namespace {
 
         // A coarse mock tick keeps this regression focused on NRT G64 planning
         // rather than the duration of immediate simulated playback.
-        Worker worker(UNIT, {}, 0.1);
+        Worker worker(UNIT);
         require(worker.setToolTable(tools), "1001 preview should accept the tool table");
         require(worker.compile({ { *hello, "autoload/hello.ngc" }, { *world, "autoload/world.ngc" },
                                  { *toolChange, "autoload/tool_change.ngc" }, { *main, "1001.ngc" } }),
@@ -358,6 +549,11 @@ namespace {
             std::chrono::steady_clock::now() - started).count();
         require(revision > initialRevision && !worker.busy(),
                 std::format("1001 preview did not finish in {:.3f} seconds", elapsed));
+        const auto messages=worker.statusMessages();
+        const auto error=std::ranges::find_if(messages,[](const auto &message) {
+            return message.kind==ngc::InterpreterStatusKind::Error;
+        });
+        require(error==messages.end(),error==messages.end()?"":"1001 preview failed: "+error->text);
         require(worker.lock([&] { return !worker.toolpath().commands().empty(); }),
                 "1001 preview should retain displayable canonical geometry");
         worker.join();
@@ -1664,7 +1860,7 @@ namespace {
         requireAxisLimits(*arc, &ngc::position_t::y, 0.35, 0.6, 3.0, "arc Y");
     }
 
-    void testBoundedLookaheadCarriesG64MetadataAndStopFallbacks() {
+    void testBoundedLookaheadCarriesG64MetadataAndSingleCommandExactStops() {
         ngc::BoundedLookaheadTrajectoryPlanner planner({
             .pathAcceleration = 4.0,
             .rapidSpeed = 120.0,
@@ -1690,28 +1886,28 @@ namespace {
         require((*first)->metadata.pathMode == ngc::ExecutablePathMode::Continuous
                     && (*first)->metadata.pathTolerance == 0.01,
                 "planned execution should retain its G64 mode and tolerance");
-        const auto *firstChunk = std::get_if<ngc::PlanChunk>(&(*first)->item);
+        const auto *firstChunk = std::get_if<ngc::PlanChunk>(&(*first)->primaryItem());
         require(firstChunk && firstChunk->stopTail.size == 1,
-                "G64 framework output should currently use a verified exact-stop fallback");
+                "an individually planned G64 command should use a verified exact stop");
 
         const auto second = planner.planOne();
         require(second.has_value() && *second, second ? "lookahead should produce its second item" : second.error());
         require(planner.windowSize() == 0, "lookahead should consume planned inputs in order");
         const auto &diagnostics = planner.diagnostics();
         require(diagnostics.commandsPlanned == 2 && diagnostics.continuousModeInputs == 1
-                    && diagnostics.exactStopFallbacks == 1,
-                "lookahead diagnostics should distinguish G64 exact-stop fallback");
+                    && diagnostics.continuousExactStops == 1,
+                "lookahead diagnostics should distinguish individually planned G64 exact stops");
         require(diagnostics.maximumWindowCommands == 2 && diagnostics.maximumStopSpans == 1
                     && diagnostics.maximumNormalSpans > 0 && diagnostics.plannedDuration > 0.0,
                 "lookahead diagnostics should retain window, span, and duration high-water marks");
 
-        ngc::BoundedLookaheadTrajectoryPlanner bounded;
-        bounded.reset(22);
-        for(std::size_t index = 0; index < ngc::BoundedLookaheadTrajectoryPlanner::MAX_LOOKAHEAD_COMMANDS; ++index)
-            require(bounded.enqueue({ ngc::SpindleStop {}, {}, {} }),
-                    "lookahead should accept every advertised bounded slot");
-        require(!bounded.enqueue({ ngc::SpindleStop {}, {}, {} }),
-                "lookahead should reject input beyond its fixed command bound");
+        ngc::BoundedLookaheadTrajectoryPlanner commandCountIndependent;
+        commandCountIndependent.reset(22);
+        for(std::size_t index=0;index<64;++index)
+            require(commandCountIndependent.enqueue({ngc::SpindleStop{},{},{}}),
+                    "the NRT horizon should not impose the removed 32-command packet boundary");
+        require(commandCountIndependent.windowSize()==64,
+                "RT PlanChunk capacity should be independent of buffered G-code command count");
 
         ngc::BoundedLookaheadTrajectoryPlanner protectedPlanner;
         protectedPlanner.reset(23);
@@ -1909,10 +2105,10 @@ namespace {
         const auto planned=planner.planWindow();
         require(planned.has_value() && *planned, planned ? "G64 window produced no plan" : planned.error());
         require((*planned)->inputs.size()==2, "G64 should plan both compatible commands in one window");
-        const auto *chunk=std::get_if<ngc::PlanChunk>(&(*planned)->item);
+        const auto *chunk=std::get_if<ngc::PlanChunk>(&(*planned)->primaryItem());
         require(chunk&&chunk->normalMotion.size>2&&chunk->stopTail.size==1,
                 "G64 should emit bounded normal motion and a verified terminal stop branch");
-        require(planner.diagnostics().exactStopFallbacks==0
+        require(planner.diagnostics().continuousExactStops==0
                     &&planner.diagnostics().blendedWindows==1
                     &&planner.diagnostics().blendedCommands==2,
                 "compatible G64 commands should use executable blending");
@@ -1944,6 +2140,246 @@ namespace {
         requireAxisLimits(*chunk,&ngc::position_t::y,10,10,50,"G64 Y motion");
     }
 
+    void testG64C2PrecisionUsesLocalCoordinates() {
+        ngc::BoundedLookaheadTrajectoryPlanner planner({
+            .pathAcceleration=5.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,.pathJerk=20.0,
+            .axisVelocity={10,10,10,10,10,10},
+            .axisAcceleration={10,10,10,10,10,10},
+            .axisJerk={50,50,50,50,50,50},
+        });
+        const ngc::TrajectoryPlanningMetadata g64 {
+            .pathMode=ngc::ExecutablePathMode::Continuous,.pathTolerance=0.001,
+        };
+        const ngc::position_t p0{1000000.0,-1000000.0,500000.0,0,0,0};
+        const ngc::position_t p1{1000000.010,-999999.998,499999.999,0,0,0};
+        const ngc::position_t p2{1000000.015,-999999.991,499999.997,0,0,0};
+        const ngc::position_t p3{1000000.021,-999999.987,499999.992,0,0,0};
+        const ngc::position_t p4{1000000.028,-999999.980,499999.990,0,0,0};
+        planner.reset(73,p0);
+        require(planner.enqueue({ngc::MoveLine{p0,p1,72.0},g64,{}}),"precision line 1 should enqueue");
+        require(planner.enqueue({ngc::MoveLine{p1,p2,72.0},g64,{}}),"precision line 2 should enqueue");
+        require(planner.enqueue({ngc::MoveLine{p2,p3,72.0},g64,{}}),"precision line 3 should enqueue");
+        require(planner.enqueue({ngc::MoveLine{p3,p4,72.0},g64,{}}),"precision line 4 should enqueue");
+        const auto planned=planner.planWindow();
+        require(planned&&*planned,planned?"precision G64 window produced no plan":planned.error());
+        const auto &chunk=std::get<ngc::PlanChunk>((*planned)->primaryItem());
+        const auto scaled=[](const ngc::position_t &value,const double amount) {
+            return ngc::position_t{value.x*amount,value.y*amount,value.z*amount,
+                value.a*amount,value.b*amount,value.c*amount};
+        };
+        for(std::size_t index=1;index<chunk.normalMotion.size;++index) {
+            const auto &previous=chunk.normalMotion[index-1];
+            const auto &current=chunk.normalMotion[index];
+            const auto currentVelocity=scaled(current.c,current.inverseDuration);
+            const auto currentAcceleration=scaled(current.b,2.0*current.inverseDurationSquared);
+            require((previous.end.position-current.d).length()<1e-8,
+                    "large-coordinate G64 position continuity should remain exact");
+            require((previous.end.velocity-currentVelocity).length()<1e-7,
+                    "large-coordinate G64 velocity continuity should remain within tolerance");
+            require((previous.end.acceleration-currentAcceleration).length()<1e-7,
+                std::format("large-coordinate G64 acceleration jump {} exceeds tolerance",
+                    (previous.end.acceleration-currentAcceleration).length()));
+        }
+    }
+
+    void testContinuousTrajectoryPacketizesBeyondNormalSpanCapacity() {
+        ngc::ExactStopTrajectoryPlanner planner({
+            .pathAcceleration=5.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,.pathJerk=20.0,
+            .axisVelocity={10,10,10,10,10,10},
+            .axisAcceleration={10,10,10,10,10,10},
+            .axisJerk={50,50,50,50,50,50},
+        });
+        constexpr std::size_t COMMANDS=150;
+        std::vector<ngc::MachineCommand> commands;
+        commands.reserve(COMMANDS);
+        ngc::position_t from{};
+        for(std::size_t command=0;command<COMMANDS;++command) {
+            auto to=from;
+            to.x+=1.0;
+            commands.emplace_back(ngc::MoveLine{from,to,120.0});
+            from=to;
+        }
+        planner.reset(76);
+        const auto planned=planner.compileContinuous(commands,0.01);
+        require(planned&&*planned,planned?"large continuous plan produced no packets":planned.error());
+        require((*planned)->chunks.size()>=2,
+                "a staged continuous trajectory larger than 256 spans should use multiple RT packets");
+        require((*planned)->chunks.front().normalMotion.size==ngc::MAX_NORMAL_SPANS_PER_CHUNK,
+                "the first continuous packet should use the available normal-span capacity");
+        ngc::BranchSequence predecessor=0;
+        std::optional<ngc::MotionState> previous;
+        for(std::size_t packet=0;packet<(*planned)->chunks.size();++packet) {
+            const auto &chunk=(*planned)->chunks[packet];
+            require(chunk.predecessorBranch==predecessor,
+                    "continuous packets should retain an ordered branch chain");
+            require(chunk.normalMotion.size>0
+                        &&chunk.normalMotion.size<=ngc::MAX_NORMAL_SPANS_PER_CHUNK,
+                    "every continuous packet should respect the RT normal-span bound");
+            require(chunk.stopTail.size>0&&chunk.stopTail.size<=ngc::MAX_STOP_SPANS_PER_CHUNK,
+                    "every continuous packet should contain a complete bounded stop tail");
+            const auto scale=[](const ngc::position_t &value,const double amount) {
+                return ngc::position_t{value.x*amount,value.y*amount,value.z*amount,
+                    value.a*amount,value.b*amount,value.c*amount};
+            };
+            const ngc::MotionState start{
+                chunk.normalMotion[0].d,
+                scale(chunk.normalMotion[0].c,chunk.normalMotion[0].inverseDuration),
+                scale(chunk.normalMotion[0].b,2.0*chunk.normalMotion[0].inverseDurationSquared),
+            };
+            if(previous) {
+                require((previous->position-start.position).length()<1e-8,
+                        "continuous packet boundaries should preserve position");
+                require((previous->velocity-start.velocity).length()<1e-7,
+                        "continuous packet boundaries should preserve velocity");
+                require((previous->acceleration-start.acceleration).length()<1e-7,
+                        "continuous packet boundaries should preserve acceleration");
+            }
+            require(chunk.stopState.velocity.length()<1e-8
+                        &&chunk.stopState.acceleration.length()<1e-8,
+                    "every packet stop branch should terminate stationary");
+            previous=chunk.normalMotion[chunk.normalMotion.size-1].end;
+            predecessor=chunk.branch;
+        }
+        require(previous&&previous->velocity.length()<1e-8&&previous->acceleration.length()<1e-8,
+                "the final continuous packet should retain the window's rest boundary");
+    }
+
+    double maximumContinuousXVelocityInRange(const ngc::ContinuousTrajectoryPlan &plan,
+                                              const double from,const double to) {
+        auto maximum=0.0;
+        for(const auto &chunk:plan.chunks) for(const auto &span:chunk.normalMotion) {
+            const auto middle=(span.d.x+span.end.position.x)/2.0;
+            if(middle>=from&&middle<=to)
+                maximum=std::max(maximum,spanAxisVelocity(span,&ngc::position_t::x));
+        }
+        return maximum;
+    }
+
+    double continuousDuration(const ngc::ContinuousTrajectoryPlan &plan) {
+        auto duration=0.0;
+        for(const auto &chunk:plan.chunks) for(const auto &span:chunk.normalMotion)
+            duration+=span.duration;
+        return duration;
+    }
+
+    void testDenseContinuousTimingFixture() {
+        const auto source=ngc::readFile("g64_dense_timing_test.ngc");
+        require(source.has_value(),source ? "" : source.error().what());
+        ngc::Machine machine(UNIT);
+        const auto commands=execute(machine,*source);
+        require(commands.size()==22,"dense timing fixture should emit 22 motion commands");
+        ngc::ExactStopTrajectoryPlanner planner({
+            .pathAcceleration=20.0,.rapidSpeed=199.8,.arcChordTolerance=0.0001,.pathJerk=100.0,
+            .axisVelocity={3.333333333333333,3.333333333333333,3.333333333333333,
+                           3.333333333333333,3.333333333333333,3.333333333333333},
+            .axisAcceleration={100,100,100,100,100,100},
+            .axisJerk={100,100,100,100,100,100},
+        });
+        planner.reset(79);
+        ngc::ContinuousAccelerationOracleModel oracleModel;
+        const auto planned=planner.compileContinuous(commands,0.001,&oracleModel);
+        require(planned&&*planned,planned ? "dense timing fixture produced no plan" : planned.error());
+        const auto entry=maximumContinuousXVelocityInRange(**planned,0.2,0.8);
+        const auto denseLines=maximumContinuousXVelocityInRange(**planned,1.01,1.19);
+        const auto denseArcs=maximumContinuousXVelocityInRange(**planned,1.21,1.39);
+        const auto exit=maximumContinuousXVelocityInRange(**planned,1.6,2.2);
+        require(entry>1.9&&exit>1.9,"long reference lines should attain the programmed F120 speed");
+        require(denseLines>0.4&&denseLines<0.6&&denseArcs>0.4&&denseArcs<0.6,
+                "dense fixture should expose its small-P cubic-blend jerk ceiling");
+        require(continuousDuration(**planned)<2.5,
+                "dense line/arc timing fixture should remain quick enough for focused debugging");
+        require(std::ranges::any_of((*planned)->pieceTiming,[](const auto &piece) {
+            return piece.velocityLimit<0.55;
+        }),"dense timing diagnostics should expose the local jerk-derived blend cap");
+        require(oracleModel.segments.size()==(*planned)->pieceTiming.size()*16,
+                "the optional Clarabel model should subdivide every geometry piece");
+        requireNear(oracleModel.plannerDuration,continuousDuration(**planned),
+                "the Clarabel model should retain the current planner duration");
+        require(std::ranges::all_of(oracleModel.segments,[](const auto &segment) {
+            return segment.length>0.0&&segment.velocityLimit>0.0
+                &&std::abs(segment.tangent.length()-1.0)<1e-8;
+        }),"the Clarabel model should contain finite positive unit-tangent intervals");
+    }
+
+    void testContinuousTimingUsesLocalEntityAndAverageBlendFeeds() {
+        ngc::ExactStopTrajectoryPlanner planner({
+            .pathAcceleration=100.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,.pathJerk=1000.0,
+            .axisVelocity={100,100,100,100,100,100},
+            .axisAcceleration={100,100,100,100,100,100},
+            .axisJerk={1000,1000,1000,1000,1000,1000},
+        });
+        const std::array<ngc::MachineCommand,2> commands {
+            ngc::MoveLine{{},{100,0,0,0,0,0},60.0},
+            ngc::MoveLine{{100,0,0,0,0,0},{200,0,0,0,0,0},180.0},
+        };
+        planner.reset(77);
+        const auto planned=planner.compileContinuous(commands,1.0);
+        require(planned&&*planned,planned?"local-feed plan produced no trajectory":planned.error());
+        const auto incoming=maximumContinuousXVelocityInRange(**planned,10.0,90.0);
+        const auto blend=maximumContinuousXVelocityInRange(**planned,97.0,103.0);
+        const auto outgoing=maximumContinuousXVelocityInRange(**planned,110.0,190.0);
+        require(incoming<=1.0+1e-8&&incoming>0.95,
+                "the retained incoming line should use its F60 local cap");
+        require(blend<=2.0+1e-8&&blend>1.9,
+                "the blend between F60 and F180 should use their F120 arithmetic mean");
+        require(outgoing<=3.0+1e-8&&outgoing>2.9,
+                "the retained outgoing line should use its F180 local cap");
+    }
+
+    void testDistantSlowEntityDoesNotThrottleFastContinuousPrefix() {
+        ngc::ExactStopTrajectoryPlanner planner({
+            .pathAcceleration=10.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,.pathJerk=100.0,
+            .axisVelocity={10,10,10,10,10,10},
+            .axisAcceleration={10,10,10,10,10,10},
+            .axisJerk={100,100,100,100,100,100},
+        });
+        const std::array<ngc::MachineCommand,3> commands {
+            ngc::MoveLine{{},{100,0,0,0,0,0},80.0},
+            ngc::MoveLine{{100,0,0,0,0,0},{101,0,0,0,0,0},1.0},
+            ngc::MoveLine{{101,0,0,0,0,0},{201,0,0,0,0,0},80.0},
+        };
+        planner.reset(78);
+        const auto planned=planner.compileContinuous(commands,0.01);
+        require(planned&&*planned,planned?"local-lookahead plan produced no trajectory":planned.error());
+        const auto fastPrefix=maximumContinuousXVelocityInRange(**planned,10.0,80.0);
+        const auto slowMiddle=maximumContinuousXVelocityInRange(**planned,100.1,100.9);
+        require(fastPrefix>1.25&&fastPrefix<=80.0/60.0+1e-8,
+                "a distant F1 entity should not globally throttle the earlier F80 line");
+        require(slowMiddle<=1.0/60.0+1e-8&&slowMiddle>0.0,
+                "the retained F1 entity should still enforce its own local feed cap");
+    }
+
+    void testContinuousPlanningFailureIsFatalAndReported() {
+        ngc::InterpreterSession session(UNIT,ngc::InterpretationMode::Preview);
+        compileSession(session,"G64 P0.01\nG1 F60 X1\nG1 Y1\n");
+        session.begin();
+        ngc::MockMotionBackend backend;
+        ngc::TrajectoryExecutionDriver driver(session,backend,{
+            .pathAcceleration=0.0,.rapidSpeed=100.0,.arcChordTolerance=0.0001,.pathJerk=10.0,
+        });
+        require(driver.begin(74),"fatal G64 test should initialize the backend");
+        backend.advance(0.0);
+        driver.serviceBackend();
+        int observed=0;
+        for(int guard=0;guard<100&&driver.state()==ngc::TrajectoryDriverState::Running;++guard)
+            (void)driver.pumpOne([](const auto &callback){callback();},
+                [&](const ngc::MachineCommand &){++observed;});
+        require(driver.state()==ngc::TrajectoryDriverState::Error,
+                "failed continuous planning must stop the G-code run");
+        require(driver.error()&&driver.error()->contains("fatal continuous-motion compilation failure")
+                    &&driver.error()->contains("G64 window commands=2")
+                    &&driver.error()->contains("trajectory limits must be positive"),
+                driver.error()?*driver.error():"fatal G64 failure did not retain an error");
+        require(observed==0,"a failed continuous window must not publish any commands");
+        require(driver.planningDiagnostics().continuousExactStops==0,
+                "a failed continuous window must not be counted as an individually planned exact stop");
+        const auto &messages=session.statusMessages();
+        require(!messages.empty()&&messages.back().kind==ngc::InterpreterStatusKind::Error
+                    &&messages.back().text==*driver.error(),
+                "fatal trajectory planning errors must enter the chronological UI status stream");
+        session.stop();
+    }
+
     void testG64ExecutesRetainedArcAndLocalSpline() {
         const ngc::TrajectoryPlanningMetadata g64 {
             .pathMode=ngc::ExecutablePathMode::Continuous,.pathTolerance=0.1,
@@ -1958,10 +2394,10 @@ namespace {
                 "G64 arc should enter arc window");
         const auto arcPlan=arcPlanner.planWindow();
         require(arcPlan.has_value()&&*arcPlan,arcPlan?"arc G64 window produced no plan":arcPlan.error());
-        require((*arcPlan)->inputs.size()==2&&arcPlanner.diagnostics().exactStopFallbacks==0
+        require((*arcPlan)->inputs.size()==2&&arcPlanner.diagnostics().continuousExactStops==0
                     &&arcPlanner.diagnostics().blendedWindows==1,
                 "line/arc G64 should execute as one piecewise blended window");
-        const auto *chunk=std::get_if<ngc::PlanChunk>(&(*arcPlan)->item);
+        const auto *chunk=std::get_if<ngc::PlanChunk>(&(*arcPlan)->primaryItem());
         require(chunk&&chunk->normalMotion.size>3,
                 "line/arc G64 should retain adaptively verified curved geometry");
         requireNear(chunk->normalMotion[0].d.x,a0.x,
@@ -1988,10 +2424,10 @@ namespace {
         const auto planned=planner.planWindow();
         require(planned&&*planned,planned?"retained-line G64 produced no plan":planned.error());
         require((*planned)->inputs.size()==3,
-                std::format("retained-line G64 should blend all commands (fallbacks={}, spans={})",
-                    planner.diagnostics().exactStopFallbacks,
-                    std::get<ngc::PlanChunk>((*planned)->item).normalMotion.size));
-        const auto *chunk=std::get_if<ngc::PlanChunk>(&(*planned)->item);
+                std::format("retained-line G64 should blend all commands (single exact stops={}, spans={})",
+                    planner.diagnostics().continuousExactStops,
+                    std::get<ngc::PlanChunk>((*planned)->primaryItem()).normalMotion.size));
+        const auto *chunk=std::get_if<ngc::PlanChunk>(&(*planned)->primaryItem());
         require(chunk,"retained-line G64 should produce a plan chunk");
         bool foundExactMiddle=false;
         for(const auto &span:chunk->normalMotion) {
@@ -2641,12 +3077,12 @@ namespace {
         require(std::ranges::is_sorted(activationSpans)&&std::ranges::all_of(activationSpans,
                     [](const auto span) { return span!=0; }),
                 "combined G64 commands should retain ordered activation span identities");
-        require(driver.planningDiagnostics().exactStopFallbacks == 0
+        require(driver.planningDiagnostics().continuousExactStops == 0
                     && driver.planningDiagnostics().blendedWindows == 1
                     && driver.planningDiagnostics().blendedCommands == 3
                     && driver.planningDiagnostics().maximumWindowCommands == 3,
-                std::format("driver G64 diagnostics mismatch (fallback={}, windows={}, commands={}, window={})",
-                    driver.planningDiagnostics().exactStopFallbacks,
+                std::format("driver G64 diagnostics mismatch (single exact stops={}, windows={}, commands={}, window={})",
+                    driver.planningDiagnostics().continuousExactStops,
                     driver.planningDiagnostics().blendedWindows,
                     driver.planningDiagnostics().blendedCommands,
                     driver.planningDiagnostics().maximumWindowCommands));
@@ -2654,6 +3090,44 @@ namespace {
         requireNear(latest.commanded.position.x, 2.0, "mock RT execution should reach the final planned X position");
         requireNear(latest.commanded.position.z, -1.0,
                     "mock RT execution should preserve its final Z position");
+    }
+
+    void testHeldRecoveryPreservesBufferedG64Commands() {
+        std::string source="G64 P0.001\n";
+        constexpr int COMMANDS=70;
+        for(int command=1;command<=COMMANDS;++command)
+            source+=std::format("G1 F60 X{:.3f}\n",static_cast<double>(command)*0.01);
+        ngc::InterpreterSession session(UNIT,ngc::InterpretationMode::Preview);
+        compileSession(session,source);
+        session.begin();
+        ngc::MockMotionBackend backend;
+        ngc::TrajectoryExecutionDriver driver(session,backend,{
+            .pathAcceleration=10.0,.rapidSpeed=100.0,.arcChordTolerance=0.0001,.pathJerk=100.0,
+        });
+        require(driver.begin(75),"held-recovery G64 driver should initialize");
+        int observed=0;
+        for(int guard=0;guard<1000&&driver.state()==ngc::TrajectoryDriverState::Running;++guard) {
+            for(int fill=0;fill<64;++fill)
+                if(!driver.pumpOne([](const auto &callback){callback();},
+                    [&](const ngc::MachineCommand &){++observed;})) break;
+            backend.runUntilIdle(0.1);
+            driver.serviceBackend();
+        }
+        require(driver.state()==ngc::TrajectoryDriverState::Completed,
+                driver.error()?*driver.error():"held recovery did not complete");
+        require(observed==COMMANDS,std::format(
+            "held recovery lost or duplicated buffered G64 commands: observed {} expected {}",
+            observed,COMMANDS));
+        require(driver.planningDiagnostics().commandsPlanned==COMMANDS,
+                "held recovery should plan every buffered G64 command exactly once");
+        require(driver.planningDiagnostics().blendedWindows==1
+                    &&driver.planningDiagnostics().maximumWindowCommands==COMMANDS
+                    &&driver.planningDiagnostics().maximumNormalSpans==ngc::MAX_NORMAL_SPANS_PER_CHUNK
+                    &&driver.planningDiagnostics().maximumStopSpans>1
+                    &&driver.planningDiagnostics().maximumStopSpans<=ngc::MAX_STOP_SPANS_PER_CHUNK,
+                "a continuous run beyond the old 32-command/256-span boundaries should publish "
+                "one blended horizon as multiple bounded RT packets with a real moving stop tail");
+        session.stop();
     }
 
     void testParameterReadWaitsForPriorMotionCompletion() {
@@ -2762,6 +3236,11 @@ int main() {
         testInterpreterCancellationInterruptsEvaluation();
         testSimulationWorkerStartsPlayback();
         testAdaptivePocketsStartsSimulation();
+        testTimedSimulationRefillsMultiPacketContinuousBatch();
+        testImmediatePreviewBuildsGeometryWithoutTrajectoryExecution();
+        testGeometryPreviewResolvesProbeAtCanonicalTarget();
+        testAdaptivePocketsGeometryPreviewAvoidsTrajectoryExecution();
+        testSimulationDriverFailureAppearsInGuiStatusStream();
         test1001PreviewCompletesBoundedly();
         testMdiToolChangeUsesAutoloadPrograms();
         testSimulationWorkerPersistsUntilReset();
@@ -2796,9 +3275,15 @@ int main() {
         testN70N75PreviewPrefixesCompleteBoundedly();
         testExactStopPlannerCompilesLinesAndArcs();
         testExactStopPlannerEnforcesIndependentAxisLimits();
-        testBoundedLookaheadCarriesG64MetadataAndStopFallbacks();
+        testBoundedLookaheadCarriesG64MetadataAndSingleCommandExactStops();
         testPreviewJunctionUsesOneSixControlSpline();
         testBoundedPlannerExecutesPiecewiseG64Geometry();
+        testG64C2PrecisionUsesLocalCoordinates();
+        testContinuousTrajectoryPacketizesBeyondNormalSpanCapacity();
+        testContinuousTimingUsesLocalEntityAndAverageBlendFeeds();
+        testDistantSlowEntityDoesNotThrottleFastContinuousPrefix();
+        testDenseContinuousTimingFixture();
+        testContinuousPlanningFailureIsFatalAndReported();
         testG64ExecutesRetainedArcAndLocalSpline();
         testExecutableG64RetainsExactPrimitiveMiddles();
         testVerifiedCubicArcSpanCounts();
@@ -2812,6 +3297,7 @@ int main() {
         testProbeCompilesAsBackendOwnedTriggeredMove();
         testDualScrewJointMoveStopsEachMotorOnItsOwnSwitch();
         testTrajectoryDriverConnectsInterpreterToMockRtBackend();
+        testHeldRecoveryPreservesBufferedG64Commands();
         testParameterReadWaitsForPriorMotionCompletion();
         testMotionWordSynchronizationPolicy();
     } catch(const std::exception &error) {

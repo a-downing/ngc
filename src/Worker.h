@@ -8,9 +8,7 @@
 #include <unordered_map>
 
 #include "evaluator/InterpreterSession.h"
-#include "machine/MockMotionBackend.h"
 #include "machine/ToolpathRecorder.h"
-#include "machine/TrajectoryExecutionDriver.h"
 #include "memory/Vars.h"
 
 class Worker {
@@ -19,24 +17,17 @@ class Worker {
     std::thread m_thread;
 
     ngc::InterpreterSession m_session;
-    ngc::MockMotionBackend m_backend;
-    ngc::TrajectoryExecutionDriver m_driver;
     ngc::ToolpathRecorder m_toolpath;
-    ngc::MockTrajectorySnapshot m_backendTrajectory;
     std::unordered_map<ngc::Var, double> m_parameterSnapshot;
 
     bool m_doJoin = false;
     bool m_doCompile = false;
     bool m_doExecute = false;
     bool m_busy = false;
-    ngc::EpochId m_nextEpoch = 1;
-    double m_servoPeriod;
 
 public:
-    explicit Worker(const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch,
-                    const ngc::TrajectoryLimits limits = {}, const double servoPeriod = 0.001)
-        : m_session(unit, ngc::InterpretationMode::Preview), m_driver(m_session, m_backend, limits),
-          m_servoPeriod(servoPeriod) {
+    explicit Worker(const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch)
+        : m_session(unit, ngc::InterpretationMode::Preview) {
         refreshParameterSnapshot();
         m_thread = std::thread(&Worker::work, this);
     }
@@ -58,7 +49,6 @@ public:
 
     const ngc::Machine &machine() const { return m_session.machine(); }
     const ngc::ToolpathRecorder &toolpath() const { return m_toolpath; }
-    const ngc::MockTrajectorySnapshot &backendTrajectory() const { return m_backendTrajectory; }
 
     bool compiled() const {
         std::scoped_lock lock(m_mutex);
@@ -182,63 +172,68 @@ private:
             std::scoped_lock lock(m_mutex);
             m_session.begin();
             m_toolpath.clear();
-            m_backend.clearTrajectoryDiagnostics();
-            m_backendTrajectory = {};
-            if(!m_driver.begin(m_nextEpoch++)) {
-                m_busy = false;
-                return;
-            }
         }
 
+        // Preview consumes canonical geometry directly. Timed polynomial
+        // planning, constraint verification, packetization, and backend
+        // execution belong to Simulation/RealRun and provide no display data.
+        ngc::ToolpathRecorder preview;
         for(;;) {
-            for(int fill = 0; fill < 64; ++fill) {
-                if(!m_driver.pumpOne([&](const auto &callback) {
-                    std::scoped_lock lock(m_mutex);
-                    callback();
-                }, [&](const ngc::MachineCommand &command, const ngc::ExecutionItem &item,
-                       const ngc::TrajectoryPlanningMetadata &planning,
-                       const ngc::TrajectoryCommandPresentation &presentation, const ngc::SpanId) {
-                    std::scoped_lock lock(m_mutex);
-                    if(std::holds_alternative<ngc::ProbeMove>(command)) {
-                        const auto &move = std::get<ngc::TriggeredMove>(item);
-                        const auto contact = move.target + presentation.tool.offset
-                            - presentation.activeToolOffset;
-                        (void)m_backend.configureSyntheticInput(move.moveId, contact);
-                    }
-                    const auto workCoordinateSystem=presentation.workCoordinateSystem.value_or(
-                        ngc::WorkCoordinateSystem{"G54",{}});
-                    m_toolpath.consume(command, presentation.activeToolOffset, workCoordinateSystem,
-                        planning.pathMode == ngc::ExecutablePathMode::Continuous,
-                        planning.pathTolerance);
-                })) break;
-            }
-
-            {
-                // nextWithBlocks() returns only while the evaluator is paused or after it has joined.
-                std::scoped_lock lock(m_mutex);
-                refreshParameterSnapshot();
-            }
-
             if(joinRequested()) {
                 m_session.stop();
                 break;
             }
 
-            m_backend.runUntilIdle(m_servoPeriod);
-            {
+            auto event=m_session.next([&](const auto &callback) {
                 std::scoped_lock lock(m_mutex);
-                m_driver.serviceBackend();
-            }
-
-            if(m_driver.state() == ngc::TrajectoryDriverState::Completed) break;
-            if(m_driver.state() == ngc::TrajectoryDriverState::Error) {
+                callback();
+            });
+            if(auto *command=std::get_if<ngc::MachineCommand>(&event)) {
+                ngc::position_t activeToolOffset;
+                ngc::WorkCoordinateSystem workCoordinateSystem;
+                bool g64Active=false;
+                std::optional<double> g64Tolerance;
+                {
+                    std::scoped_lock lock(m_mutex);
+                    activeToolOffset=m_session.machine().toolOffset();
+                    workCoordinateSystem={
+                        std::string(name(*m_session.machine().state().modeCoordSys)),
+                        m_session.machine().workOffset()};
+                    g64Active=m_session.machine().state().modePath==ngc::GCPath::G64;
+                    g64Tolerance=m_session.machine().pathTolerance();
+                }
+                std::optional<ngc::ProbeMove> probe;
+                if(const auto *value=std::get_if<ngc::ProbeMove>(command)) probe=*value;
+                preview.consume(std::move(*command),activeToolOffset,std::move(workCoordinateSystem),
+                    g64Active,g64Tolerance);
+                if(probe) {
+                    // Geometry preview assumes contact at the canonical probe
+                    // target. Physical tool length/contact simulation belongs
+                    // only to timed execution.
+                    const auto result=ngc::ProbeResult{
+                        probe->id(),ngc::ProbeStatus::Triggered,probe->target(),probe->target()};
+                    std::scoped_lock lock(m_mutex);
+                    m_session.provideProbeResult(result);
+                }
+            } else if(std::holds_alternative<ngc::InterpreterCompleted>(event)) {
+                break;
+            } else if(std::holds_alternative<ngc::InterpreterError>(event)) {
+                break;
+            } else if(const auto *waiting=std::get_if<ngc::InterpreterWaitingForProbe>(&event)) {
+                {
+                    std::scoped_lock lock(m_mutex);
+                    m_session.reportError(std::format(
+                        "preview reached probe barrier {} without its canonical probe command",
+                        waiting->commandId));
+                }
+                m_session.stop();
                 break;
             }
         }
 
-        const auto backendTrajectory = m_backend.trajectorySnapshot();
         std::scoped_lock lock(m_mutex);
-        m_backendTrajectory = backendTrajectory;
+        m_toolpath.replace(std::move(preview));
+        refreshParameterSnapshot();
         m_busy = false;
     }
 
