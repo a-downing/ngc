@@ -1781,6 +1781,11 @@ namespace {
 
         const auto line = planner.compile(ngc::MoveLine { {}, { 2, 0, 0, 0, 0, 0 }, 60.0 });
         require(line.has_value(), line ? "" : line.error());
+        const auto lineTimeLaw=ngc::totalTimeLawCalls(planner.lastTimeLawDiagnostics());
+        require(lineTimeLaw.calls==1&&lineTimeLaw.successes==1&&lineTimeLaw.failures==0
+                    &&lineTimeLaw.solverCalls==1&&lineTimeLaw.cacheHits==0
+                    &&planner.lastTimeLawDiagnostics().exactStop.calls==1,
+                "exact-stop line should report its successful scalar Ruckig solve");
         require(line->normalMotion.size >= 2, "exact-stop line should contain acceleration and deceleration spans");
         requireNear(evaluateSpan(line->normalMotion[0], 0.0).x, 0.0,
                     "compiled line should begin at the canonical start");
@@ -2283,10 +2288,10 @@ namespace {
         denseLengths.fill(0.005);
         const auto denseControlDistances=
             ngc::spline_detail::evenlySpacedCompositeControlDistances(denseLengths,SCALE);
-        require(denseControlDistances.size()==2
-                    &&std::abs(denseControlDistances[0]-0.025)<1e-12
-                    &&std::abs(denseControlDistances[1]-0.075)<1e-12,
-                "dense tiny entities should reduce to controls spaced approximately P apart");
+        require(denseControlDistances.size()==denseLengths.size()
+                    &&std::abs(denseControlDistances.front()-0.0025)<1e-12
+                    &&std::abs(denseControlDistances.back()-0.0975)<1e-12,
+                "dense tiny entities should use one midpoint control per entity");
 
         const auto previewLine=[](const glm::dvec3 start,const glm::dvec3 tangent) {
             return ngc::experimental::JunctionEntity {
@@ -2325,7 +2330,7 @@ namespace {
         require(directCluster&&directCluster->controlPoints.size()==8
                     &&std::abs(directCluster->controlPoints[3].x-1.1)<1e-12
                     &&std::abs(directCluster->controlPoints[4].x-1.3)<1e-12,
-                "cluster controls should be evenly spaced over the composite short path");
+                "cluster controls should directly sample one midpoint per entity");
         const std::array shortClusterEntities{
             clusterLine(0.0,1.0),clusterLine(1.0,0.04),clusterLine(1.04,1.0),
         };
@@ -2351,8 +2356,9 @@ namespace {
         const auto planned=planner.compileContinuous(commands,SCALE);
         require(planned&&*planned,planned?
                 "micro-cluster fixture produced no plan":planned.error());
-        require((*planned)->pieceTiming.size()==3,
-                "a short run totaling less than 6P should use one ordinary spline piece");
+        require((*planned)->pieceTiming.size()==5,
+                "a short run totaling less than 6P should time each of its three spline "
+                "knot spans independently between the retained bounding pieces");
         require((*planned)->activationSpans.size()==commands.size()
                     &&(*planned)->activationSpans[0]<(*planned)->activationSpans[1]
                     &&(*planned)->activationSpans[1]==(*planned)->activationSpans[2],
@@ -2424,6 +2430,65 @@ namespace {
                         >=diagnostics.maximumContinuousHorizonSeconds
                     &&diagnostics.totalPlanningSeconds>=diagnostics.totalContinuousHorizonSeconds,
                 "rolling diagnostics should retain per-horizon and total planning computation time");
+        require(diagnostics.publishedSplineInverse.queries>0
+                    &&diagnostics.publishedSplineInverse.exactCacheHits>0,
+                "rolling diagnostics should accumulate published spline inverse cache work");
+        const auto allTimeLaw=ngc::totalTimeLawCalls(diagnostics.timeLaw);
+        const auto publishedTimeLaw=ngc::totalTimeLawCalls(diagnostics.publishedTimeLaw);
+        const auto prefixTimeLaw=ngc::totalTimeLawCalls(diagnostics.rollingPrefixProbeTimeLaw);
+        const auto suffixTimeLaw=ngc::totalTimeLawCalls(diagnostics.rollingSuffixProbeTimeLaw);
+        require(allTimeLaw.calls>=publishedTimeLaw.calls&&publishedTimeLaw.calls>0
+                    &&prefixTimeLaw.calls>0&&suffixTimeLaw.calls>0
+                    &&allTimeLaw.calls==allTimeLaw.successes+allTimeLaw.failures,
+                "rolling diagnostics should classify published and provisional time-law attempts");
+    }
+
+    void testInfiniteJerkTrajectoryTimeMatchesAnalyticLine() {
+        constexpr auto infinity=std::numeric_limits<double>::infinity();
+        const ngc::InfiniteJerkPathPiece line {
+            .length=10.0,
+            .velocityLimit=3.0,
+            .tangentAt=[](double) { return ngc::position_t{1,0,0,0,0,0}; },
+            .curvatureAt=[](double) { return ngc::position_t{}; },
+        };
+        const auto timed=ngc::infiniteJerkTrajectoryTime(std::span{&line,std::size_t {1}}, {
+            .pathAcceleration=2.0,
+            .axisVelocity={infinity,infinity,infinity,infinity,infinity,infinity},
+            .axisAcceleration={infinity,infinity,infinity,infinity,infinity,infinity},
+        },0.0,0.0,{.maximumRefinements=11,.relativeTolerance=1e-7});
+        require(timed.has_value(),timed?"":timed.error());
+        require(std::abs(timed->duration-29.0/6.0)<5e-6,std::format(
+            "infinite-jerk line time should match the analytic trapezoidal profile: "
+            "actual={} expected={} error={} intervals={} refinements={}",timed->duration,
+            29.0/6.0,timed->estimatedDurationError,timed->intervals,timed->refinements));
+        requireNear(timed->maximumVelocity,3.0,
+            "infinite-jerk line time should reach its programmed velocity");
+
+        const ngc::InfiniteJerkPathPiece shortLine {
+            .length=2.0,
+            .velocityLimit=10.0,
+            .tangentAt=line.tangentAt,
+            .curvatureAt=line.curvatureAt,
+        };
+        const auto triangular=ngc::infiniteJerkTrajectoryTime(
+            std::span{&shortLine,std::size_t {1}}, {
+                .pathAcceleration=2.0,
+                .axisVelocity={infinity,infinity,infinity,infinity,infinity,infinity},
+                .axisAcceleration={infinity,infinity,infinity,infinity,infinity,infinity},
+            });
+        require(triangular.has_value(),triangular?"":triangular.error());
+        requireNear(triangular->duration,2.0,
+            "infinite-jerk line time should match the analytic triangular profile");
+
+        const ngc::simulation_detail::ArcReference quarterCircle(ngc::MoveArc {
+            {1,0,0,0,0,0},{0,1,0,0,0,0},{},{0,0,1},60.0});
+        require(quarterCircle.valid(),"infinite-jerk curvature fixture should be a valid arc");
+        const auto curvature=quarterCircle.curvatureAtDistance(quarterCircle.length()/2.0);
+        requireNear(curvature.length(),1.0,
+            "analytic unit-circle arc-length curvature should have unit magnitude");
+        require(std::abs(curvature.x+std::numbers::sqrt2/2.0)<1e-9
+                    &&std::abs(curvature.y+std::numbers::sqrt2/2.0)<1e-9,
+                "analytic unit-circle curvature should point toward the center");
     }
 
     void testExactStopLeadInAdvancesRollingBoundary() {
@@ -2600,10 +2665,20 @@ namespace {
             .axisAcceleration={100,100,100,100,100,100},
             .axisJerk={100,100,100,100,100,100},
         });
+        planner.setContinuousPlanningEffort({
+            .measureStationVisitReplay=true,
+            .enableStationVisitReplay=false,
+        });
         planner.reset(79);
         ngc::ContinuousAccelerationOracleModel oracleModel;
-        const auto planned=planner.compileContinuous(commands,0.001,&oracleModel);
+        ngc::InfiniteJerkTrajectoryTimeResult infiniteJerkTime;
+        const auto planned=planner.compileContinuous(commands,0.001,&oracleModel,
+            std::nullopt,std::nullopt,{},12U,&infiniteJerkTime);
         require(planned&&*planned,planned ? "dense timing fixture produced no plan" : planned.error());
+        require(infiniteJerkTime.duration>0.0
+                    &&infiniteJerkTime.duration<continuousDuration(**planned),
+                "dense smoothed-path infinite-jerk oracle should be faster than the "
+                "executable jerk-limited plan");
         const auto entry=maximumContinuousXVelocityInRange(**planned,0.2,0.8);
         const auto denseLines=maximumContinuousXVelocityInRange(**planned,1.01,1.19);
         const auto denseArcs=maximumContinuousXVelocityInRange(**planned,1.21,1.39);
@@ -2637,6 +2712,97 @@ namespace {
             return segment.length>0.0&&segment.velocityLimit>0.0
                 &&std::abs(segment.tangent.length()-1.0)<1e-8;
         }),"the Clarabel model should contain finite positive unit-tangent intervals");
+        const auto &inverse=(*planned)->splineInverse;
+        require(inverse.queries>inverse.endpointQueries&&inverse.exactCacheHits>0,
+                "dense timing should exercise the exact spline inverse cache");
+        require(inverse.constructionIntegralEvaluations>0
+                    &&inverse.inverseIntegralEvaluations==inverse.newtonIterations
+                    &&inverse.inverseIntegralEvaluations
+                        <inverse.queries-inverse.endpointQueries,
+                "exact spline inverse caching should avoid repeated adaptive integrals");
+        require(inverse.iterationLimitHits==0&&inverse.maximumNewtonIterations<=12,
+                "cached spline inverses should retain bounded safeguarded Newton correction");
+        const auto &arcInverse=(*planned)->arcInverse;
+        require(arcInverse.queries>0&&arcInverse.exactCacheHits>0,
+                "dense timing should exercise the exact arc inverse cache");
+        require(arcInverse.constructionIntegralEvaluations>0
+                    &&arcInverse.inverseIntegralEvaluations==arcInverse.newtonIterations
+                    &&arcInverse.inverseIntegralEvaluations<arcInverse.queries,
+                "exact arc inverse caching should avoid repeated adaptive integrals");
+        require(arcInverse.iterationLimitHits==0&&arcInverse.maximumNewtonIterations<=12,
+                "cached arc inverses should retain bounded safeguarded Newton correction");
+        const auto &timeLaw=(*planned)->timeLaw;
+        const auto totalTimeLaw=ngc::totalTimeLawCalls(timeLaw);
+        const auto resultsAreComplete=[](const ngc::TimeLawCallDiagnostics &value) {
+            return value.calls==value.successes+value.failures;
+        };
+        require(totalTimeLaw.calls>0&&totalTimeLaw.calls==totalTimeLaw.successes+totalTimeLaw.failures
+                    &&totalTimeLaw.cacheHits>0&&totalTimeLaw.solverCalls<totalTimeLaw.calls
+                    &&totalTimeLaw.cacheMisses+totalTimeLaw.cacheHits
+                        ==totalTimeLaw.calls-timeLaw.continuousSeed.calls
+                    &&timeLaw.exactStop.calls==0
+                    &&timeLaw.continuousSeed.calls>=(*planned)->pieceTiming.size()
+                    &&timeLaw.stationCurrentVelocity.calls>0
+                    &&timeLaw.stationCapVelocity.calls>0
+                    &&timeLaw.stationVelocityBracket.calls>0
+                    &&resultsAreComplete(timeLaw.continuousSeed)
+                    &&resultsAreComplete(timeLaw.stationCurrentVelocity)
+                    &&resultsAreComplete(timeLaw.stationCapVelocity)
+                    &&resultsAreComplete(timeLaw.stationVelocityBracket),
+                "continuous time-law instrumentation should classify every solver result");
+        const auto &endpointFeasibility=timeLaw.endpointFeasibility;
+        require(endpointFeasibility.cachedGeometryEndpoints==2*(*planned)->pieceTiming.size()
+                    &&endpointFeasibility.candidateChecks>0
+                    &&endpointFeasibility.accelerationRejections
+                        +endpointFeasibility.jerkRejections
+                        <=endpointFeasibility.candidateChecks,
+                "dense timing should reuse cached one-sided geometry and classify coupled "
+                "endpoint rejections before local timing");
+        const auto &locality=timeLaw.correctionPassLocality;
+        require((totalTimeLaw.correctionPassCalls==0)==locality.empty(),
+                "correction locality should record every pass after the initial solve");
+        for(const auto &pass:locality) {
+            require(pass.pass>0&&pass.pieceCount==(*planned)->pieceTiming.size()
+                        &&pass.correctedPieces>0
+                        &&pass.changedPieceTimings+pass.bitExactReusablePieceTimings
+                            ==pass.pieceCount
+                        &&pass.changedUncorrectedPieceTimings<=pass.changedPieceTimings
+                        &&pass.firstCorrectedPiece<=pass.lastCorrectedPiece
+                        &&pass.lastCorrectedPiece<pass.pieceCount
+                        &&pass.bitExactReusablePrefixPieces
+                            +pass.bitExactReusableSuffixPieces
+                            <=pass.bitExactReusablePieceTimings,
+                    "correction locality should partition exact timing reuse and retain valid "
+                    "corrected-piece bounds");
+            require(pass.changedPieceTimings==0
+                        ||(pass.changedPieceTimingRuns>0
+                           &&pass.maximumChangedPieceTimingRun>0
+                           &&pass.firstChangedPieceTiming<=pass.lastChangedPieceTiming
+                           &&pass.lastChangedPieceTiming<pass.pieceCount),
+                    "changed correction timings should retain bounded affected runs");
+        }
+        const auto &replay=timeLaw.stationVisitReplay;
+        require(replay.exactOutputMatches+replay.outputMismatches
+                    ==replay.exactInputMatches
+                    &&replay.exactInputMatches<=replay.comparableVisits
+                    &&replay.comparableVisits<=replay.activeVisits
+                    &&replay.potentialTimeLawCalls<=totalTimeLaw.correctionPassCalls
+                    &&replay.potentialSolverCalls<=totalTimeLaw.solverCalls
+                    &&replay.potentialMaterializations<=totalTimeLaw.cacheMaterializations,
+                "station replay shadow diagnostics should compare every exact input and bound "
+                "the work attributed to verified output matches");
+
+        planner.reset(80);
+        const auto repeated=planner.compileContinuous(commands,0.001);
+        require(repeated&&*repeated,
+                repeated?"repeated timing-cache plan was empty":repeated.error());
+        const auto repeatedTimeLaw=ngc::totalTimeLawCalls((*repeated)->timeLaw);
+        require(repeatedTimeLaw.cacheHits>0
+                    &&repeatedTimeLaw.solverCalls<totalTimeLaw.solverCalls,
+                "thread-local timing cache should reuse exact results across compilations");
+        requireNear(continuousDuration(**repeated),continuousDuration(**planned),
+                "cross-compilation timing-cache reuse should preserve duration");
+
     }
 
     void testContinuousTimingRetainsRuckigBrakePreProfile() {
@@ -2740,14 +2906,21 @@ namespace {
         const auto planned=planner.compileContinuous(commands,0.01);
         require(planned&&*planned,planned?
                 "local cluster-feed plan produced no trajectory":planned.error());
-        require((*planned)->pieceTiming.size()==4,
-                "a feed change inside a collapsed cluster should split only its timing pieces");
-        const auto &slowCluster=(*planned)->pieceTiming[1];
-        const auto &fastCluster=(*planned)->pieceTiming[2];
+        require((*planned)->pieceTiming.size()==6,
+                "a feed change inside a collapsed cluster should preserve per-knot timing "
+                "pieces and subdivide only the span containing the feed boundary");
+        const auto &slowCluster=(*planned)->pieceTiming[2];
+        const auto &fastCluster=(*planned)->pieceTiming[3];
         requireNear(slowCluster.velocityLimit,40.0/60.0,
                 "the incoming cluster portion should retain its F40 cap");
-        requireNear(fastCluster.velocityLimit,72.0/60.0,
-                "the remaining cluster portion should recover its F72 cap");
+        requireNear(fastCluster.velocityLimit,72.0/60.0,std::format(
+                "the remaining cluster portion should recover its F72 cap: [{}, {}, {}, "
+                "{}, {}, {}]",(*planned)->pieceTiming[0].velocityLimit,
+                (*planned)->pieceTiming[1].velocityLimit,
+                (*planned)->pieceTiming[2].velocityLimit,
+                (*planned)->pieceTiming[3].velocityLimit,
+                (*planned)->pieceTiming[4].velocityLimit,
+                (*planned)->pieceTiming[5].velocityLimit));
         require(slowCluster.exitVelocity<=40.0/60.0+1e-8,
                 "the shared feed-change station should respect the lower adjacent cap");
     }
@@ -3041,7 +3214,8 @@ namespace {
             ngc::MoveArc { { 1, 0, 0, 0, 0, 0 }, { 0, 0, 1+MISMATCH, 0, 0, 0 }, {}, { 0, -1, 0 }, 60.0 },
         };
         for(const auto &arc : arcs) {
-            const ngc::simulation_detail::ArcReference reference(arc);
+            ngc::simulation_detail::ArcInverseDiagnostics inverse;
+            const ngc::simulation_detail::ArcReference reference(arc,&inverse);
             require(reference.valid(), "arc reference geometry variant should be valid");
             const auto from = reference.positionAtDistance(0.0);
             const auto to = reference.positionAtDistance(reference.length());
@@ -3051,6 +3225,15 @@ namespace {
             requireNear(to.x, arc.to().x, "arc reference should preserve end X");
             requireNear(to.y, arc.to().y, "arc reference should preserve end Y");
             requireNear(to.z, arc.to().z, "arc reference should preserve end Z");
+            const auto middleDistance=reference.length()*0.375;
+            const auto firstParameter=reference.parameterAtDistance(middleDistance);
+            const auto cachedParameter=reference.parameterAtDistance(middleDistance);
+            require(firstParameter==cachedParameter&&inverse.exactCacheHits==1,
+                    "arc inverse cache should return the bit-exact certified parameter");
+            require(inverse.inverseIntegralEvaluations==inverse.newtonIterations
+                        &&inverse.iterationLimitHits==0
+                        &&inverse.maximumNewtonIterations<=12,
+                    "arc geometry variants should retain bounded exact inverse correction");
         }
     }
 
@@ -3750,6 +3933,7 @@ int main() {
         testImmediateDrainStopsAtHeldWithStaleDescendants();
         testN70N75PreviewPrefixesCompleteBoundedly();
         testExactStopPlannerCompilesLinesAndArcs();
+        testInfiniteJerkTrajectoryTimeMatchesAnalyticLine();
         testExactStopPlannerEnforcesIndependentAxisLimits();
         testBoundedLookaheadCarriesG64MetadataAndSingleCommandExactStops();
         testPreviewJunctionUsesOneSixControlSpline();

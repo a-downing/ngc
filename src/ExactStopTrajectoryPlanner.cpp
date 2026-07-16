@@ -5,7 +5,10 @@
 
 #include <algorithm>
 #include <array>
+#include <bit>
+#include <chrono>
 #include <cmath>
+#include <cstdint>
 #include <format>
 #include <functional>
 #include <initializer_list>
@@ -115,6 +118,147 @@ namespace ngc {
             ruckig::InputParameter<1> input;
             ruckig::Ruckig<1> generator;
             ruckig::Trajectory<1> trajectory;
+        };
+
+        enum class TimeLawPurpose {
+            ExactStop,
+            ContinuousSeed,
+            StationCurrentVelocity,
+            StationCapVelocity,
+            StationVelocityBracket,
+        };
+
+        using TimeLawInputKey=std::array<std::uint64_t,8>;
+
+        struct TimeLawInputHash {
+            std::size_t operator()(const TimeLawInputKey &values) const {
+                auto result=std::size_t {0xcbf29ce484222325ULL};
+                for(const auto value:values) {
+                    result^=static_cast<std::size_t>(value);
+                    result*=std::size_t {0x100000001b3ULL};
+                    if constexpr(sizeof(std::size_t)<sizeof(value))
+                        result^=static_cast<std::size_t>(value>>32U);
+                }
+                return result;
+            }
+        };
+
+        TimeLawInputKey timeLawInputKey(const double length,const double fromVelocity,
+                const double fromAcceleration,const double toVelocity,
+                const double toAcceleration,const double requestedVelocity,
+                const double acceleration,const double jerk) {
+            return {
+                std::bit_cast<std::uint64_t>(length),
+                std::bit_cast<std::uint64_t>(fromVelocity),
+                std::bit_cast<std::uint64_t>(fromAcceleration),
+                std::bit_cast<std::uint64_t>(toVelocity),
+                std::bit_cast<std::uint64_t>(toAcceleration),
+                std::bit_cast<std::uint64_t>(requestedVelocity),
+                std::bit_cast<std::uint64_t>(acceleration),
+                std::bit_cast<std::uint64_t>(jerk),
+            };
+        }
+
+        struct TimeLawCacheEntry {
+            TimeLawInputKey key {};
+            double duration=0.0;
+            bool successful=false;
+            bool valid=false;
+        };
+
+        constexpr std::size_t SMALL_TIME_LAW_CACHE_SIZE=32768;
+        // A 128K direct-mapped table is about 11 MiB and was the measured knee
+        // for large horizons. A 256K table removed more solver calls but did not
+        // improve wall time. Smaller rolling probes avoid initializing it.
+        constexpr std::size_t LARGE_TIME_LAW_CACHE_SIZE=131072;
+
+        TimeLawCacheEntry *threadTimeLawCache() {
+            thread_local auto cache=
+                std::make_unique<TimeLawCacheEntry[]>(LARGE_TIME_LAW_CACHE_SIZE);
+            return cache.get();
+        }
+
+        struct TimeLawInstrumentation {
+            TimeLawDiagnostics diagnostics;
+            std::unique_ptr<TimeLawCacheEntry[]> cache;
+            std::size_t cacheSize=SMALL_TIME_LAW_CACHE_SIZE;
+            bool shareAcrossCompilations=false;
+
+            void configureCache(const std::size_t requestedSize,const bool share) {
+                if(cache) PANIC("time-law cache configured after first use");
+                if(requestedSize==0||(requestedSize&(requestedSize-1))!=0)
+                    PANIC("time-law cache size must be a power of two");
+                cacheSize=requestedSize;
+                shareAcrossCompilations=share;
+            }
+
+            TimeLawCacheEntry *entries() {
+                if(shareAcrossCompilations) return threadTimeLawCache();
+                if(!cache) cache=std::make_unique<TimeLawCacheEntry[]>(cacheSize);
+                return cache.get();
+            }
+
+            TimeLawCallDiagnostics &forPurpose(const TimeLawPurpose purpose) {
+                switch(purpose) {
+                    case TimeLawPurpose::ExactStop: return diagnostics.exactStop;
+                    case TimeLawPurpose::ContinuousSeed: return diagnostics.continuousSeed;
+                    case TimeLawPurpose::StationCurrentVelocity:
+                        return diagnostics.stationCurrentVelocity;
+                    case TimeLawPurpose::StationCapVelocity:
+                        return diagnostics.stationCapVelocity;
+                    case TimeLawPurpose::StationVelocityBracket:
+                        return diagnostics.stationVelocityBracket;
+                }
+                PANIC("invalid time-law instrumentation purpose");
+            }
+
+            TimeLawCallDiagnostics &begin(const TimeLawPurpose purpose,
+                                          const bool correctionPass) {
+                auto &result=forPurpose(purpose);
+                ++result.calls;
+                if(correctionPass) ++result.correctionPassCalls;
+                return result;
+            }
+
+            TimeLawCacheEntry *find(const TimeLawInputKey &key,
+                                    TimeLawCallDiagnostics &diagnosticsForPurpose) {
+                auto &entry=entries()[TimeLawInputHash{}(key)&(cacheSize-1)];
+                if(entry.valid&&entry.key==key) {
+                    ++diagnosticsForPurpose.cacheHits;
+                    return &entry;
+                }
+                ++diagnosticsForPurpose.cacheMisses;
+                if(entry.valid) ++diagnosticsForPurpose.cacheCollisions;
+                return nullptr;
+            }
+
+            void store(const TimeLawInputKey &key,const bool successful,
+                       const double duration) {
+                auto &entry=entries()[TimeLawInputHash{}(key)&(cacheSize-1)];
+                entry={key,duration,successful,true};
+            }
+        };
+
+        struct TimeLawCallTimer {
+            TimeLawCallDiagnostics &diagnostics;
+            std::chrono::steady_clock::time_point started=std::chrono::steady_clock::now();
+            bool succeeded=false;
+
+            ~TimeLawCallTimer() {
+                diagnostics.seconds+=std::chrono::duration<double>(
+                    std::chrono::steady_clock::now()-started).count();
+                if(succeeded) ++diagnostics.successes;
+                else ++diagnostics.failures;
+            }
+        };
+
+        struct TimeLawCompilationRecorder {
+            TimeLawDiagnostics &destination;
+            TimeLawInstrumentation instrumentation;
+
+            explicit TimeLawCompilationRecorder(TimeLawDiagnostics &destinationValue)
+                :destination(destinationValue) { }
+            ~TimeLawCompilationRecorder() { destination=instrumentation.diagnostics; }
         };
 
         struct ScalarPhase {
@@ -279,7 +423,8 @@ namespace ngc {
                 return std::unexpected("Ruckig failed to calculate a moving-boundary stop trajectory");
 
             std::vector<double> times{0.0,trajectory.get_duration()};
-            const auto &profiles=trajectory.get_profiles_ref().front();
+            const auto trajectoryProfiles=trajectory.get_profiles();
+            const auto &profiles=trajectoryProfiles.front();
             for(const auto &profile:profiles) {
                 auto elapsed=0.0;
                 for(const auto duration:profile.brake.t) {
@@ -447,7 +592,7 @@ namespace ngc {
             return std::abs(6.0*span.a.*component * span.inverseDurationCubed);
         }
 
-        std::expected<TimeLaw, std::string> timeLawBetween(TimeLawWorkspace &workspace,
+        std::expected<TimeLaw, std::string> solveTimeLawBetween(TimeLawWorkspace &workspace,
                 const double length,const double fromVelocity,const double fromAcceleration,
                 const double toVelocity,const double toAcceleration,
                 const double requestedVelocity,const double acceleration,const double jerk) {
@@ -481,7 +626,7 @@ namespace ngc {
                     "Ruckig failed local position timing: length={} state (v={}, a={}) -> "
                     "(v={}, a={}) limits v={} a={} j={}",length,fromVelocity,fromAcceleration,
                     toVelocity,toAcceleration,requestedVelocity,acceleration,jerk));
-            const auto &profiles=trajectory.get_profiles_ref();
+            const auto profiles=trajectory.get_profiles();
             const auto &profile=profiles.front().front();
             TimeLaw result {{
                 0.0,0.0,fromVelocity,fromAcceleration,0.0}};
@@ -561,13 +706,81 @@ namespace ngc {
             return result;
         }
 
+        std::expected<TimeLaw, std::string> timeLawBetween(TimeLawWorkspace &workspace,
+                TimeLawInstrumentation &instrumentation,const TimeLawPurpose purpose,
+                const bool correctionPass,
+                const double length,const double fromVelocity,const double fromAcceleration,
+                const double toVelocity,const double toAcceleration,
+                const double requestedVelocity,const double acceleration,const double jerk) {
+            auto &diagnostics=instrumentation.begin(purpose,correctionPass);
+            TimeLawCallTimer timer {diagnostics};
+            ++diagnostics.solverCalls;
+            auto result=solveTimeLawBetween(workspace,length,fromVelocity,fromAcceleration,
+                toVelocity,toAcceleration,requestedVelocity,acceleration,jerk);
+            timer.succeeded=result.has_value();
+            return result;
+        }
+
+        struct CandidateTimeLaw {
+            std::optional<TimeLaw> timing;
+            double duration=0.0;
+            bool successful=false;
+        };
+
+        CandidateTimeLaw candidateTimeLawBetween(TimeLawWorkspace &workspace,
+                TimeLawInstrumentation &instrumentation,const TimeLawPurpose purpose,
+                const bool correctionPass,
+                const double length,const double fromVelocity,const double fromAcceleration,
+                const double toVelocity,const double toAcceleration,
+                const double requestedVelocity,const double acceleration,const double jerk) {
+            auto &diagnostics=instrumentation.begin(purpose,correctionPass);
+            TimeLawCallTimer timer {diagnostics};
+            const auto key=timeLawInputKey(length,fromVelocity,fromAcceleration,toVelocity,
+                toAcceleration,requestedVelocity,acceleration,jerk);
+            if(const auto *cached=instrumentation.find(key,diagnostics)) {
+                timer.succeeded=cached->successful;
+                return {.timing=std::nullopt,.duration=cached->duration,
+                    .successful=cached->successful};
+            }
+            ++diagnostics.solverCalls;
+            auto result=solveTimeLawBetween(workspace,length,fromVelocity,fromAcceleration,
+                toVelocity,toAcceleration,requestedVelocity,acceleration,jerk);
+            if(!result) {
+                instrumentation.store(key,false,0.0);
+                return {};
+            }
+            const auto duration=result->back().time;
+            instrumentation.store(key,true,duration);
+            timer.succeeded=true;
+            return {.timing=std::move(*result),.duration=duration,.successful=true};
+        }
+
+        std::optional<TimeLaw> materializeCandidateTimeLaw(TimeLawWorkspace &workspace,
+                TimeLawInstrumentation &instrumentation,const TimeLawPurpose purpose,
+                const double length,const double fromVelocity,const double fromAcceleration,
+                const double toVelocity,const double toAcceleration,
+                const double requestedVelocity,const double acceleration,const double jerk) {
+            auto &diagnostics=instrumentation.forPurpose(purpose);
+            ++diagnostics.cacheMaterializations;
+            ++diagnostics.solverCalls;
+            const auto started=std::chrono::steady_clock::now();
+            auto result=solveTimeLawBetween(workspace,length,fromVelocity,fromAcceleration,
+                toVelocity,toAcceleration,requestedVelocity,acceleration,jerk);
+            diagnostics.seconds+=std::chrono::duration<double>(
+                std::chrono::steady_clock::now()-started).count();
+            if(!result) return std::nullopt;
+            return std::move(*result);
+        }
+
         std::expected<TimeLaw, std::string> timeLaw(TimeLawWorkspace &workspace,
+                TimeLawInstrumentation &instrumentation,
                 const double length, const double requestedVelocity, const double acceleration, const double jerk) {
             if(std::isinf(acceleration)) return TimeLaw{
                 {0.0,0.0,requestedVelocity,0.0},
                 {length/requestedVelocity,length,requestedVelocity,0.0},
             };
-            return timeLawBetween(workspace,length,0.0,0.0,0.0,0.0,
+            return timeLawBetween(workspace,instrumentation,TimeLawPurpose::ExactStop,false,
+                                  length,0.0,0.0,0.0,0.0,
                                   requestedVelocity,acceleration,jerk);
         }
 
@@ -605,6 +818,14 @@ namespace ngc {
             return left.x*right.x + left.y*right.y + left.z*right.z
                 + left.a*right.a + left.b*right.b + left.c*right.c;
         }
+
+        struct CoupledEndpointGeometry {
+            position_t tangent;
+            position_t curvature;
+            position_t curvatureDerivative;
+        };
+
+        enum class CoupledEndpointResult { Feasible, Acceleration, Jerk };
 
         bool finitePosition(const position_t &value) {
             return std::ranges::all_of(AXIS_COMPONENTS,[&](const auto component) {
@@ -678,16 +899,38 @@ namespace ngc {
             std::vector<double> m_spanDistances;
             double m_parameterMaximum=0.0;
             double m_length=0.0;
+            SplineInverseDiagnostics *m_inverseDiagnostics=nullptr;
+            struct InverseCacheEntry {
+                double distance=0.0;
+                double parameter=0.0;
+                bool valid=false;
+            };
+            static constexpr std::size_t INVERSE_CACHE_SIZE=16;
+            mutable std::array<InverseCacheEntry,INVERSE_CACHE_SIZE> m_inverseCache;
+
+            static std::size_t inverseCacheIndex(const double distance) {
+                auto bits=std::bit_cast<std::uint64_t>(distance);
+                bits^=bits>>33;
+                bits*=0xff51afd7ed558ccdULL;
+                bits^=bits>>33;
+                return static_cast<std::size_t>(bits)&(INVERSE_CACHE_SIZE-1);
+            }
 
             double speed(const double parameter) const { return derivative(parameter).length(); }
-            double integratedLength(const double from,const double to) const {
+            double integratedLength(const double from,const double to,
+                                    const bool inverseEvaluation=false) const {
                 if(to<=from) return 0.0;
+                if(m_inverseDiagnostics) {
+                    if(inverseEvaluation) ++m_inverseDiagnostics->inverseIntegralEvaluations;
+                    else ++m_inverseDiagnostics->constructionIntegralEvaluations;
+                }
                 return integrateAdaptive([&](const double u) { return speed(u); },from,to,
                     1e-12*std::max(1.0,to-from));
             }
         public:
-            explicit CubicBSplineReference(std::vector<position_t> controls)
-                : m_controls(std::move(controls)) {
+            explicit CubicBSplineReference(std::vector<position_t> controls,
+                                           SplineInverseDiagnostics *inverseDiagnostics)
+                : m_controls(std::move(controls)),m_inverseDiagnostics(inverseDiagnostics) {
                 if(m_controls.size()<4) return;
                 m_parameterMaximum=static_cast<double>(m_controls.size()-3);
                 m_knots.assign(m_controls.size()+4,m_parameterMaximum);
@@ -733,8 +976,10 @@ namespace ngc {
             }
 
             template<std::size_t Count>
-            explicit CubicBSplineReference(const std::array<position_t,Count> &controls)
-                : CubicBSplineReference(std::vector<position_t>(controls.begin(),controls.end())) {}
+            explicit CubicBSplineReference(const std::array<position_t,Count> &controls,
+                                           SplineInverseDiagnostics *inverseDiagnostics)
+                : CubicBSplineReference(
+                    std::vector<position_t>(controls.begin(),controls.end()),inverseDiagnostics) {}
 
             double length() const { return m_length; }
             std::span<const double> spanDistances() const { return m_spanDistances; }
@@ -753,9 +998,21 @@ namespace ngc {
             double parameterAtDistance(const double requestedDistance) const {
                 if(!std::isfinite(requestedDistance)||!std::isfinite(m_length)||m_length<=1e-15)
                     return m_parameterMaximum;
+                if(m_inverseDiagnostics) ++m_inverseDiagnostics->queries;
                 const auto distance=std::clamp(requestedDistance,0.0,m_length);
-                if(distance<=0.0) return 0.0;
-                if(distance>=m_length) return m_parameterMaximum;
+                if(distance<=0.0) {
+                    if(m_inverseDiagnostics) ++m_inverseDiagnostics->endpointQueries;
+                    return 0.0;
+                }
+                if(distance>=m_length) {
+                    if(m_inverseDiagnostics) ++m_inverseDiagnostics->endpointQueries;
+                    return m_parameterMaximum;
+                }
+                auto &cache=m_inverseCache[inverseCacheIndex(distance)];
+                if(cache.valid&&cache.distance==distance) {
+                    if(m_inverseDiagnostics) ++m_inverseDiagnostics->exactCacheHits;
+                    return cache.parameter;
+                }
                 const auto upper=std::lower_bound(m_nodes.begin(),m_nodes.end(),distance,
                     [](const LengthNode &node,const double value) { return node.distance<value; });
                 const auto lower=upper-1;
@@ -766,15 +1023,32 @@ namespace ngc {
                 const auto distanceTolerance=1e-12*std::max(1.0,m_length);
                 for(unsigned iteration=0;iteration<12;++iteration) {
                     const auto parameterDistance=
-                        lower->distance+integratedLength(lower->parameter,parameter);
+                        lower->distance+integratedLength(lower->parameter,parameter,true);
+                    if(m_inverseDiagnostics) {
+                        ++m_inverseDiagnostics->newtonIterations;
+                        m_inverseDiagnostics->maximumNewtonIterations=std::max(
+                            m_inverseDiagnostics->maximumNewtonIterations,
+                            static_cast<std::size_t>(iteration+1));
+                    }
                     const auto error=parameterDistance-distance;
-                    if(std::abs(error)<=distanceTolerance) return parameter;
+                    if(std::abs(error)<=distanceTolerance) {
+                        if(iteration==0&&m_inverseDiagnostics)
+                            ++m_inverseDiagnostics->seedConvergences;
+                        cache={distance,parameter,true};
+                        return parameter;
+                    }
                     if(error<0.0) from=parameter;
                     else to=parameter;
                     const auto localSpeed=speed(parameter);
                     const auto newton=localSpeed>1e-15?parameter-error/localSpeed:parameter;
-                    parameter=newton>from&&newton<to?newton:std::midpoint(from,to);
+                    if(newton>from&&newton<to) parameter=newton;
+                    else {
+                        parameter=std::midpoint(from,to);
+                        if(m_inverseDiagnostics) ++m_inverseDiagnostics->safeguardedBisections;
+                    }
                 }
+                if(m_inverseDiagnostics) ++m_inverseDiagnostics->iterationLimitHits;
+                cache={distance,parameter,true};
                 return parameter;
             }
             position_t positionAtDistance(const double distance) const {
@@ -834,6 +1108,7 @@ namespace ngc {
             std::function<position_t(double)> positionAt;
             std::function<position_t(double)> tangentAt;
             std::function<position_t(double)> curvatureAt;
+            std::function<position_t(double)> infiniteJerkCurvatureAt;
             std::function<position_t(double)> curvatureDerivativeAt;
             std::function<double(double,double)> chordErrorBound;
         };
@@ -846,6 +1121,7 @@ namespace ngc {
             bool linear=false;
             std::function<PathSample(double)> sampleAt;
             std::function<position_t(double)> curvatureAt;
+            std::function<position_t(double)> infiniteJerkCurvatureAt;
             std::function<position_t(double)> curvatureDerivativeAt;
             std::function<position_t(double)> positionAt;
             std::function<double(double,double)> chordErrorBound;
@@ -863,6 +1139,7 @@ namespace ngc {
     }
 
     std::expected<PlanChunk, std::string> ExactStopTrajectoryPlanner::compile(const MachineCommand &command) {
+        m_lastTimeLawDiagnostics={};
         if(m_limits.pathAcceleration <= 0.0 || m_limits.pathJerk <= 0.0
            || m_limits.rapidSpeed <= 0.0 || m_limits.arcChordTolerance <= 0.0
            || !positiveAxisLimits(m_limits.axisVelocity)
@@ -878,6 +1155,7 @@ namespace ngc {
         chunk.predecessorBranch = m_previousBranch;
         chunk.branch = chunk.id;
         TimeLawWorkspace timeLawWorkspace;
+        TimeLawCompilationRecorder timeLawRecorder {m_lastTimeLawDiagnostics};
 
         auto appendMotion = [&](const double length, const double speedPerMinute,
                                 const position_t &maximumTangent,
@@ -894,7 +1172,8 @@ namespace ngc {
                 pathLimit(maximumTangent, m_limits.axisAcceleration));
             const auto jerk = std::min(m_limits.pathJerk,
                 pathLimit(maximumTangent, m_limits.axisJerk));
-            const auto timing = timeLaw(timeLawWorkspace,length,requestedVelocity,acceleration,jerk);
+            const auto timing = timeLaw(timeLawWorkspace,timeLawRecorder.instrumentation,
+                length,requestedVelocity,acceleration,jerk);
             if(!timing) return timing.error();
             const auto &boundaries = *timing;
             for(std::size_t phase = 1; phase < boundaries.size(); ++phase) {
@@ -1037,7 +1316,10 @@ namespace ngc {
             std::optional<MotionState> requestedStartState,
             std::optional<MotionState> requestedEndState,
             const std::span<const double> scaleOverrides,
-            const unsigned requestedVelocitySearchIterations) {
+            const unsigned requestedVelocitySearchIterations,
+            InfiniteJerkTrajectoryTimeResult *infiniteJerkTime) {
+        m_lastTimeLawDiagnostics={};
+        TimeLawCompilationRecorder timeLawRecorder {m_lastTimeLawDiagnostics};
         if(commands.empty()) return std::unexpected("continuous trajectory window is empty");
         if(blendScale<=0.0) return std::unexpected("continuous trajectory blend scale must be positive");
         if(m_limits.pathAcceleration<=0.0||m_limits.pathJerk<=0.0
@@ -1051,12 +1333,18 @@ namespace ngc {
                 >MAX_REACHABILITY_ACCELERATION_CANDIDATES
            ||m_continuousPlanningEffort.candidateBudgetMultiplier==0
            ||m_continuousPlanningEffort.candidateBudgetMultiplier>1024
+           ||m_continuousPlanningEffort.maximumLocalCorrectionPasses==0
+           ||m_continuousPlanningEffort.maximumLocalCorrectionPasses>128
+           ||m_continuousPlanningEffort.geometryVerificationBudgetMultiplier<36
+           ||m_continuousPlanningEffort.geometryVerificationBudgetMultiplier>256
            ||!std::isfinite(m_continuousPlanningEffort
                 .curvatureDerivativeVelocityCapMultiplier)
            ||m_continuousPlanningEffort.curvatureDerivativeVelocityCapMultiplier<=0.0)
             return std::unexpected("continuous planning effort is outside its bounded range");
         reportProgress();
 
+        SplineInverseDiagnostics splineInverseDiagnostics;
+        simulation_detail::ArcInverseDiagnostics arcInverseDiagnostics;
         std::vector<ContinuousEntity> entities;
         entities.reserve(commands.size());
         position_t expectedStart=m_position;
@@ -1088,6 +1376,7 @@ namespace ngc {
                         },
                         .tangentAt=[tangent](double) { return tangent; },
                         .curvatureAt=[](double) { return position_t{}; },
+                        .infiniteJerkCurvatureAt={},
                         .curvatureDerivativeAt=[](double) { return position_t{}; },
                         .chordErrorBound=[](double,double) { return 0.0; },
                     };
@@ -1102,7 +1391,8 @@ namespace ngc {
                             command.from().z,command.from().a,command.from().b,command.from().c,
                             expectedStart.x,expectedStart.y,expectedStart.z,expectedStart.a,
                             expectedStart.b,expectedStart.c,mismatch));
-                    auto reference=std::make_shared<simulation_detail::ArcReference>(command);
+                    auto reference=std::make_shared<simulation_detail::ArcReference>(
+                        command,&arcInverseDiagnostics);
                     if(!reference->valid()||reference->length()<=1e-12)
                         return std::unexpected("continuous path contains an invalid arc");
                     const std::function<position_t(double)> curvatureAt=[reference](const double distance) {
@@ -1129,6 +1419,10 @@ namespace ngc {
                             return reference->tangentAtDistance(distance);
                         },
                         .curvatureAt=curvatureAt,
+                        .infiniteJerkCurvatureAt=infiniteJerkTime
+                            ?std::function<position_t(double)>{[reference](const double distance) {
+                                return reference->curvatureAtDistance(distance);
+                            }}:std::function<position_t(double)>{},
                         .curvatureDerivativeAt=[reference,curvatureAt](const double distance) {
                             const auto length=reference->length();
                             const auto step=std::clamp(length*1e-3,1e-7,
@@ -1235,6 +1529,11 @@ namespace ngc {
                 .curvatureAt=[entity,from,length](const double distance) {
                     return entity.curvatureAt(from+std::clamp(distance,0.0,length));
                 },
+                .infiniteJerkCurvatureAt=entity.infiniteJerkCurvatureAt
+                    ?std::function<position_t(double)>{[entity,from,length](const double distance) {
+                        return entity.infiniteJerkCurvatureAt(
+                            from+std::clamp(distance,0.0,length));
+                    }}:std::function<position_t(double)>{},
                 .curvatureDerivativeAt=[entity,from,length](const double distance) {
                     return entity.curvatureDerivativeAt(from+std::clamp(distance,0.0,length));
                 },
@@ -1335,19 +1634,6 @@ namespace ngc {
                 scaled(endCurvature,3.0*outgoingHandle*outgoingHandle)));
             controls.push_back(subtract(end.position,scaled(end.tangent,outgoingHandle)));
             controls.push_back(end.position);
-            if(controls.size()>6) {
-                std::vector<std::array<double,6>> sourceControls;
-                sourceControls.reserve(controls.size());
-                for(const auto &control:controls)
-                    sourceControls.push_back({control.x,control.y,control.z,
-                                              control.a,control.b,control.c});
-                const auto conditioned=spline_detail::conditionCubicSplineInteriorControls<6>(
-                    sourceControls,blendScale);
-                for(std::size_t control=0;control<controls.size();++control)
-                    controls[control]={conditioned[control][0],conditioned[control][1],
-                        conditioned[control][2],conditioned[control][3],
-                        conditioned[control][4],conditioned[control][5]};
-            }
             if(!std::ranges::all_of(controls,finitePosition))
                 return std::unexpected("continuous evenly-spaced spline controls are not finite");
             return controls;
@@ -1361,12 +1647,13 @@ namespace ngc {
                 return std::unexpected("continuous evenly-spaced spline controls are not finite");
             auto capturedControls=m_continuousPlanningEffort.captureSplineGeometry
                 ?controls:std::vector<position_t>{};
-            auto spline=std::make_shared<CubicBSplineReference>(std::move(controls));
+            auto spline=std::make_shared<CubicBSplineReference>(
+                std::move(controls),&splineInverseDiagnostics);
             if(!std::isfinite(spline->length())||spline->length()<=1e-12)
                 return std::unexpected("continuous path produced a zero-length evenly-spaced spline");
             std::vector<GeometryPiece> result;
             const auto spanDistances=spline->spanDistances();
-            constexpr std::size_t timingSpansPerPiece=3;
+            constexpr std::size_t timingSpansPerPiece=1;
             struct FeedSection {
                 double end=0.0;
                 double speed=0.0;
@@ -1442,6 +1729,7 @@ namespace ngc {
                         return spline->curvatureAtDistance(
                             offset+std::clamp(distance,0.0,length));
                     },
+                    .infiniteJerkCurvatureAt={},
                     .curvatureDerivativeAt=[spline,offset,length](const double distance) {
                         return spline->curvatureDerivativeAtDistance(
                             offset+std::clamp(distance,0.0,length));
@@ -1555,7 +1843,8 @@ namespace ngc {
             };
             if(!std::ranges::all_of(controls,finitePosition))
                 return std::unexpected("continuous B-spline controls are not finite");
-            auto spline=std::make_shared<CubicBSplineReference>(controls);
+            auto spline=std::make_shared<CubicBSplineReference>(
+                controls,&splineInverseDiagnostics);
             if(!std::isfinite(spline->length())||spline->length()<=1e-12)
                 return std::unexpected("continuous path produced a zero-length B-spline blend");
             if(m_continuousPlanningEffort.captureSplineGeometry)
@@ -1594,6 +1883,7 @@ namespace ngc {
                     if(spline->length()-distance<=1e-10) return endCurvature;
                     return spline->curvatureAtDistance(distance);
                 },
+                .infiniteJerkCurvatureAt={},
                 .curvatureDerivativeAt=[spline](const double distance) {
                     return spline->curvatureDerivativeAtDistance(distance);
                 },
@@ -1606,6 +1896,9 @@ namespace ngc {
             });
         }
         if(pieces.empty()) return std::unexpected("continuous path produced no geometry");
+        timeLawRecorder.instrumentation.configureCache(
+            pieces.size()>1024?LARGE_TIME_LAW_CACHE_SIZE:SMALL_TIME_LAW_CACHE_SIZE,
+            m_continuousPlanningEffort.shareTimeLawCacheAcrossCompilations);
 
         const auto expectedEnd=expectedStart;
         const auto startState=requestedStartState.value_or(MotionState{m_position,{},{}});
@@ -1636,15 +1929,37 @@ namespace ngc {
         if(!scalarStart) return std::unexpected(scalarStart.error());
         auto scalarEnd=scalarBoundary(pieces.back(),pieces.back().length,endState,"end");
         if(!scalarEnd) return std::unexpected(scalarEnd.error());
+        if(infiniteJerkTime) {
+            std::vector<InfiniteJerkPathPiece> infiniteJerkPieces;
+            infiniteJerkPieces.reserve(pieces.size());
+            for(const auto &piece:pieces) infiniteJerkPieces.push_back({
+                .length=piece.length,
+                .velocityLimit=piece.speed,
+                .tangentAt=[sample=piece.sampleAt](const double distance) {
+                    return sample(distance).tangent;
+                },
+                .curvatureAt=piece.infiniteJerkCurvatureAt
+                    ?piece.infiniteJerkCurvatureAt:piece.curvatureAt,
+            });
+            auto measured=infiniteJerkTrajectoryTime(infiniteJerkPieces,{
+                .pathAcceleration=m_limits.pathAcceleration,
+                .axisVelocity=m_limits.axisVelocity,
+                .axisAcceleration=m_limits.axisAcceleration,
+            },scalarStart->first,scalarEnd->first);
+            if(!measured) return std::unexpected(std::format(
+                "smoothed-path infinite-jerk timing failed: {}",measured.error()));
+            *infiniteJerkTime=*measured;
+        }
 
         auto result=std::make_unique<ContinuousTrajectoryPlan>();
         std::vector<AxisPolynomialSpan> normalSpans;
         std::vector<std::size_t> normalSpanPieces;
         const auto maximumStagedNormalSpans=std::max<std::size_t>(8192,pieces.size()*8);
         const auto maximumGeometryVerificationAttemptsPerPass=
-            std::max<std::size_t>(8192,pieces.size()*3);
+            std::max<std::size_t>(8192,pieces.size()*4);
         const auto maximumTotalGeometryVerificationAttempts=
-            std::max<std::size_t>(32768,pieces.size()*36);
+            std::max<std::size_t>(32768,pieces.size()
+                *m_continuousPlanningEffort.geometryVerificationBudgetMultiplier);
         std::size_t curvedReachabilityStations=0;
         for(std::size_t station=1;station<pieces.size();++station)
             if(!pieces[station-1].linear||!pieces[station].linear)
@@ -1657,7 +1972,7 @@ namespace ngc {
         const auto maximumLinearCandidateEvaluationsPerPass=candidateBudgetMultiplier
             *std::max<std::size_t>(32768,linearReachabilityStations*512);
         const auto maximumTotalCurvedCandidateEvaluations=candidateBudgetMultiplier
-            *std::max<std::size_t>(524288,curvedReachabilityStations*384);
+            *std::max<std::size_t>(524288,curvedReachabilityStations*1024);
         const auto maximumTotalLinearCandidateEvaluations=candidateBudgetMultiplier
             *std::max<std::size_t>(131072,linearReachabilityStations*2048);
         auto nextChunk=m_nextChunk;
@@ -1792,6 +2107,25 @@ namespace ngc {
         }
         const auto initialLocalLimits=localLimits;
 
+        // These one-sided endpoint values are geometry-only and remain valid
+        // through every local-limit correction pass. Candidate evaluation used
+        // to repeat the exact inverse/sample path for both sides of every
+        // station even though only scalar velocity and acceleration changed.
+        std::vector<CoupledEndpointGeometry> pieceStartGeometry;
+        std::vector<CoupledEndpointGeometry> pieceEndGeometry;
+        pieceStartGeometry.reserve(pieces.size());
+        pieceEndGeometry.reserve(pieces.size());
+        for(const auto &piece:pieces) {
+            const auto start=piece.sampleAt(0.0);
+            const auto end=piece.sampleAt(piece.length);
+            pieceStartGeometry.push_back({start.tangent,piece.curvatureAt(0.0),
+                piece.curvatureDerivativeAt(0.0)});
+            pieceEndGeometry.push_back({end.tangent,piece.curvatureAt(piece.length),
+                piece.curvatureDerivativeAt(piece.length)});
+        }
+        timeLawRecorder.instrumentation.diagnostics.endpointFeasibility
+            .cachedGeometryEndpoints+=2*pieces.size();
+
         const auto kinematicAt=[&](const std::size_t pieceIndex,const TimeBoundary &boundary) {
             const auto &piece=pieces[pieceIndex];
             auto local=std::clamp(boundary.distance,0.0,piece.length);
@@ -1807,7 +2141,8 @@ namespace ngc {
             };
         };
 
-        constexpr unsigned MAX_LOCAL_CORRECTION_PASSES=24;
+        const auto maximumLocalCorrectionPasses=
+            m_continuousPlanningEffort.maximumLocalCorrectionPasses;
         bool constraintsVerified=false;
         std::string correctionHistory;
         std::size_t totalGeometryVerificationAttempts=0;
@@ -1815,7 +2150,87 @@ namespace ngc {
         std::size_t totalCurvedCandidateEvaluations=0;
         std::size_t totalLinearCandidateEvaluations=0;
         TimeLawWorkspace timeLawWorkspace;
-        for(unsigned correctionPass=0;correctionPass<MAX_LOCAL_CORRECTION_PASSES;++correctionPass) {
+        std::vector<double> previousStationVelocity;
+        std::vector<double> previousStationAcceleration;
+        std::vector<TimeLaw> previousPieceTiming;
+        std::vector<std::size_t> previouslyCorrectedPieces;
+        const auto bitExactDouble=[](const double left,const double right) {
+            return std::bit_cast<std::uint64_t>(left)
+                ==std::bit_cast<std::uint64_t>(right);
+        };
+        const auto bitExactTimeLaw=[&](const TimeLaw &left,const TimeLaw &right) {
+            if(left.size()!=right.size()) return false;
+            for(std::size_t boundary=0;boundary<left.size();++boundary) {
+                const auto &a=left[boundary];
+                const auto &b=right[boundary];
+                if(!bitExactDouble(a.time,b.time)
+                   ||!bitExactDouble(a.distance,b.distance)
+                   ||!bitExactDouble(a.velocity,b.velocity)
+                   ||!bitExactDouble(a.acceleration,b.acceleration)
+                   ||!bitExactDouble(a.jerk,b.jerk)
+                   ||a.ruckigBrakePhase!=b.ruckigBrakePhase) return false;
+            }
+            return true;
+        };
+        struct StationVisitKey {
+            // 5 visit/search fields, 15 scalar fields, and two complete
+            // 11-boundary TimeLaws at 1+6 words each require at most 154 words.
+            std::array<std::uint64_t,160> words {};
+            std::size_t size=0;
+
+            void push_back(const std::uint64_t value) {
+                if(size==words.size()) PANIC("station visit exact key exceeded capacity");
+                words[size++]=value;
+            }
+            bool operator==(const StationVisitKey &other) const {
+                return size==other.size
+                    &&std::equal(words.begin(),words.begin()+size,other.words.begin());
+            }
+        };
+        const auto appendFingerprintDouble=[](StationVisitKey &fingerprint,
+                                               const double value) {
+            fingerprint.push_back(std::bit_cast<std::uint64_t>(value));
+        };
+        const auto appendTimeLawFingerprint=[&](StationVisitKey &fingerprint,
+                                                const TimeLaw &timing) {
+            fingerprint.push_back(timing.size());
+            for(const auto &boundary:timing) {
+                appendFingerprintDouble(fingerprint,boundary.time);
+                appendFingerprintDouble(fingerprint,boundary.distance);
+                appendFingerprintDouble(fingerprint,boundary.velocity);
+                appendFingerprintDouble(fingerprint,boundary.acceleration);
+                appendFingerprintDouble(fingerprint,boundary.jerk);
+                fingerprint.push_back(boundary.ruckigBrakePhase?1U:0U);
+            }
+        };
+        struct StationVisitReplayRecord {
+            StationVisitKey input;
+            TimeLaw leftTiming;
+            TimeLaw rightTiming;
+            double velocity=0.0;
+            double acceleration=0.0;
+            std::size_t candidateEvaluations=0;
+            std::size_t endpointChecks=0;
+            std::size_t accelerationRejections=0;
+            std::size_t jerkRejections=0;
+            std::size_t velocityCandidateSets=0;
+            std::size_t capVelocitySearches=0;
+            std::size_t binaryVelocitySearchSteps=0;
+            bool improved=false;
+        };
+        constexpr auto NO_STATION_VISIT=std::numeric_limits<std::size_t>::max();
+        std::vector<StationVisitReplayRecord> previousStationVisits;
+        std::vector<std::size_t> previousStationVisitSlots;
+        // Retain bounded production memory. Offline profiles with more than
+        // three sweeps deliberately run without cross-pass visit snapshots.
+        const auto enableStationVisitReplay=
+            m_continuousPlanningEffort.enableStationVisitReplay
+            &&m_continuousPlanningEffort.reachabilitySweeps<=3;
+        const auto measureStationVisitReplay=
+            (m_continuousPlanningEffort.measureStationVisitReplay||enableStationVisitReplay)
+            &&m_continuousPlanningEffort.reachabilitySweeps<=3;
+        for(unsigned correctionPass=0;correctionPass<maximumLocalCorrectionPasses;
+                ++correctionPass) {
             reportProgress();
             std::vector<double> stationCaps(pieces.size()+1,std::numeric_limits<double>::infinity());
             stationCaps.front()=scalarStart->first;
@@ -1873,7 +2288,9 @@ namespace ngc {
             std::vector<TimeLaw> pieceTiming(pieces.size());
             for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
                 if((pieceIndex&31U)==0) reportProgress();
-                auto timing=timeLawBetween(timeLawWorkspace,pieces[pieceIndex].length,
+                auto timing=timeLawBetween(timeLawWorkspace,timeLawRecorder.instrumentation,
+                    TimeLawPurpose::ContinuousSeed,correctionPass>0,
+                    pieces[pieceIndex].length,
                     stationVelocity[pieceIndex],0.0,stationVelocity[pieceIndex+1],0.0,
                     localLimits[pieceIndex].velocity,localLimits[pieceIndex].acceleration,
                     localLimits[pieceIndex].jerk);
@@ -1886,28 +2303,30 @@ namespace ngc {
                 pieceTiming.begin(),pieceTiming.end(),0.0,
                 [](const double total,const auto &timing) { return total+timing.back().time; });
 
-            const auto stateWithinCoupledLimits=[&](const std::size_t pieceIndex,
-                    const double distance,const double velocity,const double acceleration) {
-                const auto sample=pieces[pieceIndex].sampleAt(distance);
-                const auto curvature=pieces[pieceIndex].curvatureAt(distance);
-                const auto axisAcceleration=add(scaled(sample.tangent,acceleration),
-                    scaled(curvature,velocity*velocity));
-                if(axisAcceleration.length()>m_limits.pathAcceleration*(1.0+1e-10)) return false;
+            const auto stateWithinCoupledLimits=[&](const CoupledEndpointGeometry &geometry,
+                    const std::size_t pieceIndex,const double velocity,
+                    const double acceleration) {
+                const auto axisAcceleration=add(scaled(geometry.tangent,acceleration),
+                    scaled(geometry.curvature,velocity*velocity));
+                if(axisAcceleration.length()>m_limits.pathAcceleration*(1.0+1e-10))
+                    return CoupledEndpointResult::Acceleration;
                 for(const auto component:AXIS_COMPONENTS)
                     if(std::abs(axisAcceleration.*component)
-                       >m_limits.axisAcceleration.*component*(1.0+1e-10)) return false;
+                       >m_limits.axisAcceleration.*component*(1.0+1e-10))
+                        return CoupledEndpointResult::Acceleration;
 
-                const auto geometricJerk=add(scaled(curvature,3.0*velocity*acceleration),
-                    scaled(pieces[pieceIndex].curvatureDerivativeAt(distance),
-                           velocity*velocity*velocity));
+                const auto geometricJerk=add(
+                    scaled(geometry.curvature,3.0*velocity*acceleration),
+                    scaled(geometry.curvatureDerivative,velocity*velocity*velocity));
                 auto minimumScalarJerk=-localLimits[pieceIndex].jerk;
                 auto maximumScalarJerk=localLimits[pieceIndex].jerk;
                 for(const auto component:AXIS_COMPONENTS) {
-                    const auto tangent=sample.tangent.*component;
+                    const auto tangent=geometry.tangent.*component;
                     const auto geometric=geometricJerk.*component;
                     const auto limit=m_limits.axisJerk.*component;
                     if(std::abs(tangent)<=1e-15) {
-                        if(std::abs(geometric)>limit*(1.0+1e-10)) return false;
+                        if(std::abs(geometric)>limit*(1.0+1e-10))
+                            return CoupledEndpointResult::Jerk;
                         continue;
                     }
                     auto lower=(-limit-geometric)/tangent;
@@ -1916,11 +2335,13 @@ namespace ngc {
                     minimumScalarJerk=std::max(minimumScalarJerk,lower);
                     maximumScalarJerk=std::min(maximumScalarJerk,upper);
                 }
-                if(minimumScalarJerk>maximumScalarJerk) return false;
-                const auto scalarJerk=std::clamp(-positionDot(sample.tangent,geometricJerk),
+                if(minimumScalarJerk>maximumScalarJerk)
+                    return CoupledEndpointResult::Jerk;
+                const auto scalarJerk=std::clamp(-positionDot(geometry.tangent,geometricJerk),
                     minimumScalarJerk,maximumScalarJerk);
-                return add(scaled(sample.tangent,scalarJerk),geometricJerk).length()
-                    <=m_limits.pathJerk*(1.0+1e-10);
+                return add(scaled(geometry.tangent,scalarJerk),geometricJerk).length()
+                    <=m_limits.pathJerk*(1.0+1e-10)
+                    ?CoupledEndpointResult::Feasible:CoupledEndpointResult::Jerk;
             };
 
             const auto reachabilitySweeps=m_continuousPlanningEffort.reachabilitySweeps;
@@ -1946,7 +2367,15 @@ namespace ngc {
             std::size_t binaryVelocitySearchSteps=0;
             std::size_t improvedStationVisits=0;
             bool reachabilityCandidateBudgetExceeded=false;
-            const auto optimizeStation=[&](const std::size_t station) {
+            const auto stationVisitSlotCount=measureStationVisitReplay
+                ?reachabilitySweeps*2*(pieces.size()>0?pieces.size()-1:0):0;
+            std::vector<StationVisitReplayRecord> currentStationVisits;
+            std::vector<std::size_t> currentStationVisitSlots(
+                stationVisitSlotCount,NO_STATION_VISIT);
+            currentStationVisits.reserve(measureStationVisitReplay
+                ?std::min(stationVisitSlotCount,2*pieces.size()):0);
+            const auto optimizeStation=[&](const std::size_t station,
+                                           const unsigned sweep,const bool reverse) {
                 if(reachabilityCandidateBudgetExceeded) return false;
                 const auto leftPiece=station-1;
                 const auto rightPiece=station;
@@ -1960,6 +2389,9 @@ namespace ngc {
                     <=std::max(1e-10,stationCaps[station]*1e-9);
                 if(atCap||leftSeedSlope*rightSeedSlope<=0.0) return false;
                 ++activeStationVisits;
+                auto &replayDiagnostics=
+                    timeLawRecorder.instrumentation.diagnostics.stationVisitReplay;
+                if(measureStationVisitReplay) ++replayDiagnostics.activeVisits;
                 auto bestVelocity=stationVelocity[station];
                 auto bestAcceleration=stationAcceleration[station];
                 auto bestLeft=pieceTiming[leftPiece];
@@ -1970,7 +2402,110 @@ namespace ngc {
                     localLimits[leftPiece].acceleration,localLimits[rightPiece].acceleration);
                 const auto curvedCandidate=!pieces[leftPiece].linear||!pieces[rightPiece].linear;
 
-                const auto evaluate=[&](const double velocity,const double acceleration) {
+                StationVisitKey visitInput;
+                const auto visitSlot=((static_cast<std::size_t>(sweep)*2
+                    +(reverse?1U:0U))*(pieces.size()-1))+(station-1);
+                const StationVisitReplayRecord *matchingVisit=nullptr;
+                TimeLawCallDiagnostics timeLawBefore;
+                std::size_t candidatesBefore=0;
+                std::size_t endpointChecksBefore=0;
+                std::size_t accelerationRejectionsBefore=0;
+                std::size_t jerkRejectionsBefore=0;
+                std::size_t velocityCandidateSetsBefore=0;
+                std::size_t capVelocitySearchesBefore=0;
+                std::size_t binaryVelocitySearchStepsBefore=0;
+                std::chrono::steady_clock::time_point visitStarted;
+                if(measureStationVisitReplay) {
+                    visitInput.push_back(station);
+                    visitInput.push_back(sweep);
+                    visitInput.push_back(reverse?1U:0U);
+                    visitInput.push_back(reachabilityAccelerationCandidates);
+                    visitInput.push_back(reachabilityVelocitySearchIterations);
+                    appendFingerprintDouble(visitInput,stationVelocity[station-1]);
+                    appendFingerprintDouble(visitInput,stationVelocity[station]);
+                    appendFingerprintDouble(visitInput,stationVelocity[station+1]);
+                    appendFingerprintDouble(visitInput,stationAcceleration[station-1]);
+                    appendFingerprintDouble(visitInput,stationAcceleration[station]);
+                    appendFingerprintDouble(visitInput,stationAcceleration[station+1]);
+                    appendFingerprintDouble(visitInput,stationCaps[station]);
+                    appendFingerprintDouble(visitInput,pieces[leftPiece].length);
+                    appendFingerprintDouble(visitInput,pieces[rightPiece].length);
+                    appendFingerprintDouble(visitInput,localLimits[leftPiece].velocity);
+                    appendFingerprintDouble(visitInput,localLimits[leftPiece].acceleration);
+                    appendFingerprintDouble(visitInput,localLimits[leftPiece].jerk);
+                    appendFingerprintDouble(visitInput,localLimits[rightPiece].velocity);
+                    appendFingerprintDouble(visitInput,localLimits[rightPiece].acceleration);
+                    appendFingerprintDouble(visitInput,localLimits[rightPiece].jerk);
+                    appendTimeLawFingerprint(visitInput,pieceTiming[leftPiece]);
+                    appendTimeLawFingerprint(visitInput,pieceTiming[rightPiece]);
+                    if(visitSlot<previousStationVisitSlots.size()
+                       &&previousStationVisitSlots[visitSlot]!=NO_STATION_VISIT) {
+                        ++replayDiagnostics.comparableVisits;
+                        const auto &previous=previousStationVisits[
+                            previousStationVisitSlots[visitSlot]];
+                        if(previous.input==visitInput) {
+                            ++replayDiagnostics.exactInputMatches;
+                            matchingVisit=&previous;
+                        }
+                    }
+                    timeLawBefore=totalTimeLawCalls(
+                        timeLawRecorder.instrumentation.diagnostics);
+                    candidatesBefore=reachabilityCandidateEvaluations;
+                    endpointChecksBefore=timeLawRecorder.instrumentation.diagnostics
+                        .endpointFeasibility.candidateChecks;
+                    accelerationRejectionsBefore=timeLawRecorder.instrumentation.diagnostics
+                        .endpointFeasibility.accelerationRejections;
+                    jerkRejectionsBefore=timeLawRecorder.instrumentation.diagnostics
+                        .endpointFeasibility.jerkRejections;
+                    velocityCandidateSetsBefore=velocityCandidateSets;
+                    capVelocitySearchesBefore=capVelocitySearches;
+                    binaryVelocitySearchStepsBefore=binaryVelocitySearchSteps;
+                    visitStarted=std::chrono::steady_clock::now();
+                }
+
+                if(enableStationVisitReplay&&matchingVisit) {
+                    reachabilityCandidateEvaluations+=matchingVisit->candidateEvaluations;
+                    totalReachabilityCandidateEvaluations+=matchingVisit->candidateEvaluations;
+                    auto &passEvaluations=curvedCandidate
+                        ?curvedCandidateEvaluations:linearCandidateEvaluations;
+                    auto &totalEvaluations=curvedCandidate
+                        ?totalCurvedCandidateEvaluations:totalLinearCandidateEvaluations;
+                    passEvaluations+=matchingVisit->candidateEvaluations;
+                    totalEvaluations+=matchingVisit->candidateEvaluations;
+                    const auto passBound=curvedCandidate
+                        ?maximumCurvedCandidateEvaluationsPerPass
+                        :maximumLinearCandidateEvaluationsPerPass;
+                    const auto totalBound=curvedCandidate
+                        ?maximumTotalCurvedCandidateEvaluations
+                        :maximumTotalLinearCandidateEvaluations;
+                    if(passEvaluations>passBound||totalEvaluations>totalBound) {
+                        reachabilityCandidateBudgetExceeded=true;
+                        return false;
+                    }
+                    auto &endpointDiagnostics=
+                        timeLawRecorder.instrumentation.diagnostics.endpointFeasibility;
+                    endpointDiagnostics.candidateChecks+=matchingVisit->endpointChecks;
+                    endpointDiagnostics.accelerationRejections+=
+                        matchingVisit->accelerationRejections;
+                    endpointDiagnostics.jerkRejections+=matchingVisit->jerkRejections;
+                    velocityCandidateSets+=matchingVisit->velocityCandidateSets;
+                    capVelocitySearches+=matchingVisit->capVelocitySearches;
+                    binaryVelocitySearchSteps+=matchingVisit->binaryVelocitySearchSteps;
+                    stationVelocity[station]=matchingVisit->velocity;
+                    stationAcceleration[station]=matchingVisit->acceleration;
+                    pieceTiming[leftPiece]=matchingVisit->leftTiming;
+                    pieceTiming[rightPiece]=matchingVisit->rightTiming;
+                    if(matchingVisit->improved) ++improvedStationVisits;
+                    ++replayDiagnostics.exactOutputMatches;
+                    if(currentStationVisitSlots[visitSlot]!=NO_STATION_VISIT)
+                        PANIC("duplicate acceleration-aware station replay slot");
+                    currentStationVisitSlots[visitSlot]=currentStationVisits.size();
+                    currentStationVisits.push_back(*matchingVisit);
+                    return matchingVisit->improved;
+                }
+
+                const auto evaluate=[&](const double velocity,const double acceleration,
+                                        const TimeLawPurpose purpose) {
                     ++reachabilityCandidateEvaluations;
                     ++totalReachabilityCandidateEvaluations;
                     if((reachabilityCandidateEvaluations&127U)==0) reportProgress();
@@ -1992,32 +2527,66 @@ namespace ngc {
                     }
                     if(velocity<0.0||velocity>stationCaps[station]*(1.0+1e-10)
                        ||std::abs(acceleration)>accelerationLimit*(1.0+1e-10)) return false;
-                    if(!stateWithinCoupledLimits(leftPiece,pieces[leftPiece].length,
-                            velocity,acceleration)
-                       ||!stateWithinCoupledLimits(rightPiece,0.0,velocity,acceleration))
+                    auto &endpointDiagnostics=
+                        timeLawRecorder.instrumentation.diagnostics.endpointFeasibility;
+                    ++endpointDiagnostics.candidateChecks;
+                    auto endpointResult=stateWithinCoupledLimits(
+                        pieceEndGeometry[leftPiece],leftPiece,velocity,acceleration);
+                    if(endpointResult==CoupledEndpointResult::Feasible)
+                        endpointResult=stateWithinCoupledLimits(
+                            pieceStartGeometry[rightPiece],rightPiece,velocity,acceleration);
+                    if(endpointResult!=CoupledEndpointResult::Feasible) {
+                        if(endpointResult==CoupledEndpointResult::Acceleration)
+                            ++endpointDiagnostics.accelerationRejections;
+                        else
+                            ++endpointDiagnostics.jerkRejections;
                         return false;
-                    auto left=timeLawBetween(timeLawWorkspace,pieces[leftPiece].length,
+                    }
+                    auto left=candidateTimeLawBetween(timeLawWorkspace,
+                        timeLawRecorder.instrumentation,
+                        purpose,correctionPass>0,pieces[leftPiece].length,
                         stationVelocity[station-1],stationAcceleration[station-1],
                         velocity,acceleration,localLimits[leftPiece].velocity,
                         localLimits[leftPiece].acceleration,localLimits[leftPiece].jerk);
-                    if(!left) return false;
-                    auto right=timeLawBetween(timeLawWorkspace,pieces[rightPiece].length,
+                    if(!left.successful) return false;
+                    auto right=candidateTimeLawBetween(timeLawWorkspace,
+                        timeLawRecorder.instrumentation,
+                        purpose,correctionPass>0,pieces[rightPiece].length,
                         velocity,acceleration,stationVelocity[station+1],
                         stationAcceleration[station+1],localLimits[rightPiece].velocity,
                         localLimits[rightPiece].acceleration,localLimits[rightPiece].jerk);
-                    if(!right) return false;
-                    const auto duration=left->back().time+right->back().time;
+                    if(!right.successful) return false;
+                    const auto duration=left.duration+right.duration;
                     if(duration<bestDuration-1e-12) {
+                        if(!left.timing)
+                            left.timing=materializeCandidateTimeLaw(timeLawWorkspace,
+                                timeLawRecorder.instrumentation,purpose,
+                                pieces[leftPiece].length,stationVelocity[station-1],
+                                stationAcceleration[station-1],velocity,acceleration,
+                                localLimits[leftPiece].velocity,
+                                localLimits[leftPiece].acceleration,
+                                localLimits[leftPiece].jerk);
+                        if(!left.timing) return false;
+                        if(!right.timing)
+                            right.timing=materializeCandidateTimeLaw(timeLawWorkspace,
+                                timeLawRecorder.instrumentation,purpose,
+                                pieces[rightPiece].length,velocity,acceleration,
+                                stationVelocity[station+1],stationAcceleration[station+1],
+                                localLimits[rightPiece].velocity,
+                                localLimits[rightPiece].acceleration,
+                                localLimits[rightPiece].jerk);
+                        if(!right.timing) return false;
                         bestDuration=duration;
                         bestVelocity=velocity;
                         bestAcceleration=acceleration;
-                        bestLeft=std::move(*left);
-                        bestRight=std::move(*right);
+                        bestLeft=std::move(*left.timing);
+                        bestRight=std::move(*right.timing);
                         improved=true;
                     }
                     return true;
                 };
-                const auto evaluateVelocity=[&](const double velocity) {
+                const auto evaluateVelocity=[&](const double velocity,
+                                                const TimeLawPurpose purpose) {
                     ++velocityCandidateSets;
                     const auto leftSlope=(velocity*velocity
                         -stationVelocity[station-1]*stationVelocity[station-1])
@@ -2070,24 +2639,26 @@ namespace ngc {
                             feasible=true;
                             continue;
                         }
-                        feasible=evaluate(velocity,candidate)||feasible;
+                        feasible=evaluate(velocity,candidate,purpose)||feasible;
                         if(reachabilityCandidateBudgetExceeded) break;
                     }
                     return feasible;
                 };
-                (void)evaluateVelocity(stationVelocity[station]);
+                (void)evaluateVelocity(stationVelocity[station],
+                    TimeLawPurpose::StationCurrentVelocity);
                 const auto cap=stationCaps[station];
                 if(!reachabilityCandidateBudgetExceeded
                    &&cap>stationVelocity[station]+1e-10) {
                     ++capVelocitySearches;
-                    if(!evaluateVelocity(cap)) {
+                    if(!evaluateVelocity(cap,TimeLawPurpose::StationCapVelocity)) {
                         auto low=stationVelocity[station];
                         auto high=cap;
                         for(unsigned iteration=0;
                             iteration<reachabilityVelocitySearchIterations;++iteration) {
                             ++binaryVelocitySearchSteps;
                             const auto middle=std::midpoint(low,high);
-                            if(evaluateVelocity(middle)) low=middle;
+                            if(evaluateVelocity(middle,
+                                    TimeLawPurpose::StationVelocityBracket)) low=middle;
                             else high=middle;
                             if(reachabilityCandidateBudgetExceeded) break;
                         }
@@ -2098,14 +2669,72 @@ namespace ngc {
                 pieceTiming[leftPiece]=std::move(bestLeft);
                 pieceTiming[rightPiece]=std::move(bestRight);
                 if(improved) ++improvedStationVisits;
+                if(measureStationVisitReplay) {
+                    const auto visitSeconds=std::chrono::duration<double>(
+                        std::chrono::steady_clock::now()-visitStarted).count();
+                    if(matchingVisit) {
+                        if(matchingVisit->improved==improved
+                           &&bitExactDouble(matchingVisit->velocity,
+                               stationVelocity[station])
+                           &&bitExactDouble(matchingVisit->acceleration,
+                               stationAcceleration[station])
+                           &&bitExactTimeLaw(matchingVisit->leftTiming,
+                               pieceTiming[leftPiece])
+                           &&bitExactTimeLaw(matchingVisit->rightTiming,
+                               pieceTiming[rightPiece])) {
+                            ++replayDiagnostics.exactOutputMatches;
+                            const auto timeLawAfter=totalTimeLawCalls(
+                                timeLawRecorder.instrumentation.diagnostics);
+                            replayDiagnostics.potentialCandidateEvaluations+=
+                                reachabilityCandidateEvaluations-candidatesBefore;
+                            replayDiagnostics.potentialEndpointChecks+=
+                                timeLawRecorder.instrumentation.diagnostics.endpointFeasibility
+                                    .candidateChecks-endpointChecksBefore;
+                            replayDiagnostics.potentialTimeLawCalls+=
+                                timeLawAfter.calls-timeLawBefore.calls;
+                            replayDiagnostics.potentialSolverCalls+=
+                                timeLawAfter.solverCalls-timeLawBefore.solverCalls;
+                            replayDiagnostics.potentialMaterializations+=
+                                timeLawAfter.cacheMaterializations
+                                    -timeLawBefore.cacheMaterializations;
+                            replayDiagnostics.potentialTimeLawSeconds+=
+                                timeLawAfter.seconds-timeLawBefore.seconds;
+                            replayDiagnostics.potentialVisitSeconds+=visitSeconds;
+                        } else ++replayDiagnostics.outputMismatches;
+                    }
+                    if(currentStationVisitSlots[visitSlot]!=NO_STATION_VISIT)
+                        PANIC("duplicate acceleration-aware station visit slot");
+                    currentStationVisitSlots[visitSlot]=currentStationVisits.size();
+                    currentStationVisits.push_back({
+                        .input=visitInput,
+                        .leftTiming=pieceTiming[leftPiece],
+                        .rightTiming=pieceTiming[rightPiece],
+                        .velocity=stationVelocity[station],
+                        .acceleration=stationAcceleration[station],
+                        .candidateEvaluations=
+                            reachabilityCandidateEvaluations-candidatesBefore,
+                        .endpointChecks=timeLawRecorder.instrumentation.diagnostics
+                            .endpointFeasibility.candidateChecks-endpointChecksBefore,
+                        .accelerationRejections=timeLawRecorder.instrumentation.diagnostics
+                            .endpointFeasibility.accelerationRejections
+                                -accelerationRejectionsBefore,
+                        .jerkRejections=timeLawRecorder.instrumentation.diagnostics
+                            .endpointFeasibility.jerkRejections-jerkRejectionsBefore,
+                        .velocityCandidateSets=velocityCandidateSets-velocityCandidateSetsBefore,
+                        .capVelocitySearches=capVelocitySearches-capVelocitySearchesBefore,
+                        .binaryVelocitySearchSteps=
+                            binaryVelocitySearchSteps-binaryVelocitySearchStepsBefore,
+                        .improved=improved,
+                    });
+                }
                 return improved;
             };
             for(unsigned sweep=0;sweep<reachabilitySweeps;++sweep) {
                 auto sweepImproved=false;
                 for(std::size_t station=1;station<pieces.size();++station)
-                    sweepImproved=optimizeStation(station)||sweepImproved;
+                    sweepImproved=optimizeStation(station,sweep,false)||sweepImproved;
                 for(std::size_t station=pieces.size();station-->1;)
-                    sweepImproved=optimizeStation(station)||sweepImproved;
+                    sweepImproved=optimizeStation(station,sweep,true)||sweepImproved;
                 if(!sweepImproved||reachabilityCandidateBudgetExceeded) break;
             }
             if(reachabilityCandidateBudgetExceeded)
@@ -2123,6 +2752,8 @@ namespace ngc {
                     pieces.size(),curvedReachabilityStations,linearReachabilityStations,
                     activeStationVisits,improvedStationVisits,velocityCandidateSets,
                     capVelocitySearches,binaryVelocitySearchSteps));
+            previousStationVisits=std::move(currentStationVisits);
+            previousStationVisitSlots=std::move(currentStationVisitSlots);
             result->reachabilityCandidateEvaluations=totalReachabilityCandidateEvaluations;
             const auto reachabilityDuration=std::accumulate(pieceTiming.begin(),pieceTiming.end(),0.0,
                 [](const double total,const auto &timing) { return total+timing.back().time; });
@@ -2134,6 +2765,97 @@ namespace ngc {
                         return boundary.ruckigBrakePhase;
                     });
                 });
+            if(correctionPass>0) {
+                CorrectionPassLocalityDiagnostic locality {
+                    .pass=correctionPass,
+                    .pieceCount=pieces.size(),
+                    .correctedPieces=previouslyCorrectedPieces.size(),
+                    .firstCorrectedPiece=previouslyCorrectedPieces.front(),
+                    .lastCorrectedPiece=previouslyCorrectedPieces.back(),
+                };
+                auto firstChangedStation=stationVelocity.size();
+                auto lastChangedStation=std::size_t {0};
+                for(std::size_t station=0;station<stationVelocity.size();++station) {
+                    locality.maximumVelocityChange=std::max(locality.maximumVelocityChange,
+                        std::abs(stationVelocity[station]-previousStationVelocity[station]));
+                    locality.maximumAccelerationChange=std::max(
+                        locality.maximumAccelerationChange,
+                        std::abs(stationAcceleration[station]
+                            -previousStationAcceleration[station]));
+                    if(bitExactDouble(stationVelocity[station],previousStationVelocity[station])
+                       &&bitExactDouble(stationAcceleration[station],
+                           previousStationAcceleration[station])) continue;
+                    ++locality.changedStations;
+                    firstChangedStation=std::min(firstChangedStation,station);
+                    lastChangedStation=station;
+                }
+                if(locality.changedStations>0) {
+                    locality.firstChangedStation=firstChangedStation;
+                    locality.lastChangedStation=lastChangedStation;
+                }
+
+                auto firstChangedPiece=pieces.size();
+                auto lastChangedPiece=std::size_t {0};
+                std::vector<bool> changedPieceTiming(pieces.size(),false);
+                for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
+                    locality.maximumDurationChange=std::max(locality.maximumDurationChange,
+                        std::abs(pieceTiming[pieceIndex].back().time
+                            -previousPieceTiming[pieceIndex].back().time));
+                    if(bitExactTimeLaw(pieceTiming[pieceIndex],
+                                      previousPieceTiming[pieceIndex])) {
+                        ++locality.bitExactReusablePieceTimings;
+                        continue;
+                    }
+                    ++locality.changedPieceTimings;
+                    changedPieceTiming[pieceIndex]=true;
+                    firstChangedPiece=std::min(firstChangedPiece,pieceIndex);
+                    lastChangedPiece=pieceIndex;
+                    const auto corrected=std::ranges::lower_bound(
+                        previouslyCorrectedPieces,pieceIndex);
+                    if(corrected==previouslyCorrectedPieces.end()||*corrected!=pieceIndex)
+                        ++locality.changedUncorrectedPieceTimings;
+                    auto distance=pieces.size();
+                    if(corrected!=previouslyCorrectedPieces.end())
+                        distance=std::min(distance,*corrected-pieceIndex);
+                    if(corrected!=previouslyCorrectedPieces.begin())
+                        distance=std::min(distance,
+                            pieceIndex-*(corrected-1));
+                    locality.maximumPropagationFromCorrectedPiece=std::max(
+                        locality.maximumPropagationFromCorrectedPiece,distance);
+                }
+                for(std::size_t pieceIndex=0;pieceIndex<pieces.size();) {
+                    const auto changed=changedPieceTiming[pieceIndex];
+                    const auto begin=pieceIndex;
+                    while(pieceIndex<pieces.size()
+                          &&changedPieceTiming[pieceIndex]==changed) ++pieceIndex;
+                    const auto length=pieceIndex-begin;
+                    if(changed) {
+                        ++locality.changedPieceTimingRuns;
+                        locality.maximumChangedPieceTimingRun=std::max(
+                            locality.maximumChangedPieceTimingRun,length);
+                    } else {
+                        ++locality.bitExactReusablePieceTimingRuns;
+                        locality.maximumBitExactReusablePieceTimingRun=std::max(
+                            locality.maximumBitExactReusablePieceTimingRun,length);
+                    }
+                }
+                if(locality.changedPieceTimings>0) {
+                    locality.firstChangedPieceTiming=firstChangedPiece;
+                    locality.lastChangedPieceTiming=lastChangedPiece;
+                    locality.bitExactReusablePrefixPieces=firstChangedPiece;
+                    locality.bitExactReusableSuffixPieces=pieces.size()-lastChangedPiece-1;
+                    if(firstChangedPiece<locality.firstCorrectedPiece)
+                        locality.leftPropagationPieces=
+                            locality.firstCorrectedPiece-firstChangedPiece;
+                    if(lastChangedPiece>locality.lastCorrectedPiece)
+                        locality.rightPropagationPieces=
+                            lastChangedPiece-locality.lastCorrectedPiece;
+                } else {
+                    locality.bitExactReusablePrefixPieces=pieces.size();
+                }
+                timeLawRecorder.instrumentation.diagnostics.correctionPassLocality
+                    .push_back(locality);
+            }
             auto maximumStationAcceleration=0.0;
             for(const auto value:stationAcceleration)
                 maximumStationAcceleration=std::max(maximumStationAcceleration,std::abs(value));
@@ -2417,8 +3139,13 @@ namespace ngc {
                 constraintsVerified=true;
                 break;
             }
+            previousStationVelocity=stationVelocity;
+            previousStationAcceleration=stationAcceleration;
+            previousPieceTiming=pieceTiming;
+            previouslyCorrectedPieces.clear();
             for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
                 if(correction[pieceIndex]<=1.0+1e-9) continue;
+                previouslyCorrectedPieces.push_back(pieceIndex);
                 const auto factor=correction[pieceIndex]*1.01;
                 localLimits[pieceIndex].velocity/=factor;
                 localLimits[pieceIndex].acceleration/=factor*factor;
@@ -2428,7 +3155,7 @@ namespace ngc {
         if(!constraintsVerified)
             return std::unexpected(std::format(
                 "continuous local constraint correction did not converge after {} passes: {}",
-                MAX_LOCAL_CORRECTION_PASSES,correctionHistory));
+                maximumLocalCorrectionPasses,correctionHistory));
 
         const MotionState emittedStart{
             normalSpans.front().d,
@@ -2534,6 +3261,9 @@ namespace ngc {
         m_position=expectedEnd;
         result->activationSpans=std::move(activationSpans);
         result->splineGeometry=std::move(splineGeometryDiagnostics);
+        result->timeLaw=timeLawRecorder.instrumentation.diagnostics;
+        result->splineInverse=splineInverseDiagnostics;
+        result->arcInverse=arcInverseDiagnostics;
         return result;
     }
 

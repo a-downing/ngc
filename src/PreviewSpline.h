@@ -31,8 +31,8 @@ namespace ngc::experimental {
 
     struct JunctionBlend {
         // One open-clamped, uniform degree-three B-spline. Ordinary junctions
-        // have six controls; longer short-entity clusters have evenly spaced,
-        // variable-count interior controls.
+        // have six controls; longer short-entity clusters have one directly
+        // sampled interior control per replaced entity.
         std::vector<glm::dvec3> controlPoints;
         double incomingTrim = 0.0;
         double outgoingTrim = 0.0;
@@ -175,15 +175,6 @@ namespace ngc::experimental {
         }
         result.controlPoints.insert(result.controlPoints.end(),
             outer->controlPoints.end()-3,outer->controlPoints.end());
-        std::vector<spline_detail::Vector3> sourceControls;
-        sourceControls.reserve(result.controlPoints.size());
-        for(const auto &control:result.controlPoints)
-            sourceControls.push_back({control.x,control.y,control.z});
-        const auto conditioned=spline_detail::conditionCubicSplineInteriorControls<3>(
-            sourceControls,programmedScale);
-        for(std::size_t control=0;control<result.controlPoints.size();++control)
-            result.controlPoints[control]={conditioned[control][0],conditioned[control][1],
-                                           conditioned[control][2]};
         return result;
     }
 

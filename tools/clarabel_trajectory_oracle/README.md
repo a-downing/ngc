@@ -2,6 +2,8 @@
 
 This is a non-production development oracle for the G64 scalar timing law. It does not enter `MotionBackend`, packetization, stop-tail generation, or the real-time contract.
 
+The C++ exporter now reports a direct smoothed-path infinite-jerk duration before any Rust/Clarabel step. `InfiniteJerkTrajectoryTime` uses analytic tangent/curvature acceleration constraints and a refined forward/backward squared-speed envelope over the same exact smoothed pieces. This direct value is the preferred acceleration-only jerk-sweep comparison because it does not retain jerk-derived local velocity caps and does not require Clarabel. It remains a converged numerical diagnostic, not an executable trajectory or formal continuous lower-bound certificate. The model file and Rust solver remain useful for inspecting station profiles and jerk-aware sequential-convex experiments.
+
 The C++ exporter evaluates one compatible positive-`P` G64 horizon with the normal NGC geometry and planner. Every retained primitive or blend piece is divided into 32 midpoint intervals so a long line can contain acceleration, cruise, and braking states while curved geometry exposes its changing acceleration cones. It records the current jerk-limited planner duration, conservative local velocity caps, tangent, curvature, and configured aggregate/per-axis acceleration limits.
 
 The Rust program uses Clarabel 0.11.1 to solve a convex discretized minimum-time path parameterization. Its variables include squared station speed `x = v^2`, station speed, and interval duration. Rotated second-order cones enforce `v^2 <= x` and the exact constant-path-acceleration interval time `dt = 2 ds / (v_i + v_{i+1})`. Standard second-order cones enforce
@@ -28,6 +30,19 @@ An optional final argument scales aggregate and every finite per-axis jerk limit
 ```powershell
 build\ngc_g64_oracle_export.exe adaptive_pockets.ngc build\adaptive_jerk_10.txt machine.toml 10
 ```
+
+Explicit high-jerk exports retain finite proof ceilings without modifying production defaults. Multipliers above 1x use at most 48 local correction passes and 104 cumulative geometry attempts per piece. A 100x multiplier uses the bounded offline maximum of 128 and 256 because the 5,164-motion `adaptive_pockets.ngc` horizon continues correcting real emitted acceleration violations beyond pass 47. Any failure at those bounds remains fatal.
+
+Current direct infinite-jerk comparisons are:
+
+| Program | Jerk | Verified planner | Direct infinite-jerk | Planner excess |
+| --- | ---: | ---: | ---: | ---: |
+| `adaptive.ngc` | 1x | 307.532106312 s | 155.522529678 s | 97.7412% |
+| `adaptive.ngc` | 10x | 180.944350029 s | 155.522529678 s | 16.3461% |
+| `adaptive.ngc` | 100x | 175.358673959 s | 155.522529678 s | 12.7545% |
+| `adaptive_pockets.ngc` | 1x | 305.274659685 s | 128.319614704 s | 137.9018% |
+| `adaptive_pockets.ngc` | 10x | 165.646505067 s | 128.319614704 s | 29.0890% |
+| `adaptive_pockets.ngc` | 100x | 154.051257265 s | 128.319614704 s | 20.0528% |
 
 Rolling planner convergence can be profiled without changing production defaults. The
 `--effort` profiles vary reachability sweeps and velocity refinement, and `--rolling-only`
@@ -106,6 +121,6 @@ The coupled-limit-aware planner was compared with a freshly generated 32-way ora
 | `adaptive_pockets.ngc` | 10x | 309.467499743 s | 277.916090073 s | 11.353% |
 | `adaptive_pockets.ngc` | 30x | 233.634337079 s | 224.038614824 s | 4.283% |
 
-The dense planner nearly coincides with the acceleration-only oracle by 100x jerk. The adaptive gap also collapses rapidly through 30x. Exact outgoing Ruckig phase jerk removed reconstruction error and made every supported adaptive result slightly faster. Adaptive 100x now stops at the explicit per-pass geometry-proof budget; 1000x stops at the acceleration-aware candidate-evaluation budget. These deterministic failures replace recursion-depth/correction instability in an extreme, poorly conditioned regime. Dense 1000x was slightly slower than 100x in both planner and oracle results, so it should not be interpreted as a monotone physical limit.
+The dense planner nearly coincides with this historical Clarabel model by 100x jerk, and the historical adaptive gap collapses rapidly through 30x. Exact outgoing Ruckig phase jerk removed reconstruction error and made every supported result slightly faster. The current exporter can complete 100x `adaptive.ngc` and `adaptive_pockets.ngc` under explicit bounded offline proof ceilings, as recorded in the direct-reference table above. The older Clarabel rows retain their original geometry/planner checkpoint and must not be mixed numerically with the current direct infinite-jerk result. Dense 1000x was slightly slower than 100x in both historical models, so it should not be interpreted as a monotone physical limit.
 
 This is strong evidence that dynamic jerk accounts for most of the normal-limit Clarabel gap and that the existing planner is close to the acceleration-only optimum when jerk becomes nonbinding. It does not prove normal-jerk time optimality because Clarabel omits `q' j + 3 q'' v a + q''' v^3`; a jerk-aware oracle would be needed for that claim.

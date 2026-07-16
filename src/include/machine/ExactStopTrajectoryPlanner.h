@@ -10,6 +10,8 @@
 #include <vector>
 
 #include "machine/MotionBackend.h"
+#include "machine/ArcInterpolation.h"
+#include "machine/InfiniteJerkTrajectoryTime.h"
 
 namespace ngc {
     enum class ContinuousVelocityLimitCause {
@@ -26,11 +28,18 @@ namespace ngc {
         unsigned minimumVelocitySearchIterations = 0;
         std::size_t accelerationCandidates = 6;
         std::size_t candidateBudgetMultiplier = 1;
+        // Production defaults remain bounded. Standalone offline profiles may
+        // raise these ceilings to measure difficult high-jerk horizons.
+        unsigned maximumLocalCorrectionPasses = 24;
+        std::size_t geometryVerificationBudgetMultiplier = 36;
         bool capLargeHorizonVelocitySearch = true;
         double curvatureDerivativeVelocityCapMultiplier = 1.0;
         bool applyCurvatureDerivativeVelocityCap = true;
         bool measureCurvatureDerivativeNumerics = false;
         bool captureSplineGeometry = false;
+        bool measureStationVisitReplay = false;
+        bool enableStationVisitReplay = true;
+        bool shareTimeLawCacheAcrossCompilations = true;
     };
 
     struct ContinuousPieceTimingDiagnostic {
@@ -88,6 +97,172 @@ namespace ngc {
         std::vector<ContinuousAccelerationOracleSegment> segments;
     };
 
+    // NRT-only cost evidence for the safeguarded spline arc-length inverse.
+    // Exact-distance cache misses retain adaptive integration and the existing
+    // parameter bracket as their authority.
+    struct SplineInverseDiagnostics {
+        std::size_t constructionIntegralEvaluations = 0;
+        std::size_t queries = 0;
+        std::size_t endpointQueries = 0;
+        std::size_t exactCacheHits = 0;
+        std::size_t inverseIntegralEvaluations = 0;
+        std::size_t newtonIterations = 0;
+        std::size_t seedConvergences = 0;
+        std::size_t safeguardedBisections = 0;
+        std::size_t iterationLimitHits = 0;
+        std::size_t maximumNewtonIterations = 0;
+    };
+
+    // NRT-only cost evidence for calls into the scalar Ruckig position solver.
+    // Candidate calls use a compile-local bit-exact result cache. A cached
+    // successful duration is materialized again only if it becomes the new
+    // selected timing, so retained phase data still comes from Ruckig and the
+    // complete validation path.
+    struct TimeLawCallDiagnostics {
+        std::size_t calls = 0;
+        std::size_t successes = 0;
+        std::size_t failures = 0;
+        std::size_t solverCalls = 0;
+        std::size_t cacheHits = 0;
+        std::size_t cacheMisses = 0;
+        std::size_t cacheCollisions = 0;
+        std::size_t cacheMaterializations = 0;
+        std::size_t correctionPassCalls = 0;
+        double seconds = 0.0;
+
+        TimeLawCallDiagnostics &operator+=(const TimeLawCallDiagnostics &other) {
+            calls+=other.calls;
+            successes+=other.successes;
+            failures+=other.failures;
+            solverCalls+=other.solverCalls;
+            cacheHits+=other.cacheHits;
+            cacheMisses+=other.cacheMisses;
+            cacheCollisions+=other.cacheCollisions;
+            cacheMaterializations+=other.cacheMaterializations;
+            correctionPassCalls+=other.correctionPassCalls;
+            seconds+=other.seconds;
+            return *this;
+        }
+    };
+
+    // NRT-only evidence for the cached one-sided coupled endpoint checks that
+    // run before local Ruckig transition solves.
+    struct EndpointFeasibilityDiagnostics {
+        std::size_t cachedGeometryEndpoints = 0;
+        std::size_t candidateChecks = 0;
+        std::size_t accelerationRejections = 0;
+        std::size_t jerkRejections = 0;
+
+        EndpointFeasibilityDiagnostics &operator+=(const EndpointFeasibilityDiagnostics &other) {
+            cachedGeometryEndpoints+=other.cachedGeometryEndpoints;
+            candidateChecks+=other.candidateChecks;
+            accelerationRejections+=other.accelerationRejections;
+            jerkRejections+=other.jerkRejections;
+            return *this;
+        }
+    };
+
+    // NRT-only pass-to-pass evidence for deciding whether exact-constraint
+    // correction can safely reuse an unchanged prefix or suffix. Every record
+    // compares one correction replan with the complete preceding pass using
+    // bit-exact scalar station states and scalar TimeLaw phase boundaries.
+    struct CorrectionPassLocalityDiagnostic {
+        unsigned pass = 0;
+        std::size_t pieceCount = 0;
+        std::size_t correctedPieces = 0;
+        std::size_t firstCorrectedPiece = 0;
+        std::size_t lastCorrectedPiece = 0;
+        std::size_t changedStations = 0;
+        std::size_t firstChangedStation = 0;
+        std::size_t lastChangedStation = 0;
+        std::size_t changedPieceTimings = 0;
+        std::size_t changedUncorrectedPieceTimings = 0;
+        std::size_t changedPieceTimingRuns = 0;
+        std::size_t maximumChangedPieceTimingRun = 0;
+        std::size_t firstChangedPieceTiming = 0;
+        std::size_t lastChangedPieceTiming = 0;
+        std::size_t bitExactReusablePieceTimings = 0;
+        std::size_t bitExactReusablePieceTimingRuns = 0;
+        std::size_t maximumBitExactReusablePieceTimingRun = 0;
+        std::size_t bitExactReusablePrefixPieces = 0;
+        std::size_t bitExactReusableSuffixPieces = 0;
+        std::size_t leftPropagationPieces = 0;
+        std::size_t rightPropagationPieces = 0;
+        std::size_t maximumPropagationFromCorrectedPiece = 0;
+        double maximumVelocityChange = 0.0;
+        double maximumAccelerationChange = 0.0;
+        double maximumDurationChange = 0.0;
+    };
+
+    // NRT-only shadow evidence for replaying an acceleration-aware station
+    // visit on the following correction pass. Shadow matches still execute the
+    // visit and compare its complete output, so these counters do not affect
+    // trajectory selection or resource-budget authority.
+    struct StationVisitReplayDiagnostics {
+        std::size_t activeVisits = 0;
+        std::size_t comparableVisits = 0;
+        std::size_t exactInputMatches = 0;
+        std::size_t exactOutputMatches = 0;
+        std::size_t outputMismatches = 0;
+        std::size_t potentialCandidateEvaluations = 0;
+        std::size_t potentialEndpointChecks = 0;
+        std::size_t potentialTimeLawCalls = 0;
+        std::size_t potentialSolverCalls = 0;
+        std::size_t potentialMaterializations = 0;
+        double potentialTimeLawSeconds = 0.0;
+        double potentialVisitSeconds = 0.0;
+
+        StationVisitReplayDiagnostics &operator+=(
+                const StationVisitReplayDiagnostics &other) {
+            activeVisits+=other.activeVisits;
+            comparableVisits+=other.comparableVisits;
+            exactInputMatches+=other.exactInputMatches;
+            exactOutputMatches+=other.exactOutputMatches;
+            outputMismatches+=other.outputMismatches;
+            potentialCandidateEvaluations+=other.potentialCandidateEvaluations;
+            potentialEndpointChecks+=other.potentialEndpointChecks;
+            potentialTimeLawCalls+=other.potentialTimeLawCalls;
+            potentialSolverCalls+=other.potentialSolverCalls;
+            potentialMaterializations+=other.potentialMaterializations;
+            potentialTimeLawSeconds+=other.potentialTimeLawSeconds;
+            potentialVisitSeconds+=other.potentialVisitSeconds;
+            return *this;
+        }
+    };
+
+    struct TimeLawDiagnostics {
+        TimeLawCallDiagnostics exactStop;
+        TimeLawCallDiagnostics continuousSeed;
+        TimeLawCallDiagnostics stationCurrentVelocity;
+        TimeLawCallDiagnostics stationCapVelocity;
+        TimeLawCallDiagnostics stationVelocityBracket;
+        EndpointFeasibilityDiagnostics endpointFeasibility;
+        std::vector<CorrectionPassLocalityDiagnostic> correctionPassLocality;
+        StationVisitReplayDiagnostics stationVisitReplay;
+
+        TimeLawDiagnostics &operator+=(const TimeLawDiagnostics &other) {
+            exactStop+=other.exactStop;
+            continuousSeed+=other.continuousSeed;
+            stationCurrentVelocity+=other.stationCurrentVelocity;
+            stationCapVelocity+=other.stationCapVelocity;
+            stationVelocityBracket+=other.stationVelocityBracket;
+            endpointFeasibility+=other.endpointFeasibility;
+            correctionPassLocality.insert(correctionPassLocality.end(),
+                other.correctionPassLocality.begin(),other.correctionPassLocality.end());
+            stationVisitReplay+=other.stationVisitReplay;
+            return *this;
+        }
+    };
+
+    inline TimeLawCallDiagnostics totalTimeLawCalls(const TimeLawDiagnostics &diagnostics) {
+        auto total=diagnostics.exactStop;
+        total+=diagnostics.continuousSeed;
+        total+=diagnostics.stationCurrentVelocity;
+        total+=diagnostics.stationCapVelocity;
+        total+=diagnostics.stationVelocityBracket;
+        return total;
+    }
+
     struct ContinuousTrajectoryPlan {
         struct SplineGeometry {
             std::size_t firstInput = 0;
@@ -105,6 +280,9 @@ namespace ngc {
         std::size_t reachabilityCandidateEvaluations = 0;
         std::size_t geometryVerificationAttempts = 0;
         std::size_t geometryVerificationHighWater = 0;
+        TimeLawDiagnostics timeLaw;
+        SplineInverseDiagnostics splineInverse;
+        simulation_detail::ArcInverseDiagnostics arcInverse;
         // Optional NRT development snapshot; never crosses MotionBackend.
         std::vector<SplineGeometry> splineGeometry;
     };
@@ -137,6 +315,7 @@ namespace ngc {
         BranchSequence m_previousBranch = 0;
         position_t m_position{};
         std::function<void()> m_progressCallback;
+        TimeLawDiagnostics m_lastTimeLawDiagnostics;
 
     public:
         explicit ExactStopTrajectoryPlanner(TrajectoryLimits limits = {});
@@ -147,10 +326,16 @@ namespace ngc {
         void setContinuousPlanningEffort(const ContinuousPlanningEffort &effort) {
             m_continuousPlanningEffort=effort;
         }
+        const ContinuousPlanningEffort &continuousPlanningEffort() const {
+            return m_continuousPlanningEffort;
+        }
         void setProgressCallback(std::function<void()> callback) {
             m_progressCallback=std::move(callback);
         }
         const std::function<void()> &progressCallback() const { return m_progressCallback; }
+        const TimeLawDiagnostics &lastTimeLawDiagnostics() const {
+            return m_lastTimeLawDiagnostics;
+        }
         void reportProgress() const {
             if(m_progressCallback) m_progressCallback();
         }
@@ -163,7 +348,8 @@ namespace ngc {
             std::optional<MotionState> startState = std::nullopt,
             std::optional<MotionState> endState = std::nullopt,
             std::span<const double> scaleOverrides = {},
-            unsigned velocitySearchIterations = 12);
+            unsigned velocitySearchIterations = 12,
+            InfiniteJerkTrajectoryTimeResult *infiniteJerkTime = nullptr);
         std::expected<TriggeredMove, std::string> compileTriggeredMove(
             const ProbeMove &command, DigitalInputId input = 0,
             InputCondition condition = InputCondition::Active);

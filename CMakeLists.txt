@@ -20,25 +20,31 @@ find_package(OpenGL REQUIRED)
 find_package(glm CONFIG REQUIRED)
 #find_package(glfw3 REQUIRED)
 add_subdirectory(glfw)
+add_library(ngc_ruckig STATIC
+        src/third_party/ruckig/src/brake.cpp
+        src/third_party/ruckig/src/position_first_step1.cpp
+        src/third_party/ruckig/src/position_first_step2.cpp
+        src/third_party/ruckig/src/position_second_step1.cpp
+        src/third_party/ruckig/src/position_second_step2.cpp
+        src/third_party/ruckig/src/position_third_step1.cpp
+        src/third_party/ruckig/src/position_third_step2.cpp
+        src/third_party/ruckig/src/velocity_second_step1.cpp
+        src/third_party/ruckig/src/velocity_second_step2.cpp
+        src/third_party/ruckig/src/velocity_third_step1.cpp
+        src/third_party/ruckig/src/velocity_third_step2.cpp)
+target_include_directories(ngc_ruckig PUBLIC src/third_party/ruckig/include)
+target_compile_definitions(ngc_ruckig PUBLIC _USE_MATH_DEFINES)
+target_compile_options(ngc_ruckig PRIVATE -O2)
+
 set(BUILD_EXAMPLES OFF)
-set(BUILD_PYTHON_MODULE OFF)
-set(BUILD_CLOUD_CLIENT OFF)
 set(BUILD_TESTS OFF)
-set(BUILD_BENCHMARK OFF)
-set(BUILD_SHARED_LIBS OFF)
-add_subdirectory(ruckig EXCLUDE_FROM_ALL)
-target_compile_definitions(ruckig PUBLIC _USE_MATH_DEFINES)
-target_compile_options(ruckig PRIVATE -O2)
 add_subdirectory(tomlplusplus EXCLUDE_FROM_ALL)
 unset(BUILD_EXAMPLES)
-unset(BUILD_PYTHON_MODULE)
-unset(BUILD_CLOUD_CLIENT)
 unset(BUILD_TESTS)
-unset(BUILD_BENCHMARK)
-unset(BUILD_SHARED_LIBS)
 
 add_library(ngc_core STATIC
         src/ArcInterpolation.cpp
+        src/InfiniteJerkTrajectoryTime.cpp
         src/MachineConfiguration.cpp
         src/ExactStopTrajectoryPlanner.cpp
         src/Evaluator.cpp
@@ -46,7 +52,7 @@ add_library(ngc_core STATIC
         src/MockMotionBackend.cpp
         src/ToolTable.cpp)
 target_include_directories(ngc_core PUBLIC src/include)
-target_link_libraries(ngc_core PRIVATE ruckig tomlplusplus::tomlplusplus)
+target_link_libraries(ngc_core PRIVATE ngc_ruckig tomlplusplus::tomlplusplus)
 ngc_target_defaults(ngc_core)
 
 # add_library(utils)
@@ -144,7 +150,24 @@ target_link_libraries(ngc_g64_oracle_export PRIVATE ngc_core)
 ngc_target_defaults(ngc_g64_oracle_export)
 
 add_executable(ngc_spline_geometry_analyzer tools/ngc_spline_geometry_analyzer.cpp)
+target_link_libraries(ngc_spline_geometry_analyzer PRIVATE ngc_core)
 ngc_target_defaults(ngc_spline_geometry_analyzer)
+add_test(NAME ngc_spline_geometry_analyzer_test
+    COMMAND ngc_spline_geometry_analyzer
+        ${CMAKE_SOURCE_DIR}/tools/testdata/spline_geometry_analyzer_snapshot.txt
+        --optimize-all 0.005 10.0
+        ${CMAKE_CURRENT_BINARY_DIR}/spline_geometry_analyzer_test.csv)
+set_tests_properties(ngc_spline_geometry_analyzer_test PROPERTIES
+    PASS_REGULAR_EXPRESSION
+        "optimized 1 variable-control short-entity splines from 1 captured splines")
+add_test(NAME ngc_spline_half_entity_controls_test
+    COMMAND ngc_spline_geometry_analyzer
+        ${CMAKE_SOURCE_DIR}/tools/testdata/spline_geometry_analyzer_snapshot.txt
+        --half-entity-controls
+        ${CMAKE_CURRENT_BINARY_DIR}/spline_half_entity_controls_test.csv)
+set_tests_properties(ngc_spline_half_entity_controls_test PROPERTIES
+    PASS_REGULAR_EXPRESSION
+        "reconstructed 1 variable-control short-entity splines with one interior control per two entities")
 
 add_executable(ngc_quintic_spline_analyzer tools/ngc_quintic_spline_analyzer.cpp)
 ngc_target_defaults(ngc_quintic_spline_analyzer)

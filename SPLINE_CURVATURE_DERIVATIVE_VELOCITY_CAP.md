@@ -111,10 +111,11 @@ s(u)=\int_0^u \lVert\mathbf r_u(\xi)\rVert\,d\xi.
 
 The planner evaluates this integral with adaptive Simpson integration. It builds a distance lookup containing 32 integration intervals per B-spline knot span. For a requested distance (s), it:
 
-1. Finds the lookup interval containing (s).
-2. Linearly interpolates an initial parameter estimate inside that interval.
-3. Performs up to 12 safeguarded Newton iterations.
-4. Uses
+1. Checks a fixed 16-entry, bit-exact per-spline result cache.
+2. On a miss, finds the lookup interval containing (s).
+3. Linearly interpolates an initial parameter estimate inside that interval.
+4. Performs up to 12 safeguarded Newton iterations.
+5. Uses
 
    \[
    u_{n+1}=u_n-\frac{s(u_n)-s_{\text{requested}}}
@@ -122,9 +123,10 @@ The planner evaluates this integral with adaptive Simpson integration. It builds
    \]
 
    when that Newton step remains inside the bracket.
-5. Falls back to the bracket midpoint when the Newton step would leave the bracket or the local parameter speed is too small.
+6. Falls back to the bracket midpoint when the Newton step would leave the bracket or the local parameter speed is too small.
+7. Caches the certified result under the exact requested-distance bit pattern.
 
-This produces the parameter value used to evaluate the spline derivatives at a particular arc-length distance.
+This produces the parameter value used to evaluate the spline derivatives at a particular arc-length distance. The cache is not an approximate inverse: tolerance-near distances do not match, and every cache value was previously returned by the original bracketed adaptive-integral/Newton path for the same spline and exact distance. A monotone cubic inverse seed was tested and removed because it changed threshold-sensitive trajectory output despite reducing integration work.
 
 ## 3. Calculate the curvature vector
 

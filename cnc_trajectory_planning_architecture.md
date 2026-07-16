@@ -1616,12 +1616,19 @@ Add:
 
 Add:
 
+- proof-preserving reuse of exact geometry queries;
 - better fitting objectives;
 - tighter derivative bounds;
 - feed derating near low-watermark conditions;
 - larger planning windows;
 - optimized event scheduling;
 - diagnostics and profiling.
+
+The first measured Stage 5 optimization is implemented. Per-reference 16-entry caches reuse spline and arc parameters only for bit-identical requested distances whose results were already certified by the existing bracketed adaptive-integral/Newton inverse. This reduced `adaptive_pockets.ngc` full-horizon planning from about 5.40 seconds to about 3.01-3.08 seconds and the 54-horizon rolling calculation from about 12.69 seconds to 6.23 seconds, with byte-identical oracle exports and unchanged proof counters. An approximate monotone spline-inverse seed was rejected because it changed a threshold-sensitive trajectory. Future caches must retain the same equivalence standard.
+
+After these caches, profiling identifies local state-to-state timing as the leading cost. The next performance stage should make station acceleration/jerk feasibility intervals explicit and instrument Ruckig calls by purpose before attempting reachability or memoization changes. Such filters may reject candidates early but never become acceptance authority.
+
+An opt-in NRT comparison now makes the acceleration-only limit explicit without changing the executable planner. `InfiniteJerkTrajectoryTime` consumes the exact smoothed arc-length piece stream, derives scalar-acceleration intervals from `q'(s) a + q''(s) v^2`, propagates forward/backward squared-speed envelopes, and refines total time numerically. `ngc_g64_oracle_export` uses it to report how far the verified jerk-limited plan remains from the same geometry's infinite-jerk traversal. The reference does not enter normal planning or RT transport, is not emitted as `PlanChunk`, and is not itself a continuous feasibility certificate. Its reusable library boundary is intentional: a future planner may reuse the acceleration envelope as a seed only if final jerk-aware timing and exact polynomial verification remain authoritative.
 
 ## Stage 6: Optional smoothness upgrade
 

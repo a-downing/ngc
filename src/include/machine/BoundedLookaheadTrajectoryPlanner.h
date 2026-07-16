@@ -100,6 +100,13 @@ namespace ngc {
         std::uint64_t rollingSuffixProbeFailures = 0;
         std::uint64_t rollingPrefixProbeFailures = 0;
         double rollingSearchSeconds = 0.0;
+        // All attempted scalar Ruckig solves, including failed rolling probes.
+        TimeLawDiagnostics timeLaw;
+        TimeLawDiagnostics publishedTimeLaw;
+        TimeLawDiagnostics rollingPrefixProbeTimeLaw;
+        TimeLawDiagnostics rollingSuffixProbeTimeLaw;
+        SplineInverseDiagnostics publishedSplineInverse;
+        simulation_detail::ArcInverseDiagnostics publishedArcInverse;
     };
 
     // NRT-only compatible command horizon. RT capacity is imposed later while
@@ -131,6 +138,36 @@ namespace ngc {
         static std::string formatPosition(const position_t &value) {
             return std::format("[X={} Y={} Z={} A={} B={} C={}]",
                 value.x,value.y,value.z,value.a,value.b,value.c);
+        }
+
+        static void accumulateSplineInverse(SplineInverseDiagnostics &total,
+                                             const SplineInverseDiagnostics &value) {
+            total.constructionIntegralEvaluations+=value.constructionIntegralEvaluations;
+            total.queries+=value.queries;
+            total.endpointQueries+=value.endpointQueries;
+            total.exactCacheHits+=value.exactCacheHits;
+            total.inverseIntegralEvaluations+=value.inverseIntegralEvaluations;
+            total.newtonIterations+=value.newtonIterations;
+            total.seedConvergences+=value.seedConvergences;
+            total.safeguardedBisections+=value.safeguardedBisections;
+            total.iterationLimitHits+=value.iterationLimitHits;
+            total.maximumNewtonIterations=std::max(
+                total.maximumNewtonIterations,value.maximumNewtonIterations);
+        }
+
+        static void accumulateArcInverse(simulation_detail::ArcInverseDiagnostics &total,
+                                         const simulation_detail::ArcInverseDiagnostics &value) {
+            total.constructionIntegralEvaluations+=value.constructionIntegralEvaluations;
+            total.queries+=value.queries;
+            total.endpointQueries+=value.endpointQueries;
+            total.exactCacheHits+=value.exactCacheHits;
+            total.inverseIntegralEvaluations+=value.inverseIntegralEvaluations;
+            total.newtonIterations+=value.newtonIterations;
+            total.seedConvergences+=value.seedConvergences;
+            total.safeguardedBisections+=value.safeguardedBisections;
+            total.iterationLimitHits+=value.iterationLimitHits;
+            total.maximumNewtonIterations=std::max(
+                total.maximumNewtonIterations,value.maximumNewtonIterations);
         }
 
         static std::string inputLocation(const TrajectoryPlannerInput &input) {
@@ -600,6 +637,7 @@ namespace ngc {
                     return ExecutionItem { *move };
                 } else {
                     auto chunk = m_exactStop.compile(input.command);
+                    m_diagnostics.timeLaw+=m_exactStop.lastTimeLawDiagnostics();
                     if(!chunk) return std::unexpected(chunk.error());
                     if(auto verified = verifyStopBranch(*chunk); !verified)
                         return std::unexpected(verified.error());
@@ -678,6 +716,11 @@ namespace ngc {
                 const auto activeInputs=std::ranges::count_if(inputs,[](const auto &input) {
                     return input.presentationActivation;
                 });
+                accumulateSplineInverse(
+                    m_diagnostics.publishedSplineInverse,continuous->splineInverse);
+                accumulateArcInverse(
+                    m_diagnostics.publishedArcInverse,continuous->arcInverse);
+                m_diagnostics.publishedTimeLaw+=continuous->timeLaw;
                 if(m_continuousDiagnosticCallback)
                     m_continuousDiagnosticCallback(*continuous,inputs);
                 auto planned=std::make_unique<PlannedExecution>(
@@ -759,11 +802,16 @@ namespace ngc {
                     ++m_diagnostics.rollingBoundaryCandidates;
                     const auto boundary=splitBoundaryState(split,velocity);
                     ExactStopTrajectoryPlanner suffixProbe(m_exactStop.limits());
+                    suffixProbe.setContinuousPlanningEffort(
+                        m_exactStop.continuousPlanningEffort());
                     suffixProbe.setProgressCallback(m_exactStop.progressCallback());
                     suffixProbe.reset(1,split.position);
                     auto suffix=suffixProbe.compileContinuous(
                         suffixProbeCommands,blendScale,nullptr,boundary,std::nullopt,
                         suffixProbeScales,ROLLING_VELOCITY_SEARCH_ITERATIONS);
+                    m_diagnostics.timeLaw+=suffixProbe.lastTimeLawDiagnostics();
+                    m_diagnostics.rollingSuffixProbeTimeLaw+=
+                        suffixProbe.lastTimeLawDiagnostics();
                     if(!suffix) {
                         ++m_diagnostics.rollingSuffixProbeFailures;
                         m_lastRollingCandidateError="suffix: "+suffix.error();
@@ -773,6 +821,9 @@ namespace ngc {
                     auto prefix=prefixPlanner.compileContinuous(
                         prefixCommands,blendScale,nullptr,m_continuousBoundary,boundary,
                         prefixScales,ROLLING_VELOCITY_SEARCH_ITERATIONS);
+                    m_diagnostics.timeLaw+=prefixPlanner.lastTimeLawDiagnostics();
+                    m_diagnostics.rollingPrefixProbeTimeLaw+=
+                        prefixPlanner.lastTimeLawDiagnostics();
                     if(!prefix) {
                         ++m_diagnostics.rollingPrefixProbeFailures;
                         m_lastRollingCandidateError="prefix: "+prefix.error();
@@ -821,6 +872,7 @@ namespace ngc {
             auto continuous=m_exactStop.compileContinuous(
                 commands,blendScale,nullptr,m_continuousBoundary,std::nullopt,scales,
                 movingBoundary?ROLLING_VELOCITY_SEARCH_ITERATIONS:12U);
+            m_diagnostics.timeLaw+=m_exactStop.lastTimeLawDiagnostics();
             if(!continuous) return std::unexpected(std::format(
                 "fatal continuous-motion compilation failure: {}; cause: {}",context,continuous.error()));
             std::vector<TrajectoryPlannerInput> inputs;

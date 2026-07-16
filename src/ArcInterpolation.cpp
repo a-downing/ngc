@@ -1,7 +1,9 @@
 #include "machine/ArcInterpolation.h"
 
 #include <algorithm>
+#include <bit>
 #include <cmath>
+#include <cstdint>
 #include <numbers>
 #include <functional>
 #include <numeric>
@@ -42,8 +44,10 @@ namespace ngc::simulation_detail {
         }
     }
 
-    ArcReference::ArcReference(const MoveArc &arc) : m_arc(arc), m_geometry(arcGeometry(arc)) {
+    ArcReference::ArcReference(const MoveArc &arc, ArcInverseDiagnostics *inverseDiagnostics)
+        : m_arc(arc), m_geometry(arcGeometry(arc)), m_inverseDiagnostics(inverseDiagnostics) {
         if(!m_geometry) return;
+        if(m_inverseDiagnostics) ++m_inverseDiagnostics->constructionIntegralEvaluations;
         const auto function = [this](const double parameter) { return speed(parameter); };
         const auto fromValue = function(0.0);
         const auto middleValue = function(0.5);
@@ -99,8 +103,38 @@ namespace ngc::simulation_detail {
 
     double ArcReference::speed(const double parameter) const { return derivative(parameter).length(); }
 
-    double ArcReference::integratedLength(const double from, const double to) const {
+    std::size_t ArcReference::inverseCacheIndex(const double distance) {
+        auto bits = std::bit_cast<std::uint64_t>(distance);
+        bits ^= bits >> 33;
+        bits *= 0xff51afd7ed558ccdULL;
+        bits ^= bits >> 33;
+        return static_cast<std::size_t>(bits) & (INVERSE_CACHE_SIZE-1);
+    }
+
+    position_t ArcReference::secondDerivative(const double requestedParameter) const {
+        const auto parameter = std::clamp(requestedParameter, 0.0, 1.0);
+        if(!m_geometry) return {};
+        const auto &geometry = *m_geometry;
+        const auto start = rotate(geometry.startArm, geometry.sweep*parameter, geometry.axisUnit);
+        const auto end = rotate(geometry.endArm, -geometry.sweep*(1.0-parameter), geometry.axisUnit);
+        const auto startDerivative = scale(cross(geometry.axisUnit, start), geometry.sweep);
+        const auto endDerivative = scale(cross(geometry.axisUnit, end), geometry.sweep);
+        const auto startSecond = scale(
+            cross(geometry.axisUnit, startDerivative), geometry.sweep);
+        const auto endSecond = scale(
+            cross(geometry.axisUnit, endDerivative), geometry.sweep);
+        const auto xyz = scale(startDerivative,-2.0)+scale(startSecond,1.0-parameter)
+            +scale(endDerivative,2.0)+scale(endSecond,parameter);
+        return {xyz.x,xyz.y,xyz.z,0.0,0.0,0.0};
+    }
+
+    double ArcReference::integratedLength(const double from, const double to,
+                                          const bool inverseEvaluation) const {
         if(to <= from) return 0.0;
+        if(m_inverseDiagnostics) {
+            if(inverseEvaluation) ++m_inverseDiagnostics->inverseIntegralEvaluations;
+            else ++m_inverseDiagnostics->constructionIntegralEvaluations;
+        }
         const auto function = [this](const double parameter) { return speed(parameter); };
         const auto middle = std::midpoint(from, to);
         const auto fromValue = function(from);
@@ -113,9 +147,21 @@ namespace ngc::simulation_detail {
 
     double ArcReference::parameterAtDistance(const double requestedDistance) const {
         if(m_length <= 0.0) return 1.0;
+        if(m_inverseDiagnostics) ++m_inverseDiagnostics->queries;
         const auto distance = std::clamp(requestedDistance, 0.0, m_length);
-        if(distance == 0.0) return 0.0;
-        if(distance == m_length) return 1.0;
+        if(distance == 0.0) {
+            if(m_inverseDiagnostics) ++m_inverseDiagnostics->endpointQueries;
+            return 0.0;
+        }
+        if(distance == m_length) {
+            if(m_inverseDiagnostics) ++m_inverseDiagnostics->endpointQueries;
+            return 1.0;
+        }
+        auto &cache = m_inverseCache[inverseCacheIndex(distance)];
+        if(cache.valid && cache.distance == distance) {
+            if(m_inverseDiagnostics) ++m_inverseDiagnostics->exactCacheHits;
+            return cache.parameter;
+        }
         const auto upper = std::lower_bound(m_lengthNodes.begin(), m_lengthNodes.end(), distance,
             [](const LengthNode &node, const double value) { return node.distance < value; });
         const auto lower = upper-1;
@@ -126,15 +172,32 @@ namespace ngc::simulation_detail {
         const auto distanceTolerance = 1e-12*std::max(1.0, m_length);
         for(unsigned iteration = 0; iteration < 12; ++iteration) {
             const auto parameterDistance = lower->distance
-                +integratedLength(lower->parameter, parameter);
+                +integratedLength(lower->parameter, parameter, true);
+            if(m_inverseDiagnostics) {
+                ++m_inverseDiagnostics->newtonIterations;
+                m_inverseDiagnostics->maximumNewtonIterations = std::max(
+                    m_inverseDiagnostics->maximumNewtonIterations,
+                    static_cast<std::size_t>(iteration+1));
+            }
             const auto error = parameterDistance-distance;
-            if(std::abs(error) <= distanceTolerance) return parameter;
+            if(std::abs(error) <= distanceTolerance) {
+                if(iteration == 0 && m_inverseDiagnostics)
+                    ++m_inverseDiagnostics->seedConvergences;
+                cache = {distance, parameter, true};
+                return parameter;
+            }
             if(error < 0.0) from = parameter;
             else to = parameter;
             const auto localSpeed = speed(parameter);
             const auto newton = localSpeed > 1e-15 ? parameter-error/localSpeed : parameter;
-            parameter = newton > from && newton < to ? newton : std::midpoint(from, to);
+            if(newton > from && newton < to) parameter = newton;
+            else {
+                parameter = std::midpoint(from, to);
+                if(m_inverseDiagnostics) ++m_inverseDiagnostics->safeguardedBisections;
+            }
         }
+        if(m_inverseDiagnostics) ++m_inverseDiagnostics->iterationLimitHits;
+        cache = {distance, parameter, true};
         return parameter;
     }
 
@@ -146,6 +209,19 @@ namespace ngc::simulation_detail {
         const auto value = derivative(parameterAtDistance(distance));
         const auto magnitude = value.length();
         return magnitude > 0.0 ? scaled(value, 1.0/magnitude) : position_t{};
+    }
+
+    position_t ArcReference::curvatureAtDistance(const double distance) const {
+        const auto parameter=parameterAtDistance(distance);
+        const auto first=derivative(parameter);
+        const auto second=secondDerivative(parameter);
+        const auto speedSquared=first.x*first.x+first.y*first.y+first.z*first.z
+            +first.a*first.a+first.b*first.b+first.c*first.c;
+        if(speedSquared<=1e-30) return {};
+        const auto firstSecond=first.x*second.x+first.y*second.y+first.z*second.z
+            +first.a*second.a+first.b*second.b+first.c*second.c;
+        return scaled(second,1.0/speedSquared)
+            -scaled(first,firstSecond/(speedSquared*speedSquared));
     }
 
     double ArcReference::chordErrorBound(const double fromDistance, const double toDistance) const {

@@ -71,9 +71,7 @@ namespace ngc::spline_detail {
             totalLength+=length;
         }
         if(!std::isfinite(totalLength)||totalLength<=0.0) return {};
-        const auto desired=std::max<std::size_t>(1,static_cast<std::size_t>(
-            std::llround(totalLength/programmedScale)));
-        const auto controlCount=std::min(entityLengths.size(),desired);
+        const auto controlCount=entityLengths.size();
         result.reserve(controlCount);
         for(std::size_t control=0;control<controlCount;++control)
             result.push_back(totalLength*(static_cast<double>(control)+0.5)

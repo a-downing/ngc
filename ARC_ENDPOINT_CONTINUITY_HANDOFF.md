@@ -232,6 +232,8 @@ The worktree is intentionally dirty from the completed work in the current sessi
 
 The arc endpoint-continuity fix described in this document has now been implemented. Preview and exact-stop planning share endpoint-exact reference geometry; planning uses arc-length parameterization, updated tangent/curvature/tolerance handling, and explicit canonical boundary samples. Regression coverage includes rounded-radius endpoint continuity, arc/line command junctions, geometry variants, cubic tolerance, dynamic limits, and recoverable rejection beyond `Machine::arcTolerance()`.
 
+Each arc reference now also retains a fixed 16-entry bit-exact inverse-result cache. A cache miss still starts from the preintegrated ordered bracket and runs safeguarded Newton against the actual adaptive integral; only the result for that exact distance and reference is reused. On `adaptive_pockets.ngc` this reduced adaptive arc inverse integrals from 7,593,087 to 3,130,549 without changing the exported model, canonical endpoints, verified spans, duration, or proof counters. Dense line/arc, `1001.ngc`, rounded-IJK, full-circle, helical, major-sweep, and non-XY regression coverage remains authoritative. Do not generalize this cache into tolerance-near matching or unchecked inverse interpolation.
+
 Run before editing:
 
 ```powershell

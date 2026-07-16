@@ -1,19 +1,33 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
+#include <memory>
 #include <numeric>
+#include <optional>
 #include <span>
 #include <sstream>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
+
+#include "machine/ArcInterpolation.h"
 
 namespace {
     using Point=std::array<double,6>;
+
+    ngc::position_t position(const Point &point) {
+        return {point[0],point[1],point[2],point[3],point[4],point[5]};
+    }
+    Point point(const ngc::position_t &position) {
+        return {position.x,position.y,position.z,
+                position.a,position.b,position.c};
+    }
 
     Point subtract(const Point &a,const Point &b) {
         Point result{};
@@ -64,6 +78,47 @@ namespace {
         std::size_t lastSource=0;
         std::vector<Point> controls;
         std::vector<double> boundaries;
+    };
+
+    struct Primitive {
+        bool arc=false;
+        std::size_t id=0;
+        double feed=0.0;
+        Point start{};
+        Point end{};
+        std::array<double,3> center{};
+        std::array<double,3> axis{};
+        std::shared_ptr<ngc::simulation_detail::ArcReference> arcReference;
+
+        void prepare() {
+            if(!arc) return;
+            arcReference=std::make_shared<ngc::simulation_detail::ArcReference>(ngc::MoveArc(
+                position(start),position(end),
+                {center[0],center[1],center[2]},
+                {axis[0],axis[1],axis[2]},feed));
+            if(!arcReference->valid()||arcReference->length()<=1e-12)
+                throw std::runtime_error("captured source contains an invalid arc");
+        }
+
+        double length() const {
+            return arc?arcReference->length():lengthOfLine();
+        }
+        double lengthOfLine() const {
+            const auto delta=subtract(end,start);
+            return std::sqrt(dot(delta,delta));
+        }
+        Point positionAtDistance(const double requested) const {
+            const auto primitiveLength=length();
+            const auto distance=std::clamp(requested,0.0,primitiveLength);
+            if(arc) return point(arcReference->positionAtDistance(distance));
+            if(primitiveLength<=1e-15) return start;
+            return added(start,scaled(subtract(end,start),distance/primitiveLength));
+        }
+    };
+
+    struct Snapshot {
+        std::vector<Primitive> primitives;
+        std::vector<Spline> splines;
     };
 
     struct DifferentialSample {
@@ -124,6 +179,227 @@ namespace {
             return result;
         }
     };
+
+    struct SourceSegment {
+        const Primitive *primitive=nullptr;
+        double from=0.0;
+        double to=0.0;
+        double length=0.0;
+    };
+
+    struct SourceComposite {
+        std::vector<SourceSegment> segments;
+        double length=0.0;
+
+        Point positionAtDistance(const double requested) const {
+            if(segments.empty()) throw std::runtime_error("source composite is empty");
+            const auto distance=std::clamp(requested,0.0,length);
+            auto segmentStart=0.0;
+            for(const auto &segment:segments) {
+                if(distance<=segmentStart+segment.length||&segment==&segments.back()) {
+                    const auto local=segment.length>0.0
+                        ?(distance-segmentStart)/segment.length:0.0;
+                    return segment.primitive->positionAtDistance(
+                        std::lerp(segment.from,segment.to,std::clamp(local,0.0,1.0)));
+                }
+                segmentStart+=segment.length;
+            }
+            return segments.back().primitive->positionAtDistance(segments.back().to);
+        }
+    };
+
+    double closestPrimitiveDistance(const Primitive &primitive,const Point &target,
+                                    const bool preferLater) {
+        const auto primitiveLength=primitive.length();
+        if(!primitive.arc) {
+            const auto delta=subtract(primitive.end,primitive.start);
+            const auto denominator=dot(delta,delta);
+            if(denominator<=1e-30) return 0.0;
+            return primitiveLength*std::clamp(
+                dot(subtract(target,primitive.start),delta)/denominator,0.0,1.0);
+        }
+        constexpr unsigned COARSE_INTERVALS=256;
+        auto best=0U;
+        auto bestSquared=std::numeric_limits<double>::infinity();
+        for(unsigned sample=0;sample<=COARSE_INTERVALS;++sample) {
+            const auto distance=primitiveLength*sample/COARSE_INTERVALS;
+            const auto delta=subtract(primitive.positionAtDistance(distance),target);
+            const auto squared=dot(delta,delta);
+            if(squared<bestSquared
+               ||(squared==bestSquared&&((preferLater&&sample>best)
+                                         ||(!preferLater&&sample<best)))) {
+                best=sample;
+                bestSquared=squared;
+            }
+        }
+        auto lower=primitiveLength*(best==0?0:best-1)/COARSE_INTERVALS;
+        auto upper=primitiveLength*(best==COARSE_INTERVALS?COARSE_INTERVALS:best+1)
+            /COARSE_INTERVALS;
+        const auto squaredDistance=[&](const double distance) {
+            const auto delta=subtract(primitive.positionAtDistance(distance),target);
+            return dot(delta,delta);
+        };
+        constexpr double GOLDEN=0.6180339887498948482;
+        auto left=upper-GOLDEN*(upper-lower);
+        auto right=lower+GOLDEN*(upper-lower);
+        auto leftValue=squaredDistance(left);
+        auto rightValue=squaredDistance(right);
+        for(unsigned iteration=0;iteration<64;++iteration) {
+            if(leftValue<=rightValue) {
+                upper=right;
+                right=left;
+                rightValue=leftValue;
+                left=upper-GOLDEN*(upper-lower);
+                leftValue=squaredDistance(left);
+            } else {
+                lower=left;
+                left=right;
+                leftValue=rightValue;
+                right=lower+GOLDEN*(upper-lower);
+                rightValue=squaredDistance(right);
+            }
+        }
+        return std::midpoint(lower,upper);
+    }
+
+    SourceComposite sourceCompositeFor(const Snapshot &snapshot,const Spline &spline) {
+        if(spline.firstSource>spline.lastSource
+           ||spline.lastSource>=snapshot.primitives.size())
+            throw std::runtime_error("spline source range is outside the captured primitives");
+        SourceComposite result;
+        result.segments.reserve(spline.lastSource-spline.firstSource+1);
+        for(auto source=spline.firstSource;source<=spline.lastSource;++source) {
+            const auto &primitive=snapshot.primitives[source];
+            if(primitive.id!=source)
+                throw std::runtime_error("captured primitive IDs are not dense and ordered");
+            auto from=0.0;
+            auto to=primitive.length();
+            if(source==spline.firstSource)
+                from=closestPrimitiveDistance(primitive,spline.controls.front(),true);
+            if(source==spline.lastSource)
+                to=closestPrimitiveDistance(primitive,spline.controls.back(),false);
+            if(to+1e-12<from)
+                throw std::runtime_error("captured spline endpoints reverse their source primitive");
+            const auto segmentLength=std::max(0.0,to-from);
+            result.segments.push_back({&primitive,from,to,segmentLength});
+            result.length+=segmentLength;
+        }
+        if(result.length<=1e-12)
+            throw std::runtime_error("captured spline has an empty source primitive interval");
+        const auto endpointError=std::max(
+            length(subtract(result.positionAtDistance(0.0),spline.controls.front())),
+            length(subtract(result.positionAtDistance(result.length),spline.controls.back())));
+        if(endpointError>1e-7)
+            throw std::runtime_error("could not associate captured spline endpoints with source primitives");
+        return result;
+    }
+
+    SourceComposite completePrimitiveRange(const Snapshot &snapshot,
+            const std::size_t first,const std::size_t last) {
+        if(first>last||last>=snapshot.primitives.size())
+            throw std::runtime_error("source primitive range is invalid");
+        SourceComposite result;
+        result.segments.reserve(last-first+1);
+        for(auto source=first;source<=last;++source) {
+            const auto &primitive=snapshot.primitives[source];
+            if(primitive.id!=source)
+                throw std::runtime_error("captured primitive IDs are not dense and ordered");
+            const auto segmentLength=primitive.length();
+            result.segments.push_back({&primitive,0.0,segmentLength,segmentLength});
+            result.length+=segmentLength;
+        }
+        return result;
+    }
+
+    Spline halfEntityControlSpline(const Snapshot &snapshot,const Spline &original) {
+        if(original.controls.size()<=6||original.lastSource<=original.firstSource+1)
+            return original;
+        const auto interiorEntityCount=original.lastSource-original.firstSource-1;
+        const auto interiorControlCount=(interiorEntityCount+1)/2;
+        const auto interior=completePrimitiveRange(
+            snapshot,original.firstSource+1,original.lastSource-1);
+        Spline candidate=original;
+        candidate.controls.clear();
+        candidate.controls.reserve(interiorControlCount+6);
+        candidate.controls.insert(candidate.controls.end(),
+            original.controls.begin(),original.controls.begin()+3);
+        for(std::size_t control=0;control<interiorControlCount;++control) {
+            const auto distance=interior.length*(static_cast<double>(control)+0.5)
+                /static_cast<double>(interiorControlCount);
+            candidate.controls.push_back(interior.positionAtDistance(distance));
+        }
+        candidate.controls.insert(candidate.controls.end(),
+            original.controls.end()-3,original.controls.end());
+        candidate.boundaries.clear();
+        return candidate;
+    }
+
+    struct OrderedDeviation {
+        double maximum=0.0;
+        double candidateLength=0.0;
+    };
+
+    OrderedDeviation orderedSourceDeviation(const Spline &candidate,
+            const SourceComposite &source,const unsigned samplesPerSpan) {
+        if(samplesPerSpan==0) throw std::runtime_error("ordered deviation needs samples");
+        const SplineEvaluator evaluator(candidate);
+        const auto spans=candidate.controls.size()-3;
+        const auto sampleCount=spans*samplesPerSpan;
+        std::vector<Point> positions;
+        std::vector<double> distances;
+        positions.reserve(sampleCount+1);
+        distances.reserve(sampleCount+1);
+        for(std::size_t sample=0;sample<=sampleCount;++sample) {
+            const auto parameter=static_cast<double>(spans)*sample/sampleCount;
+            positions.push_back(evaluator.at(parameter).position);
+            distances.push_back(sample==0?0.0:distances.back()
+                +length(subtract(positions.back(),positions[positions.size()-2])));
+        }
+        OrderedDeviation result{.candidateLength=distances.back()};
+        if(result.candidateLength<=1e-15) {
+            result.maximum=std::numeric_limits<double>::infinity();
+            return result;
+        }
+        for(std::size_t sample=0;sample<positions.size();++sample) {
+            const auto sourceDistance=source.length*distances[sample]/result.candidateLength;
+            result.maximum=std::max(result.maximum,length(subtract(
+                positions[sample],source.positionAtDistance(sourceDistance))));
+        }
+        return result;
+    }
+
+    struct OrderedDeviationProxy {
+        std::vector<Point> sourcePositions;
+        unsigned samplesPerSpan=0;
+    };
+
+    OrderedDeviationProxy makeOrderedDeviationProxy(const SourceComposite &source,
+            const std::size_t spans,const unsigned samplesPerSpan) {
+        OrderedDeviationProxy result{
+            .sourcePositions={},
+            .samplesPerSpan=samplesPerSpan,
+        };
+        const auto sampleCount=spans*samplesPerSpan;
+        result.sourcePositions.reserve(sampleCount+1);
+        for(std::size_t sample=0;sample<=sampleCount;++sample)
+            result.sourcePositions.push_back(source.positionAtDistance(
+                source.length*sample/sampleCount));
+        return result;
+    }
+
+    double orderedSourceDeviationProxy(const Spline &candidate,
+            const OrderedDeviationProxy &proxy) {
+        const SplineEvaluator evaluator(candidate);
+        const auto sampleCount=proxy.sourcePositions.size()-1;
+        const auto spans=candidate.controls.size()-3;
+        auto maximum=0.0;
+        for(std::size_t sample=0;sample<=sampleCount;++sample) {
+            const auto parameter=static_cast<double>(spans)*sample/sampleCount;
+            maximum=std::max(maximum,length(subtract(
+                evaluator.at(parameter).position,proxy.sourcePositions[sample])));
+        }
+        return maximum;
+    }
 
     struct FeedProfilePoint {
         double distance=0.0;
@@ -283,12 +559,14 @@ namespace {
         double tangentialDerivativeAtMaximum=0.0;
         double normalDerivativeAtMaximum=0.0;
         double maximumNormalCurvatureDerivative=0.0;
+        double maximumNormalCurvatureDerivativeParameter=0.0;
         double integratedNormalCurvatureDerivative=0.0;
         double derivativeTraversalCost=0.0;
         double derivativeVelocityCap=0.0;
     };
 
-    Measurement measure(Spline spline) {
+    Measurement measure(Spline spline,const unsigned samplesPerSpan=32) {
+        if(samplesPerSpan==0) throw std::runtime_error("spline measurement needs samples");
         const auto count=spline.controls.size();
         const auto maximumParameter=static_cast<double>(count-3);
         std::vector<double> knots(count+4,maximumParameter);
@@ -323,21 +601,20 @@ namespace {
         result.minimumParameterSpeed=std::numeric_limits<double>::infinity();
         std::vector<double> spanMaximumDerivative(count-3,0.0);
         std::vector<double> spanLengths(count-3,0.0);
-        constexpr unsigned SAMPLES_PER_SPAN=32;
         for(std::size_t span=0;span+3<count;++span) {
             double previousSpeed=0.0;
             double previousNormalDerivative=0.0;
-            for(unsigned sample=0;sample<=SAMPLES_PER_SPAN;++sample) {
+            for(unsigned sample=0;sample<=samplesPerSpan;++sample) {
                 auto parameter=static_cast<double>(span)
-                    +static_cast<double>(sample)/SAMPLES_PER_SPAN;
-                if(sample==SAMPLES_PER_SPAN&&span+4<count)
+                    +static_cast<double>(sample)/samplesPerSpan;
+                if(sample==samplesPerSpan&&span+4<count)
                     parameter=std::nextafter(parameter,static_cast<double>(span));
                 const auto r1=evaluate(first,firstKnots,2,parameter);
                 const auto r2=evaluate(second,secondKnots,1,parameter);
                 const auto r3=evaluate(third,thirdKnots,0,parameter);
                 const auto speed=length(r1);
                 const auto distanceStep=sample>0
-                    ?(previousSpeed+speed)*0.5/SAMPLES_PER_SPAN:0.0;
+                    ?(previousSpeed+speed)*0.5/samplesPerSpan:0.0;
                 if(sample>0) spanLengths[span]+=distanceStep;
                 result.minimumParameterSpeed=std::min(result.minimumParameterSpeed,speed);
                 if(speed<=1e-15) {
@@ -364,8 +641,10 @@ namespace {
                 const auto tangential=dot(tangent,derivative);
                 const auto normalDerivative=length(
                     subtract(derivative,scaled(tangent,tangential)));
-                result.maximumNormalCurvatureDerivative=std::max(
-                    result.maximumNormalCurvatureDerivative,normalDerivative);
+                if(normalDerivative>result.maximumNormalCurvatureDerivative) {
+                    result.maximumNormalCurvatureDerivative=normalDerivative;
+                    result.maximumNormalCurvatureDerivativeParameter=parameter;
+                }
                 if(sample>0) result.integratedNormalCurvatureDerivative+=
                     0.5*(previousNormalDerivative+normalDerivative)*distanceStep;
                 previousSpeed=speed;
@@ -433,37 +712,46 @@ namespace {
         return best;
     }
 
-    double maximumCurveDeviation(const Spline &reference,const Spline &candidate) {
-        if(reference.controls.size()!=candidate.controls.size())
-            return std::numeric_limits<double>::infinity();
-        const SplineEvaluator referenceEvaluator(reference);
-        const SplineEvaluator candidateEvaluator(candidate);
-        constexpr unsigned SAMPLES_PER_SPAN=48;
-        const auto samples=(reference.controls.size()-3)*SAMPLES_PER_SPAN;
-        auto maximum=0.0;
-        for(std::size_t sample=0;sample<=samples;++sample) {
-            const auto parameter=static_cast<double>(reference.controls.size()-3)
-                *sample/samples;
-            maximum=std::max(maximum,length(subtract(
-                referenceEvaluator.at(parameter).position,
-                candidateEvaluator.at(parameter).position)));
-        }
-        return maximum;
-    }
-
     struct PhysicalJerkOptimization {
         Measurement measurement;
-        double maximumCurveDeviation=0.0;
+        double originalSourceDeviation=0.0;
+        double originalLength=0.0;
+        double maximumSourceDeviation=0.0;
+        double candidateLength=0.0;
+        std::size_t candidateEvaluations=0;
+        std::size_t acceptedCandidates=0;
+        bool budgetExhausted=false;
+        bool retained=false;
+        bool finalDeviationRejected=false;
+        bool finalCurvatureRejected=false;
+        bool finalObjectiveRejected=false;
+        double computationSeconds=0.0;
     };
 
     PhysicalJerkOptimization optimizePhysicalJerk(const Measurement &original,
-            const double programmedScale,const double maximumCurveDeviationInP) {
-        PhysicalJerkOptimization best{original,0.0};
+            const SourceComposite &source,const double programmedScale,
+            const double maximumCurveDeviationInP) {
+        constexpr std::size_t MAXIMUM_CANDIDATE_EVALUATIONS=100000;
+        const auto started=std::chrono::steady_clock::now();
+        const auto originalDeviation=orderedSourceDeviation(original.spline,source,256);
+        PhysicalJerkOptimization best{
+            .measurement=original,
+            .originalSourceDeviation=originalDeviation.maximum,
+            .originalLength=originalDeviation.candidateLength,
+            .maximumSourceDeviation=originalDeviation.maximum,
+            .candidateLength=originalDeviation.candidateLength,
+        };
         if(original.spline.controls.size()<=6||!std::isfinite(maximumCurveDeviationInP)
            ||maximumCurveDeviationInP<=0.0
            ||original.maximumNormalCurvatureDerivative<=0.0
-           ||original.integratedNormalCurvatureDerivative<=0.0) return best;
+           ||original.integratedNormalCurvatureDerivative<=0.0) {
+            best.computationSeconds=std::chrono::duration<double>(
+                std::chrono::steady_clock::now()-started).count();
+            return best;
+        }
         const auto deviationLimit=programmedScale*maximumCurveDeviationInP;
+        const auto deviationProxy=makeOrderedDeviationProxy(
+            source,original.spline.controls.size()-3,24);
         const auto score=[&](const Measurement &measurement) {
             const auto peak=measurement.maximumNormalCurvatureDerivative
                 /original.maximumNormalCurvatureDerivative;
@@ -473,19 +761,26 @@ namespace {
                 +4.0*std::max(0.0,peak-1.0)
                 +2.0*std::max(0.0,integral-1.0);
         };
-        auto bestScore=score(best.measurement);
+        auto bestScore=score(measure(original.spline,24));
         const SplineEvaluator originalEvaluator(original.spline);
         const auto startGeometry=originalEvaluator.at(0.0);
         const auto endGeometry=originalEvaluator.at(
             static_cast<double>(original.spline.controls.size()-3));
         const auto consider=[&](Spline candidateSpline) {
-            const auto deviation=maximumCurveDeviation(original.spline,candidateSpline);
-            if(deviation>deviationLimit*(1.0+1e-12)) return false;
-            auto candidate=measure(std::move(candidateSpline));
+            if(best.candidateEvaluations>=MAXIMUM_CANDIDATE_EVALUATIONS) {
+                best.budgetExhausted=true;
+                return false;
+            }
+            ++best.candidateEvaluations;
+            const auto deviation=orderedSourceDeviationProxy(candidateSpline,deviationProxy);
+            if(deviation>0.98*deviationLimit*(1.0+1e-12)) return false;
+            auto candidate=measure(std::move(candidateSpline),24);
             if(candidate.maximumCurvature>original.maximumCurvature*1.02) return false;
             const auto candidateScore=score(candidate);
             if(candidateScore>=bestScore*(1.0-1e-10)) return false;
-            best={std::move(candidate),deviation};
+            best.measurement=std::move(candidate);
+            best.maximumSourceDeviation=deviation;
+            ++best.acceptedCandidates;
             bestScore=candidateScore;
             return true;
         };
@@ -542,15 +837,354 @@ namespace {
                 }
             }
         }
-        if(best.measurement.maximumNormalCurvatureDerivative
-                >=original.maximumNormalCurvatureDerivative
-           ||best.measurement.integratedNormalCurvatureDerivative
-                >=original.integratedNormalCurvatureDerivative)
-            return {original,0.0};
+        best.measurement=measure(std::move(best.measurement.spline));
+        auto verifiedDeviation=orderedSourceDeviation(best.measurement.spline,source,256);
+        best.maximumSourceDeviation=verifiedDeviation.maximum;
+        best.candidateLength=verifiedDeviation.candidateLength;
+        if(best.acceptedCandidates>0) {
+            best.finalDeviationRejected=
+                best.maximumSourceDeviation>deviationLimit*(1.0+1e-9);
+            best.finalCurvatureRejected=best.measurement.maximumCurvature
+                >original.maximumCurvature*1.02*(1.0+1e-9);
+            best.finalObjectiveRejected=
+                best.measurement.maximumNormalCurvatureDerivative
+                    >=original.maximumNormalCurvatureDerivative
+                ||best.measurement.integratedNormalCurvatureDerivative
+                    >=original.integratedNormalCurvatureDerivative;
+            best.retained=!best.finalDeviationRejected&&!best.finalCurvatureRejected
+                &&!best.finalObjectiveRejected;
+        }
+        if(!best.retained) {
+            best.measurement=original;
+            best.maximumSourceDeviation=originalDeviation.maximum;
+            best.candidateLength=originalDeviation.candidateLength;
+        }
+        best.computationSeconds=std::chrono::duration<double>(
+            std::chrono::steady_clock::now()-started).count();
         return best;
     }
 
-    std::vector<Spline> readSnapshot(const std::filesystem::path &path) {
+    struct EndpointErrors {
+        double position=0.0;
+        double tangent=0.0;
+        double curvature=0.0;
+    };
+
+    EndpointErrors endpointErrors(const Spline &original,const Spline &candidate) {
+        const SplineEvaluator originalEvaluator(original);
+        const SplineEvaluator candidateEvaluator(candidate);
+        const auto maximumParameter=static_cast<double>(original.controls.size()-3);
+        const auto originalStart=originalEvaluator.at(0.0);
+        const auto candidateStart=candidateEvaluator.at(0.0);
+        const auto originalEnd=originalEvaluator.at(maximumParameter);
+        const auto candidateEnd=candidateEvaluator.at(maximumParameter);
+        return {
+            .position=std::max(
+                length(subtract(originalStart.position,candidateStart.position)),
+                length(subtract(originalEnd.position,candidateEnd.position))),
+            .tangent=std::max(
+                length(subtract(originalStart.tangent,candidateStart.tangent)),
+                length(subtract(originalEnd.tangent,candidateEnd.tangent))),
+            .curvature=std::max(
+                length(subtract(originalStart.curvature,candidateStart.curvature)),
+                length(subtract(originalEnd.curvature,candidateEnd.curvature))),
+        };
+    }
+
+    void writeOptimizationReport(const Snapshot &snapshot,const double programmedScale,
+            const double maximumSourceDeviationInP,const std::filesystem::path &outputPath) {
+        if(!std::isfinite(programmedScale)||programmedScale<=0.0)
+            throw std::runtime_error("programmed scale must be positive and finite");
+        if(!std::isfinite(maximumSourceDeviationInP)||maximumSourceDeviationInP<=0.0)
+            throw std::runtime_error("maximum source deviation must be positive and finite");
+        std::ofstream output(outputPath,std::ios::trunc);
+        output.precision(17);
+        output<<"id,horizon,first_source,last_source,controls,spans,eligible,improved,"
+            "source_length,original_length,optimized_length,length_change,"
+            "original_max_curvature,optimized_max_curvature,curvature_ratio,"
+            "original_max_normal_qs,optimized_max_normal_qs,normal_qs_ratio,"
+            "jerk_limited_speed_gain,original_integrated_normal_qs,"
+            "optimized_integrated_normal_qs,integrated_normal_qs_ratio,"
+            "original_source_deviation,optimized_source_deviation,deviation_limit,"
+            "endpoint_position_error,endpoint_tangent_error,endpoint_curvature_error,"
+            "candidate_evaluations,accepted_candidates,budget_exhausted,"
+            "retained,final_deviation_rejected,final_curvature_rejected,"
+            "final_objective_rejected,"
+            "optimization_seconds\n";
+        auto improvedCount=std::size_t{0};
+        auto eligibleCount=std::size_t{0};
+        auto regressionCount=std::size_t{0};
+        auto maximumGain=1.0;
+        auto totalSeconds=0.0;
+        for(const auto &spline:snapshot.splines) {
+            // Six-control splines are ordinary two-entity junction blends. This
+            // experiment targets only the variable-control short-entity splines.
+            if(spline.controls.size()<=6) continue;
+            const auto source=sourceCompositeFor(snapshot,spline);
+            const auto original=measure(spline);
+            const auto optimized=optimizePhysicalJerk(
+                original,source,programmedScale,maximumSourceDeviationInP);
+            const auto errors=endpointErrors(original.spline,optimized.measurement.spline);
+            const auto eligible=true;
+            const auto improved=optimized.retained
+                &&optimized.measurement.maximumNormalCurvatureDerivative
+                <original.maximumNormalCurvatureDerivative*(1.0-1e-10)
+                &&optimized.measurement.integratedNormalCurvatureDerivative
+                <original.integratedNormalCurvatureDerivative*(1.0-1e-10);
+            const auto curvatureRatio=original.maximumCurvature>0.0
+                ?optimized.measurement.maximumCurvature/original.maximumCurvature:1.0;
+            const auto peakRatio=original.maximumNormalCurvatureDerivative>0.0
+                ?optimized.measurement.maximumNormalCurvatureDerivative
+                    /original.maximumNormalCurvatureDerivative:1.0;
+            const auto integralRatio=original.integratedNormalCurvatureDerivative>0.0
+                ?optimized.measurement.integratedNormalCurvatureDerivative
+                    /original.integratedNormalCurvatureDerivative:1.0;
+            const auto speedGain=peakRatio>0.0?std::cbrt(1.0/peakRatio):1.0;
+            const auto deviationLimit=programmedScale*maximumSourceDeviationInP;
+            const auto regressed=improved&&(optimized.maximumSourceDeviation>
+                    deviationLimit*(1.0+1e-9)
+                ||curvatureRatio>1.02*(1.0+1e-9)
+                ||errors.position>1e-10||errors.tangent>1e-10||errors.curvature>1e-8);
+            eligibleCount+=eligible;
+            improvedCount+=improved;
+            regressionCount+=regressed;
+            maximumGain=std::max(maximumGain,speedGain);
+            totalSeconds+=optimized.computationSeconds;
+            output<<spline.id<<','<<spline.horizon<<','<<spline.firstSource<<','
+                <<spline.lastSource<<','<<spline.controls.size()<<','
+                <<spline.controls.size()-3<<','<<eligible<<','<<improved<<','
+                <<source.length<<','<<optimized.originalLength<<','
+                <<optimized.candidateLength<<','
+                <<optimized.candidateLength-optimized.originalLength<<','
+                <<original.maximumCurvature<<','<<optimized.measurement.maximumCurvature<<','
+                <<curvatureRatio<<','<<original.maximumNormalCurvatureDerivative<<','
+                <<optimized.measurement.maximumNormalCurvatureDerivative<<','<<peakRatio<<','
+                <<speedGain<<','<<original.integratedNormalCurvatureDerivative<<','
+                <<optimized.measurement.integratedNormalCurvatureDerivative<<','
+                <<integralRatio<<','<<optimized.originalSourceDeviation<<','
+                <<optimized.maximumSourceDeviation<<','<<deviationLimit<<','
+                <<errors.position<<','<<errors.tangent<<','<<errors.curvature<<','
+                <<optimized.candidateEvaluations<<','<<optimized.acceptedCandidates<<','
+                <<optimized.budgetExhausted<<','<<optimized.retained<<','
+                <<optimized.finalDeviationRejected<<','
+                <<optimized.finalCurvatureRejected<<','
+                <<optimized.finalObjectiveRejected<<','
+                <<optimized.computationSeconds<<'\n';
+        }
+        output.flush();
+        if(!output) throw std::runtime_error("incomplete optimization report write");
+        std::cout<<"optimized "<<eligibleCount<<" variable-control short-entity splines from "
+            <<snapshot.splines.size()<<" captured splines ("<<improvedCount<<" improved, "
+            <<regressionCount<<" regressions) into "<<outputPath.string()
+            <<"; maximum theoretical local jerk-limited speed gain "<<maximumGain
+            <<"; optimizer time "<<totalSeconds<<" s\n";
+    }
+
+    void writeHalfEntityControlReport(const Snapshot &snapshot,
+            const std::filesystem::path &outputPath) {
+        std::ofstream output(outputPath,std::ios::trunc);
+        output.precision(17);
+        output<<"id,horizon,first_source,last_source,interior_entities,"
+            "original_controls,half_entity_controls,original_spans,half_entity_spans,"
+            "original_max_curvature,half_entity_max_curvature,curvature_ratio,"
+            "original_max_qs,half_entity_max_qs,max_qs_ratio,"
+            "original_max_qs_parameter,half_entity_max_qs_parameter,"
+            "original_max_normal_qs,half_entity_max_normal_qs,normal_qs_ratio,"
+            "original_max_normal_qs_parameter,half_entity_max_normal_qs_parameter,"
+            "half_entity_peak_distance_to_knot,"
+            "jerk_limited_speed_gain,original_integrated_normal_qs,"
+            "half_entity_integrated_normal_qs,integrated_normal_qs_ratio,"
+            "original_min_parameter_speed,half_entity_min_parameter_speed,"
+            "source_length,original_length,half_entity_length,length_change,"
+            "original_source_deviation,half_entity_source_deviation,"
+            "endpoint_position_error,endpoint_tangent_error,endpoint_curvature_error\n";
+        auto count=std::size_t{0};
+        auto lowerPeakCount=std::size_t{0};
+        auto lowerNormalPeakCount=std::size_t{0};
+        auto lowerIntegralCount=std::size_t{0};
+        auto maximumSpeedGain=0.0;
+        for(const auto &spline:snapshot.splines) {
+            if(spline.controls.size()<=6||spline.lastSource<=spline.firstSource+1)
+                continue;
+            const auto source=sourceCompositeFor(snapshot,spline);
+            const auto candidateSpline=halfEntityControlSpline(snapshot,spline);
+            const auto original=measure(spline);
+            const auto candidate=measure(candidateSpline);
+            const auto originalDeviation=orderedSourceDeviation(spline,source,256);
+            const auto candidateDeviation=orderedSourceDeviation(candidateSpline,source,256);
+            const auto errors=endpointErrors(spline,candidateSpline);
+            const auto curvatureRatio=original.maximumCurvature>0.0
+                ?candidate.maximumCurvature/original.maximumCurvature:1.0;
+            const auto derivativeRatio=original.maximumCurvatureDerivative>0.0
+                ?candidate.maximumCurvatureDerivative
+                    /original.maximumCurvatureDerivative:1.0;
+            const auto normalRatio=original.maximumNormalCurvatureDerivative>0.0
+                ?candidate.maximumNormalCurvatureDerivative
+                    /original.maximumNormalCurvatureDerivative:1.0;
+            const auto integralRatio=original.integratedNormalCurvatureDerivative>0.0
+                ?candidate.integratedNormalCurvatureDerivative
+                    /original.integratedNormalCurvatureDerivative:1.0;
+            const auto speedGain=normalRatio>0.0
+                ?std::cbrt(1.0/normalRatio):std::numeric_limits<double>::infinity();
+            ++count;
+            lowerPeakCount+=derivativeRatio<1.0;
+            lowerNormalPeakCount+=normalRatio<1.0;
+            lowerIntegralCount+=integralRatio<1.0;
+            maximumSpeedGain=std::max(maximumSpeedGain,speedGain);
+            output<<spline.id<<','<<spline.horizon<<','<<spline.firstSource<<','
+                <<spline.lastSource<<','
+                <<spline.lastSource-spline.firstSource-1<<','
+                <<spline.controls.size()<<','<<candidateSpline.controls.size()<<','
+                <<spline.controls.size()-3<<','<<candidateSpline.controls.size()-3<<','
+                <<original.maximumCurvature<<','<<candidate.maximumCurvature<<','
+                <<curvatureRatio<<','<<original.maximumCurvatureDerivative<<','
+                <<candidate.maximumCurvatureDerivative<<','<<derivativeRatio<<','
+                <<original.maximumCurvatureDerivativeParameter<<','
+                <<candidate.maximumCurvatureDerivativeParameter<<','
+                <<original.maximumNormalCurvatureDerivative<<','
+                <<candidate.maximumNormalCurvatureDerivative<<','<<normalRatio<<','
+                <<original.maximumNormalCurvatureDerivativeParameter<<','
+                <<candidate.maximumNormalCurvatureDerivativeParameter<<','
+                <<std::abs(candidate.maximumNormalCurvatureDerivativeParameter
+                    -std::round(candidate.maximumNormalCurvatureDerivativeParameter))<<','
+                <<speedGain<<','<<original.integratedNormalCurvatureDerivative<<','
+                <<candidate.integratedNormalCurvatureDerivative<<','<<integralRatio<<','
+                <<original.minimumParameterSpeed<<','<<candidate.minimumParameterSpeed<<','
+                <<source.length<<','<<originalDeviation.candidateLength<<','
+                <<candidateDeviation.candidateLength<<','
+                <<candidateDeviation.candidateLength-originalDeviation.candidateLength<<','
+                <<originalDeviation.maximum<<','<<candidateDeviation.maximum<<','
+                <<errors.position<<','<<errors.tangent<<','<<errors.curvature<<'\n';
+        }
+        output.flush();
+        if(!output) throw std::runtime_error("incomplete half-entity control report write");
+        std::cout<<"reconstructed "<<count
+            <<" variable-control short-entity splines with one interior control per two "
+            <<"entities (rounded up) into "<<outputPath.string()<<"; lower total peak q_s="
+            <<lowerPeakCount<<", lower normal peak q_s="<<lowerNormalPeakCount
+            <<", lower integrated normal q_s="<<lowerIntegralCount
+            <<", maximum theoretical local jerk-limited speed gain="
+            <<maximumSpeedGain<<'\n';
+    }
+
+    struct CurvatureDerivativeProfilePoint {
+        double distanceFraction=0.0;
+        double normalDerivative=0.0;
+    };
+
+    std::vector<CurvatureDerivativeProfilePoint> curvatureDerivativeProfile(
+            const Spline &spline) {
+        constexpr std::size_t SAMPLES_PER_SPAN=128;
+        const auto spans=spline.controls.size()-3;
+        const auto sampleCount=spans*SAMPLES_PER_SPAN;
+        const SplineEvaluator evaluator(spline);
+        std::vector<CurvatureDerivativeProfilePoint> result;
+        result.reserve(sampleCount+1);
+        Point previous{};
+        for(std::size_t sample=0;sample<=sampleCount;++sample) {
+            const auto parameter=static_cast<double>(spans)*sample/sampleCount;
+            const auto geometry=evaluator.at(parameter);
+            const auto tangential=dot(geometry.tangent,geometry.curvatureDerivative);
+            const auto normal=length(subtract(geometry.curvatureDerivative,
+                scaled(geometry.tangent,tangential)));
+            const auto distance=sample==0?0.0:result.back().distanceFraction
+                +length(subtract(geometry.position,previous));
+            result.push_back({distance,normal});
+            previous=geometry.position;
+        }
+        const auto total=result.back().distanceFraction;
+        for(auto &point:result) point.distanceFraction/=total;
+        return result;
+    }
+
+    void writeHalfEntityProfile(const Snapshot &snapshot,const std::size_t splineId,
+            const std::filesystem::path &basePath) {
+        const auto found=std::ranges::find(snapshot.splines,splineId,&Spline::id);
+        if(found==snapshot.splines.end()) throw std::runtime_error("requested spline ID not found");
+        const auto candidate=halfEntityControlSpline(snapshot,*found);
+        const auto originalProfile=curvatureDerivativeProfile(*found);
+        const auto candidateProfile=curvatureDerivativeProfile(candidate);
+        const auto originalPeak=std::ranges::max(originalProfile,{},
+            &CurvatureDerivativeProfilePoint::normalDerivative).normalDerivative;
+        const auto candidatePeak=std::ranges::max(candidateProfile,{},
+            &CurvatureDerivativeProfilePoint::normalDerivative).normalDerivative;
+        const auto maximum=std::max(originalPeak,candidatePeak);
+
+        auto csvPath=basePath;
+        csvPath.replace_extension("csv");
+        std::ofstream csv(csvPath,std::ios::trunc);
+        csv.precision(17);
+        csv<<"series,distance_fraction,normal_curvature_derivative\n";
+        for(const auto &point:originalProfile)
+            csv<<"production,"<<point.distanceFraction<<','<<point.normalDerivative<<'\n';
+        for(const auto &point:candidateProfile)
+            csv<<"half_entity,"<<point.distanceFraction<<','<<point.normalDerivative<<'\n';
+        csv.flush();
+        if(!csv) throw std::runtime_error("incomplete half-entity profile CSV write");
+
+        auto svgPath=basePath;
+        svgPath.replace_extension("svg");
+        std::ofstream svg(svgPath,std::ios::trunc);
+        constexpr double WIDTH=1200.0,HEIGHT=660.0,LEFT=105.0,RIGHT=35.0;
+        constexpr double TOP=85.0,BOTTOM=95.0;
+        const auto plotWidth=WIDTH-LEFT-RIGHT;
+        const auto plotHeight=HEIGHT-TOP-BOTTOM;
+        const auto x=[&](const double fraction) { return LEFT+plotWidth*fraction; };
+        const auto y=[&](const double derivative) {
+            return TOP+plotHeight*(1.0-derivative/maximum);
+        };
+        svg<<"<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"1200\" height=\"660\" "
+            "viewBox=\"0 0 1200 660\"><rect width=\"1200\" height=\"660\" fill=\"white\"/>"
+            "<style>text{font-family:Segoe UI,Arial,sans-serif;fill:#222}.grid{stroke:#ddd;stroke-width:1}"
+            ".axis{stroke:#222;stroke-width:1.4}.production{fill:none;stroke:#222;stroke-width:1.7}"
+            ".half{fill:none;stroke:#d62728;stroke-width:1.8}</style>";
+        svg<<"<text x=\""<<LEFT<<"\" y=\"30\" font-size=\"22\" font-weight=\"600\">"
+            "Slow trochoid spline "<<splineId<<": normal curvature derivative</text>"
+            "<text x=\""<<LEFT<<"\" y=\"57\" font-size=\"14\">Production peak "
+            <<originalPeak<<"; half-entity peak "<<candidatePeak<<" (ratio "
+            <<candidatePeak/originalPeak<<")</text>";
+        for(unsigned grid=0;grid<=5;++grid) {
+            const auto value=maximum*grid/5.0;
+            const auto py=y(value);
+            svg<<"<line class=\"grid\" x1=\""<<LEFT<<"\" y1=\""<<py
+                <<"\" x2=\""<<WIDTH-RIGHT<<"\" y2=\""<<py<<"\"/>"
+                "<text x=\""<<LEFT-10<<"\" y=\""<<py+5
+                <<"\" font-size=\"12\" text-anchor=\"end\">"<<value<<"</text>";
+            const auto fraction=static_cast<double>(grid)/5.0;
+            const auto px=x(fraction);
+            svg<<"<line class=\"grid\" x1=\""<<px<<"\" y1=\""<<TOP
+                <<"\" x2=\""<<px<<"\" y2=\""<<TOP+plotHeight<<"\"/>"
+                "<text x=\""<<px<<"\" y=\""<<TOP+plotHeight+24
+                <<"\" font-size=\"12\" text-anchor=\"middle\">"<<fraction<<"</text>";
+        }
+        svg<<"<line class=\"axis\" x1=\""<<LEFT<<"\" y1=\""<<TOP
+            <<"\" x2=\""<<LEFT<<"\" y2=\""<<TOP+plotHeight<<"\"/>"
+            "<line class=\"axis\" x1=\""<<LEFT<<"\" y1=\""<<TOP+plotHeight
+            <<"\" x2=\""<<WIDTH-RIGHT<<"\" y2=\""<<TOP+plotHeight<<"\"/>";
+        const auto polyline=[&](const std::string_view css,
+                                const std::vector<CurvatureDerivativeProfilePoint> &profile) {
+            svg<<"<polyline class=\""<<css<<"\" points=\"";
+            for(const auto &point:profile)
+                svg<<x(point.distanceFraction)<<','<<y(point.normalDerivative)<<' ';
+            svg<<"\"/>";
+        };
+        polyline("production",originalProfile);
+        polyline("half",candidateProfile);
+        svg<<"<text x=\"600\" y=\"625\" font-size=\"15\" text-anchor=\"middle\">"
+            "Normalized distance along spline</text>"
+            "<text x=\"22\" y=\"330\" font-size=\"15\" text-anchor=\"middle\" "
+            "transform=\"rotate(-90 22 330)\">Normal curvature derivative</text>"
+            "<line class=\"production\" x1=\"760\" y1=\"620\" x2=\"800\" y2=\"620\"/>"
+            "<text x=\"810\" y=\"625\" font-size=\"13\">production</text>"
+            "<line class=\"half\" x1=\"930\" y1=\"620\" x2=\"970\" y2=\"620\"/>"
+            "<text x=\"980\" y=\"625\" font-size=\"13\">half-entity controls</text></svg>";
+        svg.flush();
+        if(!svg) throw std::runtime_error("incomplete half-entity profile SVG write");
+        std::cout<<"wrote half-entity curvature-derivative comparison to "
+            <<csvPath.string()<<" and "<<svgPath.string()<<'\n';
+    }
+
+    Snapshot readSnapshot(const std::filesystem::path &path) {
         std::ifstream input(path);
         if(!input) throw std::runtime_error("could not open geometry snapshot");
         std::string word;
@@ -558,16 +1192,28 @@ namespace {
         if(word!="ngc_spline_geometry_v1") throw std::runtime_error("unsupported snapshot");
         std::size_t primitiveCount=0;
         input>>word>>primitiveCount;
+        if(word!="primitive_count") throw std::runtime_error("malformed primitive count");
+        Snapshot result;
+        result.primitives.reserve(primitiveCount);
         for(std::size_t primitive=0;primitive<primitiveCount;++primitive) {
-            input>>word;
-            const auto values=word=="line"?14U:20U;
-            double ignored=0.0;
-            for(unsigned value=0;value<values;++value) input>>ignored;
+            Primitive value;
+            input>>word>>value.id>>value.feed;
+            if(word!="line"&&word!="arc")
+                throw std::runtime_error("malformed captured primitive");
+            value.arc=word=="arc";
+            for(auto &coordinate:value.start) input>>coordinate;
+            for(auto &coordinate:value.end) input>>coordinate;
+            if(value.arc) {
+                for(auto &coordinate:value.center) input>>coordinate;
+                for(auto &coordinate:value.axis) input>>coordinate;
+            }
+            value.prepare();
+            result.primitives.push_back(std::move(value));
         }
         std::size_t splineCount=0;
         input>>word>>splineCount;
-        std::vector<Spline> result;
-        result.reserve(splineCount);
+        if(word!="spline_count") throw std::runtime_error("malformed spline count");
+        result.splines.reserve(splineCount);
         for(std::size_t index=0;index<splineCount;++index) {
             Spline spline;
             std::size_t controlCount=0,boundaryCount=0;
@@ -584,7 +1230,7 @@ namespace {
             if(word!="boundaries") throw std::runtime_error("malformed boundary record");
             spline.boundaries.resize(boundaryCount);
             for(auto &boundary:spline.boundaries) input>>boundary;
-            result.push_back(std::move(spline));
+            result.splines.push_back(std::move(spline));
         }
         if(!input) throw std::runtime_error("incomplete geometry snapshot");
         return result;
@@ -597,12 +1243,14 @@ int main(const int argc,char **argv) {
             const auto splineId=std::stoull(argv[3]);
             const auto feedPerMinute=std::stod(argv[4]);
             const auto maximumCurveDeviationInP=std::stod(argv[5]);
-            const auto splines=readSnapshot(argv[1]);
-            const auto found=std::ranges::find(splines,splineId,&Spline::id);
-            if(found==splines.end()) throw std::runtime_error("requested spline ID not found");
+            const auto snapshot=readSnapshot(argv[1]);
+            const auto found=std::ranges::find(snapshot.splines,splineId,&Spline::id);
+            if(found==snapshot.splines.end())
+                throw std::runtime_error("requested spline ID not found");
             const auto original=measure(*found);
+            const auto source=sourceCompositeFor(snapshot,*found);
             const auto optimized=optimizePhysicalJerk(
-                original,0.005,maximumCurveDeviationInP);
+                original,source,0.005,maximumCurveDeviationInP);
             writeFeedProfile(optimized.measurement.spline,feedPerMinute,argv[6]);
             const SplineEvaluator originalEvaluator(original.spline);
             const SplineEvaluator optimizedEvaluator(optimized.measurement.spline);
@@ -617,7 +1265,8 @@ int main(const int argc,char **argv) {
                 <<optimized.measurement.maximumNormalCurvatureDerivative
                 <<"; integral "<<original.integratedNormalCurvatureDerivative
                 <<" -> "<<optimized.measurement.integratedNormalCurvatureDerivative
-                <<"; maximum curve deviation "<<optimized.maximumCurveDeviation
+                <<"; original source deviation "<<optimized.originalSourceDeviation
+                <<"; maximum source deviation "<<optimized.maximumSourceDeviation
                 <<"; endpoint errors position="<<std::max(
                     length(subtract(originalStart.position,optimizedStart.position)),
                     length(subtract(originalEnd.position,optimizedEnd.position)))
@@ -633,9 +1282,10 @@ int main(const int argc,char **argv) {
             const auto splineId=std::stoull(argv[3]);
             const auto feedPerMinute=std::stod(argv[4]);
             const auto maximumDisplacementInP=std::stod(argv[5]);
-            const auto splines=readSnapshot(argv[1]);
-            const auto found=std::ranges::find(splines,splineId,&Spline::id);
-            if(found==splines.end()) throw std::runtime_error("requested spline ID not found");
+            const auto snapshot=readSnapshot(argv[1]);
+            const auto found=std::ranges::find(snapshot.splines,splineId,&Spline::id);
+            if(found==snapshot.splines.end())
+                throw std::runtime_error("requested spline ID not found");
             const auto original=measure(*found);
             const auto relaxed=relaxInteriorControls(
                 original,0.005,maximumDisplacementInP);
@@ -650,10 +1300,29 @@ int main(const int argc,char **argv) {
         if(argc==6&&std::string_view(argv[2])=="--profile") {
             const auto splineId=std::stoull(argv[3]);
             const auto feedPerMinute=std::stod(argv[4]);
-            const auto splines=readSnapshot(argv[1]);
-            const auto found=std::ranges::find(splines,splineId,&Spline::id);
-            if(found==splines.end()) throw std::runtime_error("requested spline ID not found");
+            const auto snapshot=readSnapshot(argv[1]);
+            const auto found=std::ranges::find(snapshot.splines,splineId,&Spline::id);
+            if(found==snapshot.splines.end())
+                throw std::runtime_error("requested spline ID not found");
             writeFeedProfile(*found,feedPerMinute,argv[5]);
+            return 0;
+        }
+        if(argc==6&&std::string_view(argv[2])=="--optimize-all") {
+            const auto programmedScale=std::stod(argv[3]);
+            const auto maximumSourceDeviationInP=std::stod(argv[4]);
+            const auto snapshot=readSnapshot(argv[1]);
+            writeOptimizationReport(snapshot,programmedScale,
+                maximumSourceDeviationInP,argv[5]);
+            return 0;
+        }
+        if(argc==4&&std::string_view(argv[2])=="--half-entity-controls") {
+            const auto snapshot=readSnapshot(argv[1]);
+            writeHalfEntityControlReport(snapshot,argv[3]);
+            return 0;
+        }
+        if(argc==5&&std::string_view(argv[2])=="--profile-half-entity") {
+            const auto snapshot=readSnapshot(argv[1]);
+            writeHalfEntityProfile(snapshot,std::stoull(argv[3]),argv[4]);
             return 0;
         }
         if(argc<2||argc>4) {
@@ -666,16 +1335,23 @@ int main(const int argc,char **argv) {
                 "<output-base>\n"
                 "       ngc_spline_geometry_analyzer <snapshot.txt> --profile-optimized "
                 "<spline-id> <feed-per-minute> <maximum-curve-deviation-in-P> "
-                "<output-base>\n";
+                "<output-base>\n"
+                "       ngc_spline_geometry_analyzer <snapshot.txt> --optimize-all "
+                "<programmed-scale> <maximum-source-deviation-in-P> <output.csv>\n"
+                "       ngc_spline_geometry_analyzer <snapshot.txt> "
+                "--half-entity-controls <output.csv>\n"
+                "       ngc_spline_geometry_analyzer <snapshot.txt> "
+                "--profile-half-entity <spline-id> <output-base>\n";
             return 2;
         }
         const auto maximumDisplacementInP=argc==4?std::stod(argv[3]):0.20;
         if(!std::isfinite(maximumDisplacementInP)||maximumDisplacementInP<=0.0)
             throw std::runtime_error("maximum displacement must be positive and finite");
-        auto splines=readSnapshot(argv[1]);
+        auto snapshot=readSnapshot(argv[1]);
         std::vector<Measurement> measurements;
-        measurements.reserve(splines.size());
-        for(auto &spline:splines) measurements.push_back(measure(std::move(spline)));
+        measurements.reserve(snapshot.splines.size());
+        for(auto &spline:snapshot.splines)
+            measurements.push_back(measure(std::move(spline)));
         std::vector<Measurement> relaxed;
         relaxed.reserve(measurements.size());
         for(const auto &measurement:measurements)

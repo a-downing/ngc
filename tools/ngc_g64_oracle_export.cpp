@@ -50,6 +50,128 @@ namespace {
         std::vector<double> pieceBoundaries;
     };
 
+    void printTimeLawDiagnostics(const std::string_view label,
+                                 const ngc::TimeLawDiagnostics &diagnostics) {
+        const auto total=ngc::totalTimeLawCalls(diagnostics);
+        const auto category=[](const ngc::TimeLawCallDiagnostics &value) {
+            return std::format("{}/{}/{}/{}/{}/{}/{}/{}/{}@{}s",value.calls,
+                value.successes,value.failures,value.solverCalls,value.cacheHits,
+                value.cacheMisses,value.cacheCollisions,value.cacheMaterializations,
+                value.correctionPassCalls,value.seconds);
+        };
+        std::cout<<std::format(
+            "{} timeLawBetween total calls={} successes={} failures={} solver calls={} "
+            "cache hits={} misses={} collisions={} materializations={} correction-pass calls={} "
+            "measured={} s; categories "
+            "(calls/successes/failures/solver/hits/misses/collisions/materializations/"
+            "correction@seconds) "
+            "exact-stop={} seed={} current={} cap={} bracket={}\n",
+            label,total.calls,total.successes,total.failures,total.solverCalls,total.cacheHits,
+            total.cacheMisses,total.cacheCollisions,total.cacheMaterializations,
+            total.correctionPassCalls,total.seconds,category(diagnostics.exactStop),
+            category(diagnostics.continuousSeed),category(diagnostics.stationCurrentVelocity),
+            category(diagnostics.stationCapVelocity),
+            category(diagnostics.stationVelocityBracket));
+        const auto &endpoints=diagnostics.endpointFeasibility;
+        std::cout<<std::format(
+            "{} endpoint feasibility cached geometry={} candidate checks={} "
+            "acceleration rejections={} jerk rejections={}\n",label,
+            endpoints.cachedGeometryEndpoints,endpoints.candidateChecks,
+            endpoints.accelerationRejections,endpoints.jerkRejections);
+        const auto &passes=diagnostics.correctionPassLocality;
+        std::size_t comparedPieces=0;
+        std::size_t correctedPieces=0;
+        std::size_t changedStations=0;
+        std::size_t changedPieceTimings=0;
+        std::size_t changedUncorrectedPieceTimings=0;
+        std::size_t changedPieceTimingRuns=0;
+        std::size_t reusablePieceTimings=0;
+        std::size_t reusablePieceTimingRuns=0;
+        std::size_t reusableEdgePieces=0;
+        std::size_t maximumLeftPropagation=0;
+        std::size_t maximumRightPropagation=0;
+        std::size_t maximumNearestPropagation=0;
+        std::size_t maximumChangedRun=0;
+        std::size_t maximumReusableRun=0;
+        for(const auto &pass:passes) {
+            comparedPieces+=pass.pieceCount;
+            correctedPieces+=pass.correctedPieces;
+            changedStations+=pass.changedStations;
+            changedPieceTimings+=pass.changedPieceTimings;
+            changedUncorrectedPieceTimings+=pass.changedUncorrectedPieceTimings;
+            changedPieceTimingRuns+=pass.changedPieceTimingRuns;
+            reusablePieceTimings+=pass.bitExactReusablePieceTimings;
+            reusablePieceTimingRuns+=pass.bitExactReusablePieceTimingRuns;
+            reusableEdgePieces+=pass.bitExactReusablePrefixPieces
+                +pass.bitExactReusableSuffixPieces;
+            maximumLeftPropagation=std::max(
+                maximumLeftPropagation,pass.leftPropagationPieces);
+            maximumRightPropagation=std::max(
+                maximumRightPropagation,pass.rightPropagationPieces);
+            maximumNearestPropagation=std::max(maximumNearestPropagation,
+                pass.maximumPropagationFromCorrectedPiece);
+            maximumChangedRun=std::max(
+                maximumChangedRun,pass.maximumChangedPieceTimingRun);
+            maximumReusableRun=std::max(maximumReusableRun,
+                pass.maximumBitExactReusablePieceTimingRun);
+        }
+        std::cout<<std::format(
+            "{} correction locality replans={} compared pieces={} corrected pieces={} "
+            "changed stations={} changed piece timings={} uncorrected changes={} "
+            "changed runs={} max changed run={}; bit-exact reusable timings={} ({}%) "
+            "reusable runs={} max reusable run={}; reusable edge pieces={} ({}%); "
+            "max propagation left={} right={} nearest={}\n",
+            label,passes.size(),comparedPieces,correctedPieces,changedStations,
+            changedPieceTimings,changedUncorrectedPieceTimings,changedPieceTimingRuns,
+            maximumChangedRun,reusablePieceTimings,
+            comparedPieces?100.0*reusablePieceTimings/comparedPieces:0.0,
+            reusablePieceTimingRuns,maximumReusableRun,reusableEdgePieces,
+            comparedPieces?100.0*reusableEdgePieces/comparedPieces:0.0,
+            maximumLeftPropagation,maximumRightPropagation,maximumNearestPropagation);
+        const auto &replay=diagnostics.stationVisitReplay;
+        std::cout<<std::format(
+            "{} station replay shadow active visits={} comparable={} exact inputs={} "
+            "exact outputs={} output mismatches={}; potential candidate evaluations={} "
+            "endpoint checks={} timeLaw calls={} ({}% of correction calls) solver calls={} "
+            "({}% of all solver calls) materializations={} timeLaw={} s visit={} s\n",
+            label,replay.activeVisits,replay.comparableVisits,replay.exactInputMatches,
+            replay.exactOutputMatches,replay.outputMismatches,
+            replay.potentialCandidateEvaluations,replay.potentialEndpointChecks,
+            replay.potentialTimeLawCalls,
+            total.correctionPassCalls
+                ?100.0*replay.potentialTimeLawCalls/total.correctionPassCalls:0.0,
+            replay.potentialSolverCalls,
+            total.solverCalls?100.0*replay.potentialSolverCalls/total.solverCalls:0.0,
+            replay.potentialMaterializations,replay.potentialTimeLawSeconds,
+            replay.potentialVisitSeconds);
+    }
+
+    void printCorrectionPassDetails(const std::string_view label,
+            const ngc::TimeLawDiagnostics &diagnostics) {
+        for(const auto &pass:diagnostics.correctionPassLocality)
+            std::cout<<std::format(
+                "{} correction pass={} pieces={} corrected={} corrected_range=[{},{}] "
+                "changed_stations={} station_range=[{},{}] changed_timings={} "
+                "uncorrected_changes={} changed_runs={} max_changed_run={} "
+                "timing_range=[{},{}] reusable={} reusable_runs={} max_reusable_run={} "
+                "reusable_edges=[{},{}] propagation=[left={} right={} nearest={}] "
+                "max_delta=[v={} a={} duration={}]\n",
+                label,pass.pass,pass.pieceCount,pass.correctedPieces,
+                pass.firstCorrectedPiece,pass.lastCorrectedPiece,
+                pass.changedStations,pass.firstChangedStation,pass.lastChangedStation,
+                pass.changedPieceTimings,pass.changedUncorrectedPieceTimings,
+                pass.changedPieceTimingRuns,pass.maximumChangedPieceTimingRun,
+                pass.firstChangedPieceTiming,
+                pass.lastChangedPieceTiming,pass.bitExactReusablePieceTimings,
+                pass.bitExactReusablePieceTimingRuns,
+                pass.maximumBitExactReusablePieceTimingRun,
+                pass.bitExactReusablePrefixPieces,pass.bitExactReusableSuffixPieces,
+                pass.leftPropagationPieces,pass.rightPropagationPieces,
+                pass.maximumPropagationFromCorrectedPiece,
+                pass.maximumVelocityChange,pass.maximumAccelerationChange,
+                pass.maximumDurationChange);
+    }
+
     void writePieceTimingSnapshot(const std::filesystem::path &modelPath,
                                   const std::vector<PlannedPieceTrace> &pieces) {
         auto path=modelPath;
@@ -283,6 +405,27 @@ namespace {
             const std::string_view argument) {
         if(argument.empty()||argument=="--effort=current")
             return {"current",{}};
+        if(argument=="--effort=replay-shadow")
+            return {"replay-shadow",{
+                .measureStationVisitReplay=true,
+                .enableStationVisitReplay=false,
+            }};
+        if(argument=="--effort=replay")
+            return {"replay",{
+                .enableStationVisitReplay=true,
+            }};
+        if(argument=="--effort=no-replay")
+            return {"no-replay",{
+                .enableStationVisitReplay=false,
+            }};
+        if(argument=="--effort=global-time-cache")
+            return {"global-time-cache",{
+                .shareTimeLawCacheAcrossCompilations=true,
+            }};
+        if(argument=="--effort=local-time-cache")
+            return {"local-time-cache",{
+                .shareTimeLawCacheAcrossCompilations=false,
+            }};
         if(argument=="--effort=derivative125")
             return {"derivative125",{
                 .curvatureDerivativeVelocityCapMultiplier=1.25,
@@ -559,7 +702,7 @@ int main(const int argc,char **argv) {
         if(argc<3||argc>8) {
             std::cerr<<"usage: ngc_g64_oracle_export <program.ngc> <model.txt> "
                 "[machine.toml] [jerk-multiplier] [--rolling|--rolling-only] "
-                "[--effort=current|derivative125|derivative150|derivative200|derivative250|derivative300|no-derivative-cap|velocity6|velocity8|velocity10|velocity12|combined|combined20|combined40|medium|high|extreme] "
+                "[--effort=current|replay|no-replay|replay-shadow|global-time-cache|local-time-cache|derivative125|derivative150|derivative200|derivative250|derivative300|no-derivative-cap|velocity6|velocity8|velocity10|velocity12|combined|combined20|combined40|medium|high|extreme] "
                 "[--trace-slow]\n";
             return 2;
         }
@@ -583,6 +726,24 @@ int main(const int argc,char **argv) {
             if(consumed!=std::string_view(argv[4]).size()||!std::isfinite(jerkMultiplier)
                ||jerkMultiplier<=0.0)
                 throw std::runtime_error("jerk multiplier must be a finite positive number");
+        }
+        if(jerkMultiplier>1.0) {
+            // High-jerk sweeps can require more local proof/correction work.
+            // Keep production defaults unchanged and retain finite offline
+            // ceilings for these explicit exporter experiments.
+            // adaptive.ngc converged at 35 passes and 266,655 cumulative
+            // attempts across 2,893 pieces (about 92.17 per piece). These
+            // ceilings retain 37% pass and 12.8% geometry headroom.
+            effort.maximumLocalCorrectionPasses=48;
+            effort.geometryVerificationBudgetMultiplier=104;
+            if(jerkMultiplier>=100.0) {
+                // The much larger adaptive_pockets.ngc 100x horizon still
+                // corrects real emitted acceleration violations at pass 47.
+                // Use the library's bounded offline maximum for this extreme
+                // sweep; failure remains fatal at either ceiling.
+                effort.maximumLocalCorrectionPasses=128;
+                effort.geometryVerificationBudgetMultiplier=256;
+            }
         }
         const auto configuration=ngc::loadMachineConfiguration(configurationPath);
         if(!configuration) throw std::runtime_error(configuration.error());
@@ -711,7 +872,11 @@ int main(const int argc,char **argv) {
                 "last horizon calculation={} s; "
                 "maximum horizon calculation={} s; published horizon calculation={} s; "
                 "rolling search calculation={} s; total planning calculation={} s; "
-                "boundary candidates={} suffix failures={} prefix failures={}{}\n",
+                "boundary candidates={} suffix failures={} prefix failures={}; "
+                "published spline inverse queries={} endpoints={} exact cache hits={} "
+                "construction integrals={} inverse integrals={} Newton iterations={}; "
+                "published arc inverse queries={} endpoints={} exact cache hits={} "
+                "construction integrals={} inverse integrals={} Newton iterations={}{}\n",
                 effortName,trajectoryLimits.lookaheadDuration,horizons,chunks,
                 diagnostics.plannedDuration,
                 delta,percent,diagnostics.firstContinuousHorizonSeconds,
@@ -723,8 +888,26 @@ int main(const int argc,char **argv) {
                 diagnostics.rollingBoundaryCandidates,
                 diagnostics.rollingSuffixProbeFailures,
                 diagnostics.rollingPrefixProbeFailures,
+                diagnostics.publishedSplineInverse.queries,
+                diagnostics.publishedSplineInverse.endpointQueries,
+                diagnostics.publishedSplineInverse.exactCacheHits,
+                diagnostics.publishedSplineInverse.constructionIntegralEvaluations,
+                diagnostics.publishedSplineInverse.inverseIntegralEvaluations,
+                diagnostics.publishedSplineInverse.newtonIterations,
+                diagnostics.publishedArcInverse.queries,
+                diagnostics.publishedArcInverse.endpointQueries,
+                diagnostics.publishedArcInverse.exactCacheHits,
+                diagnostics.publishedArcInverse.constructionIntegralEvaluations,
+                diagnostics.publishedArcInverse.inverseIntegralEvaluations,
+                diagnostics.publishedArcInverse.newtonIterations,
                 rollingPlanner.lastRollingCandidateError().empty()?std::string{}:
                     std::format("; last failure={}",rollingPlanner.lastRollingCandidateError()));
+            printTimeLawDiagnostics("rolling all attempts",diagnostics.timeLaw);
+            printTimeLawDiagnostics("rolling published",diagnostics.publishedTimeLaw);
+            printTimeLawDiagnostics("rolling prefix probes",
+                diagnostics.rollingPrefixProbeTimeLaw);
+            printTimeLawDiagnostics("rolling suffix probes",
+                diagnostics.rollingSuffixProbeTimeLaw);
             if(traceSlow) {
                 writeGeometrySnapshot(modelPath,window.commands,capturedSplines);
                 writePieceTimingSnapshot(modelPath,plannedPieces);
@@ -741,8 +924,10 @@ int main(const int argc,char **argv) {
         planner.setContinuousPlanningEffort(effort);
         planner.reset(1,startPosition(window.commands.front()));
         ngc::ContinuousAccelerationOracleModel model;
+        ngc::InfiniteJerkTrajectoryTimeResult infiniteJerkTime;
         const auto planningStart=std::chrono::steady_clock::now();
-        const auto plan=planner.compileContinuous(window.commands,*window.blendScale,&model);
+        const auto plan=planner.compileContinuous(window.commands,*window.blendScale,&model,
+            std::nullopt,std::nullopt,{},12U,&infiniteJerkTime);
         const auto planningEnd=std::chrono::steady_clock::now();
         if(!plan) throw std::runtime_error(plan.error());
         const auto writingStart=std::chrono::steady_clock::now();
@@ -753,18 +938,49 @@ int main(const int argc,char **argv) {
         std::cout<<std::format(
             "exported {} oracle segments from {} motions and {} verified spans; "
             "planner duration={} s; "
+            "smoothed-path infinite-jerk duration={} s (gap={} s, {}%); "
+            "infinite-jerk last-refinement delta={} s intervals={} refinements={}; "
             "velocity-only seed={} s; acceleration-aware improvement={} s; "
             "selected Ruckig brake phases={}; "
             "reachability candidate evaluations={}; geometry verification attempts={} "
-            "high-water={}; plan calculation wall={} s; model write wall={} s\n",
+            "high-water={}; spline inverse queries={} endpoints={} exact cache hits={} "
+            "construction integrals={} "
+            "inverse integrals={} Newton iterations={} seed convergences={} bisections={} "
+            "iteration-limit hits={} maximum iterations={}; arc inverse queries={} endpoints={} "
+            "exact cache hits={} construction integrals={} inverse integrals={} Newton iterations={} "
+            "seed convergences={} bisections={} iteration-limit hits={} maximum iterations={}; "
+            "plan calculation wall={} s; "
+            "model write wall={} s\n",
             model.segments.size(),window.commands.size(),normalSpans,model.plannerDuration,
+            infiniteJerkTime.duration,model.plannerDuration-infiniteJerkTime.duration,
+            100.0*(model.plannerDuration/infiniteJerkTime.duration-1.0),
+            infiniteJerkTime.estimatedDurationError,infiniteJerkTime.intervals,
+            infiniteJerkTime.refinements,
             (*plan)->velocityOnlySeedDuration,
             (*plan)->velocityOnlySeedDuration-(*plan)->accelerationAwareDuration,
             (*plan)->ruckigBrakePhases,
             (*plan)->reachabilityCandidateEvaluations,
             (*plan)->geometryVerificationAttempts,(*plan)->geometryVerificationHighWater,
+            (*plan)->splineInverse.queries,(*plan)->splineInverse.endpointQueries,
+            (*plan)->splineInverse.exactCacheHits,
+            (*plan)->splineInverse.constructionIntegralEvaluations,
+            (*plan)->splineInverse.inverseIntegralEvaluations,
+            (*plan)->splineInverse.newtonIterations,(*plan)->splineInverse.seedConvergences,
+            (*plan)->splineInverse.safeguardedBisections,
+            (*plan)->splineInverse.iterationLimitHits,
+            (*plan)->splineInverse.maximumNewtonIterations,
+            (*plan)->arcInverse.queries,(*plan)->arcInverse.endpointQueries,
+            (*plan)->arcInverse.exactCacheHits,
+            (*plan)->arcInverse.constructionIntegralEvaluations,
+            (*plan)->arcInverse.inverseIntegralEvaluations,
+            (*plan)->arcInverse.newtonIterations,(*plan)->arcInverse.seedConvergences,
+            (*plan)->arcInverse.safeguardedBisections,
+            (*plan)->arcInverse.iterationLimitHits,
+            (*plan)->arcInverse.maximumNewtonIterations,
             std::chrono::duration<double>(planningEnd-planningStart).count(),
             std::chrono::duration<double>(writingEnd-writingStart).count());
+        printTimeLawDiagnostics("full horizon",(*plan)->timeLaw);
+        printCorrectionPassDetails("full horizon",(*plan)->timeLaw);
         if(rolling) runRolling(model.plannerDuration);
         return 0;
     } catch(const std::exception &error) {
