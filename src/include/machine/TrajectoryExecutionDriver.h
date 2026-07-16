@@ -50,6 +50,7 @@ namespace ngc {
             for(std::size_t index=0; index<planned.inputs.size(); ++index) {
                 if(index>=planned.activationItems.size()||planned.activationItems[index]!=itemIndex) continue;
                 const auto &input=planned.inputs[index];
+                if(!input.presentationActivation) continue;
                 const auto activation=index<planned.activationSpans.size()
                     ? planned.activationSpans[index] : SpanId{};
                 const auto &item=planned.items[itemIndex];
@@ -94,6 +95,9 @@ namespace ngc {
         }
 
         void setLimits(const TrajectoryLimits &limits) { m_planner.setLimits(limits); }
+        void setPlanningProgressCallback(std::function<void()> callback) {
+            m_planner.setProgressCallback(std::move(callback));
+        }
 
         template<typename Synchronize, typename Observe, typename ObserveLifecycle = std::nullptr_t>
         bool pumpOne(Synchronize &&synchronize, Observe &&observe, ObserveLifecycle &&observeLifecycle = nullptr) {
@@ -138,6 +142,13 @@ namespace ngc {
                 publishPlanned(std::move(*planned));
                 return true;
             };
+            const auto planRollingPrefix=[&]() -> bool {
+                if(!m_planner.shouldPlanRollingPrefix()) return false;
+                auto planned=m_planner.planWindow(false);
+                if(!planned) { fail(planned.error()); return true; }
+                if(*planned) publishPlanned(std::move(*planned));
+                return true;
+            };
 
             if((m_interpretationComplete || m_synchronizationPending)
                &&m_planner.windowSize()!=0) {
@@ -160,7 +171,10 @@ namespace ngc {
                     fail("bounded trajectory lookahead window is full");
                     return true;
                 }
-                if(retain) return true;
+                if(retain) {
+                    (void)planRollingPrefix();
+                    return true;
+                }
                 (void)planWindow();
                 return true;
             }
@@ -197,7 +211,8 @@ namespace ngc {
                         fail("bounded trajectory lookahead window is full");
                         return true;
                     }
-                    if(!retain) (void)planWindow();
+                    if(retain) (void)planRollingPrefix();
+                    else (void)planWindow();
                 }
             } else if(std::holds_alternative<InterpreterCompleted>(event)) {
                 if(m_planner.windowSize()!=0) (void)planWindow();
@@ -259,6 +274,13 @@ namespace ngc {
                         if(m_synchronizationPending) {
                             m_session.provideSynchronization();
                             m_synchronizationPending = false;
+                        }
+                        if(m_planner.hasRollingContinuation()) {
+                            fail(std::format(
+                                "motion stopped on a rolling-horizon packet branch with {} retained "
+                                "continuous commands; the stopped off-path state cannot be joined back "
+                                "to the immutable G64 suffix",m_planner.windowSize()));
+                            continue;
                         }
                     }
                     if(held->epoch == m_epoch && !m_interpretationComplete && !m_probePending) {

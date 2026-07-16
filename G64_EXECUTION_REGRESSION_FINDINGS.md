@@ -397,7 +397,7 @@ Coverage now includes large-coordinate C2 continuity, 150-command compiler packe
 
 ## Clarabel acceleration-limited development oracle
 
-A standalone solver comparison now lives in `tools/clarabel_trajectory_oracle`. It is deliberately outside production planning and the RT contract. `ngc_g64_oracle_export` evaluates one compatible positive-`P` G64 horizon using the normal interpreter, geometry builder, local constraint correction, and jerk-limited planner. Only when explicitly requested, `compileContinuous()` also emits an NRT model containing the final conservative velocity cap plus midpoint tangent and curvature for 16 intervals per geometry piece. The exporter writes those values and the current planner duration to a small versioned text format.
+A standalone solver comparison now lives in `tools/clarabel_trajectory_oracle`. It is deliberately outside production planning and the RT contract. `ngc_g64_oracle_export` evaluates one compatible positive-`P` G64 horizon using the normal interpreter, geometry builder, local constraint correction, and jerk-limited planner. Only when explicitly requested, `compileContinuous()` also emits an NRT model containing the final conservative velocity cap plus midpoint tangent and curvature for 32 intervals per geometry piece. The exporter writes those values and the current planner duration to a small versioned text format.
 
 The Rust sidecar pins Clarabel 0.11.1 and solves a discretized convex minimum-time path parameterization. For each station it uses squared speed `x = v^2` and speed `v`; every interval also has duration `dt`. Rotated second-order cones impose `v^2 <= x` and the exact constant-scalar-acceleration interval time
 
@@ -437,10 +437,11 @@ Additional one-off measurements isolated the first compatible G64 feed/arc horiz
 | `1001.ngc`, 16 intervals/piece | 242 | 5,504 | 95.447292693 s | 81.535928748 s | 13.911363945 s (14.575%) | 0.619791 s |
 | `adaptive_pockets.ngc`, 4 intervals/piece | 5,164 | 38,640 | 622.540851901 s | 463.583039019 s | 158.957812883 s (25.534%) | 10.052023 s |
 | `adaptive_pockets.ngc`, 16 intervals/piece | 5,164 | 154,560 | 622.540851901 s | 447.064353307 s | 175.476498594 s (28.187%) | 35.462374 s |
+| `adaptive_pockets.ngc`, 32 intervals/piece | 5,164 | 309,120 | 622.540851901 s | 446.160170792 s | 176.380681109 s (28.332%) | 50.661873 s |
 
 The corresponding planner/export wall times were about 17.3 seconds for `1001.ngc`, 56.4 seconds for the four-interval adaptive model, and 60.3 seconds for the sixteen-interval adaptive model. Relative to the Clarabel result, the current trajectory was about 17.1% longer on `1001.ngc` and 39.25% longer on the refined adaptive model.
 
-Increasing adaptive-pocket resolution from four to sixteen intervals per piece reduced the oracle duration by 16.518685712 seconds, or about 3.56% of the four-interval result. Four intervals are therefore demonstrably too coarse. Sixteen intervals are more informative but have not been shown converged; future comparisons should refine adaptively and stop only when duration and active constraints stabilize.
+Increasing adaptive-pocket resolution from four to sixteen intervals per piece reduced the oracle duration by 16.518685712 seconds, or about 3.56% of the four-interval result. Increasing it again from sixteen to thirty-two reduced duration by another 0.904182515 seconds, or about 0.202% of the sixteen-interval result. Four intervals are therefore demonstrably too coarse. Thirty-two intervals are closer but have not been shown converged; future comparisons should refine adaptively and stop only when duration and active constraints stabilize.
 
 The correction-pass experiment is also important. The 12-pass production ceiling failed with the last reported path-jerk excess already near the limit, while the otherwise unchanged algorithm completed the entire 5,164-motion horizon under a temporary 64-pass ceiling and produced the 622.540851901-second verified trajectory. This shows that the reported adaptive-pocket failure is a correction-iteration ceiling rather than proof that the path is infeasible. Merely raising the ceiling is not the intended near-time-optimal solution: it still repeats expensive whole-horizon reachability, Ruckig timing, polynomial emission, and exact verification, as reflected in the roughly one-minute export. The source was restored to 12 passes after measurement; no planner behavior was changed by this documentation-only checkpoint.
 
@@ -448,17 +449,75 @@ The solver reaches the programmed 2.0 unit/s station speed and the configured 20
 
 Use the oracle next as a diagnostic target: refine its stations until its acceleration-only duration converges, compare its station envelope against the current Ruckig boundaries, then add jerk-feasible `(s,v,a)` reachability toward that envelope. Do not copy the Clarabel profile directly into `PlanChunk`, do not call the solver from RT code, and do not weaken fatal post-generation verification.
 
+## First coupled-limit-aware `(s,v,a)` reachability stage
+
+The production planner now keeps the velocity-only forward/backward result only as a feasible diagnostic seed. Three bidirectional coordinate sweeps optimize shared station velocity and acceleration on monotone ramps. Every accepted update must reduce the combined duration of its adjacent pieces, pass both local Ruckig position solves, and admit aggregate/per-axis acceleration and jerk at both geometry boundaries including the coupled curvature terms. There is no separately timed velocity-only fallback selection. Exact emitted-polynomial verification remains authoritative and local correction now retains a 1% reserve so re-optimization does not repeatedly consume a marginal correction.
+
+| Program | Previous planner | Velocity-only seed with current limits | Coupled `(v,a)` planner | Current 32-way Clarabel | Gain versus current seed |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Dense fixture | 2.424964579 s | 2.447639143 s | 2.423589511 s | 1.753531942 s | 0.024049632 s (0.983%) |
+| `adaptive_pockets.ngc` | 622.540851901 s | 622.279618933 s | 621.916364725 s | 446.679202750 s | 0.363254207 s (0.058%) |
+
+The dense result is 0.001375068 seconds faster than the previous planner. The adaptive result is now 0.624487176 seconds faster than the previous recorded run while retaining the requested 1% correction reserve. The improvement came from preserving Ruckig's exact outgoing constant jerk in every scalar phase instead of reconstructing it from rounded boundary accelerations. The current station optimizer is useful but is not complete reachable-set propagation: it can still settle in a local state sequence, and fixed geometry-piece stations remain too coarse for some constraint transitions. A development attempt using one greedy forward/backward frontier and another using a small discrete global state lattice both produced worse verified trajectories because scalar-time improvements ignored coupled geometric jerk and caused stronger exact correction. Those approaches were removed.
+
+### Jerk-limit diagnostic
+
+Scaling aggregate and finite per-axis jerk together while holding velocity and acceleration fixed sharply closes the gap to a freshly generated 32-way Clarabel model:
+
+| Program | Jerk | Verified planner | Clarabel | Planner excess over oracle |
+| --- | ---: | ---: | ---: | ---: |
+| Dense fixture | 1x | 2.423589511 s | 1.753531942 s | 38.212% |
+| Dense fixture | 10x | 1.601229453 s | 1.478985519 s | 8.265% |
+| Dense fixture | 100x | 1.333088266 s | 1.329211801 s | 0.292% |
+| Dense fixture | 1000x | 1.352727075 s | 1.351002408 s | 0.128% |
+| `adaptive_pockets.ngc` | 1x | 621.916364725 s | 446.679202750 s | 39.231% |
+| `adaptive_pockets.ngc` | 10x | 309.467499743 s | 277.916090073 s | 11.353% |
+| `adaptive_pockets.ngc` | 30x | 233.634337079 s | 224.038614824 s | 4.283% |
+
+Adaptive 100x now stops fatally at the per-pass geometry-verification budget after 28,981 attempts rather than recursing into a 27.8 ns interval. Adaptive 1000x stops at the curvature-coupled acceleration-aware reachability budget after 316,529 total candidate evaluations (about 14 seconds in the recorded run) rather than consuming minutes of repeated correction work. Production, 10x, and 30x complete below both bounds. Dense 1000x was slightly slower than 100x in both models. These extreme points expose numerical and representation limits, not a clean infinite-jerk asymptote.
+
+Curved emission first retries a failed complete-solve cubic at the nearest exact Ruckig phase boundary, then uses ordered midpoint subdivision. Each ordered Bezier-hull proof has bounded internal work, and the complete horizon has explicit per-pass and cumulative reachability, geometry-verification, and staged-span budgets. Exceeding a budget is an information-rich fatal planning error; it never falls back to exact-stop motion.
+
+The successful trend is strong evidence that dynamic jerk accounts for most of the normal-limit Clarabel gap and that the planner approaches the acceleration-only optimum when jerk becomes nonbinding. It does not establish normal-jerk optimality: Clarabel omits the dynamic `q' j + 3 q'' v a + q''' v^3` constraint, so a jerk-aware reference is required before attributing the remaining normal-limit time to reachability.
+
+### Jerk-aware Clarabel follow-up
+
+The oracle v3 export now includes path/axis jerk, analytic `q'''`, and production piece-boundary PVA/duration diagnostics. A development `--jerk-aware` mode repeatedly linearizes the complete finite-difference jerk vector about the latest squared-speed profile and solves the trust-region conic subproblem with Clarabel. Every reported result is checked against the nonlinear discrete jerk afterward. This is sequential convex programming, not a proof of the nonconvex global optimum, and it does not replace exact emitted-polynomial verification.
+
+At 64 dynamics intervals per geometry piece, the dense fixture produced a 2.216415722-second discretely jerk-feasible reference versus the planner's 2.423589511 seconds, leaving 9.347% planner excess relative to the reference. The 32-way value was 2.209524075 seconds, a 0.31% grid change. On `1001.ngc`, 32 intervals per piece produced 89.638000361 seconds versus the planner's 95.338245391 seconds, leaving 6.359% excess; its 16-way result was 88.823845456 seconds. The attempted 64-way `1001.ngc` SCP did not converge numerically.
+
+The full 309,120-interval adaptive-pocket v3 model exports successfully, but a four-way 38,640-segment jerk SCP did not complete within five minutes. A one-way solve was demonstrably too coarse and is not a comparison result. A scalable jerk-aware reference for that horizon therefore remains open.
+
+The v3 profile comparison localizes the dense loss to alternating 0.006/0.014-unit blend pieces where the oracle carries about 0.3–0.44 unit/s more boundary speed. On `1001.ngc`, the largest repeated 0.080-second gaps retain nearly identical boundary speeds but carry about +4.24/-4.24 unit/s² oracle acceleration. Three production experiments were rejected and removed: relaxing the local station veto made dense slower after correction; a bounded global acceleration lattice either regressed `1001.ngc` or produced no post-verification gain; and inserting midpoint stations into long curved pieces drove exact correction to a 353-second `1001.ngc` trajectory. The stable planner durations remain 2.423589511 seconds and 95.338245391 seconds. Do not restore those scalar-profile experiments without solving the emitted-polynomial/coupled-correction interaction as part of the frontier state.
+
+### P0.002 adaptive-pocket resource follow-up
+
+Changing `adaptive_pockets.ngc` from G64 P0.001 to P0.002 initially stopped at the curved reachability per-pass guard after 290,146 evaluations. Profiling showed that 54,330 of the first 63,626 velocity candidate sets were the unconditional 12-step refinement below an infeasible station cap. The production search now deduplicates clamped acceleration candidates, reuses the already-timed current state, stops unchanged bidirectional sweeps, and uses four velocity-bracket refinements only when a horizon exceeds 1,024 curved stations. Small horizons retain all 12 steps.
+
+Removing that excess work exposed a separate correctness bug. Some acceleration-carrying Ruckig solutions include a two-phase brake pre-profile, but scalar extraction retained only the seven main phases and sampled jerk ambiguously at exact boundaries. The reconstructed distance could reverse inside a curved fit and pass inverted bounds to `std::clamp`. Scalar extraction now integrates the brake and main phases in order with their exact outgoing jerks, checks the exact interior velocity minimum of every constant-jerk phase, and rejects any decreasing curved-emission interval before geometry proof.
+
+Arc and six-control spline distance inversion now start from their accurate preintegrated lookup bracket and use at most 12 safeguarded Newton steps against the actual adaptive length integral instead of 48 and 44 fixed bisections respectively. Local correction has a measured 24-pass ceiling; cumulative work guards were scaled without changing the per-pass curved-candidate or geometry-verification limits.
+
+| Program | Verified duration | Plan calculation wall | Candidate evaluations | Geometry attempts |
+| --- | ---: | ---: | ---: | ---: |
+| Dense fixture | 2.423589511 s | 0.466 s | 59,294 | 553 |
+| `1001.ngc` | 95.338245390 s | 0.501 s | 7,478 | 27,022 |
+| `adaptive_pockets.ngc`, P0.001 | 621.995691618 s | 2.806 s | 169,366 | 109,870 |
+| `adaptive_pockets.ngc`, P0.002 | 586.628780107 s | 18.690 s | 2,629,123 | 242,864 |
+
+Dense and `1001.ngc` retain their established durations. The large-horizon P0.001 policy is 0.079326893 seconds (0.0128%) slower than the previous 621.916364725-second result while reducing measured planning wall time from about 25.38 to 2.81 seconds. P0.002 now completes well below the previous three-minute observation. A 1000x jerk stress run still terminates explicitly at a cumulative geometry-verification bound instead of consuming unbounded work.
+
 ## Current implementation plan
 
 The C2 precision, fatal-error visibility, held-recovery, NRT span staging, multi-packet publication, moving packet stop-tail, command-activation ownership, local geometry caps, forward/backward velocity reachability, and first acceleration-carrying local Ruckig timing stage above are implemented. Continue in this order:
 
 1. Refine the Clarabel acceleration-only model adaptively until duration and active acceleration constraints converge on the dense fixture and representative full-program horizons. The adaptive-pocket four-versus-sixteen result proves that four intervals per piece are insufficient. Retain the fixed short analytic regression.
-2. Replace the velocity-only station reachability envelope with acceleration-aware forward/backward `(s,v,a)` reachability. Maximize locally reachable station velocity/acceleration with Ruckig feasibility toward the Clarabel envelope, while preserving the zero-acceleration comparison and exact emitted-polynomial authority.
-3. Add adaptive production timing stations only where geometry/constraint variation requires them. Do not create a fixed multiplier of spans per G-code entity and do not treat timing stations as semantic stops. The oracle's fixed 16-way diagnostic subdivision is not the production strategy.
+2. Extend the coupled-limit-aware station optimizer into complete forward/backward `(s,v,a)` reachable-set propagation. Keep Ruckig feasibility and exact emitted-polynomial authority; do not restore a separately selected zero-acceleration fallback.
+3. Add adaptive production timing stations only where geometry/constraint variation requires them. Do not create a fixed multiplier of spans per G-code entity and do not treat timing stations as semantic stops. The oracle's fixed 32-way diagnostic subdivision is not the production strategy.
 4. Use the dense fixture to distinguish algorithmic loss from hard `q'''(s)v^3` blend limits. Add at least one fixture whose constraint transition genuinely benefits from acceleration carry and assert a measured duration reduction.
-5. Retain the resulting local caps and acceleration-aware timing in a rolling mutable suffix.
-6. Commit and publish only an immutable prefix whose moving boundary state and complete stop branch are proved, so an uninterrupted G64 program does not need to reach a protected boundary before motion can start or repeat whole-horizon correction work.
-7. Add an explicit NRT horizon-duration/resource guard and bounded feed-hold latency without reintroducing a semantic G-code command-count stop.
+5. Reduce the implemented rolling prefix's suffix-probe CPU cost and add numerically identical arc-interior split states; do not weaken the strict boundary PVA proof.
+6. Extend the implemented incremental publication to numerically identical arc-interior anchors so arc-only regions do not need to extend to a later retained line or protected boundary.
+7. Add bounded resumable feed-hold latency without reintroducing a semantic G-code command-count stop or a synthetic connector from an off-path stop state.
 8. Preserve fatal termination for every geometry, C2, constraint, capacity, stop-tail, or publication proof failure. Never substitute exact-stop motion for failed requested G64.
 9. Add an end-to-end regression containing a real probe barrier followed by enough compatible G64 geometry to require multiple rolling planning horizons as well as multiple `PlanChunk` packets.
 10. Assert all of the following:
@@ -483,3 +542,40 @@ ctest --test-dir build --output-on-failure
 ```
 
 Both commands passed. The repository was clean before this report file was added.
+
+## Rolling immutable-prefix checkpoint (2026-07-15)
+
+`trajectory.lookahead_duration` now configures a positive minimum predicted duration for NRT rolling G64 planning. While compatible commands are still being interpreted, `BoundedLookaheadTrajectoryPlanner` searches beyond that minimum for a retained-line interior where both the committed prefix and a following stop-feasible suffix accept the same nonzero PVA boundary. A failed provisional search retains the window and retries after more lookahead; it never creates an artificial terminal stop. The split preserves the entity's original G64 scale on both halves, including a short entity split at the midpoint shared by its neighboring splines. The retained half is marked as already activated so command presentation is not duplicated. Arc-interior anchors remain disabled because independently reconstructed partial-arc curvature differed at the strict PVA boundary gate; arc-only regions extend rather than weakening continuity proof.
+
+The exact continuous compiler accepts explicit start/end `MotionState` values, projects them onto the path tangent/curvature state, fixes their scalar velocity and acceleration during reachability, verifies emitted boundary PVA, and generates a normal moving-boundary stop branch at the last packet. A focused regression crosses two horizons at nonzero speed and asserts exact position/velocity/acceleration continuity, a real stop tail, one-time source activation, final rest, and per-horizon/total timing diagnostics.
+
+With `adaptive_pockets.ngc` at P0.002 and a 2-second configured minimum, the incremental rolling benchmark produced 54 horizons and 161 chunks. Safe boundaries made actual horizons about 2.96 to 16.04 seconds long. Rolling boundaries now warm-start one velocity step above the previous successful fraction, then halve only as required; their bounded prefix/suffix solves use six velocity-bracket refinements while ordinary full-horizon solves retain twelve. Boundary candidates fell from 306 to 241 and failed suffix probes from 252 to 186. The first horizon calculated in about 0.78 seconds, the maximum was about 1.28 seconds, published-horizon calculation totaled about 28.67 seconds, failed incremental searches added about 0.47 seconds, and total planning calculation was about 29.14 seconds. This is about 40.7% less computation than the previous 49.14-second rolling result. Planned motion duration was 589.677061658 seconds: +1.560036445 seconds or about +0.265% versus the previous rolling result, and +3.048281551 seconds or about +0.520% versus the 586.628780107-second full-horizon result. Full-horizon refinement and the established dense/`1001.ngc` comparison baselines are unchanged. The exporter supports `--rolling` for a full comparison with per-horizon rows and `--rolling-only` for policy profiling without rebuilding the Clarabel model.
+
+## Short-entity spline curvature-derivative investigation (2026-07-16)
+
+The remaining visibly slow adaptive-pocket trochoids were isolated by enabling `--trace-slow`. The exporter now retains an `ngc_spline_geometry_v1` snapshot containing the exact source line/arc records, every captured spline control polygon, and its timing-piece boundaries; a separate CSV retains all planned piece boundary states and limits. The standalone `ngc_spline_geometry_analyzer` evaluates analytic first, second, and third B-spline parameter derivatives and converts them to arc-length tangent, curvature, and curvature-vector derivative. Finite-difference curvature checks at the reported extrema agree with the analytic values, including the large normal components, so the principal spikes are not floating-point noise or a mistaken parameter-space third derivative.
+
+At constant scalar speed `v`, the diagnostic uses
+
+```text
+axis acceleration = q''(s) v^2
+axis jerk         = q'''(s) v^3
+```
+
+For a planar curve, `q'''` decomposes into turning jerk along the tangent and curvature-change jerk normal to the tangent. Turning jerk remains nonzero on a perfect circle because the centripetal-acceleration vector rotates. The large differences between visually similar trochoids were dominated instead by the normal component: the direct-control cubic is C2, but its curvature derivative can change abruptly at simple knots and at the transition from the constrained endpoint controls to the interior controls.
+
+For captured spline 627 at F80 (1.333333333 inch/s), the production cubic measured 30.342 inch/s^2 peak acceleration and 9,517.8 inch/s^3 peak total jerk. Curvature-change jerk contributed 9,516.8 inch/s^3 while turning jerk peaked at 690.5 inch/s^3. The production planner does not cap that complete 0.480835-inch spline at one velocity: it creates eleven timing pieces. The recorded boundary speeds rose from F17.6 at entry through F39.8, F47.7, and F50.1 in the middle before falling to F19.9 at exit. A constant-F80 graph alone is not a reachability proof because accelerating motion also includes the `q' j + 3 q'' v a` terms and must reserve distance and jerk for the restricted exit.
+
+The original bounded control-polygon conditioner was intentionally weak. A standalone traversal-cost coordinate search with the same fixed first/last three controls reduced spline 627's peak F80 jerk only from 9,517.8 to 8,963.0 inch/s^3 and increased its mean jerk. Directly optimizing peak and integrated normal curvature derivative while retaining those fixed controls improved the peak to 8,835.0 inch/s^3. The decisive cubic experiment allowed the endpoint tangent-handle length and the adjacent tangential control to vary together while analytically preserving exact endpoint position, tangent, and curvature. Under a sampled `0.2P` deviation bound it reduced spline 627's normal curvature-derivative peak from 4,014.91 to 498.824 and its arc-length integral from 81.3209 to 31.3805. Maximum displacement was 0.000793304 inch; endpoint position error was zero, tangent error was `5.39e-14`, and curvature error was `1.64e-11`. The same experiment reduced the peak from 14,110.8 to 1,963.33 on spline 744 and from 1,278.39 to 732.786 on spline 863.
+
+The separate `ngc_quintic_spline_analyzer` performs a genuine primitive-chain reconstruction rather than degree-elevating the cubic. It uses the same effective span count, simple degree-five knots, and endpoint primitive derivatives through `q'''`. Its free controls are then optimized against peak plus integrated normal curvature derivative while a high-resolution check enforces maximum primitive deviation no greater than `0.2P` (0.001 inch for these P0.005 captures). Results were:
+
+| Captured spline | Production cubic peak | Optimized cubic peak | Optimized quintic peak | Quintic integral | Verified quintic deviation |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 627 | 4,014.91 | 498.824 | 389.731 | 25.2135 | 0.000971435 in |
+| 744 | 14,120.7 | 1,963.33 | 1,252.77 | 49.2376 | 0.000977076 in |
+| 863 | 1,278.39 | 732.786 | 718.319 | 39.9638 | 0.000974564 in |
+
+The optimized quintic reduced peak normal curvature derivative by another 21.9%, 36.2%, and 2.0% relative to the optimized cubic on those three captures. It also removed the cubic's mathematical C2 knot jumps by providing C4 continuity. The gain is path-dependent rather than automatic: most of the benefit came from explicitly conditioning the endpoint transition and the physical arc-length objective, not from degree elevation alone.
+
+These analyzers are not production geometry. Their primitive-deviation checks are sampled, and the standalone arc evaluator is a directed endpoint-exact approximation rather than the production adaptive `ArcReference`. No experimental controls enter preview, the continuous compiler, `PlanChunk`, or `MotionBackend`. Before adopting degree five, implement one shared preview/planner construction using the production arc reference, prove endpoint and ordered deviation bounds, preserve source feed/activation mapping, measure planning cost, and rerun the complete geometry, timing, capacity, stop-branch, rolling-boundary, and UI regressions.

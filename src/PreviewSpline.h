@@ -6,10 +6,14 @@
 #include <cstddef>
 #include <functional>
 #include <optional>
+#include <span>
+#include <tuple>
 #include <vector>
 
 #include <glm/geometric.hpp>
 #include <glm/vec3.hpp>
+
+#include "machine/SplineHandleOptimization.h"
 
 namespace ngc::experimental {
     struct JunctionState {
@@ -21,10 +25,14 @@ namespace ngc::experimental {
     struct JunctionEntity {
         double length = 0.0;
         std::function<JunctionState(double)> stateAtDistance;
+        bool linear = false;
+        std::optional<glm::dvec3> midpointCurvature = std::nullopt;
     };
 
     struct JunctionBlend {
-        // One open-clamped degree-three B-spline with six controls.
+        // One open-clamped, uniform degree-three B-spline. Ordinary junctions
+        // have six controls; longer short-entity clusters have evenly spaced,
+        // variable-count interior controls.
         std::vector<glm::dvec3> controlPoints;
         double incomingTrim = 0.0;
         double outgoingTrim = 0.0;
@@ -43,7 +51,8 @@ namespace ngc::experimental {
     // itself is deliberately not a control point.
     inline std::optional<JunctionBlend> fitJunction(const JunctionEntity &incoming,
                                                      const JunctionEntity &outgoing,
-                                                     const double programmedScale) {
+                                                     const double programmedScale,
+                                                     const bool requireCommonEndpoint=true) {
         constexpr double MINIMUM_LENGTH = 1e-12;
         if(programmedScale <= 0.0 || incoming.length <= MINIMUM_LENGTH
            || outgoing.length <= MINIMUM_LENGTH) return std::nullopt;
@@ -51,7 +60,8 @@ namespace ngc::experimental {
         const auto incomingEnd = incoming.stateAtDistance(incoming.length);
         const auto outgoingStart = outgoing.stateAtDistance(0.0);
         const auto positionScale = std::max({programmedScale, incoming.length, outgoing.length, 1.0});
-        if(glm::length(incomingEnd.position - outgoingStart.position) > positionScale * 1e-9)
+        if(requireCommonEndpoint
+           &&glm::length(incomingEnd.position-outgoingStart.position)>positionScale*1e-9)
             return std::nullopt;
 
         const auto incomingScale = entityBlendScale(incoming, programmedScale);
@@ -60,8 +70,15 @@ namespace ngc::experimental {
 
         const auto incomingTrim = 3.0 * incomingScale;
         const auto outgoingTrim = 3.0 * outgoingScale;
-        const auto start = incoming.stateAtDistance(incoming.length - incomingTrim);
-        const auto end = outgoing.stateAtDistance(outgoingTrim);
+        const auto blendState=[](const JunctionEntity &entity,const double distance) {
+            auto state=entity.stateAtDistance(distance);
+            if(entity.midpointCurvature
+               &&std::abs(distance-0.5*entity.length)<=1e-9*std::max(1.0,entity.length))
+                state.curvature=*entity.midpointCurvature;
+            return state;
+        };
+        const auto start = blendState(incoming,incoming.length - incomingTrim);
+        const auto end = blendState(outgoing,outgoingTrim);
         const auto fittedHandle = [](const JunctionState &endpoint,
                                      const glm::dvec3 &twoStepsInside,
                                      const double fallbackScale,
@@ -81,12 +98,24 @@ namespace ngc::experimental {
             }
             return std::pair {handle, tangentDistance};
         };
-        const auto [incomingHandle, incomingTangentDistance] = fittedHandle(
+        auto [incomingHandle, incomingTangentDistance] = fittedHandle(
             start, incoming.stateAtDistance(incoming.length - incomingScale).position,
             incomingScale, 2.0 * incomingScale);
-        const auto [outgoingHandle, outgoingTangentDistance] = fittedHandle(
+        auto [outgoingHandle, outgoingTangentDistance] = fittedHandle(
             end, outgoing.stateAtDistance(outgoingScale).position,
             outgoingScale, -2.0 * outgoingScale);
+        if(glm::length(start.curvature)>1e-12||glm::length(end.curvature)>1e-12) {
+            const auto endpoint=[](const JunctionState &state) {
+                return spline_detail::Endpoint3 {
+                    .position={state.position.x,state.position.y,state.position.z},
+                    .tangent={state.tangent.x,state.tangent.y,state.tangent.z},
+                    .curvature={state.curvature.x,state.curvature.y,state.curvature.z},
+                };
+            };
+            std::tie(incomingHandle,outgoingHandle)=spline_detail::optimizeHandles(
+                endpoint(start),endpoint(end),incomingTangentDistance,outgoingTangentDistance,
+                incomingHandle,outgoingHandle,incomingScale,outgoingScale);
+        }
         return JunctionBlend {
             .controlPoints = {
                 start.position,
@@ -105,15 +134,73 @@ namespace ngc::experimental {
         };
     }
 
+    inline std::optional<JunctionBlend> buildEvenlySpacedControlCluster(
+            const std::span<const JunctionEntity> entities,const std::size_t left,
+            const std::size_t right,const double programmedScale) {
+        if(programmedScale<=0.0||right<=left+1||right>=entities.size()) return std::nullopt;
+        const auto outer=fitJunction(
+            entities[left],entities[right],programmedScale,false);
+        if(!outer) return std::nullopt;
+        JunctionBlend result{
+            .controlPoints={},
+            .incomingTrim=outer->incomingTrim,
+            .outgoingTrim=outer->outgoingTrim,
+            .incomingScale=outer->incomingScale,
+            .outgoingScale=outer->outgoingScale,
+        };
+        std::vector<double> interiorLengths;
+        interiorLengths.reserve(right-left-1);
+        auto interiorLength=0.0;
+        for(auto index=left+1;index<right;++index) {
+            interiorLength+=entities[index].length;
+            interiorLengths.push_back(entities[index].length);
+        }
+        if(interiorLength<6.0*programmedScale) return outer;
+        const auto distances=spline_detail::evenlySpacedCompositeControlDistances(
+            interiorLengths,programmedScale);
+        if(distances.empty()) return std::nullopt;
+        result.controlPoints.reserve(distances.size()+6);
+        result.controlPoints.insert(result.controlPoints.end(),
+            outer->controlPoints.begin(),outer->controlPoints.begin()+3);
+        auto entity=left+1;
+        auto entityStart=0.0;
+        for(const auto distance:distances) {
+            while(entity+1<right
+                  &&distance>entityStart+entities[entity].length) {
+                entityStart+=entities[entity].length;
+                ++entity;
+            }
+            result.controlPoints.push_back(entities[entity].stateAtDistance(
+                std::clamp(distance-entityStart,0.0,entities[entity].length)).position);
+        }
+        result.controlPoints.insert(result.controlPoints.end(),
+            outer->controlPoints.end()-3,outer->controlPoints.end());
+        std::vector<spline_detail::Vector3> sourceControls;
+        sourceControls.reserve(result.controlPoints.size());
+        for(const auto &control:result.controlPoints)
+            sourceControls.push_back({control.x,control.y,control.z});
+        const auto conditioned=spline_detail::conditionCubicSplineInteriorControls<3>(
+            sourceControls,programmedScale);
+        for(std::size_t control=0;control<result.controlPoints.size();++control)
+            result.controlPoints[control]={conditioned[control][0],conditioned[control][1],
+                                           conditioned[control][2]};
+        return result;
+    }
+
     inline glm::dvec3 evaluateClampedCubicBSpline(const std::vector<glm::dvec3> &controls,
                                                    const double parameter) {
         constexpr std::size_t DEGREE = 3;
-        constexpr std::array knots {0.0,0.0,0.0,0.0,1.0,2.0,3.0,3.0,3.0,3.0};
+        if(controls.size()<4) return {};
+        const auto maximumParameter=static_cast<double>(controls.size()-3);
+        std::vector<double> knots(controls.size()+DEGREE+1,maximumParameter);
+        for(std::size_t index=0;index<=DEGREE;++index) knots[index]=0.0;
+        for(std::size_t index=DEGREE+1;index<controls.size();++index)
+            knots[index]=static_cast<double>(index-DEGREE);
         if(parameter <= 0.0) return controls.front();
-        if(parameter >= 3.0) return controls.back();
+        if(parameter >= maximumParameter) return controls.back();
 
-        const auto span = parameter < 1.0 ? std::size_t {3}
-                        : parameter < 2.0 ? std::size_t {4} : std::size_t {5};
+        const auto span=std::min(controls.size()-1,
+            DEGREE+static_cast<std::size_t>(std::floor(parameter)));
         std::array<glm::dvec3, DEGREE+1> work;
         for(std::size_t index=0;index<=DEGREE;++index)
             work[index]=controls[span-DEGREE+index];
@@ -129,10 +216,11 @@ namespace ngc::experimental {
     }
 
     inline void tessellateJunction(const JunctionBlend &blend, std::vector<glm::dvec3> &lineVertices) {
-        constexpr int SAMPLE_COUNT = 72;
+        const auto parameterMaximum=static_cast<double>(blend.controlPoints.size()-3);
+        const auto sampleCount=24*static_cast<int>(blend.controlPoints.size()-3);
         auto previous = blend.controlPoints.front();
-        for(int i = 1; i <= SAMPLE_COUNT; ++i) {
-            const auto parameter=3.0*static_cast<double>(i)/SAMPLE_COUNT;
+        for(int i = 1; i <= sampleCount; ++i) {
+            const auto parameter=parameterMaximum*static_cast<double>(i)/sampleCount;
             const auto current=evaluateClampedCubicBSpline(blend.controlPoints,parameter);
             lineVertices.push_back(previous);
             lineVertices.push_back(current);

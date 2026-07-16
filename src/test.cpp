@@ -298,9 +298,10 @@ namespace {
         const auto toolChange = ngc::readFile("autoload/tool_change.ngc");
         auto main = ngc::readFile("adaptive_pockets.ngc");
         require(hello && world && toolChange && main, "adaptive-pockets simulation inputs should load");
-        const auto g64=main->find("N40 G64 P0.001");
+        const auto g64=main->find("N40 G64 P");
         require(g64!=std::string::npos,"adaptive-pockets startup fixture should contain its G64 block");
-        main->replace(g64,std::string_view("N40 G64 P0.001").size(),"N40 G61");
+        const auto g64End=main->find('\n',g64);
+        main->replace(g64,g64End==std::string::npos?main->size()-g64:g64End-g64,"N40 G61");
         ngc::ToolTable tools;
         const auto loadedTools = tools.load();
         require(loadedTools.has_value(), loadedTools ? "" : loadedTools.error());
@@ -354,6 +355,40 @@ namespace {
             return entry.kind==ngc::InterpreterStatusKind::Error;
         }),"successful multi-packet refill should not publish a GUI error");
         worker.join();
+    }
+
+    void testTimedSimulationPublishesSnapshotsDuringPlanning() {
+        std::string source="G0 X100\nG64 P0.001\n";
+        constexpr int COMMANDS=800;
+        for(int command=1;command<=COMMANDS;++command)
+            source+=std::format("G1 F60 X{:.6f}\n",100.0+static_cast<double>(command)*0.001);
+        SimulationWorker worker;
+        ngc::ToolTable tools;
+        require(worker.start({{source,"planning-snapshot-progress.ngc"}},tools),
+                "planning snapshot progress simulation should start");
+        auto snapshot=worker.snapshot();
+        auto maximumSnapshotSeconds=0.0;
+        auto sawMotionDuringPlanning=false;
+        for(int attempt=0;attempt<5000&&snapshot.status!=ngc::SimulationStatus::Error
+            &&snapshot.trajectoryPlanning.continuousHorizons==0;++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            const auto snapshotStarted=std::chrono::steady_clock::now();
+            snapshot=worker.snapshot();
+            maximumSnapshotSeconds=std::max(maximumSnapshotSeconds,
+                std::chrono::duration<double>(std::chrono::steady_clock::now()-snapshotStarted).count());
+            if(snapshot.hasActiveMotion&&snapshot.machinePosition.x>0.01)
+                sawMotionDuringPlanning=true;
+        }
+        worker.stop();
+        worker.join();
+        require(snapshot.status!=ngc::SimulationStatus::Error,snapshot.error);
+        require(snapshot.trajectoryPlanning.continuousHorizons>0,
+                "dense continuous planning should finish within the snapshot regression timeout");
+        require(sawMotionDuringPlanning,
+                "timed simulation should publish moving tool snapshots while continuous planning runs");
+        require(maximumSnapshotSeconds<0.25,std::format(
+            "GUI-facing simulation snapshots blocked for {:.6f} seconds during planning",
+            maximumSnapshotSeconds));
     }
 
     void testImmediatePreviewBuildsGeometryWithoutTrajectoryExecution() {
@@ -2049,9 +2084,14 @@ namespace {
         require(glm::length(curvedControls[1]-curvedControls[0])<scale
                     &&glm::length(curvedControls[5]-curvedControls[4])<scale,
                 "arc geometry should shorten tangent handles when that better follows the arc");
-        require(glm::length(curvedControls[2]-curvedIncoming.stateAtDistance(9.0).position)<1e-9
-                    &&glm::length(curvedControls[3]-curvedOutgoing.stateAtDistance(1.0).position)<1e-9,
-                "circular-arc interior controls should use the curvature-matched nearby geometry");
+        const auto incomingControlDeparture=
+            glm::length(curvedControls[2]-curvedIncoming.stateAtDistance(9.0).position);
+        const auto outgoingControlDeparture=
+            glm::length(curvedControls[3]-curvedOutgoing.stateAtDistance(1.0).position);
+        require(std::max(incomingControlDeparture,outgoingControlDeparture)<0.25*scale,
+                "optimized curved controls should remain close to the neighboring arc geometry");
+        require(std::max(incomingControlDeparture,outgoingControlDeparture)>1e-6,
+                "curved handle optimization should improve on the initial nearby-point fit");
 
         const auto lineEntity=[](const glm::dvec3 from,const glm::dvec3 tangent,const double length) {
             return ngc::experimental::JunctionEntity {
@@ -2094,6 +2134,7 @@ namespace {
             .axisVelocity={10,10,10,10,10,10},
             .axisAcceleration={10,10,10,10,10,10},
             .axisJerk={50,50,50,50,50,50},
+            .lookaheadDuration=1000.0,
         });
         const ngc::position_t p0{0,0,0,0,0,0}, p1{5,0,0,0,0,0}, p2{5,5,0,0,0,0};
         planner.reset(70,p0);
@@ -2138,6 +2179,290 @@ namespace {
         }
         requireAxisLimits(*chunk,&ngc::position_t::x,10,10,50,"G64 X motion");
         requireAxisLimits(*chunk,&ngc::position_t::y,10,10,50,"G64 Y motion");
+    }
+
+    void testShortLineMidpointCurvatureInference() {
+        constexpr double DEFLECTION=0.1;
+        constexpr double LENGTH=0.02;
+        const auto curvature=ngc::spline_detail::inferShortLineMidpointCurvature(
+            {std::cos(DEFLECTION),-std::sin(DEFLECTION),0.0},{1.0,0.0,0.0},
+            {std::cos(DEFLECTION),std::sin(DEFLECTION),0.0},LENGTH);
+        require(curvature.has_value(),
+                "consistent short-line turns should infer a midpoint curvature");
+        const auto expected=2.0*std::tan(0.5*DEFLECTION)/LENGTH;
+        requireNear((*curvature)[0],0.0,
+                    "short-line midpoint curvature should remain normal to the line");
+        requireNear((*curvature)[1],expected,
+                    "short-line midpoint curvature should use the tangent-circle radius");
+        requireNear((*curvature)[2],0.0,
+                    "planar short-line curvature should remain in its turn plane");
+        require(!ngc::spline_detail::inferShortLineMidpointCurvature(
+                    {std::cos(DEFLECTION),-std::sin(DEFLECTION),0.0},{1.0,0.0,0.0},
+                    {std::cos(DEFLECTION),-std::sin(DEFLECTION),0.0},LENGTH),
+                "a reversing short-line turn should retain zero midpoint curvature");
+    }
+
+    void testCubicSplineInteriorControlConditioning() {
+        using Control=ngc::spline_detail::Vector3;
+        const std::array<Control,9> controls {{
+            {0.0,0.0,0.0}, {1.0,0.0,0.0}, {2.0,0.1,0.0},
+            {3.0,0.8,0.0}, {4.0,-0.7,0.0}, {5.0,0.9,0.0},
+            {6.0,0.1,0.0}, {7.0,0.0,0.0}, {8.0,0.0,0.0},
+        }};
+        const auto thirdDifferenceEnergy=[](const auto &values) {
+            auto energy=0.0;
+            for(std::size_t first=0;first+3<values.size();++first)
+                for(std::size_t axis=0;axis<3;++axis) {
+                    const auto difference=-values[first][axis]+3.0*values[first+1][axis]
+                        -3.0*values[first+2][axis]+values[first+3][axis];
+                    energy+=difference*difference;
+                }
+            return energy;
+        };
+        const auto conditioned=
+            ngc::spline_detail::conditionCubicSplineInteriorControls<3>(controls,1.0);
+        require(conditioned.size()==controls.size(),
+            "cubic control conditioning should preserve the control count");
+        for(const auto index:{0U,1U,2U,6U,7U,8U})
+            require(conditioned[index]==controls[index],
+                "cubic control conditioning should preserve the constrained endpoint controls");
+        for(std::size_t control=3;control<=5;++control)
+            for(std::size_t axis=0;axis<3;++axis)
+                require(std::abs(conditioned[control][axis]-controls[control][axis])
+                            <=0.2+1e-12,
+                    "cubic control conditioning should bound every interior-control displacement");
+        require(thirdDifferenceEnergy(conditioned)<thirdDifferenceEnergy(controls),
+            "cubic control conditioning should reduce control-polygon third-difference energy");
+    }
+
+    void testMicroEntityClusterCollapsesToOneSpline() {
+        constexpr double SCALE=0.05;
+        const std::array lengths{1.0,0.02,0.01,1.0,0.06,1.0};
+        const auto clusters=ngc::spline_detail::detectMicroEntityClusters(lengths,SCALE);
+        require(clusters.size()==1&&clusters[0].left==0
+                    &&clusters[0].firstCollapsed==1&&clusters[0].lastCollapsed==2
+                    &&clusters[0].right==3,
+                "only a micro-entity chain with total length at most P should collapse");
+
+        const auto clusterEntity=[](const double length,
+                const ngc::spline_detail::Vector3 &start,
+                const ngc::spline_detail::Vector3 &middle,
+                const ngc::spline_detail::Vector3 &end,
+                const ngc::spline_detail::Vector3 &tangent) {
+            return ngc::spline_detail::ClusterEntity3{
+                .length=length,.positions={start,middle,end},
+                .tangents={tangent,tangent,tangent},
+            };
+        };
+        const auto normalized=[](const double x,const double y) {
+            const auto magnitude=std::hypot(x,y);
+            return ngc::spline_detail::Vector3{x/magnitude,y/magnitude,0.0};
+        };
+        const std::array inflection{
+            clusterEntity(1.0,{0,0,0},{0.5,-0.025,0},{1,-0.05,0},normalized(1,-0.05)),
+            clusterEntity(0.08,{1,-0.05,0},{1.04,-0.049,0},{1.08,-0.05,0},
+                normalized(1,0)),
+            clusterEntity(1.0,{1.08,-0.05,0},{1.58,-0.075,0},{2.08,-0.1,0},
+                normalized(1,-0.05)),
+        };
+        const auto inflectionClusters=ngc::spline_detail::detectMicroEntityClusters(
+            inflection,SCALE);
+        require(inflectionClusters.size()==1&&inflectionClusters[0].left==0
+                    &&inflectionClusters[0].right==2,
+                "a shallow, deviation-bounded inflection should collapse");
+
+        const std::array clusterLengths{1.0,0.04,0.06,0.05,1.0};
+        const auto midpointClusters=ngc::spline_detail::detectShortEntitySplineClusters(
+            clusterLengths,SCALE);
+        require(midpointClusters.size()==1&&midpointClusters[0].left==0
+                    &&midpointClusters[0].firstInterior==1
+                    &&midpointClusters[0].lastInterior==3
+                    &&midpointClusters[0].right==4,
+                "consecutive entities at most 6P should form one midpoint-control cluster");
+        std::array<double,20> denseLengths{};
+        denseLengths.fill(0.005);
+        const auto denseControlDistances=
+            ngc::spline_detail::evenlySpacedCompositeControlDistances(denseLengths,SCALE);
+        require(denseControlDistances.size()==2
+                    &&std::abs(denseControlDistances[0]-0.025)<1e-12
+                    &&std::abs(denseControlDistances[1]-0.075)<1e-12,
+                "dense tiny entities should reduce to controls spaced approximately P apart");
+
+        const auto previewLine=[](const glm::dvec3 start,const glm::dvec3 tangent) {
+            return ngc::experimental::JunctionEntity {
+                .length=1.0,
+                .stateAtDistance=[=](const double distance) {
+                    return ngc::experimental::JunctionState {
+                        .position=start+tangent*distance,.tangent=tangent,.curvature={} };
+                },
+                .linear=true,
+            };
+        };
+        const auto previewIncoming=previewLine({0,0,0},{1,0,0});
+        const auto previewOutgoing=previewLine({1.02,0.01,0},{1,0.1,0});
+        require(!ngc::experimental::fitJunction(previewIncoming,previewOutgoing,SCALE),
+                "an ordinary preview junction should require a shared canonical endpoint");
+        require(ngc::experimental::fitJunction(
+                    previewIncoming,previewOutgoing,SCALE,false).has_value(),
+                "a detected micro-cluster should bridge its separated long-entity endpoints");
+
+        const auto clusterLine=[](const double from,const double length) {
+            return ngc::experimental::JunctionEntity{
+                .length=length,
+                .stateAtDistance=[=](const double distance) {
+                    return ngc::experimental::JunctionState{
+                        .position={from+distance,0,0},.tangent={1,0,0},.curvature={}};
+                },
+                .linear=true,
+            };
+        };
+        const std::array clusterEntities{
+            clusterLine(0.0,1.0),clusterLine(1.0,0.2),
+            clusterLine(1.2,0.2),clusterLine(1.4,1.0),
+        };
+        const auto directCluster=ngc::experimental::buildEvenlySpacedControlCluster(
+            clusterEntities,0,3,SCALE);
+        require(directCluster&&directCluster->controlPoints.size()==8
+                    &&std::abs(directCluster->controlPoints[3].x-1.1)<1e-12
+                    &&std::abs(directCluster->controlPoints[4].x-1.3)<1e-12,
+                "cluster controls should be evenly spaced over the composite short path");
+        const std::array shortClusterEntities{
+            clusterLine(0.0,1.0),clusterLine(1.0,0.04),clusterLine(1.04,1.0),
+        };
+        const auto omittedShortCluster=ngc::experimental::buildEvenlySpacedControlCluster(
+            shortClusterEntities,0,2,SCALE);
+        require(omittedShortCluster&&omittedShortCluster->controlPoints.size()==6,
+                "a short run totaling less than 6P should add no interior controls");
+
+        const ngc::position_t p0{0,0,0,0,0,0},p1{1,0,0,0,0,0};
+        const ngc::position_t p2{1.04,0.004,0,0,0,0},p3{2,0.1,0,0,0,0};
+        const std::array<ngc::MachineCommand,3> commands{
+            ngc::MoveLine{p0,p1,60.0},ngc::MoveLine{p1,p2,60.0},
+            ngc::MoveLine{p2,p3,60.0},
+        };
+        ngc::ExactStopTrajectoryPlanner planner({
+            .pathAcceleration=20.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,
+            .pathJerk=200.0,
+            .axisVelocity={20,20,20,20,20,20},
+            .axisAcceleration={40,40,40,40,40,40},
+            .axisJerk={400,400,400,400,400,400},
+        });
+        planner.reset(38,p0);
+        const auto planned=planner.compileContinuous(commands,SCALE);
+        require(planned&&*planned,planned?
+                "micro-cluster fixture produced no plan":planned.error());
+        require((*planned)->pieceTiming.size()==3,
+                "a short run totaling less than 6P should use one ordinary spline piece");
+        require((*planned)->activationSpans.size()==commands.size()
+                    &&(*planned)->activationSpans[0]<(*planned)->activationSpans[1]
+                    &&(*planned)->activationSpans[1]==(*planned)->activationSpans[2],
+                "collapsed command activations should remain ordered on the replacement spline");
+    }
+
+    void testRollingContinuousHorizonsPreserveMovingPvaBoundary() {
+        ngc::BoundedLookaheadTrajectoryPlanner planner({
+            .pathAcceleration=10.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,.pathJerk=100.0,
+            .axisVelocity={10,10,10,10,10,10},
+            .axisAcceleration={20,20,20,20,20,20},
+            .axisJerk={100,100,100,100,100,100},
+            .lookaheadDuration=2.0,
+        });
+        const ngc::TrajectoryPlanningMetadata g64{
+            .pathMode=ngc::ExecutablePathMode::Continuous,.pathTolerance=0.01,
+        };
+        const ngc::position_t p0{0,0,0,0,0,0},p1{1,0,0,0,0,0};
+        const ngc::position_t p2{1,1,0,0,0,0},p3{5,1,0,0,0,0};
+        planner.reset(74,p0);
+        require(planner.enqueue({ngc::MoveLine{p0,p1,60.0},g64,{}}),
+                "rolling fixture line 1 should enqueue");
+        require(planner.enqueue({ngc::MoveLine{p1,p2,60.0},g64,{}}),
+                "rolling fixture line 2 should enqueue");
+        require(planner.enqueue({ngc::MoveLine{p2,p3,60.0},g64,{}}),
+                "rolling fixture line 3 should enqueue");
+
+        const auto first=planner.planWindow();
+        require(first&&*first,first?"rolling fixture produced no first horizon":first.error());
+        require(planner.windowSize()==1&&(*first)->inputs.size()==3,
+                "the first rolling horizon should commit the original commands and retain one suffix");
+        const auto &firstChunk=std::get<ngc::PlanChunk>((*first)->items.back());
+        const auto firstEnd=firstChunk.normalMotion[firstChunk.normalMotion.size-1].end;
+        require(firstEnd.velocity.length()>0.5,
+                "a rolling horizon boundary should remain moving rather than insert an exact stop");
+        require(firstChunk.stopTail.size>1,
+                "a moving rolling horizon boundary should retain a real bounded stop branch");
+
+        const auto second=planner.planWindow();
+        require(second&&*second,second?"rolling fixture produced no final horizon":second.error());
+        require(planner.windowSize()==0&&(*second)->inputs.size()==1
+                    &&!(*second)->inputs.front().presentationActivation,
+                "the final horizon should consume the already-activated retained suffix");
+        const auto &secondChunk=std::get<ngc::PlanChunk>((*second)->items.front());
+        const auto scaled=[](const ngc::position_t &value,const double amount) {
+            return ngc::position_t{value.x*amount,value.y*amount,value.z*amount,
+                value.a*amount,value.b*amount,value.c*amount};
+        };
+        const ngc::MotionState secondStart{
+            secondChunk.normalMotion[0].d,
+            scaled(secondChunk.normalMotion[0].c,secondChunk.normalMotion[0].inverseDuration),
+            scaled(secondChunk.normalMotion[0].b,
+                2.0*secondChunk.normalMotion[0].inverseDurationSquared),
+        };
+        require((firstEnd.position-secondStart.position).length()<1e-8,
+                "rolling horizons should preserve position continuity");
+        require((firstEnd.velocity-secondStart.velocity).length()<1e-7,
+                "rolling horizons should preserve velocity continuity");
+        require((firstEnd.acceleration-secondStart.acceleration).length()<1e-7,
+                "rolling horizons should preserve acceleration continuity");
+        const auto &finalChunk=std::get<ngc::PlanChunk>((*second)->items.back());
+        const auto finalState=finalChunk.normalMotion[finalChunk.normalMotion.size-1].end;
+        require((finalState.position-p3).length()<1e-8&&finalState.velocity.length()<1e-8
+                    &&finalState.acceleration.length()<1e-8,
+                "the final rolling horizon should reach the canonical endpoint at rest");
+        const auto &diagnostics=planner.diagnostics();
+        require(diagnostics.continuousHorizons==2&&diagnostics.blendedCommands==3
+                    &&diagnostics.totalContinuousHorizonSeconds
+                        >=diagnostics.maximumContinuousHorizonSeconds
+                    &&diagnostics.totalPlanningSeconds>=diagnostics.totalContinuousHorizonSeconds,
+                "rolling diagnostics should retain per-horizon and total planning computation time");
+    }
+
+    void testExactStopLeadInAdvancesRollingBoundary() {
+        ngc::BoundedLookaheadTrajectoryPlanner planner({
+            .pathAcceleration=10.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,.pathJerk=100.0,
+            .axisVelocity={10,10,10,10,10,10},
+            .axisAcceleration={20,20,20,20,20,20},
+            .axisJerk={100,100,100,100,100,100},
+            .lookaheadDuration=2.0,
+        });
+        const ngc::TrajectoryPlanningMetadata exactStop{
+            .pathMode=ngc::ExecutablePathMode::ExactStop,.pathTolerance=std::nullopt,
+        };
+        const ngc::TrajectoryPlanningMetadata g64{
+            .pathMode=ngc::ExecutablePathMode::Continuous,.pathTolerance=0.01,
+        };
+        const ngc::position_t probeStop{-10,2,-4,0,0,0};
+        const ngc::position_t p0{0,0,0,0,0,0},p1{1,0,0,0,0,0};
+        const ngc::position_t p2{1,1,0,0,0,0},p3{5,1,0,0,0,0};
+        planner.reset(76,probeStop);
+        std::size_t progressCallbacks=0;
+        planner.setProgressCallback([&] { ++progressCallbacks; });
+        require(planner.enqueue({ngc::MoveLine{probeStop,p0,60.0},exactStop,{}}),
+                "exact-stop lead-in should enqueue");
+        const auto leadIn=planner.planWindow();
+        require(leadIn&&*leadIn,leadIn?"exact-stop lead-in produced no plan":leadIn.error());
+
+        require(planner.enqueue({ngc::MoveLine{p0,p1,60.0},g64,{}})
+                    &&planner.enqueue({ngc::MoveLine{p1,p2,60.0},g64,{}})
+                    &&planner.enqueue({ngc::MoveLine{p2,p3,60.0},g64,{}}),
+                "post-probe rolling fixture should enqueue");
+        const auto rolling=planner.planWindow();
+        require(rolling&&*rolling,rolling?
+                "post-probe rolling fixture produced no horizon":rolling.error());
+        const auto &firstChunk=std::get<ngc::PlanChunk>((*rolling)->items.front());
+        require((firstChunk.normalMotion[0].d-p0).length()<1e-9,
+                "a G64 horizon after exact-stop motion should start at the exact-stop endpoint");
+        require(progressCallbacks>0,
+                "continuous planning should cooperatively report NRT presentation progress");
     }
 
     void testG64C2PrecisionUsesLocalCoordinates() {
@@ -2288,17 +2613,89 @@ namespace {
                 "dense fixture should expose its small-P cubic-blend jerk ceiling");
         require(continuousDuration(**planned)<2.5,
                 "dense line/arc timing fixture should remain quick enough for focused debugging");
+        require((*planned)->accelerationAwareDuration
+                    <(*planned)->velocityOnlySeedDuration-1e-4,
+                std::format("acceleration-aware reachability should improve the velocity-only seed: "
+                    "aware={} seed={}",(*planned)->accelerationAwareDuration,
+                    (*planned)->velocityOnlySeedDuration));
+        require(std::ranges::any_of((*planned)->pieceTiming,[](const auto &piece) {
+            return std::abs(piece.entryAcceleration)>1e-3
+                ||std::abs(piece.exitAcceleration)>1e-3;
+        }),"dense timing fixture should carry nonzero acceleration across a piece boundary");
         require(std::ranges::any_of((*planned)->pieceTiming,[](const auto &piece) {
             return piece.velocityLimit<0.55;
         }),"dense timing diagnostics should expose the local jerk-derived blend cap");
-        require(oracleModel.segments.size()==(*planned)->pieceTiming.size()*16,
+        require(oracleModel.segments.size()==(*planned)->pieceTiming.size()*32,
                 "the optional Clarabel model should subdivide every geometry piece");
+        require(oracleModel.pieceTiming.size()==(*planned)->pieceTiming.size(),
+                "the optional Clarabel model should retain planner station states");
+        requireNear(oracleModel.pathJerk,100.0,
+                "the optional Clarabel model should retain aggregate jerk");
         requireNear(oracleModel.plannerDuration,continuousDuration(**planned),
                 "the Clarabel model should retain the current planner duration");
         require(std::ranges::all_of(oracleModel.segments,[](const auto &segment) {
             return segment.length>0.0&&segment.velocityLimit>0.0
                 &&std::abs(segment.tangent.length()-1.0)<1e-8;
         }),"the Clarabel model should contain finite positive unit-tangent intervals");
+    }
+
+    void testContinuousTimingRetainsRuckigBrakePreProfile() {
+        const auto source=ngc::readFile("1001.ngc");
+        require(source.has_value(),source ? "" : source.error().what());
+        ngc::Machine machine(UNIT);
+        const auto emitted=execute(machine,*source);
+        std::vector<ngc::MachineCommand> commands;
+        for(const auto &command:emitted) {
+            const auto compatible=std::visit([](const auto &value) {
+                using T=std::decay_t<decltype(value)>;
+                if constexpr(std::same_as<T,ngc::MoveLine>)
+                    return value.speed()>0.0&&!value.machineCoordinates();
+                else if constexpr(std::same_as<T,ngc::MoveArc>) return value.speed()>0.0;
+                else return false;
+            },command);
+            if(compatible) commands.push_back(command);
+        }
+        require(commands.size()==242,
+                "Ruckig regression fixture should retain its 242-motion G64 horizon");
+
+        const auto configuration=ngc::loadMachineConfiguration("machine.toml");
+        require(configuration.has_value(),configuration ? "" : configuration.error());
+        const auto start=std::visit([](const auto &value) -> ngc::position_t {
+            using T=std::decay_t<decltype(value)>;
+            if constexpr(std::same_as<T,ngc::MoveLine>||std::same_as<T,ngc::MoveArc>)
+                return value.from();
+            else return {};
+        },commands.front());
+        ngc::ExactStopTrajectoryPlanner planner(configuration->trajectory);
+        planner.reset(80,start);
+        const auto planned=planner.compileContinuous(commands,0.005);
+        require(planned&&*planned,planned
+            ? "Ruckig brake regression fixture produced no plan" : planned.error());
+
+        const auto scaled=[](const ngc::position_t &value,const double amount) {
+            return ngc::position_t{value.x*amount,value.y*amount,value.z*amount,
+                value.a*amount,value.b*amount,value.c*amount};
+        };
+        std::optional<ngc::MotionState> previous;
+        for(const auto &chunk:(*planned)->chunks) for(const auto &span:chunk.normalMotion) {
+            require(std::isfinite(span.duration)&&span.duration>0.0,
+                    "Ruckig brake regression spans should have finite positive durations");
+            const ngc::MotionState startState{
+                span.d,
+                scaled(span.c,span.inverseDuration),
+                scaled(span.b,2.0*span.inverseDurationSquared),
+            };
+            if(previous) {
+                require((previous->position-startState.position).length()<1e-8,
+                        "Ruckig brake timing should preserve position continuity");
+                require((previous->velocity-startState.velocity).length()<1e-7,
+                        "Ruckig brake timing should preserve velocity continuity");
+                require((previous->acceleration-startState.acceleration).length()<1e-7,
+                        "Ruckig brake timing should preserve acceleration continuity");
+            }
+            previous=span.end;
+        }
+        require(previous.has_value(),"Ruckig brake regression should emit normal motion");
     }
 
     void testContinuousTimingUsesLocalEntityAndAverageBlendFeeds() {
@@ -2324,6 +2721,35 @@ namespace {
                 "the blend between F60 and F180 should use their F120 arithmetic mean");
         require(outgoing<=3.0+1e-8&&outgoing>2.9,
                 "the retained outgoing line should use its F180 local cap");
+    }
+
+    void testCollapsedClusterRetainsLocalFeedChanges() {
+        ngc::ExactStopTrajectoryPlanner planner({
+            .pathAcceleration=100.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,
+            .pathJerk=1000.0,
+            .axisVelocity={100,100,100,100,100,100},
+            .axisAcceleration={100,100,100,100,100,100},
+            .axisJerk={1000,1000,1000,1000,1000,1000},
+        });
+        const std::array<ngc::MachineCommand,3> commands {
+            ngc::MoveLine{{},{1,0,0,0,0,0},40.0},
+            ngc::MoveLine{{1,0,0,0,0,0},{1.04,0,0,0,0,0},72.0},
+            ngc::MoveLine{{1.04,0,0,0,0,0},{2.04,0,0,0,0,0},72.0},
+        };
+        planner.reset(80);
+        const auto planned=planner.compileContinuous(commands,0.01);
+        require(planned&&*planned,planned?
+                "local cluster-feed plan produced no trajectory":planned.error());
+        require((*planned)->pieceTiming.size()==4,
+                "a feed change inside a collapsed cluster should split only its timing pieces");
+        const auto &slowCluster=(*planned)->pieceTiming[1];
+        const auto &fastCluster=(*planned)->pieceTiming[2];
+        requireNear(slowCluster.velocityLimit,40.0/60.0,
+                "the incoming cluster portion should retain its F40 cap");
+        requireNear(fastCluster.velocityLimit,72.0/60.0,
+                "the remaining cluster portion should recover its F72 cap");
+        require(slowCluster.exitVelocity<=40.0/60.0+1e-8,
+                "the shared feed-change station should respect the lower adjacent cap");
     }
 
     void testDistantSlowEntityDoesNotThrottleFastContinuousPrefix() {
@@ -2386,6 +2812,7 @@ namespace {
         };
         ngc::BoundedLookaheadTrajectoryPlanner arcPlanner({
             .pathAcceleration=5.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,.pathJerk=20.0,
+            .lookaheadDuration=1000.0,
         });
         const ngc::position_t a0{-2,0,0,0,0,0},a1{-1,0,0,0,0,0},a2{0,-1,0,0,0,0};
         arcPlanner.reset(71,a0);
@@ -2411,6 +2838,7 @@ namespace {
     void testExecutableG64RetainsExactPrimitiveMiddles() {
         ngc::BoundedLookaheadTrajectoryPlanner planner({
             .pathAcceleration=5.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,.pathJerk=20.0,
+            .lookaheadDuration=1000.0,
         });
         const ngc::position_t p0{0,0,0,0,0,0},p1{10,0,0,0,0,0};
         const ngc::position_t p2{10,10,0,0,0,0},p3{20,10,0,0,0,0};
@@ -2674,6 +3102,8 @@ namespace {
                 "machine configuration should load and convert a validated rapid velocity");
         require(configuration->trajectory.arcChordTolerance > 0.0,
                 "machine configuration should load a validated arc chord tolerance");
+        requireNear(configuration->trajectory.lookaheadDuration,2.0,
+                    "machine configuration should load the rolling lookahead duration in seconds");
         requireNear(configuration->simulation.servoPeriod, 0.001,
                     "machine configuration should load the fixed simulation servo period");
         requireNear(configuration->simulation.schedulerPeriod, 0.01,
@@ -3078,9 +3508,12 @@ namespace {
                     [](const auto span) { return span!=0; }),
                 "combined G64 commands should retain ordered activation span identities");
         require(driver.planningDiagnostics().continuousExactStops == 0
-                    && driver.planningDiagnostics().blendedWindows == 1
+                    && driver.planningDiagnostics().blendedWindows == 2
                     && driver.planningDiagnostics().blendedCommands == 3
-                    && driver.planningDiagnostics().maximumWindowCommands == 3,
+                    && driver.planningDiagnostics().maximumWindowCommands == 3
+                    && driver.planningDiagnostics().continuousHorizons == 2
+                    && driver.planningDiagnostics().totalContinuousHorizonSeconds
+                        >=driver.planningDiagnostics().maximumContinuousHorizonSeconds,
                 std::format("driver G64 diagnostics mismatch (single exact stops={}, windows={}, commands={}, window={})",
                     driver.planningDiagnostics().continuousExactStops,
                     driver.planningDiagnostics().blendedWindows,
@@ -3090,6 +3523,48 @@ namespace {
         requireNear(latest.commanded.position.x, 2.0, "mock RT execution should reach the final planned X position");
         requireNear(latest.commanded.position.z, -1.0,
                     "mock RT execution should preserve its final Z position");
+    }
+
+    void testTrajectoryDriverPublishesRollingPrefixBeforeProtectedBoundary() {
+        std::string source="G64 P0.01\n";
+        constexpr int COMMANDS=12;
+        for(int command=1;command<=COMMANDS;++command)
+            source+=std::format("G1 F60 X{}\n",command);
+        ngc::InterpreterSession session(UNIT,ngc::InterpretationMode::Simulation);
+        compileSession(session,source);
+        session.begin();
+
+        ngc::MockMotionBackend backend;
+        ngc::TrajectoryExecutionDriver driver(session,backend,{
+            .pathAcceleration=10.0,.rapidSpeed=100.0,.arcChordTolerance=0.0001,
+            .pathJerk=100.0,.lookaheadDuration=2.0,
+        });
+        require(driver.begin(13),"incremental rolling driver should initialize");
+        auto observed=0;
+        auto publishedBeforeCompletion=false;
+        for(int guard=0;guard<10000&&driver.state()==ngc::TrajectoryDriverState::Running;++guard) {
+            for(int fill=0;fill<64;++fill) {
+                if(!driver.pumpOne([](const auto &callback){callback();},
+                    [&](const ngc::MachineCommand &) {
+                        ++observed;
+                        if(!driver.interpretationComplete()) publishedBeforeCompletion=true;
+                    })) break;
+            }
+            backend.advance(0.01);
+            driver.serviceBackend();
+        }
+        require(driver.state()==ngc::TrajectoryDriverState::Completed,
+                driver.error()?*driver.error():"incremental rolling execution did not complete");
+        require(publishedBeforeCompletion,
+                "rolling lookahead should publish an immutable prefix before reaching the G64 boundary");
+        require(observed==COMMANDS,
+                "incremental rolling publication should activate every source command exactly once");
+        require(driver.planningDiagnostics().continuousHorizons>=2
+                    &&driver.planningDiagnostics().firstContinuousHorizonSeconds>0.0
+                    &&driver.planningDiagnostics().totalPlanningSeconds
+                        >=driver.planningDiagnostics().totalContinuousHorizonSeconds,
+                "incremental rolling execution should retain first/per-horizon/total timing diagnostics");
+        session.stop();
     }
 
     void testHeldRecoveryPreservesBufferedG64Commands() {
@@ -3237,6 +3712,7 @@ int main() {
         testSimulationWorkerStartsPlayback();
         testAdaptivePocketsStartsSimulation();
         testTimedSimulationRefillsMultiPacketContinuousBatch();
+        testTimedSimulationPublishesSnapshotsDuringPlanning();
         testImmediatePreviewBuildsGeometryWithoutTrajectoryExecution();
         testGeometryPreviewResolvesProbeAtCanonicalTarget();
         testAdaptivePocketsGeometryPreviewAvoidsTrajectoryExecution();
@@ -3277,12 +3753,19 @@ int main() {
         testExactStopPlannerEnforcesIndependentAxisLimits();
         testBoundedLookaheadCarriesG64MetadataAndSingleCommandExactStops();
         testPreviewJunctionUsesOneSixControlSpline();
+        testShortLineMidpointCurvatureInference();
+        testCubicSplineInteriorControlConditioning();
+        testMicroEntityClusterCollapsesToOneSpline();
         testBoundedPlannerExecutesPiecewiseG64Geometry();
+        testRollingContinuousHorizonsPreserveMovingPvaBoundary();
+        testExactStopLeadInAdvancesRollingBoundary();
         testG64C2PrecisionUsesLocalCoordinates();
         testContinuousTrajectoryPacketizesBeyondNormalSpanCapacity();
         testContinuousTimingUsesLocalEntityAndAverageBlendFeeds();
+        testCollapsedClusterRetainsLocalFeedChanges();
         testDistantSlowEntityDoesNotThrottleFastContinuousPrefix();
         testDenseContinuousTimingFixture();
+        testContinuousTimingRetainsRuckigBrakePreProfile();
         testContinuousPlanningFailureIsFatalAndReported();
         testG64ExecutesRetainedArcAndLocalSpline();
         testExecutableG64RetainsExactPrimitiveMiddles();
@@ -3297,6 +3780,7 @@ int main() {
         testProbeCompilesAsBackendOwnedTriggeredMove();
         testDualScrewJointMoveStopsEachMotorOnItsOwnSwitch();
         testTrajectoryDriverConnectsInterpreterToMockRtBackend();
+        testTrajectoryDriverPublishesRollingPrefixBeforeProtectedBoundary();
         testHeldRecoveryPreservesBufferedG64Commands();
         testParameterReadWaitsForPriorMotionCompletion();
         testMotionWordSynchronizationPolicy();

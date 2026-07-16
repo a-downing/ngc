@@ -578,13 +578,71 @@ public:
             std::optional<double> splineScale;
             const auto flushSpline = [&] {
                 if(!splineScale) return;
-                for(std::size_t i = 1; i < splineEntities.size(); ++i) {
+                const auto vector=[](const glm::dvec3 &value) {
+                    return ngc::spline_detail::Vector3{value.x,value.y,value.z};
+                };
+                std::vector<double> entityLengths;
+                entityLengths.reserve(splineEntities.size());
+                for(const auto &entity:splineEntities) entityLengths.push_back(entity.length);
+                const auto clusters=ngc::spline_detail::detectShortEntitySplineClusters(
+                    entityLengths,*splineScale);
+                constexpr auto NO_CLUSTER=std::numeric_limits<std::size_t>::max();
+                std::vector<std::size_t> clusterRight(splineEntities.size(),NO_CLUSTER);
+                std::vector<bool> collapsed(splineEntities.size(),false);
+                std::vector<bool> suppressedJunction(
+                    splineEntities.empty()?0:splineEntities.size()-1,false);
+                for(const auto &cluster:clusters) {
+                    clusterRight[cluster.left]=cluster.right;
+                    for(auto entity=cluster.firstInterior;entity<=cluster.lastInterior;++entity)
+                        collapsed[entity]=true;
+                    for(auto junction=cluster.left;junction<cluster.right;++junction)
+                        suppressedJunction[junction]=true;
+                }
+                for(std::size_t i=1;i+1<splineEntities.size();++i) {
+                    auto &previous=splineEntities[i-1];
+                    auto &current=splineEntities[i];
+                    auto &next=splineEntities[i+1];
+                    if(collapsed[i-1]||collapsed[i]||collapsed[i+1]
+                       ||!previous.linear||!current.linear||!next.linear
+                       ||previous.length>6.0 * *splineScale*(1.0+1e-12)
+                       ||current.length>6.0 * *splineScale*(1.0+1e-12)
+                       ||next.length>6.0 * *splineScale*(1.0+1e-12)) continue;
+                    const auto minimumLength=std::min({previous.length,current.length,next.length});
+                    const auto maximumLength=std::max({previous.length,current.length,next.length});
+                    if(minimumLength<=1e-12||maximumLength>1.5*minimumLength) continue;
+                    const auto curvature=ngc::spline_detail::inferShortLineMidpointCurvature(
+                        vector(previous.stateAtDistance(previous.length).tangent),
+                        vector(current.stateAtDistance(0.5*current.length).tangent),
+                        vector(next.stateAtDistance(0.0).tangent),current.length);
+                    if(curvature) current.midpointCurvature=glm::dvec3(
+                        (*curvature)[0],(*curvature)[1],(*curvature)[2]);
+                }
+                for(std::size_t junction=0;junction+1<splineEntities.size();++junction) {
+                    auto outgoing=junction+1;
+                    auto cluster=false;
+                    if(clusterRight[junction]!=NO_CLUSTER) {
+                        outgoing=clusterRight[junction];
+                        cluster=true;
+                    } else if(suppressedJunction[junction]) continue;
+                    if(cluster) {
+                        const auto fitted=ngc::experimental::buildEvenlySpacedControlCluster(
+                            splineEntities,junction,outgoing,*splineScale);
+                        if(!fitted) continue;
+                        ngc::experimental::tessellateJunction(
+                            *fitted,cache.g64ClusterSplineLines);
+                        cache.g64ControlPoints.insert(cache.g64ControlPoints.end(),
+                            fitted->controlPoints.begin(),fitted->controlPoints.end());
+                        for(std::size_t control=1;control<fitted->controlPoints.size();++control)
+                            segment(cache.g64ControlPolygon,fitted->controlPoints[control-1],
+                                fitted->controlPoints[control]);
+                        continue;
+                    }
                     const auto blend = ngc::experimental::fitJunction(
-                        splineEntities[i - 1], splineEntities[i], *splineScale);
+                        splineEntities[junction],splineEntities[outgoing],*splineScale);
                     if(!blend) continue;
-                    const auto shortEntity = splineEntities[i - 1].length <= 6.0 * *splineScale
-                        || splineEntities[i].length <= 6.0 * *splineScale;
-                    auto &splineLines = shortEntity
+                    const auto shortEntity=splineEntities[junction].length<=6.0 * *splineScale
+                        ||splineEntities[outgoing].length<=6.0 * *splineScale;
+                    auto &splineLines=shortEntity
                         ? cache.g64ClusterSplineLines : cache.g64SplineLines;
                     ngc::experimental::tessellateJunction(*blend, splineLines);
                     cache.g64ControlPoints.insert(cache.g64ControlPoints.end(),
@@ -616,6 +674,7 @@ public:
                             .curvature = {},
                         };
                     },
+                    .linear = true,
                 };
             };
             const auto arcEntity = [&](const ngc::MoveArc &arc) {

@@ -121,13 +121,21 @@ namespace ngc::simulation_detail {
         const auto lower = upper-1;
         auto from = lower->parameter;
         auto to = upper->parameter;
-        for(unsigned iteration = 0; iteration < 48; ++iteration) {
-            const auto middle = std::midpoint(from, to);
-            const auto middleDistance = lower->distance + integratedLength(lower->parameter, middle);
-            if(middleDistance < distance) from = middle;
-            else to = middle;
+        auto parameter = std::lerp(from, to,
+            (distance-lower->distance)/(upper->distance-lower->distance));
+        const auto distanceTolerance = 1e-12*std::max(1.0, m_length);
+        for(unsigned iteration = 0; iteration < 12; ++iteration) {
+            const auto parameterDistance = lower->distance
+                +integratedLength(lower->parameter, parameter);
+            const auto error = parameterDistance-distance;
+            if(std::abs(error) <= distanceTolerance) return parameter;
+            if(error < 0.0) from = parameter;
+            else to = parameter;
+            const auto localSpeed = speed(parameter);
+            const auto newton = localSpeed > 1e-15 ? parameter-error/localSpeed : parameter;
+            parameter = newton > from && newton < to ? newton : std::midpoint(from, to);
         }
-        return std::midpoint(from, to);
+        return parameter;
     }
 
     position_t ArcReference::positionAtDistance(const double distance) const {

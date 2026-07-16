@@ -222,7 +222,7 @@ public:
     void setRapidSpeed(const double speed) {
         std::scoped_lock lock(m_mutex);
         m_limits.rapidSpeed = std::max(speed, 1e-6);
-        m_driver.setLimits(m_limits);
+        if(!m_running&&!m_start&&!m_home&&!m_activeJog) m_driver.setLimits(m_limits);
     }
     ngc::SimulationSnapshot snapshot() const { std::scoped_lock lock(m_mutex); return m_snapshot; }
 
@@ -803,13 +803,13 @@ private:
             m_snapshot.maximumTickExecutionSeconds = 0.0;
             m_executorTickMultiplier.store(m_tickMultiplier, std::memory_order_relaxed);
             m_executorPaused.store(false, std::memory_order_relaxed);
+            m_driver.setLimits(m_limits);
             lock.unlock();
 
             m_session.setPrograms(programs);
             m_session.machine().toolTable() = std::move(tools);
             m_session.compile([](const auto &callback) { callback(); });
             if(preserve) m_session.beginContinuation(); else m_session.begin();
-            m_driver.setLimits(m_limits);
             if(!m_driver.begin(m_nextEpoch++, startingPosition)) {
                 m_session.reportError("simulation trajectory driver failed to initialize its backend control channels");
                 m_session.stop();
@@ -896,6 +896,22 @@ private:
                 m_snapshot.maximumWakeLatenessSeconds = maximumWakeLateness.load(std::memory_order_relaxed);
                 m_snapshot.maximumTickExecutionSeconds = maximumTickExecution.load(std::memory_order_relaxed);
             };
+            auto nextPlanningRefresh=clock::now();
+            m_driver.setPlanningProgressCallback([&] {
+                const auto now=clock::now();
+                if(now<nextPlanningRefresh) return;
+                nextPlanningRefresh=now+std::chrono::milliseconds(16);
+                std::unique_lock snapshotLock(m_mutex,std::try_to_lock);
+                if(!snapshotLock.owns_lock()) return;
+                ngc::ExecutionSnapshot backendSnapshot;
+                while(m_backend.tryTakeSnapshot(backendSnapshot))
+                    applyBackendSnapshot(backendSnapshot);
+                copyTimingSnapshot();
+            });
+            struct PlanningProgressReset {
+                ngc::TrajectoryExecutionDriver &driver;
+                ~PlanningProgressReset() { driver.setPlanningProgressCallback({}); }
+            } planningProgressReset{m_driver};
 
             for(;;) {
                 lock.lock();
@@ -971,13 +987,21 @@ private:
 
                 bool filled = false;
                 for(int fill = 0; fill < 64; ++fill) {
-                    if(!m_driver.pumpOne([](const auto &callback) { callback(); },
+                    lock.unlock();
+                    const auto pumped=m_driver.pumpOne([](const auto &callback) { callback(); },
                         [&](const auto &command, const auto &chunk, const auto &,
                             const auto &presentation, const ngc::SpanId activationSpan) {
+                            std::scoped_lock presentationLock(m_mutex);
                             observeCommand(command,chunk,presentation,activationSpan);
                         },
-                        [&](const auto &lifecycle) { observeLifecycle(lifecycle); })) break;
+                        [&](const auto &lifecycle) {
+                            std::scoped_lock presentationLock(m_mutex);
+                            observeLifecycle(lifecycle);
+                        });
+                    lock.lock();
+                    if(!pumped) break;
                     filled = true;
+                    if(m_join||m_stop||m_paused) break;
                 }
                 m_snapshot.statusMessages = m_session.statusMessages();
                 m_snapshot.trajectoryPlanning = m_driver.planningDiagnostics();

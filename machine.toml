@@ -12,6 +12,8 @@ path_jerk = 100.0
 rapid_velocity = 3.33
 # machine-units
 arc_chord_tolerance = 0.0001
+# minimum seconds of provisional G64 motion before a proven rolling split
+lookahead_duration = 2.0
 
 [simulation]
 # seconds per mock executor servo tick
@@ -34,7 +36,7 @@ joints = [0]
 minimum = -14.0
 maximum = 13.75
 max_velocity = 3.33333333333
-max_acceleration = 100
+max_acceleration = 20
 max_jerk = 100
 
 [axes.y]
@@ -42,7 +44,7 @@ joints = [1, 2]
 minimum = 0
 maximum = 33.25
 max_velocity = 3.33333333333
-max_acceleration = 100
+max_acceleration = 20
 max_jerk = 100
 
 [axes.z]
@@ -50,7 +52,7 @@ joints = [3]
 minimum = -8.5
 maximum = 0.001
 max_velocity = 3.33333333333
-max_acceleration = 100
+max_acceleration = 20
 max_jerk = 100
 
 # Stable logical input IDs. A future physical backend will map these names and

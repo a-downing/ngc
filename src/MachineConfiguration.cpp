@@ -203,6 +203,7 @@ namespace ngc {
             const auto jerk = positiveNumber(*trajectory, "path_jerk", path);
             const auto rapidVelocity = positiveNumber(*trajectory, "rapid_velocity", path);
             const auto chordTolerance = positiveNumber(*trajectory, "arc_chord_tolerance", path);
+            const auto lookaheadDuration = positiveNumber(*trajectory, "lookahead_duration", path);
             const auto servoPeriod = positiveNumber(*simulation, "servo_period", path);
             const auto schedulerPeriod = positiveNumber(*simulation, "scheduler_period", path);
             const auto jogAcceleration = positiveNumber(*jogging, "acceleration", path);
@@ -211,6 +212,7 @@ namespace ngc {
             if(!jerk) return std::unexpected(jerk.error());
             if(!rapidVelocity) return std::unexpected(rapidVelocity.error());
             if(!chordTolerance) return std::unexpected(chordTolerance.error());
+            if(!lookaheadDuration) return std::unexpected(lookaheadDuration.error());
             if(!servoPeriod) return std::unexpected(servoPeriod.error());
             if(!schedulerPeriod) return std::unexpected(schedulerPeriod.error());
             if(!jogAcceleration) return std::unexpected(jogAcceleration.error());
@@ -224,6 +226,7 @@ namespace ngc {
             result.trajectory.pathJerk = *jerk;
             result.trajectory.rapidSpeed = *rapidVelocity * 60.0;
             result.trajectory.arcChordTolerance = *chordTolerance;
+            result.trajectory.lookaheadDuration = *lookaheadDuration;
             result.simulation = { *servoPeriod, *schedulerPeriod };
             result.jogging = { *jogAcceleration, *jogJerk };
 
