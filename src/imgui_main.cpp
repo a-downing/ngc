@@ -1,3 +1,4 @@
+#include <chrono>
 #include <cstdio>
 #include <fstream>
 #include <print>
@@ -84,7 +85,7 @@ int main(int, char**) {
     }
 
     glfwMakeContextCurrent(window);
-    glfwSwapInterval(0);
+    glfwSwapInterval(1);
     glfwSetScrollCallback(window, application_scroll_callback);
 
     // Setup Dear ImGui context
@@ -116,6 +117,7 @@ int main(int, char**) {
         // - When io.WantCaptureKeyboard is true, do not dispatch keyboard input data to your main application, or clear/overwrite your copy of the keyboard data.
         // Generally you may always pass all inputs to dear imgui, and hide them from your application based on those two flags.
         glfwPollEvents();
+        const auto renderStart=std::chrono::steady_clock::now();
 
         // Start the Dear ImGui frame
         ImGui_ImplOpenGL3_NewFrame();
@@ -136,6 +138,9 @@ int main(int, char**) {
 
         app.render3D();
         ImGui_ImplOpenGL3_RenderDrawData(ImGui::GetDrawData());
+        const auto renderEnd=std::chrono::steady_clock::now();
+        app.setLastFrameRenderSeconds(
+            std::chrono::duration<double>(renderEnd-renderStart).count());
 
         glfwSwapBuffers(window);
     }

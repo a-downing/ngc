@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cmath>
 #include <limits>
+#include <mutex>
 #include <optional>
 #include <type_traits>
 
@@ -88,6 +89,11 @@ namespace ngc {
         std::uint32_t m_span = 0;
         std::uint32_t m_nextEvent = 0;
         double m_spanElapsed = 0.0;
+        double m_lastAdvanceProgramSeconds = 0.0;
+        std::atomic<double> m_currentProgramJerkMagnitude{0.0};
+        std::mutex m_executedJerkSamplesMutex;
+        std::vector<ExecutedJerkSample> m_executedJerkSamples;
+        std::optional<ExecutedJerkSample> m_latestExecutedJerkSample;
         std::uint64_t m_continuationSequence = 0;
         MockTrajectorySnapshot m_trajectoryDiagnostics;
         struct TriggeredRuntime {
@@ -194,9 +200,22 @@ namespace ngc {
         bool configureSyntheticInput(const SyntheticInputTransition &input) noexcept {
             return m_syntheticInputs.tryPush(input);
         }
-        void clearDiagnostics() { m_trajectoryDiagnostics = {}; }
+        void clearDiagnostics() {
+            m_trajectoryDiagnostics = {};
+            std::scoped_lock lock(m_executedJerkSamplesMutex);
+            m_executedJerkSamples.clear();
+        }
         MockTrajectorySnapshot diagnostics() const { return m_trajectoryDiagnostics; }
+        std::vector<ExecutedJerkSample> takeExecutedJerkSamples() {
+            std::scoped_lock lock(m_executedJerkSamplesMutex);
+            std::vector<ExecutedJerkSample> result;
+            result.swap(m_executedJerkSamples);
+            return result;
+        }
         void advance(double seconds, const bool shouldPublishSnapshot = true) {
+            m_lastAdvanceProgramSeconds = 0.0;
+            m_currentProgramJerkMagnitude.store(0.0,std::memory_order_relaxed);
+            m_latestExecutedJerkSample.reset();
             serviceControls();
             SyntheticInputTransition input;
             while(m_syntheticInputs.tryPop(input)) {
@@ -208,6 +227,7 @@ namespace ngc {
                 if(!replaced) (void)m_pendingSyntheticInputs.push(input);
             }
             seconds = std::max(seconds, 0.0);
+            const auto availableProgramSeconds = seconds;
             if(m_jog) {
                 advanceJog(seconds);
                 if(shouldPublishSnapshot || !m_jog) publishSnapshot();
@@ -229,6 +249,9 @@ namespace ngc {
                     continue;
                 }
                 const auto &span = currentSpan();
+                m_currentProgramJerkMagnitude.store(
+                    magnitude(scaled(span.a,6.0*span.inverseDurationCubed)),
+                    std::memory_order_relaxed);
                 const auto remaining = std::max(span.duration - m_spanElapsed, 0.0);
                 const auto consumed = std::min(seconds, remaining);
                 seconds -= consumed;
@@ -242,6 +265,9 @@ namespace ngc {
                 if(m_spanElapsed + 1e-12 < span.duration) break;
                 completeSpan();
             }
+            if(!m_active)
+                m_currentProgramJerkMagnitude.store(0.0,std::memory_order_relaxed);
+            m_lastAdvanceProgramSeconds = availableProgramSeconds - seconds;
             // Always publish terminal/held state even inside a decimated batch so
             // NRT cannot observe completion before its matching final snapshot.
             if(shouldPublishSnapshot || (executedActiveMotion && !m_active)
@@ -252,7 +278,19 @@ namespace ngc {
         bool advanceTick(const double seconds,const bool shouldPublishSnapshot) {
             const auto before=m_continuationSequence;
             advance(seconds,shouldPublishSnapshot);
+            if(m_latestExecutedJerkSample) {
+                std::scoped_lock lock(m_executedJerkSamplesMutex);
+                m_executedJerkSamples.push_back(*m_latestExecutedJerkSample);
+            }
             return m_continuationSequence!=before;
+        }
+
+        double lastAdvanceProgramSeconds() const noexcept {
+            return m_lastAdvanceProgramSeconds;
+        }
+
+        double currentProgramJerkMagnitude() const noexcept {
+            return m_currentProgramJerkMagnitude.load(std::memory_order_relaxed);
         }
 
         void runUntilIdle() {
@@ -1022,6 +1060,13 @@ namespace ngc {
             }
             m_trajectoryDiagnostics.spans.back().positions.push_back(m_snapshot.commanded.position);
             ++m_trajectoryDiagnostics.revision;
+            m_latestExecutedJerkSample=ExecutedJerkSample{
+                .epoch=chunk.epoch,
+                .chunk=chunk.id,
+                .span=spanId,
+                .position=m_snapshot.commanded.position,
+                .magnitude=m_currentProgramJerkMagnitude.load(std::memory_order_relaxed),
+            };
         }
 
     };
@@ -1035,6 +1080,12 @@ namespace ngc {
     void MockMotionBackend::advance(const double seconds) { m_impl->advance(seconds); }
     bool MockMotionBackend::advanceTick(const double seconds, const bool publishSnapshot) {
         return m_impl->advanceTick(seconds,publishSnapshot);
+    }
+    double MockMotionBackend::lastAdvanceProgramSeconds() const noexcept {
+        return m_impl->lastAdvanceProgramSeconds();
+    }
+    double MockMotionBackend::currentProgramJerkMagnitude() const noexcept {
+        return m_impl->currentProgramJerkMagnitude();
     }
     void MockMotionBackend::runUntilIdle() { m_impl->runUntilIdle(); }
     void MockMotionBackend::runUntilIdle(const double tickSeconds) { m_impl->runUntilIdle(tickSeconds); }
@@ -1050,4 +1101,7 @@ namespace ngc {
     }
     void MockMotionBackend::clearTrajectoryDiagnostics() { m_impl->clearDiagnostics(); }
     MockTrajectorySnapshot MockMotionBackend::trajectorySnapshot() const { return m_impl->diagnostics(); }
+    std::vector<ExecutedJerkSample> MockMotionBackend::takeExecutedJerkSamples() {
+        return m_impl->takeExecutedJerkSamples();
+    }
 }

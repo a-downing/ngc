@@ -225,6 +225,24 @@ public:
         if(!m_running&&!m_start&&!m_home&&!m_activeJog) m_driver.setLimits(m_limits);
     }
     ngc::SimulationSnapshot snapshot() const { std::scoped_lock lock(m_mutex); return m_snapshot; }
+    std::vector<ngc::ExecutedJerkSample> takeExecutedJerkSamples() {
+        auto samples=m_backend.takeExecutedJerkSamples();
+        std::scoped_lock lock(m_mutex);
+        for(auto &sample:samples) {
+            const ChunkPresentation *presentation=nullptr;
+            auto span=m_spanPresentations.upper_bound({sample.epoch,sample.span});
+            if(span!=m_spanPresentations.begin()) {
+                --span;
+                if(span->first.first==sample.epoch) presentation=&span->second;
+            }
+            if(!presentation) {
+                const auto chunk=m_chunks.find({sample.epoch,sample.chunk});
+                if(chunk!=m_chunks.end()) presentation=&chunk->second;
+            }
+            if(presentation) sample.position=sample.position-presentation->tool.offset;
+        }
+        return samples;
+    }
 
     void join() {
         { std::scoped_lock lock(m_mutex); if(!m_thread.joinable()) return; m_join = true; m_cv.notify_all(); }
@@ -797,6 +815,8 @@ private:
             m_snapshot.servoTicksPerSchedulerPeriod = m_servoTicksPerSchedulerPeriod;
             m_snapshot.tickMultiplier = m_tickMultiplier;
             m_snapshot.servoTicks = 0;
+            m_snapshot.programElapsedSeconds = 0.0;
+            m_snapshot.executedPathJerk = 0.0;
             m_snapshot.deadlineMisses = 0;
             m_snapshot.lastWakeLatenessSeconds = 0.0;
             m_snapshot.maximumWakeLatenessSeconds = 0.0;
@@ -810,6 +830,7 @@ private:
             m_session.machine().toolTable() = std::move(tools);
             m_session.compile([](const auto &callback) { callback(); });
             if(preserve) m_session.beginContinuation(); else m_session.begin();
+            m_backend.clearTrajectoryDiagnostics();
             if(!m_driver.begin(m_nextEpoch++, startingPosition)) {
                 m_session.reportError("simulation trajectory driver failed to initialize its backend control channels");
                 m_session.stop();
@@ -819,6 +840,7 @@ private:
 
             std::atomic<bool> stopExecutor{false};
             std::atomic<std::uint64_t> servoTicks{0};
+            std::atomic<double> programElapsedSeconds{0.0};
             std::atomic<std::uint64_t> deadlineMisses{0};
             std::atomic<double> lastWakeLateness{0.0};
             std::atomic<double> maximumWakeLateness{0.0};
@@ -861,6 +883,8 @@ private:
                         const auto started = clock::now();
                         const auto crossedChunk=m_backend.advanceTick(
                             m_servoPeriod,tick+1==ticksThisPeriod);
+                        programElapsedSeconds.fetch_add(
+                            m_backend.lastAdvanceProgramSeconds(), std::memory_order_relaxed);
                         const auto duration = std::chrono::duration<double>(clock::now() - started).count();
                         updateMaximum(maximumTickExecution, duration);
                         servoTicks.fetch_add(1, std::memory_order_relaxed);
@@ -891,6 +915,8 @@ private:
                 m_snapshot.servoTicksPerSchedulerPeriod = m_servoTicksPerSchedulerPeriod;
                 m_snapshot.tickMultiplier = m_executorTickMultiplier.load(std::memory_order_relaxed);
                 m_snapshot.servoTicks = servoTicks.load(std::memory_order_relaxed);
+                m_snapshot.programElapsedSeconds = programElapsedSeconds.load(std::memory_order_relaxed);
+                m_snapshot.executedPathJerk=m_backend.currentProgramJerkMagnitude();
                 m_snapshot.deadlineMisses = deadlineMisses.load(std::memory_order_relaxed);
                 m_snapshot.lastWakeLatenessSeconds = lastWakeLateness.load(std::memory_order_relaxed);
                 m_snapshot.maximumWakeLatenessSeconds = maximumWakeLateness.load(std::memory_order_relaxed);

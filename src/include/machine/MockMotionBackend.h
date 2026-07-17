@@ -26,6 +26,14 @@ namespace ngc {
         // boundary. Timed simulation uses this mock-only signal to give its NRT
         // producer a refill opportunity during accelerated scheduler batches.
         bool advanceTick(double seconds, bool publishSnapshot);
+        // Exact program-motion time consumed by the most recent advance call.
+        // This excludes idle scheduler ticks and jog motion and is intentionally
+        // mock-only presentation evidence rather than part of MotionBackend.
+        [[nodiscard]] double lastAdvanceProgramSeconds() const noexcept;
+        // Magnitude of the analytic axis-space jerk in the currently executed
+        // cubic span. Mock-only presentation telemetry; zero while no planned
+        // cubic is actively moving.
+        [[nodiscard]] double currentProgramJerkMagnitude() const noexcept;
         void runUntilIdle() override;
         // Immediate preview still executes at fixed mock-servo intervals so its
         // diagnostic position buffer reflects the values calculated by the backend.
@@ -37,6 +45,7 @@ namespace ngc {
                                           double transitionPosition) noexcept;
         void clearTrajectoryDiagnostics() override;
         MockTrajectorySnapshot trajectorySnapshot() const override;
+        std::vector<ExecutedJerkSample> takeExecutedJerkSamples() override;
 
     private:
         class Impl;

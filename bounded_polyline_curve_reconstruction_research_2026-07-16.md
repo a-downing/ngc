@@ -1,7 +1,210 @@
-# Research notes: faster certified path smoothing and jerk-limited planning
+# Research notes: bounded polyline curve reconstruction and trajectory planning
 
 Date: 2026-07-16
-Scope: original literature research plus same-day implementation and profiling follow-up.
+Updated: 2026-07-17
+Scope: fast reconstruction of fair curves from CAM polylines under the G64 `P` tube, followed by the original certified trajectory-planning research and profiling record.
+
+## Polyline reconstruction update: the current primary blocker
+
+### Required contract
+
+The reconstruction problem is not ordinary point fitting. For an ordered source polyline and programmed scale `P`, NGC needs a regular replacement curve that:
+
+- remains within `P` of the corresponding source entities, with ordered association rather than an unordered nearest-point match;
+- preserves protected endpoints, activation order, feed sections, and any genuine corner that cannot be smoothed inside the tube;
+- has continuous curvature derivative wherever execution is intended to remain continuous;
+- keeps curvature and curvature derivative low enough to avoid destroying the jerk-limited feed;
+- is constructed in bounded NRT time and then passes a separate conservative geometry proof.
+
+For a planar arc-length curve, `q''' = kappa' N - kappa^2 T`. Minimizing only signed-curvature variation `kappa'` is therefore insufficient: a small-radius circle has zero normal curvature derivative but retains the unavoidable tangential term `kappa^2`. The practical geometry objective must control both maximum curvature and the full vector magnitude of `q'''`, or use the actual coupled axis-jerk cap already consumed by the planner.
+
+The tolerance should be treated as a budget. A useful initial split is to reserve part for model construction and part for numerical/proof margin, for example `0.8P` for fitting and `0.2P` for certification headroom. The exact split should be measured rather than embedded as G64 semantics.
+
+### What the literature says
+
+The closest directly relevant published work divides into five families:
+
+1. **Confined-error global B-spline fitting.** Yang, Shen, Yuan, and Gao formulate CNC polyline fitting as a quadratic B-spline optimization with an explicit line-segment/curve Hausdorff model in [Curve fitting and optimal interpolation for CNC machining under confined error using quadratic B-splines](https://doi.org/10.1016/j.cad.2015.04.010). This is the strongest lead for treating the source as complete entities rather than point samples. Its degree and continuity are not sufficient for NGC's curvature-derivative goal, but its distance formulation is relevant to the proof front end.
+2. **Dominant-point compression followed by constrained fitting.** Du, Huang, Zhu, and Ding select dominant points, fit a B-spline, insert missed points, and add midpoint constraints for edge-to-curve error in [An error-bounded B-spline curve approximation scheme using dominant points for CNC interpolation of micro-line toolpath](https://doi.org/10.1016/j.rcim.2019.101930). This supports fast adaptive knot/control insertion. The paper itself notes that dense sampling alone is not an analytic distance guarantee, so NGC should retain its own recursive ordered verification.
+3. **Analytical G3 corner and chain constructions.** Sun and Altintas use sixth-degree, seven-control Bezier pieces and analytical error correction in [A G3 continuous tool path smoothing method for 5-axis CNC machining](https://doi.org/10.1016/j.cirpj.2020.11.002). The method avoids iterative solutions and demonstrates that bounded-error G3 line-chain smoothing can be computationally practical. It is a local construction, while NGC also needs long noisy strips to share curvature information globally.
+4. **Clothoid and PH spiral transitions.** Shahzadeh, Khosravi, Nahavandi, and Robinette bound line/arc fillet deviation with arc-length-parameterized biclothoids in [Smooth path planning using biclothoid fillets for high speed CNC machines](https://doi.org/10.1016/j.ijmachtools.2018.04.003). Li, Ait-Haddou, and Biard construct degree-seven rational PH spirals with G3 contact between compatible circle data in [Pythagorean hodograph spline spirals that match G3 Hermite data from circles](https://doi.org/10.1016/j.cam.2014.10.005). These are attractive bridges between accepted arc fits, but their planar/admissibility restrictions make them a specialized primitive rather than the universal polyline fitter.
+5. **Fairness objectives inside a tolerance band.** Moreton and Sequin motivate minimizing curvature variation in [Minimum Curvature Variation Curves, Networks, and Surfaces for Fair Free-Form Shape Design](https://digicoll.lib.berkeley.edu/record/134037), while Naseath and Red explicitly move Bezier toolpaths inside a machining tolerance band to reduce curvature in [Reducing Curvature by Deviating CAM Tool Paths within a Tolerance Band](https://doi.org/10.3722/cadaps.2008.921-931). Levien's [From Spiral to Spline](https://www2.eecs.berkeley.edu/Pubs/TechRpts/2009/EECS-2009-162.pdf) explains why curvature-variation fairness reproduces lines and circles better than point interpolation alone. These sources support the objective, but do not supply NGC's complete ordered certificate.
+
+Exact or optimal polyline simplification is useful only as preprocessing. Local Frechet methods preserve order, but optimal two-dimensional algorithms remain roughly quadratic; see [Polyline Simplification under the Local Frechet Distance has Almost-Quadratic Runtime in 2D](https://arxiv.org/abs/2201.01344). A bounded greedy recognizer is more appropriate for the online NRT path, with a slower algorithm retained only as an offline oracle.
+
+### Assessment of arc-first reconstruction
+
+Replacing maximal portions of a line strip with fitted arcs is promising, but only as a compression and initialization stage:
+
+- A long, nearly circular run can be represented by one radius and center, giving excellent curvature information at negligible evaluation cost.
+- Existing line/arc junction blending can then bridge recognized arcs, preferably with a G3 spiral or higher-degree spline when curvature derivative must be continuous.
+- Arc recognition must verify the whole ordered source subchain against the arc tube; fitting only vertices can cut across a loop or miss an edge bulge.
+- An arc has constant signed curvature but full vector curvature derivative magnitude `kappa^2`. Arc compression therefore reduces curvature noise, not necessarily physical jerk when the fitted radius is small.
+- Tangent circular arcs of different radii are only G1 at their contact. Existing cubic G2 bridges still leave curvature-derivative jumps; the bridge must explicitly match G3 circle data or the complete reconstructed chain should be refit globally.
+- Inflections, torsion, simultaneous rotary motion, and nonplanar strips need a spline fallback.
+
+The recommended use of arcs is therefore: cheaply recognize maximal low-residual planar runs, spend perhaps `0.3P` to `0.5P` of the tube on those approximations, use the resulting line/arc chain as a low-noise guide, and perform one global fair fit over compatible regions. Do not make independently fitted arcs the final executable curve merely because every arc is locally within `P`.
+
+### Recommended production-oriented algorithm
+
+The best next prototype is a hybrid with a fast common path and a proof-preserving fallback:
+
+1. Partition at protected state, feed changes that cannot share a piece, discontinuities, explicit G53, probes, and geometrically hard reversals.
+2. Run a linear-time recognizer over each compatible strip: collapse exact collinear lines; greedily propose maximal planar circle fits; reject candidates by an ordered tube check; retain dominant points at changes of turn sign or failed fits.
+3. Build one degree-five open B-spline per retained region. With simple interior knots it is C4 in its parameter and therefore has continuous arc-length curvature derivative wherever parameter speed remains positive. Use line/arc endpoint jets only at protected outer boundaries; do not force zero curvature at every original line midpoint.
+4. Initialize controls from the simplified line/arc guide using chord-length or approximate arc-length parameters.
+5. Minimize a sparse quadratic fairness proxy based on third control differences, with a smaller fidelity term. Solve the banded system directly in linear time. This should replace coordinate descent or a generic nonlinear optimizer.
+6. Add violated tube locations as active linearized constraints and repeat for a small bounded number of passes. If a pass cannot recover adequate margin, insert a knot/control at the worst ordered source interval and solve the two smaller regions.
+7. Certify the final curve with recursive Bezier-hull subdivision against ordered source-segment capsules, reserving a conservative bound for the source interval. Check both candidate-to-source deviation and sufficient ordered coverage to prevent shortcutting across folds.
+8. Measure exact curvature and curvature-derivative extrema conservatively, require a positive speed lower bound, and fall back by subdivision. Failure remains fatal; it is not permission to publish a sampled-only curve.
+
+This structure puts the expensive work where it belongs: a narrow banded solve and local proof subdivisions around active constraints. Arc recognition reduces system size but is not required for correctness.
+
+### Experiment with the existing tool
+
+`tools/ngc_quintic_spline_analyzer.cpp` was updated so the programmed `P` and allowed fraction of `P` are explicit, and so it reports fitting time. The experiment used the captured `adaptive.ngc` spline ID 1 from `build/adaptive_spline_geometry.txt`:
+
+- sources 1 through 48: 42 tiny lines followed by six arcs;
+- production representation: 32 cubic controls and 29 spans;
+- `P = 0.005 inch`, allowed deviation `1.0P`, feed `80 inch/minute`;
+- candidate: one open quintic B-spline with endpoint position/tangent/curvature/third-derivative conditions;
+- search: one deterministic coordinate sweep at each of three scales (`0.25P`, `0.0625P`, and `0.015625P`), four samples per span during search, followed by 256 samples per span for the reported check.
+
+Release result:
+
+| Metric | Production cubic | Fast quintic | Change |
+|---|---:|---:|---:|
+| Peak normal curvature derivative | 5,894,600 | 193,090 | 96.7% lower, 30.5x reduction |
+| Integrated normal curvature derivative | 6,305.6 | 1,667.96 | 73.5% lower |
+| Peak curvature | 2,331.12 | 542.94 | 76.7% lower |
+| Reported ordered deviation | n/a | 0.00357254 inch | 0.7145P |
+| Reconstructed length | 0.138259 inch | 0.144234 inch | 4.3% longer |
+| Fit time | n/a | 21.7-22.4 ms | Release, three runs; median 22.19 ms |
+
+A much denser coordinate search reached peak normal curvature derivative 59,158.6 and peak curvature 316.9 while staying at 0.004914 inch, but required 3.08 seconds. That establishes that the tube contains a much fairer curve, while also rejecting coordinate descent as the production solver. The bounded pass retains most of the benefit at about 1/139 of that search time, but roughly 22 ms for only 48 entities is still too expensive for full CAM horizons. Because every coordinate candidate remeasures the whole spline, this experiment remains quadratic in control count despite its bounded number of sweeps. A banded fairness solve is the immediate performance experiment.
+
+The generated comparison artifacts are `build/polyline_quintic_fast_release.csv` and `build/polyline_quintic_fast_release.svg`.
+
+This is evidence, not a production proof. The analyzer currently compares dense equal-progress samples to the ordered source composite; it does not compute a certified Hausdorff/Frechet bound, its arc geometry uses numerical estimates, and it does not prove extrema between samples. The experiment also mixes a line-dominated strip with six terminal arcs. The result justifies implementing the banded quintic and recursive tube verifier in the standalone tool before changing `ExactStopTrajectoryPlanner`.
+
+#### `adaptive_pockets.ngc` follow-up
+
+A rolling trace of `adaptive_pockets.ngc` captured 3,940 production spline records. Eight records replace at least eight source entities and are at least 75% lines; these were tested with the program's actual `G64 P0.002`. All eight fast quintic candidates passed the analyzer's dense ordered sampled-deviation check:
+
+| Spline | Sources | Line share | Cubic peak normal curvature derivative | Quintic peak | Reduction | Deviation | Release fit time |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 1..43 | 42/43 | 49,109,100 | 1,942,480 | 96.04%, 25.28x | 0.000841719, 0.421P | 47.53 ms |
+| 1590 | 2056..2075 | 19/20 | 6,384.77 | 4,991.21 | 21.83%, 1.28x | 0.000272923, 0.136P | 10.49 ms |
+| 1594 | 2078..2120 | 42/43 | 49,297,900 | 1,753,440 | 96.44%, 28.11x | 0.000859433, 0.430P | 47.18 ms |
+| 3173 | 4137..4148 | 11/12 | 22,721.1 | 5,897.96 | 74.04%, 3.85x | 0.000263466, 0.132P | 4.04 ms |
+| 3177 | 4151..4193 | 42/43 | 49,223,400 | 2,525,220 | 94.87%, 19.49x | 0.000778954, 0.389P | 47.35 ms |
+| 3718 | 4858..4875 | 17/18 | 17,240.3 | 6,620.26 | 61.60%, 2.60x | 0.000532395, 0.266P | 9.05 ms |
+| 3722 | 4878..4920 | 42/43 | 60,535,500 | 2,365,810 | 96.09%, 25.59x | 0.000921083, 0.461P | 47.36 ms |
+| 3939 | 5152..5163 | 11/12 | 22,980.4 | 6,452.75 | 71.92%, 3.56x | 0.000273025, 0.137P | 3.60 ms |
+
+The four pathological 43-entity strips consistently improve by roughly 19.5x to 28.1x and use less than `0.47P`, so the favorable `adaptive.ngc` result was not isolated. The moderate strips improve less because their production curvature derivative is already several orders of magnitude lower. Runtime again scales poorly for the long records: roughly 47 ms each confirms that bounded coordinate sweeps are still not the desired solver even when their geometry is successful.
+
+The trace, measurements, and candidate profiles are in `build/adaptive_pockets_spline_geometry.txt`, `build/adaptive_pockets_spline_measurements.csv`, and `build/adaptive_pockets_quintic_p002_<id>.{csv,svg}`. These remain sampled research artifacts, not certified production geometry.
+
+#### Fixed-bandwidth fairness-solver experiment
+
+The standalone quintic analyzer now also accepts the `banded` solver mode. It fixes the first and last four controls, preserving the constructed endpoint position and first three parameter derivatives, and solves
+
+```text
+minimize  sum ||control - initial_control||^2
+        + lambda * sum ||third control difference||^2
+```
+
+for every coordinate. Each third difference touches four adjacent controls, so the normal equations have fixed half-bandwidth three. A direct banded Cholesky factorization and two triangular solves are linear in control count. The experiment evaluates 13 fixed logarithmic `lambda` candidates, rejects candidates beyond `0.98P` or above the initial curvature allowance, and performs the same dense 256-sample-per-span final measurement. The weight scan and sampled measurement are bounded experimental policy rather than production semantics.
+
+On the same eight `adaptive_pockets.ngc` regions with `P = 0.002`:
+
+| Spline | Production peak normal curvature derivative | Coordinate-search peak | Banded peak | Banded reduction | Banded deviation | Banded Release time |
+|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 49,109,100 | 1,942,480 | 10,058,300 | 4.88x | 0.00180436, 0.902P | 5.70 ms |
+| 1590 | 6,384.77 | 4,991.21 | 5,376.48 | 1.19x | 0.000259275, 0.130P | 2.26 ms |
+| 1594 | 49,297,900 | 1,753,440 | 10,149,700 | 4.86x | 0.00181503, 0.908P | 5.85 ms |
+| 3173 | 22,721.1 | 5,897.96 | 6,438.16 | 3.53x | 0.000334849, 0.167P | 1.35 ms |
+| 3177 | 49,223,400 | 2,525,220 | 10,141,700 | 4.85x | 0.00181328, 0.907P | 5.35 ms |
+| 3718 | 17,240.3 | 6,620.26 | 5,571.63 | 3.09x | 0.000388823, 0.194P | 1.98 ms |
+| 3722 | 60,535,500 | 2,365,810 | 10,867,300 | 5.57x | 0.00191576, 0.958P | 5.46 ms |
+| 3939 | 22,980.4 | 6,452.75 | 6,565.72 | 3.50x | 0.000273402, 0.137P | 1.43 ms |
+
+The long-strip solve is about eight times faster than the bounded coordinate search and every candidate stays inside the sampled tube. Uniform squared third differences are not a sufficient proxy for the peak physical arc-length curvature derivative, however: the pathological strips improve only 4.85x to 5.57x instead of the coordinate search's 19.49x to 28.11x. A quick inverse-local-spacing-to-the-sixth row weighting did not improve the worst case and was removed.
+
+This result changes the next step. Keep the fixed-bandwidth solve as the fast linear algebra backbone, but replace its one global fairness weight with a small active set of locally weighted rows driven by the measured physical `q'''` peaks and tube slack. A promising bounded loop is:
+
+1. solve the uniform banded system;
+2. measure physical curvature derivative and ordered deviation;
+3. increase weights only on rows influencing the largest physical peaks, while adding linearized tube constraints where slack is low;
+4. refactor the same bandwidth-three matrix and repeat for a small fixed number of passes;
+5. insert a knot and split only if the active loop cannot obtain margin.
+
+That experiment should compare complete `q'''`, not only its normal component, and should move to recursive deviation certification before planner integration. The generated profiles are `build/adaptive_pockets_banded_p002_<id>.{csv,svg}`.
+
+#### Peak-targeted banded fairness experiment
+
+The `banded-active` analyzer mode implements the bounded active loop while retaining the same half-bandwidth-three factorization. The uniform scan supplies at most one seed from each of three sampled deviation-utilization ranges: below `0.35P`, from `0.35P` to `0.70P`, and above `0.70P`. This avoids retrying every global weight. For at most four passes per seed, the analyzer samples the physical arc-length curvature derivative, finds spans whose normal-component peak is at least 35% of the global peak, and raises the squared-third-difference weights on their overlapping rows. A pass is retained only when the combined normalized peak/integral score improves and the candidate remains below `0.98P` and the initial curvature allowance.
+
+On the same `adaptive_pockets.ngc` regions:
+
+| Spline | Production peak | Uniform banded peak | Peak-targeted peak | Production reduction | Coordinate-search peak | Deviation | Release time | Banded solves |
+|---:|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 49,109,100 | 10,058,300 | 3,812,290 | 12.88x | 1,942,480 | 0.00172529, 0.863P | 10.37 ms | 22 |
+| 1590 | 6,384.77 | 5,376.48 | 5,376.48 | 1.19x | 4,991.21 | 0.000259275, 0.130P | 2.99 ms | 16 |
+| 1594 | 49,297,900 | 10,149,700 | 3,780,660 | 13.04x | 1,753,440 | 0.00173287, 0.866P | 10.67 ms | 22 |
+| 3173 | 22,721.1 | 6,438.16 | 6,438.16 | 3.53x | 5,897.96 | 0.000334849, 0.167P | 1.69 ms | 15 |
+| 3177 | 49,223,400 | 10,141,700 | 3,824,530 | 12.87x | 2,525,220 | 0.00172981, 0.865P | 10.36 ms | 22 |
+| 3718 | 17,240.3 | 5,571.63 | 5,571.63 | 3.09x | 6,620.26 | 0.000388823, 0.194P | 3.42 ms | 17 |
+| 3722 | 60,535,500 | 10,867,300 | 3,919,580 | 15.44x | 2,365,810 | 0.00171735, 0.859P | 10.11 ms | 21 |
+| 3939 | 22,980.4 | 6,565.72 | 6,565.72 | 3.50x | 6,452.75 | 0.000273402, 0.137P | 1.73 ms | 15 |
+
+For the four pathological 43-entity strips, local reweighting improves the uniform banded result by another 2.64x to 2.77x. Their total production-to-candidate reduction becomes 12.87x to 15.44x. The targeted solve takes about 10-11 ms per long strip, roughly twice the uniform solve but 4.4-4.7 times faster than the coordinate search. It does not quite match the coordinate search's peak on those strips, but it uses 22 or fewer linear-time banded solves instead of coordinate-wise perturbation sweeps.
+
+The moderate strips mostly retain the uniform result, which is useful bounded behavior: active passes do not spend the tube merely because slack exists. An exhaustive all-weight active prototype did improve spline 3718 to 4,688.01, but raised the severe-strip cost to about 25-26 ms and was rejected in favor of the three-regime seed policy.
+
+This is encouraging but not production-ready. Deviation and physical derivatives are still sampled, not recursively certified; the reweighting targets only the normal component of `q'''`; and fixed endpoint controls consume a meaningful part of the tube on these very short strips. The next geometry experiment should now be greedy maximal arc recognition before fitting. It should measure whether removing nearly circular runs lowers control count and endpoint-boundary peaks enough that the active banded solve can use fewer passes. The generated profiles are `build/adaptive_pockets_banded_active_p002_<id>.{csv,svg}`.
+
+#### Planner integration
+
+The three experimental quintic fitters are now integrated into `ExactStopTrajectoryPlanner` behind the single `continuousSplineFitSolver()` selection point. The available selections are `CoordinateSearch`, `UniformBandedFairness`, and `PeakTargetedBandedFairness`; `CubicBaseline` is retained for controlled A/B measurement. Only variable-control short-entity clusters are reconstructed. Ordinary six-control junction splines remain cubic because fixing four quintic controls at each end leaves them no optimization freedom and converting them imposed needless proof and runtime cost.
+
+Unlike the standalone experiment, planner acceptance does not make sampled deviation authoritative. The selected quintic is checked by an ordered recursive source-tube proof. Each interval combines the maximum endpoint association error with a conservative source chord-error bound and a quintic second-derivative control-hull chord bound. Source entity boundaries are explicit initial proof boundaries, the work count is finite, and a failure is fatal rather than permission to publish the candidate. The ordinary emitted-polynomial geometry and XYZABC constraint proofs remain downstream authority.
+
+The reference implementation is degree-aware for cubic and quintic B-splines, and NRT geometry diagnostics now record degree explicitly in the version-two snapshot format. Version-one cubic snapshots remain readable by both geometry tools.
+
+Release rolling-planner A/B results on the complete current `adaptive_pockets.ngc` workload (`G64 P0.005`), using the current source tree and identical planning effort, were:
+
+| Selection | Verified rolling duration | Total rolling planning | Maximum horizon planning | Chunks |
+|---|---:|---:|---:|---:|
+| Cubic baseline | 347.7150 s | 9.781 s | 0.374 s | 107 |
+| Coordinate search | 336.4937 s | 28.946 s | 1.760 s | 107 |
+| Uniform banded | 334.4529 s | 14.023 s | 0.645 s | 107 |
+| Peak-targeted banded | 334.5554 s | 14.563 s | 0.650 s | 107 |
+
+All four selections completed the rolling planner. Uniform banding is therefore the current default: it shortened verified motion by 13.2621 seconds, or 3.81%, relative to the cubic baseline and was slightly better than peak-targeted banding in both final motion and computation on the complete workload. Coordinate search remained much too expensive. The active solver's lower sampled peak on the four pathological strips did not translate into a better complete trajectory than uniform banding; local normal-peak reduction alone is not a sufficient whole-program selection objective.
+
+The full-horizon export reached the optional infinite-jerk oracle after planning but that diagnostic did not converge within its existing nine refinements on the new geometry. Rolling production-shaped planning and all final trajectory proofs completed. The oracle refinement policy needs a separate investigation before using its duration as the quintic comparison baseline.
+
+Geometry-only ImGui Preview now calls the same `spline_detail::reconstructSpline()` function and reads the same `continuousSplineFitSolver()` selection as timed planning. Preview supplies its retained canonical XYZ source geometry, receives the same cubic or quintic degree and controls, and tessellates that degree directly. It does not invoke `ExactStopTrajectoryPlanner`, Ruckig, trajectory timing, polynomial emission, packetization, or a backend. Planner calls request the recursive source-tube certificate; Preview calls remain display-only. A focused regression reconstructs one long line strip through both paths and requires every XYZ control to agree within `1e-12`.
+
+#### Execution visualization and remaining timing question
+
+Two separate combs now make the geometry/timing distinction visible. The Preview-only short-entity cluster comb is evaluated at the same 65 arc-length sample locations used for the planner's sampled geometric caps. Its tooth magnitude represents the full geometric jerk coefficient `|q'''|`, not only normal sharpness, and its color reports whether the resulting geometric jerk cap is below programmed feed.
+
+Timed Simulation has a different executed-jerk comb. `MockMotionBackend` records the analytic XYZABC jerk-vector magnitude of the executed axis cubic at the position actually calculated on each fixed servo tick. A mock-only incremental diagnostic carries epoch, chunk, and span identity to `SimulationWorker`, which applies the matching tool geometry offset before presentation so teeth originate on the tool-tip path rather than at the spindle reference point. The UI retains one tooth every ten executed servo periods. Tooth density is therefore temporal: closer teeth mean lower speed. The green part is used aggregate path-jerk capacity and the red remainder is unused capacity. This diagnostic remains outside `MotionBackend` and does not claim a production RT telemetry contract.
+
+The `adaptive_pockets.ngc` trochoidal regions visibly contain dense teeth with large red remainders. That is direct evidence that those executed regions are slow while using little of the configured aggregate path-jerk limit. It does not yet identify the binding constraint: programmed/geometric velocity caps, aggregate acceleration, or an individual axis velocity, acceleration, or jerk limit can still dominate. The next diagnostic should label the active limiting constraint and show aggregate plus per-axis velocity/acceleration/jerk utilization at the same servo samples. This is more informative than assuming every slow curved region is failing the strict jerk proof.
+
+Simulation also reports program elapsed time in seconds and `hours:minutes:seconds`; changing the playback multiplier changes wall-clock playback but not the final program duration. The GLFW UI now uses swap interval one. Its lower-corner performance label reports the preceding frame's CPU construction and OpenGL submission time in milliseconds, measured after event polling and before `glfwSwapBuffers()`, so it excludes the vsync wait rather than presenting inter-frame time as render cost.
+
+### Immediate experiment sequence
+
+1. Completed experimentally: replace coordinate search with uniform and peak-targeted fixed-layout banded quintic fairness solves and report time per source entity.
+2. Next: add greedy maximal arc recognition and compare control count, solve time, full `q'''` rather than only its normal component, and deviation-proof workload with recognition enabled/disabled.
+3. Replace sampled deviation with ordered recursive Bezier-hull-to-polyline-capsule verification, reporting proof attempts and worst certified interval.
+4. Run on all line-dominated strips from `adaptive.ngc`, `adaptive_pockets.ngc`, and `1002_3d.ngc`, including inflections and rotary-axis motion.
+5. Only after geometry is certified, feed the candidate references into the existing timing oracle and compare verified traversal duration and total planning latency.
 
 ## Executive summary
 

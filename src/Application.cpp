@@ -90,6 +90,7 @@ class ApplicationImpl final {
     float m_toolbarHeight = 42.0f;
     float m_jogPaneWidth = 270.0f;
     ImVec4 m_viewportRect { 0, 0, 0, 0 };
+    double m_lastFrameRenderSeconds = 0.0;
     bool m_showJogPane = false;
     int m_jogTargetMode = 0;
     bool m_continuousJog = true;
@@ -107,6 +108,8 @@ class ApplicationImpl final {
     bool m_enableMemoryWindow = false;
     bool m_enableToolWindow = false;
     bool m_enableErrorWindow = false;
+    bool m_showClusterGeometricJerkComb = false;
+    bool m_showExecutedJerkComb = true;
 
     std::string m_errorMessage;
 
@@ -119,6 +122,7 @@ class ApplicationImpl final {
     SimulationWorker m_simulation;
     int m_simulationTickMultiplier = 1;
     double m_simulatedRapidSpeed;
+    double m_pathJerk;
 
     double m_time = 0.0;
     double m_dt = 0.0;
@@ -154,10 +158,26 @@ class ApplicationImpl final {
         std::vector<glm::dvec3> g64ClusterSplineLines;
         std::vector<glm::dvec3> g64ControlPolygon;
         std::vector<glm::dvec3> g64ControlPoints;
+        std::vector<ngc::experimental::GeometricJerkCombSample> clusterGeometricJerkComb;
+        double maximumClusterGeometricJerk = 0.0;
         std::vector<glm::dvec3> darkPoints;
         std::vector<glm::dvec3> lightPoints;
         std::array<BufferedRange, static_cast<std::size_t>(PreviewBatch::Count)> bufferedRanges{};
     } m_previewRenderCache;
+    struct ExecutedJerkTooth {
+        glm::dvec3 position{};
+        glm::dvec3 normal{};
+        double utilization = 0.0;
+    };
+    struct PendingJerkObservation {
+        glm::dvec3 position{};
+        double utilization = 0.0;
+    };
+    std::vector<ExecutedJerkTooth> m_executedJerkComb;
+    std::optional<PendingJerkObservation> m_pendingJerkObservation;
+    std::uint32_t m_executedJerkServoPeriodsSinceTooth = 0;
+    ngc::SimulationStatus m_lastJerkCombStatus = ngc::SimulationStatus::Stopped;
+    std::uint64_t m_lastJerkCombServoTicks = 0;
     GlGenBuffersProc m_glGenBuffers = nullptr;
     GlDeleteBuffersProc m_glDeleteBuffers = nullptr;
     GlBindBufferProc m_glBindBuffer = nullptr;
@@ -286,7 +306,8 @@ public:
           m_axes(configuration.axes), m_joints(configuration.joints),
           m_worker(configuration.unit),
           m_simulation(configuration),
-          m_simulatedRapidSpeed(configuration.trajectory.rapidSpeed) { }
+          m_simulatedRapidSpeed(configuration.trajectory.rapidSpeed),
+          m_pathJerk(configuration.trajectory.pathJerk) { }
 
     void init() {
         m_glGenBuffers = reinterpret_cast<GlGenBuffersProc>(glfwGetProcAddress("glGenBuffers"));
@@ -320,6 +341,10 @@ public:
         m_mouseDY = pos.y - m_mouseY;
         m_mouseX = pos.x;
         m_mouseY = pos.y;
+    }
+
+    void setLastFrameRenderSeconds(const double seconds) {
+        m_lastFrameRenderSeconds=std::max(seconds,0.0);
     }
 
     void addScroll(const double delta) {
@@ -563,6 +588,8 @@ public:
             cache.g64ClusterSplineLines.clear();
             cache.g64ControlPolygon.clear();
             cache.g64ControlPoints.clear();
+            cache.clusterGeometricJerkComb.clear();
+            cache.maximumClusterGeometricJerk=0.0;
             cache.darkPoints.clear();
             cache.lightPoints.clear();
 
@@ -630,6 +657,22 @@ public:
                         if(!fitted) continue;
                         ngc::experimental::tessellateJunction(
                             *fitted,cache.g64ClusterSplineLines);
+                        std::vector<ngc::experimental::ClusterFeedSection> feedSections;
+                        feedSections.reserve(outgoing-junction+1);
+                        feedSections.push_back({fitted->incomingTrim,
+                            splineEntities[junction].programmedSpeed/60.0});
+                        for(auto entity=junction+1;entity<outgoing;++entity)
+                            feedSections.push_back({splineEntities[entity].length,
+                                splineEntities[entity].programmedSpeed/60.0});
+                        feedSections.push_back({fitted->outgoingTrim,
+                            splineEntities[outgoing].programmedSpeed/60.0});
+                        auto comb=ngc::experimental::sampleGeometricJerkComb(
+                            *fitted,feedSections,m_pathJerk);
+                        for(const auto &sample:comb)
+                            cache.maximumClusterGeometricJerk=std::max(
+                                cache.maximumClusterGeometricJerk,sample.magnitude);
+                        cache.clusterGeometricJerkComb.insert(
+                            cache.clusterGeometricJerkComb.end(),comb.begin(),comb.end());
                         cache.g64ControlPoints.insert(cache.g64ControlPoints.end(),
                             fitted->controlPoints.begin(),fitted->controlPoints.end());
                         for(std::size_t control=1;control<fitted->controlPoints.size();++control)
@@ -661,7 +704,8 @@ public:
                 if(splineScale && std::abs(*splineScale - scale) > 1e-12) flushSpline();
                 splineScale = scale;
             };
-            const auto lineEntity = [](const glm::dvec3 &from, const glm::dvec3 &to) {
+            const auto lineEntity = [](const glm::dvec3 &from,const glm::dvec3 &to,
+                                       const double programmedSpeed) {
                 const auto delta = to - from;
                 const auto length = glm::length(delta);
                 const auto tangent = length > 1e-12 ? delta / length : glm::dvec3(1.0, 0.0, 0.0);
@@ -674,6 +718,7 @@ public:
                             .curvature = {},
                         };
                     },
+                    .programmedSpeed = programmedSpeed,
                     .linear = true,
                 };
             };
@@ -684,9 +729,7 @@ public:
                         arc, length > 1e-12 ? std::clamp(distance / length, 0.0, 1.0) : 0.0);
                     return glm::dvec3(value.x, value.y, value.z);
                 };
-                return ngc::experimental::JunctionEntity {
-                    .length = length,
-                    .stateAtDistance = [=](const double distance) {
+                const auto geometryAt = [=](const double distance) {
                         const auto s = std::clamp(distance, 0.0, length);
                         const auto h = std::clamp(length * 1e-4, 1e-7, std::max(length * 0.01, 1e-7));
                         glm::dvec3 p0, p1, p2;
@@ -721,7 +764,22 @@ public:
                         curvature -= tangent * glm::dot(curvature, tangent);
                         return ngc::experimental::JunctionState {
                             .position = positionAt(s), .tangent = tangent, .curvature = curvature };
+                };
+                return ngc::experimental::JunctionEntity {
+                    .length = length,
+                    .stateAtDistance = [=](const double distance) {
+                        const auto s=std::clamp(distance,0.0,length);
+                        auto result=geometryAt(s);
+                        const auto step=std::clamp(length*1e-3,1e-7,
+                            std::max(length*1e-2,1e-7));
+                        const auto from=std::max(0.0,s-step);
+                        const auto to=std::min(length,s+step);
+                        if(to-from>1e-15)
+                            result.curvatureDerivative=
+                                (geometryAt(to).curvature-geometryAt(from).curvature)/(to-from);
+                        return result;
                     },
+                    .programmedSpeed = arc.speed(),
                 };
             };
 
@@ -740,7 +798,7 @@ public:
                     cache.darkPoints.push_back(to);
                     if(toolpath.g64Active(commandIndex) && !rapid && !line->machineCoordinates()) {
                         beginSpline(toolpath.g64Tolerance(commandIndex));
-                        splineEntities.push_back(lineEntity(from, to));
+                        splineEntities.push_back(lineEntity(from,to,line->speed()));
                     } else {
                         flushSpline();
                     }
@@ -924,6 +982,52 @@ public:
             };
         });
         const auto simulationCoordinates = m_simulation.snapshot();
+        const auto continuingStatus=m_lastJerkCombStatus==ngc::SimulationStatus::Running
+            ||m_lastJerkCombStatus==ngc::SimulationStatus::Paused;
+        const auto newSimulation=simulationCoordinates.status==ngc::SimulationStatus::Running
+            &&(!continuingStatus
+               ||simulationCoordinates.servoTicks<m_lastJerkCombServoTicks);
+        if(newSimulation) {
+            m_executedJerkComb.clear();
+            m_pendingJerkObservation.reset();
+            m_executedJerkServoPeriodsSinceTooth=0;
+        }
+        const auto executedJerkSamples=m_simulation.takeExecutedJerkSamples();
+        if(m_showExecutedJerkComb&&m_pathJerk>0.0&&std::isfinite(m_pathJerk)) {
+            for(const auto &sample:executedJerkSamples) {
+                const glm::dvec3 position{
+                    sample.position.x,sample.position.y,sample.position.z};
+                const auto utilization=sample.magnitude/m_pathJerk;
+                ++m_executedJerkServoPeriodsSinceTooth;
+                if(!m_pendingJerkObservation) {
+                    m_pendingJerkObservation=PendingJerkObservation{position,utilization};
+                    continue;
+                }
+                const auto previous=*m_pendingJerkObservation;
+                const auto delta=position-previous.position;
+                const auto segmentLength=glm::length(delta);
+                if(m_executedJerkServoPeriodsSinceTooth>=10) {
+                    m_executedJerkServoPeriodsSinceTooth=0;
+                    if(segmentLength<=1e-12) {
+                        m_pendingJerkObservation=PendingJerkObservation{position,utilization};
+                        continue;
+                    }
+                    const auto tangent=delta/segmentLength;
+                    auto normal=glm::cross(glm::dvec3(0.0,0.0,1.0),tangent);
+                    if(glm::length(normal)<=1e-12)
+                        normal=glm::cross(glm::dvec3(0.0,1.0,0.0),tangent);
+                    normal=glm::normalize(normal);
+                    if(m_executedJerkComb.size()<100000)
+                        m_executedJerkComb.push_back({position,normal,utilization});
+                }
+                m_pendingJerkObservation=PendingJerkObservation{position,utilization};
+            }
+        } else {
+            m_pendingJerkObservation.reset();
+            m_executedJerkServoPeriodsSinceTooth=0;
+        }
+        m_lastJerkCombStatus=simulationCoordinates.status;
+        m_lastJerkCombServoTicks=simulationCoordinates.servoTicks;
         for(const auto &workCoordinateSystem : simulationCoordinates.usedWorkCoordinateSystems) {
             const auto match = std::ranges::find_if(coordinates.used, [&](const auto &value) {
                 return value.name == workCoordinateSystem.name;
@@ -1013,16 +1117,18 @@ public:
                               std::format("{} WCS", workCoordinateSystem.name).c_str());
         }
 
-        const auto fpsText = std::format("FPS: {:.1f}", ImGui::GetIO().Framerate);
-        const auto fpsSize = ImGui::CalcTextSize(fpsText.c_str());
-        constexpr float FPS_PADDING = 8.0f;
-        const ImVec2 fpsPosition {
-            m_viewportRect.z - fpsSize.x - FPS_PADDING,
-            m_viewportRect.w - fpsSize.y - FPS_PADDING,
+        const auto renderTimeText=std::format(
+            "Render: {:.2f} ms",m_lastFrameRenderSeconds*1000.0);
+        const auto renderTimeSize=ImGui::CalcTextSize(renderTimeText.c_str());
+        constexpr float RENDER_TIME_PADDING=8.0f;
+        const ImVec2 renderTimePosition {
+            m_viewportRect.z-renderTimeSize.x-RENDER_TIME_PADDING,
+            m_viewportRect.w-renderTimeSize.y-RENDER_TIME_PADDING,
         };
-        drawList->AddText({ fpsPosition.x + 1.0f, fpsPosition.y + 1.0f },
-                          IM_COL32(0, 0, 0, 210), fpsText.c_str());
-        drawList->AddText(fpsPosition, IM_COL32(210, 220, 225, 255), fpsText.c_str());
+        drawList->AddText({renderTimePosition.x+1.0f,renderTimePosition.y+1.0f},
+                          IM_COL32(0,0,0,210),renderTimeText.c_str());
+        drawList->AddText(renderTimePosition,IM_COL32(210,220,225,255),
+                          renderTimeText.c_str());
 
         const auto drawVertices = [](const std::vector<glm::dvec3> &vertices, const GLenum primitive,
                                      const double red, const double green, const double blue,
@@ -1082,6 +1188,54 @@ public:
         glLineWidth(1.0f);
         drawPreview(PreviewBatch::G64Spline, m_previewRenderCache.g64SplineLines, GL_LINES, 1.0f, 0.2f, 1.0f);
         drawPreview(PreviewBatch::G64Cluster, m_previewRenderCache.g64ClusterSplineLines, GL_LINES, 0.1f, 1.0f, 1.0f);
+        if(m_showClusterGeometricJerkComb
+           &&m_previewRenderCache.maximumClusterGeometricJerk>0.0) {
+            const auto maximum=m_previewRenderCache.maximumClusterGeometricJerk;
+            const auto logarithmicFloor=maximum*1e-6;
+            const auto logarithmicMaximum=std::log1p(maximum/logarithmicFloor);
+            const auto maximumToothLength=2.0*m_viewHalfHeight/height*55.0;
+            glLineWidth(1.5f);
+            glBegin(GL_LINES);
+            for(const auto &sample:m_previewRenderCache.clusterGeometricJerkComb) {
+                if(sample.magnitude<=0.0) continue;
+                const auto normalized=std::log1p(sample.magnitude/logarithmicFloor)
+                    /logarithmicMaximum;
+                const auto toothLength=maximumToothLength*normalized;
+                if(sample.geometricSpeedLimit+1e-12<sample.programmedSpeed)
+                    glColor3d(1.0,0.12,0.08);
+                else glColor3d(0.1,0.95,0.2);
+                const auto end=sample.position+sample.normalDirection*toothLength;
+                glVertex3d(sample.position.x,sample.position.y,sample.position.z);
+                glVertex3d(end.x,end.y,end.z);
+            }
+            glEnd();
+            drawList->AddText(
+                {m_viewportRect.x+10.0f,m_viewportRect.y+10.0f},
+                IM_COL32(225,225,225,255),
+                std::format("Cluster |q'''| samples (log): red below feed, green at feed; peak {:.4g}",
+                            maximum).c_str());
+        }
+        if(m_showExecutedJerkComb&&!m_executedJerkComb.empty()) {
+            const auto toothLength=2.0*m_viewHalfHeight/height*20.0;
+            glLineWidth(1.25f);
+            glBegin(GL_LINES);
+            for(const auto &tooth:m_executedJerkComb) {
+                const auto used=std::clamp(tooth.utilization,0.0,1.0);
+                const auto usedEnd=tooth.position+tooth.normal*(toothLength*used);
+                const auto limitEnd=tooth.position+tooth.normal*toothLength;
+                if(used>0.0) {
+                    glColor4d(0.1,0.95,0.2,0.72);
+                    glVertex3dv(glm::value_ptr(tooth.position));
+                    glVertex3dv(glm::value_ptr(usedEnd));
+                }
+                if(used<1.0) {
+                    glColor4d(1.0,0.12,0.08,0.65);
+                    glVertex3dv(glm::value_ptr(usedEnd));
+                    glVertex3dv(glm::value_ptr(limitEnd));
+                }
+            }
+            glEnd();
+        }
         glLineWidth(1.0f);
         drawPreview(PreviewBatch::G64ControlPolygon, m_previewRenderCache.g64ControlPolygon,
                     GL_LINES, 0.95f, 0.65f, 1.0f, 2, 0x3333);
@@ -1186,6 +1340,17 @@ public:
         ImGui::BeginDisabled(m_worker.busy());
         if(ImGui::Button("Clear Preview")) m_worker.clearToolpath();
         ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::Checkbox("Cluster jerk comb", &m_showClusterGeometricJerkComb);
+        if(ImGui::IsItemHovered())
+            ImGui::SetTooltip("Log-scaled |q'''| teeth on short-entity cluster splines.\n"
+                              "65 arc-length samples per planner piece. Red means the geometric\n"
+                              "jerk speed cap is below programmed feed; green means it is not.");
+        ImGui::SameLine();
+        ImGui::Checkbox("Executed jerk comb",&m_showExecutedJerkComb);
+        if(ImGui::IsItemHovered())
+            ImGui::SetTooltip("One tooth every 10 executed servo periods at the tool tip.\n"
+                              "Green is executed cubic path jerk; red is unused capacity.");
 
         const auto simulationActive = simulation.status == ngc::SimulationStatus::Running
             || simulation.status == ngc::SimulationStatus::Paused;
@@ -1657,7 +1822,14 @@ public:
                         simulation.toolPosition.x, simulation.toolPosition.y, simulation.toolPosition.z);
         }
         if(simulation.status != ngc::SimulationStatus::Stopped) {
-            ImGui::TextDisabled("Servo %.3f ms    Scheduler %.3f ms (%u ticks) x%u    Ticks %llu    Missed deadlines %llu    Max wake %.1f us    Max tick %.1f us",
+            const auto elapsed = std::max(simulation.programElapsedSeconds, 0.0);
+            const auto totalWholeSeconds = static_cast<std::uint64_t>(elapsed);
+            const auto hours = totalWholeSeconds / 3600;
+            const auto minutes = totalWholeSeconds / 60 % 60;
+            const auto seconds = elapsed - static_cast<double>(hours * 3600 + minutes * 60);
+            ImGui::TextDisabled("G-code elapsed %.3f s (%02llu:%02llu:%06.3f)    Servo %.3f ms    Scheduler %.3f ms (%u ticks) x%u    Ticks %llu    Missed deadlines %llu    Max wake %.1f us    Max tick %.1f us",
+                elapsed, static_cast<unsigned long long>(hours),
+                static_cast<unsigned long long>(minutes), seconds,
                 simulation.servoPeriodSeconds * 1000.0, simulation.schedulerPeriodSeconds * 1000.0,
                 simulation.servoTicksPerSchedulerPeriod, simulation.tickMultiplier,
                 static_cast<unsigned long long>(simulation.servoTicks),
@@ -2089,6 +2261,9 @@ Application::~Application() = default;
 
 void Application::init() { m_impl->init(); }
 void Application::preRender() { m_impl->preRender(); }
+void Application::setLastFrameRenderSeconds(const double seconds) {
+    m_impl->setLastFrameRenderSeconds(seconds);
+}
 void Application::addScroll(const double delta) { m_impl->addScroll(delta); }
 void Application::terminate() { m_impl->terminate(); }
 void Application::render() { m_impl->render(); }

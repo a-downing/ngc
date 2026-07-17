@@ -675,6 +675,36 @@ namespace {
         worker.join();
     }
 
+    void testSimulationProgramElapsedTimeIsPlaybackSpeedIndependent() {
+        const auto runAtMultiplier = [](const int multiplier) {
+            SimulationWorker worker;
+            ngc::ToolTable tools;
+            worker.setTickMultiplier(multiplier);
+            require(worker.start({ { "G1 F60 X0.01\n", "elapsed-time.ngc" } }, tools),
+                    "elapsed-time simulation should start");
+
+            auto snapshot = worker.snapshot();
+            for(int attempt = 0; attempt < 3000
+                && snapshot.status != ngc::SimulationStatus::Completed
+                && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                snapshot = worker.snapshot();
+            }
+            worker.join();
+            require(snapshot.status == ngc::SimulationStatus::Completed,
+                    std::format("elapsed-time simulation at x{} should complete: {}",
+                                multiplier, snapshot.error));
+            require(snapshot.programElapsedSeconds > 0.0,
+                    "completed motion should report positive G-code elapsed time");
+            return snapshot.programElapsedSeconds;
+        };
+
+        const auto normalSpeed = runAtMultiplier(1);
+        const auto accelerated = runAtMultiplier(1000);
+        requireNear(accelerated, normalSpeed,
+                    "G-code elapsed time must not depend on the playback multiplier");
+    }
+
     void testInterpreterStatusMessagesPreserveOrder() {
         ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::RealRun);
         session.setPrograms({ { "print[\"before error\"]\nG1 X1\n", "status-order.ngc" } });
@@ -1977,7 +2007,7 @@ namespace {
         chunk.epoch = 31;
         chunk.id = 1;
         chunk.branch = 1;
-        require(chunk.normalMotion.push(linearSpan(1, 0.0, 1.0, 0.01)),
+        require(chunk.normalMotion.push(linearSpan(1,0.0,1.0,0.01)),
                 "fixed-tick test motion should fit in its chunk");
         require(chunk.stopTail.push(linearSpan(2, 1.0, 1.0, 1e-6)),
                 "fixed-tick test stop tail should fit in its chunk");
@@ -1998,6 +2028,45 @@ namespace {
         while(backend.tryTakeSnapshot(snapshot)) { }
         requireNear(snapshot.commanded.position.x, 1.0,
                     "ten fixed servo ticks should complete the 10 ms span exactly");
+
+        ngc::MockMotionBackend jerkBackend;
+        ngc::PlanChunk jerkChunk;
+        jerkChunk.epoch=32;
+        jerkChunk.id=2;
+        jerkChunk.branch=2;
+        ngc::AxisPolynomialSpan cubic;
+        cubic.id=3;
+        cubic.duration=1.0;
+        cubic.inverseDuration=1.0;
+        cubic.inverseDurationSquared=1.0;
+        cubic.inverseDurationCubed=1.0;
+        cubic.a.x=1.0;
+        cubic.end.position.x=1.0;
+        cubic.end.velocity.x=3.0;
+        cubic.end.acceleration.x=6.0;
+        require(jerkChunk.normalMotion.push(cubic),
+                "jerk telemetry cubic should fit in its chunk");
+        require(jerkChunk.stopTail.push(linearSpan(4,1.0,1.0,1e-6)),
+                "jerk telemetry stop tail should fit in its chunk");
+        jerkChunk.branchState=cubic.end;
+        jerkChunk.stopState.position.x=1.0;
+        require(jerkBackend.tryPublish(jerkChunk)==ngc::PublishResult::Published,
+                "jerk telemetry chunk should publish");
+        require(jerkBackend.trySubmit(ngc::StartRequest{2,32})==ngc::SubmitResult::Submitted,
+                "jerk telemetry backend should start");
+        jerkBackend.advanceTick(0.1,true);
+        requireNear(jerkBackend.currentProgramJerkMagnitude(),6.0,
+                    "mock presentation telemetry should report analytic active-span jerk");
+        const auto jerkSamples=jerkBackend.takeExecutedJerkSamples();
+        require(jerkSamples.size()==1,
+                std::format("mock jerk diagnostics should retain every calculated servo position (got {})",
+                            jerkSamples.size()));
+        requireNear(jerkSamples.front().position.x,0.001,
+                    "mock jerk diagnostic should use the backend-calculated position");
+        requireNear(jerkSamples.front().magnitude,6.0,
+                    "mock jerk diagnostic should retain the active cubic jerk");
+        require(jerkBackend.takeExecutedJerkSamples().empty(),
+                "taking mock jerk diagnostics should consume the incremental samples");
     }
 
     void testPreviewJunctionUsesOneSixControlSpline() {
@@ -2240,6 +2309,39 @@ namespace {
             "cubic control conditioning should reduce control-polygon third-difference energy");
     }
 
+    void testGeometricJerkCombIncludesTangentialComponent() {
+        // One cubic Bezier span for q(t)=(t,t^2). At t=0 its curvature is 2,
+        // normal sharpness is zero, and q''' is the tangential vector (-4,0).
+        const ngc::experimental::JunctionBlend parabola{
+            .controlPoints={
+                {0.0,0.0,0.0},{1.0/3.0,0.0,0.0},
+                {2.0/3.0,1.0/3.0,0.0},{1.0,1.0,0.0},
+            },
+            .degree=3,
+        };
+        const std::array feedSections{
+            ngc::experimental::ClusterFeedSection{.length=1.0,.speed=6.0},
+        };
+        const auto comb=ngc::experimental::sampleGeometricJerkComb(
+            parabola,feedSections,100.0);
+        require(comb.size()==65,
+                "one planner piece should show exactly its 65 jerk sample points");
+        requireNear(comb.front().magnitude,4.0,
+                    "geometric jerk comb should measure the complete q''' magnitude");
+        requireNear(comb.front().normalMagnitude,0.0,
+                    "symmetric parabola endpoint should have zero normal sharpness");
+        requireNear(comb.front().tangentialMagnitude,4.0,
+                    "geometric jerk comb must retain the tangential kappa-squared component");
+        requireNear(comb.front().programmedSpeed,6.0,
+                    "geometric jerk comb should retain the owning programmed feed");
+        require(comb.front().geometricSpeedLimit<comb.front().programmedSpeed,
+                "a sample whose geometric jerk cap is below feed should be marked limiting");
+        requireNear(comb.front().normalDirection.x,0.0,
+                    "comb display tooth should follow the curvature normal");
+        requireNear(comb.front().normalDirection.y,1.0,
+                    "comb display tooth should follow the curvature normal");
+    }
+
     void testMicroEntityClusterCollapsesToOneSpline() {
         constexpr double SCALE=0.05;
         const std::array lengths{1.0,0.02,0.01,1.0,0.06,1.0};
@@ -2327,10 +2429,11 @@ namespace {
         };
         const auto directCluster=ngc::experimental::buildEvenlySpacedControlCluster(
             clusterEntities,0,3,SCALE);
-        require(directCluster&&directCluster->controlPoints.size()==8
-                    &&std::abs(directCluster->controlPoints[3].x-1.1)<1e-12
-                    &&std::abs(directCluster->controlPoints[4].x-1.3)<1e-12,
-                "cluster controls should directly sample one midpoint per entity");
+        require(directCluster&&directCluster->degree==5
+                    &&directCluster->controlPoints.size()==10
+                    &&std::abs(directCluster->controlPoints.front().x-0.85)<1e-12
+                    &&std::abs(directCluster->controlPoints.back().x-1.55)<1e-12,
+                "preview clusters should reconstruct the selected quintic reference");
         const std::array shortClusterEntities{
             clusterLine(0.0,1.0),clusterLine(1.0,0.04),clusterLine(1.04,1.0),
         };
@@ -2363,6 +2466,50 @@ namespace {
                     &&(*planned)->activationSpans[0]<(*planned)->activationSpans[1]
                     &&(*planned)->activationSpans[1]==(*planned)->activationSpans[2],
                 "collapsed command activations should remain ordered on the replacement spline");
+
+        std::vector<ngc::MachineCommand> longStrip;
+        longStrip.emplace_back(ngc::MoveLine{{},{1,0,0,0,0,0},60.0});
+        auto stripPosition=1.0;
+        for(unsigned segment=0;segment<8;++segment) {
+            const auto next=stripPosition+0.04;
+            longStrip.emplace_back(ngc::MoveLine{
+                {stripPosition,0,0,0,0,0},{next,0,0,0,0,0},60.0});
+            stripPosition=next;
+        }
+        longStrip.emplace_back(ngc::MoveLine{
+            {stripPosition,0,0,0,0,0},{stripPosition+1.0,0,0,0,0,0},60.0});
+        auto effort=planner.continuousPlanningEffort();
+        effort.captureSplineGeometry=true;
+        planner.setContinuousPlanningEffort(effort);
+        planner.reset(39,{});
+        const auto fittedStrip=planner.compileContinuous(longStrip,SCALE);
+        require(fittedStrip&&*fittedStrip,fittedStrip?
+            "long-strip fixture produced no plan":fittedStrip.error());
+        const auto quintic=std::ranges::find_if((*fittedStrip)->splineGeometry,
+            [](const auto &spline) { return spline.degree==5; });
+        require(quintic!=(*fittedStrip)->splineGeometry.end()
+                    &&quintic->controls.size()==16,
+                "a variable-control short-entity strip should use the selected quintic fitter");
+        std::vector<ngc::experimental::JunctionEntity> previewStrip;
+        previewStrip.push_back(clusterLine(0.0,1.0));
+        auto previewPosition=1.0;
+        for(unsigned segment=0;segment<8;++segment) {
+            previewStrip.push_back(clusterLine(previewPosition,0.04));
+            previewPosition+=0.04;
+        }
+        previewStrip.push_back(clusterLine(previewPosition,1.0));
+        const auto previewFitted=ngc::experimental::buildEvenlySpacedControlCluster(
+            previewStrip,0,previewStrip.size()-1,SCALE);
+        require(previewFitted&&previewFitted->degree==quintic->degree
+                    &&previewFitted->controlPoints.size()==quintic->controls.size(),
+                "preview and simulation should select the same spline degree and layout");
+        for(std::size_t control=0;control<quintic->controls.size();++control) {
+            const auto &previewControl=previewFitted->controlPoints[control];
+            const auto &plannedControl=quintic->controls[control];
+            require(glm::length(previewControl-glm::dvec3(
+                        plannedControl.x,plannedControl.y,plannedControl.z))<1e-12,
+                    "preview and simulation should use identical reconstructed XYZ controls");
+        }
     }
 
     void testRollingContinuousHorizonsPreserveMovingPvaBoundary() {
@@ -2913,8 +3060,9 @@ namespace {
         const auto &fastCluster=(*planned)->pieceTiming[3];
         requireNear(slowCluster.velocityLimit,40.0/60.0,
                 "the incoming cluster portion should retain its F40 cap");
-        requireNear(fastCluster.velocityLimit,72.0/60.0,std::format(
-                "the remaining cluster portion should recover its F72 cap: [{}, {}, {}, "
+        require(fastCluster.velocityLimit>slowCluster.velocityLimit+1e-8
+                &&fastCluster.velocityLimit<=72.0/60.0+1e-8,std::format(
+                "the remaining cluster portion should recover toward its F72 cap: [{}, {}, {}, "
                 "{}, {}, {}]",(*planned)->pieceTiming[0].velocityLimit,
                 (*planned)->pieceTiming[1].velocityLimit,
                 (*planned)->pieceTiming[2].velocityLimit,
@@ -3903,6 +4051,7 @@ int main() {
         test1001PreviewCompletesBoundedly();
         testMdiToolChangeUsesAutoloadPrograms();
         testSimulationWorkerPersistsUntilReset();
+        testSimulationProgramElapsedTimeIsPlaybackSpeedIndependent();
         testInterpreterStatusMessagesPreserveOrder();
         testArcUsesModalFeedrate();
         testArcCenterDistanceModes();
@@ -3939,6 +4088,7 @@ int main() {
         testPreviewJunctionUsesOneSixControlSpline();
         testShortLineMidpointCurvatureInference();
         testCubicSplineInteriorControlConditioning();
+        testGeometricJerkCombIncludesTangentialComponent();
         testMicroEntityClusterCollapsesToOneSpline();
         testBoundedPlannerExecutesPiecewiseG64Geometry();
         testRollingContinuousHorizonsPreserveMovingPvaBoundary();

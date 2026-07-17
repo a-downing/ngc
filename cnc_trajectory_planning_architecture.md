@@ -1,5 +1,13 @@
 # CNC Trajectory Planning Architecture
 
+## Current implementation update (2026-07-17)
+
+This document retains the original architectural reasoning, including sections that describe an all-cubic G64 design. The implemented geometry is now more specific: retained line/arc sections and local six-control junction blends remain cubic, while variable-control short-entity cluster splines may be reconstructed as degree-five curves. `spline_detail::continuousSplineFitSolver()` is the single selection point shared by timed planning and geometry-only Preview; uniform banded quintic fairness is the current default, with cubic baseline, bounded coordinate search, and peak-targeted banded fairness retained for controlled comparisons. Timed planning additionally requires an ordered recursive source-tube certificate before accepting reconstructed cluster geometry.
+
+Timed Simulation exposes mock-only execution diagnostics without expanding the RT-facing `MotionBackend`. Its jerk comb uses the analytic jerk of the executed axis cubic at backend-calculated fixed-servo positions, transforms those positions to the active tool tip, and retains one tooth every ten executed servo periods. Tooth density therefore indicates speed; green shows used aggregate path-jerk capacity and red shows unused capacity. This does not identify per-axis or acceleration constraints. The separate Preview cluster comb shows full geometric `|q'''|` at the planner's 65 geometric sample locations.
+
+The GUI uses vsync and reports CPU frame construction/OpenGL submission time rather than FPS or inter-frame time. Timed Simulation reports invariant program elapsed time in seconds and `hours:minutes:seconds`, independent of playback multiplier.
+
 ## Consolidated design conclusions
 
 This document summarizes the proposed architecture for a CNC controller in which:

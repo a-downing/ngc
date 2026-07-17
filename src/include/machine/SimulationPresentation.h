@@ -25,6 +25,8 @@ namespace ngc {
         std::uint32_t servoTicksPerSchedulerPeriod = 10;
         std::uint32_t tickMultiplier = 1;
         std::uint64_t servoTicks = 0;
+        double programElapsedSeconds = 0.0;
+        double executedPathJerk = 0.0;
         std::uint64_t deadlineMisses = 0;
         double lastWakeLatenessSeconds = 0.0;
         double maximumWakeLatenessSeconds = 0.0;

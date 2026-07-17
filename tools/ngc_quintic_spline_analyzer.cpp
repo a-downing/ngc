@@ -1,11 +1,14 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cmath>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <limits>
 #include <numeric>
+#include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -79,16 +82,16 @@ namespace {
         }
     };
 
-    struct CapturedSpline {std::size_t id=0,first=0,last=0;std::vector<Point> controls;};
+    struct CapturedSpline {std::size_t id=0,first=0,last=0,degree=3;std::vector<Point> controls;};
     struct Snapshot {std::vector<Primitive> primitives;std::vector<CapturedSpline> splines;};
 
     Snapshot readSnapshot(const std::filesystem::path &path) {
         std::ifstream in(path);if(!in)throw std::runtime_error("could not open snapshot");
-        std::string word;in>>word;if(word!="ngc_spline_geometry_v1")throw std::runtime_error("unsupported snapshot");
+        std::string word;in>>word;const auto version2=word=="ngc_spline_geometry_v2";if(!version2&&word!="ngc_spline_geometry_v1")throw std::runtime_error("unsupported snapshot");
         std::size_t count=0;in>>word>>count;Snapshot result;result.primitives.reserve(count);
         for(std::size_t i=0;i<count;++i){Primitive p;in>>word>>p.id>>p.feed;p.arc=word=="arc";for(auto&v:p.start)in>>v;for(auto&v:p.end)in>>v;if(p.arc){for(auto&v:p.center)in>>v;for(auto&v:p.axis)in>>v;}result.primitives.push_back(p);}
         in>>word>>count;result.splines.reserve(count);
-        for(std::size_t i=0;i<count;++i){CapturedSpline s;std::size_t horizon=0,n=0,b=0;in>>word>>s.id>>horizon>>s.first>>s.last>>n>>b;s.controls.resize(n);for(auto&c:s.controls){in>>word;for(auto&v:c)in>>v;}in>>word;double ignored=0;for(std::size_t j=0;j<b;++j)in>>ignored;result.splines.push_back(std::move(s));}
+        for(std::size_t i=0;i<count;++i){CapturedSpline s;std::size_t horizon=0,n=0,b=0;in>>word>>s.id>>horizon>>s.first>>s.last;if(version2)in>>s.degree;in>>n>>b;s.controls.resize(n);for(auto&c:s.controls){in>>word;for(auto&v:c)in>>v;}in>>word;double ignored=0;for(std::size_t j=0;j<b;++j)in>>ignored;result.splines.push_back(std::move(s));}
         if(!in)throw std::runtime_error("incomplete snapshot");return result;
     }
 
@@ -137,8 +140,8 @@ namespace {
         return q;
     }
 
-    struct Measurement {double length=0,maxDerivative=0,maxNormal=0,integralNormal=0,maxCurvature=0,maxDeviation=0;};
-    Measurement measure(const BSpline&s,const Composite *source=nullptr,unsigned perSpan=128){Measurement m;const auto spans=s.controls.size()-s.degree;const SplineEvaluator evaluator(s);Point previous=s.at(0);double previousNormal=0;for(std::size_t i=0;i<=spans*perSpan;++i){const auto u=double(i)/perSpan;const auto g=evaluator.at(u);const auto tangentComponent=dot(g.tangent,g.derivative);const auto normal=norm(sub(g.derivative,mul(g.tangent,tangentComponent)));const auto d=norm(g.derivative);m.maxDerivative=std::max(m.maxDerivative,d);m.maxNormal=std::max(m.maxNormal,normal);m.maxCurvature=std::max(m.maxCurvature,norm(g.curvature));if(i){const auto ds=norm(sub(g.position,previous));m.length+=ds;m.integralNormal+=0.5*(previousNormal+normal)*ds;}if(source)m.maxDeviation=std::max(m.maxDeviation,norm(sub(g.position,source->position(source->total*u/spans))));previous=g.position;previousNormal=normal;}return m;}
+    struct Measurement {double length=0,maxDerivative=0,maxNormal=0,maxNormalParameter=0,integralNormal=0,maxCurvature=0,maxDeviation=0,maxDeviationParameter=0;};
+    Measurement measure(const BSpline&s,const Composite *source=nullptr,unsigned perSpan=128){Measurement m;const auto spans=s.controls.size()-s.degree;const SplineEvaluator evaluator(s);Point previous=s.at(0);double previousNormal=0;for(std::size_t i=0;i<=spans*perSpan;++i){const auto u=double(i)/perSpan;const auto g=evaluator.at(u);const auto tangentComponent=dot(g.tangent,g.derivative);const auto normal=norm(sub(g.derivative,mul(g.tangent,tangentComponent)));const auto d=norm(g.derivative);m.maxDerivative=std::max(m.maxDerivative,d);if(normal>m.maxNormal){m.maxNormal=normal;m.maxNormalParameter=u;}m.maxCurvature=std::max(m.maxCurvature,norm(g.curvature));if(i){const auto ds=norm(sub(g.position,previous));m.length+=ds;m.integralNormal+=0.5*(previousNormal+normal)*ds;}if(source){const auto deviation=norm(sub(g.position,source->position(source->total*u/spans)));if(deviation>m.maxDeviation){m.maxDeviation=deviation;m.maxDeviationParameter=u;}}previous=g.position;previousNormal=normal;}return m;}
 
     BSpline optimizeQuinticPhysicalJerk(BSpline initial,const Composite &source,
                                          double programmedScale,double deviationInP) {
@@ -153,17 +156,21 @@ namespace {
         };
         auto bestMeasurement=original;
         auto bestScore=score(bestMeasurement);
-        for(const auto fraction:{0.25,0.125,0.0625,0.03125,0.015625,0.0078125}) {
+        // Experimental bounded-sweep pass: one deterministic sweep at each scale.
+        // Candidate measurement still traverses the complete spline, so this
+        // coordinate search remains quadratic in control count and is not a
+        // proposed production solver. Dense verification remains independent.
+        for(const auto fraction:{0.25,0.0625,0.015625}) {
             const auto step=programmedScale*fraction;
             auto improved=true;
-            for(unsigned sweep=0;sweep<3&&improved;++sweep) {
+            for(unsigned sweep=0;sweep<1&&improved;++sweep) {
                 improved=false;
                 for(std::size_t control=4;control+4<best.controls.size();++control)
                     for(std::size_t axis=0;axis<3;++axis)
                         for(const auto direction:{-1.0,1.0}) {
                             auto candidate=best;
                             candidate.controls[control][axis]+=direction*step;
-                            const auto measurement=measure(candidate,&source,24);
+                            const auto measurement=measure(candidate,&source,4);
                             if(measurement.maxCurvature>original.maxCurvature*1.02) continue;
                             const auto candidateScore=score(measurement);
                             if(candidateScore<bestScore*(1.0-1e-10)) {
@@ -177,8 +184,224 @@ namespace {
         }
         const auto verified=measure(best,&source,256);
         if(verified.maxDeviation>limit*(1.0+1e-9))
-            throw std::runtime_error("optimized quintic exceeds the verified 0.2P deviation bound");
+            throw std::runtime_error("optimized quintic exceeds the requested deviation bound");
         return best;
+    }
+
+    struct BandedFairnessResult {
+        BSpline spline;
+        double fairnessWeight=0.0;
+        unsigned candidates=0;
+        unsigned activePasses=0;
+    };
+
+    BandedFairnessResult optimizeQuinticBandedFairness(
+            const BSpline &initial,const Composite &source,
+            const double programmedScale,const double deviationInP,
+            const bool useActiveReweighting) {
+        constexpr std::size_t FIXED_CONTROLS_PER_END=4;
+        constexpr std::size_t HALF_BANDWIDTH=3;
+        constexpr std::array<double,4> THIRD_DIFFERENCE{-1.0,3.0,-3.0,1.0};
+        const auto firstFree=FIXED_CONTROLS_PER_END;
+        const auto lastFree=initial.controls.size()-FIXED_CONTROLS_PER_END;
+        if(lastFree<=firstFree) return {initial,0.0,0,0};
+        const auto freeCount=lastFree-firstFree;
+        const auto limit=programmedScale*deviationInP;
+        const auto original=measure(initial,&source,32);
+        if(original.maxDeviation>limit*(1.0+1e-9))
+            throw std::runtime_error("initial quintic exceeds the requested deviation bound");
+        const auto score=[&](const Measurement &measurement) {
+            const auto peak=measurement.maxNormal/std::max(original.maxNormal,1e-30);
+            const auto integral=measurement.integralNormal
+                /std::max(original.integralNormal,1e-30);
+            return 0.65*peak+0.35*integral;
+        };
+        BandedFairnessResult result{initial,0.0,0,0};
+        auto bestScore=score(original);
+
+        const auto solve=[&](const double fairnessWeight,
+                             const std::span<const double> rowWeights)
+                ->std::optional<BSpline> {
+            std::vector<std::array<double,2*HALF_BANDWIDTH+1>> matrix(freeCount);
+            std::vector<Point> rightHandSide(freeCount);
+            for(std::size_t free=0;free<freeCount;++free) {
+                matrix[free][HALF_BANDWIDTH]=1.0;
+                rightHandSide[free]=initial.controls[firstFree+free];
+            }
+            for(std::size_t row=0;row+3<initial.controls.size();++row) {
+                for(std::size_t a=0;a<THIRD_DIFFERENCE.size();++a) {
+                    const auto controlA=row+a;
+                    if(controlA<firstFree||controlA>=lastFree) continue;
+                    const auto freeA=controlA-firstFree;
+                    for(std::size_t b=0;b<THIRD_DIFFERENCE.size();++b) {
+                        const auto controlB=row+b;
+                        const auto value=fairnessWeight*rowWeights[row]
+                            *THIRD_DIFFERENCE[a]*THIRD_DIFFERENCE[b];
+                        if(controlB>=firstFree&&controlB<lastFree) {
+                            const auto freeB=controlB-firstFree;
+                            if(freeB<=freeA)
+                                matrix[freeA][HALF_BANDWIDTH+freeB-freeA]+=value;
+                        } else {
+                            for(std::size_t axis=0;axis<6;++axis)
+                                rightHandSide[freeA][axis]-=
+                                    value*initial.controls[controlB][axis];
+                        }
+                    }
+                }
+            }
+
+            std::vector<std::array<double,HALF_BANDWIDTH+1>> lower(freeCount);
+            auto factorizationValid=true;
+            for(std::size_t i=0;i<freeCount&&factorizationValid;++i) {
+                const auto firstJ=i>HALF_BANDWIDTH?i-HALF_BANDWIDTH:0;
+                for(auto j=firstJ;j<=i;++j) {
+                    auto value=matrix[i][HALF_BANDWIDTH+j-i];
+                    const auto firstK=std::max(
+                        i>HALF_BANDWIDTH?i-HALF_BANDWIDTH:0,
+                        j>HALF_BANDWIDTH?j-HALF_BANDWIDTH:0);
+                    for(auto k=firstK;k<j;++k)
+                        value-=lower[i][i-k]*lower[j][j-k];
+                    if(i==j) {
+                        if(!std::isfinite(value)||value<=1e-18) {
+                            factorizationValid=false;
+                            break;
+                        }
+                        lower[i][0]=std::sqrt(value);
+                    } else lower[i][i-j]=value/lower[j][0];
+                }
+            }
+            if(!factorizationValid) return std::nullopt;
+
+            auto candidate=initial;
+            for(std::size_t axis=0;axis<6;++axis) {
+                std::vector<double> intermediate(freeCount),solution(freeCount);
+                for(std::size_t i=0;i<freeCount;++i) {
+                    auto value=rightHandSide[i][axis];
+                    const auto maximum=std::min(HALF_BANDWIDTH,i);
+                    for(std::size_t distance=1;distance<=maximum;++distance)
+                        value-=lower[i][distance]*intermediate[i-distance];
+                    intermediate[i]=value/lower[i][0];
+                }
+                for(auto reverse=freeCount;reverse-->0;) {
+                    auto value=intermediate[reverse];
+                    const auto maximum=std::min(HALF_BANDWIDTH,freeCount-1-reverse);
+                    for(std::size_t distance=1;distance<=maximum;++distance)
+                        value-=lower[reverse+distance][distance]
+                            *solution[reverse+distance];
+                    solution[reverse]=value/lower[reverse][0];
+                    candidate.controls[firstFree+reverse][axis]=solution[reverse];
+                }
+            }
+            return candidate;
+        };
+
+        const auto acceptable=[&](const Measurement &measurement) {
+            return measurement.maxDeviation<=0.98*limit
+                &&measurement.maxCurvature<=original.maxCurvature*1.02;
+        };
+        const auto rowCount=initial.controls.size()-3;
+        const std::vector<double> uniformWeights(rowCount,1.0);
+
+        // Each solve has fixed half-bandwidth three because the objective is
+        // fidelity plus weighted squared third differences of four adjacent
+        // controls. The bounded weight scan selects the uniform starting point.
+        constexpr std::array<double,13> WEIGHTS{
+            3e-2,1e-1,3e-1,1.0,3.0,10.0,30.0,100.0,300.0,500.0,700.0,
+            1000.0,3000.0};
+        struct ActiveSeed {
+            BSpline spline;
+            Measurement measurement;
+            double fairnessWeight=0.0;
+            double score=std::numeric_limits<double>::infinity();
+        };
+        std::array<std::optional<ActiveSeed>,3> activeSeeds;
+        for(const auto fairnessWeight:WEIGHTS) {
+            auto candidate=solve(fairnessWeight,uniformWeights);
+            ++result.candidates;
+            if(!candidate) continue;
+            const auto measurement=measure(*candidate,&source,8);
+            if(!acceptable(measurement)) continue;
+            const auto candidateScore=score(measurement);
+            const auto utilization=measurement.maxDeviation/limit;
+            const auto seedIndex=utilization<0.35?0U:utilization<0.7?1U:2U;
+            if(!activeSeeds[seedIndex]
+                    ||candidateScore<activeSeeds[seedIndex]->score)
+                activeSeeds[seedIndex]=ActiveSeed{
+                    *candidate,measurement,fairnessWeight,candidateScore};
+            if(candidateScore<bestScore*(1.0-1e-10)) {
+                result.spline=std::move(*candidate);
+                result.fairnessWeight=fairnessWeight;
+                bestScore=candidateScore;
+            }
+        }
+
+        if(useActiveReweighting) {
+            constexpr unsigned ACTIVE_PASSES=4;
+            constexpr unsigned PROFILE_SAMPLES_PER_SPAN=24;
+            for(const auto &seed:activeSeeds) {
+                if(!seed) continue;
+                auto currentCandidate=seed->spline;
+                auto currentMeasurement=measure(currentCandidate,&source,12);
+                if(!acceptable(currentMeasurement)) continue;
+                auto currentScore=score(currentMeasurement);
+                auto rowWeights=uniformWeights;
+                auto acceptedPasses=0U;
+                const auto spans=currentCandidate.controls.size()-currentCandidate.degree;
+                for(unsigned pass=0;pass<ACTIVE_PASSES;++pass) {
+                    const SplineEvaluator evaluator(currentCandidate);
+                    std::vector<double> spanPeaks(spans);
+                    auto globalPeak=0.0;
+                    for(std::size_t sample=0;
+                            sample<=spans*PROFILE_SAMPLES_PER_SPAN;++sample) {
+                        const auto parameter=static_cast<double>(sample)
+                            /PROFILE_SAMPLES_PER_SPAN;
+                        const auto geometry=evaluator.at(parameter);
+                        const auto tangential=dot(geometry.tangent,geometry.derivative);
+                        const auto normal=norm(sub(geometry.derivative,
+                            mul(geometry.tangent,tangential)));
+                        const auto span=std::min(spans-1,
+                            static_cast<std::size_t>(std::floor(parameter)));
+                        spanPeaks[span]=std::max(spanPeaks[span],normal);
+                        globalPeak=std::max(globalPeak,normal);
+                    }
+                    if(!std::isfinite(globalPeak)||globalPeak<=1e-30) break;
+                    auto changed=false;
+                    for(std::size_t span=0;span<spans;++span) {
+                        const auto ratio=spanPeaks[span]/globalPeak;
+                        if(ratio<0.35) continue;
+                        const auto increase=1.0+12.0*ratio*ratio*ratio*ratio;
+                        for(std::size_t local=0;local<3;++local) {
+                            const auto row=std::min(rowCount-1,span+local);
+                            const auto updated=std::min(1e6,rowWeights[row]*increase);
+                            changed=changed||updated>rowWeights[row]*(1.0+1e-12);
+                            rowWeights[row]=updated;
+                        }
+                    }
+                    if(!changed) break;
+                    auto candidate=solve(seed->fairnessWeight,rowWeights);
+                    ++result.candidates;
+                    if(!candidate) break;
+                    const auto measurement=measure(*candidate,&source,16);
+                    if(!acceptable(measurement)) break;
+                    const auto candidateScore=score(measurement);
+                    if(candidateScore>=currentScore*(1.0-1e-10)) break;
+                    currentCandidate=std::move(*candidate);
+                    currentScore=candidateScore;
+                    ++acceptedPasses;
+                    if(candidateScore<bestScore*(1.0-1e-10)) {
+                        result.spline=currentCandidate;
+                        result.fairnessWeight=seed->fairnessWeight;
+                        result.activePasses=acceptedPasses;
+                        bestScore=candidateScore;
+                    }
+                }
+            }
+        }
+        const auto verified=measure(result.spline,&source,256);
+        if(verified.maxDeviation>limit*(1.0+1e-9))
+            throw std::runtime_error(
+                "banded-fairness quintic exceeds the requested deviation bound");
+        return result;
     }
 
     void writeComparison(const std::filesystem::path &base,const BSpline &cubic,const BSpline &quintic,const Composite &source,double feed){
@@ -193,4 +416,73 @@ namespace {
     }
 }
 
-int main(int argc,char **argv){try{if(argc!=5){std::cerr<<"usage: ngc_quintic_spline_analyzer <snapshot> <spline-id> <feed-per-minute> <output-base>\n";return 2;}const auto snapshot=readSnapshot(argv[1]);const auto id=std::stoull(argv[2]);const auto found=std::ranges::find(snapshot.splines,id,&CapturedSpline::id);if(found==snapshot.splines.end())throw std::runtime_error("spline not found");const auto source=compositeFor(snapshot,*found);BSpline cubic{3,found->controls,openKnots(found->controls.size(),3)};const auto rawQuintic=quinticFor(source,*found);const auto raw=measure(rawQuintic,&source);const auto quintic=optimizeQuinticPhysicalJerk(rawQuintic,source,0.005,0.2);const auto cm=measure(cubic),qm=measure(quintic,&source,256);writeComparison(argv[4],cubic,quintic,source,std::stod(argv[3]));std::cout<<"spline "<<id<<" cubic max_normal="<<cm.maxNormal<<" integral="<<cm.integralNormal<<" max_curvature="<<cm.maxCurvature<<"; raw_quintic max_normal="<<raw.maxNormal<<" integral="<<raw.integralNormal<<" deviation="<<raw.maxDeviation<<"; optimized_quintic max_normal="<<qm.maxNormal<<" integral="<<qm.integralNormal<<" max_curvature="<<qm.maxCurvature<<" deviation="<<qm.maxDeviation<<" length="<<qm.length<<'\n';return 0;}catch(const std::exception&e){std::cerr<<"ERROR: "<<e.what()<<'\n';return 1;}}
+int main(int argc,char **argv) {
+    try {
+        if(argc!=5&&argc!=7&&argc!=8) {
+            std::cerr<<"usage: ngc_quintic_spline_analyzer <snapshot> <spline-id> "
+                "<feed-per-minute> <output-base> [programmed-P deviation-in-P "
+                "[coordinate|banded|banded-active]]\n";
+            return 2;
+        }
+        const auto programmedScale=argc>=7?std::stod(argv[5]):0.005;
+        const auto deviationInP=argc>=7?std::stod(argv[6]):0.2;
+        const auto solver=argc==8?std::string_view(argv[7]):std::string_view("coordinate");
+        if(solver!="coordinate"&&solver!="banded"&&solver!="banded-active")
+            throw std::runtime_error(
+                "solver must be coordinate, banded, or banded-active");
+        if(!std::isfinite(programmedScale)||programmedScale<=0.0
+           ||!std::isfinite(deviationInP)||deviationInP<=0.0)
+            throw std::runtime_error("P and deviation-in-P must be finite and positive");
+        const auto snapshot=readSnapshot(argv[1]);
+        const auto id=std::stoull(argv[2]);
+        const auto found=std::ranges::find(snapshot.splines,id,&CapturedSpline::id);
+        if(found==snapshot.splines.end()) throw std::runtime_error("spline not found");
+        if(found->degree!=3)
+            throw std::runtime_error("quintic fitting experiment requires a cubic source spline");
+        const auto source=compositeFor(snapshot,*found);
+        BSpline cubic{3,found->controls,openKnots(found->controls.size(),3)};
+        const auto rawQuintic=quinticFor(source,*found);
+        const auto raw=measure(rawQuintic,&source);
+        const auto started=std::chrono::steady_clock::now();
+        auto fairnessWeight=0.0;
+        auto bandedCandidates=0U;
+        auto activePasses=0U;
+        BSpline quintic;
+        if(solver=="banded"||solver=="banded-active") {
+            auto optimized=optimizeQuinticBandedFairness(
+                rawQuintic,source,programmedScale,deviationInP,
+                solver=="banded-active");
+            quintic=std::move(optimized.spline);
+            fairnessWeight=optimized.fairnessWeight;
+            bandedCandidates=optimized.candidates;
+            activePasses=optimized.activePasses;
+        } else quintic=optimizeQuinticPhysicalJerk(
+            rawQuintic,source,programmedScale,deviationInP);
+        const auto elapsed=std::chrono::duration<double,std::milli>(
+            std::chrono::steady_clock::now()-started).count();
+        const auto cm=measure(cubic),qm=measure(quintic,&source,256);
+        writeComparison(argv[4],cubic,quintic,source,std::stod(argv[3]));
+        std::cout<<"spline "<<id
+            <<" cubic max_normal="<<cm.maxNormal
+            <<" integral="<<cm.integralNormal
+            <<" max_curvature="<<cm.maxCurvature
+            <<"; raw_quintic max_normal="<<raw.maxNormal
+            <<" integral="<<raw.integralNormal
+            <<" deviation="<<raw.maxDeviation
+            <<"; optimized_quintic max_normal="<<qm.maxNormal
+            <<" integral="<<qm.integralNormal
+            <<" max_curvature="<<qm.maxCurvature
+            <<" deviation="<<qm.maxDeviation
+            <<" length="<<qm.length
+            <<" fit_ms="<<elapsed
+            <<" solver="<<solver
+            <<" fairness_weight="<<fairnessWeight
+            <<" candidates="<<bandedCandidates
+            <<" active_passes="<<activePasses
+            <<" deviation_limit="<<programmedScale*deviationInP<<'\n';
+        return 0;
+    } catch(const std::exception&e) {
+        std::cerr<<"ERROR: "<<e.what()<<'\n';
+        return 1;
+    }
+}

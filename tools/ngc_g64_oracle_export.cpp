@@ -46,6 +46,7 @@ namespace {
         std::size_t horizon=0;
         std::size_t firstSource=0;
         std::size_t lastSource=0;
+        std::size_t degree=0;
         std::vector<ngc::position_t> controls;
         std::vector<double> pieceBoundaries;
     };
@@ -655,7 +656,7 @@ namespace {
         std::ofstream output(path,std::ios::binary|std::ios::trunc);
         if(!output) throw std::runtime_error(std::format("could not open {}",path.string()));
         output.precision(17);
-        output<<"ngc_spline_geometry_v1\n";
+        output<<"ngc_spline_geometry_v2\n";
         output<<"primitive_count "<<commands.size()<<'\n';
         for(std::size_t input=0;input<commands.size();++input)
             std::visit([&](const auto &command) {
@@ -683,7 +684,8 @@ namespace {
             const auto &spline=splines[index];
             output<<"spline "<<index<<' '<<spline.horizon<<' '
                 <<spline.firstSource<<' '<<spline.lastSource<<' '
-                <<spline.controls.size()<<' '<<spline.pieceBoundaries.size()<<'\n';
+                <<spline.degree<<' '<<spline.controls.size()<<' '
+                <<spline.pieceBoundaries.size()<<'\n';
             for(const auto &control:spline.controls)
                 output<<"control "<<control.x<<' '<<control.y<<' '<<control.z<<' '
                     <<control.a<<' '<<control.b<<' '<<control.c<<'\n';
@@ -796,6 +798,7 @@ int main(const int argc,char **argv) {
                             .horizon=diagnosticHorizon,
                             .firstSource=*sources[spline.firstInput],
                             .lastSource=*sources[spline.lastInput],
+                            .degree=spline.degree,
                             .controls=spline.controls,
                             .pieceBoundaries=spline.pieceBoundaries,
                         });

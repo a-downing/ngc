@@ -267,6 +267,7 @@ namespace ngc {
         struct SplineGeometry {
             std::size_t firstInput = 0;
             std::size_t lastInput = 0;
+            std::size_t degree = 0;
             std::vector<position_t> controls;
             std::vector<double> pieceBoundaries;
         };

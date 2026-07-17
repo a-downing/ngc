@@ -21,6 +21,7 @@ public:
 
     void init();
     void preRender();
+    void setLastFrameRenderSeconds(double seconds);
     void addScroll(double delta);
     void terminate();
     void render();

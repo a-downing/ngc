@@ -57,7 +57,7 @@ namespace {
         const auto parameter=std::clamp(requested,knots[degree],maximum);
         auto span=degree;
         while(span+1<controls.size()&&parameter>=knots[span+1]) ++span;
-        std::array<Point,4> work{};
+        std::array<Point,6> work{};
         for(std::size_t index=0;index<=degree;++index)
             work[index]=controls[span-degree+index];
         for(std::size_t level=1;level<=degree;++level)
@@ -76,6 +76,7 @@ namespace {
         std::size_t horizon=0;
         std::size_t firstSource=0;
         std::size_t lastSource=0;
+        std::size_t degree=3;
         std::vector<Point> controls;
         std::vector<double> boundaries;
     };
@@ -135,10 +136,12 @@ namespace {
     public:
         explicit SplineEvaluator(const Spline &value):spline(value) {
             const auto count=spline.controls.size();
-            const auto maximumParameter=static_cast<double>(count-3);
-            knots.assign(count+4,maximumParameter);
-            std::fill_n(knots.begin(),4,0.0);
-            for(std::size_t index=4;index<count;++index) knots[index]=index-3;
+            const auto degree=spline.degree;
+            const auto maximumParameter=static_cast<double>(count-degree);
+            knots.assign(count+degree+1,maximumParameter);
+            std::fill_n(knots.begin(),degree+1,0.0);
+            for(std::size_t index=degree+1;index<count;++index)
+                knots[index]=index-degree;
             firstKnots=std::vector<double>(knots.begin()+1,knots.end()-1);
             secondKnots=std::vector<double>(firstKnots.begin()+1,firstKnots.end()-1);
             thirdKnots=std::vector<double>(secondKnots.begin()+1,secondKnots.end()-1);
@@ -147,21 +150,23 @@ namespace {
             third.resize(count-3);
             for(std::size_t index=0;index<first.size();++index)
                 first[index]=scaled(subtract(spline.controls[index+1],spline.controls[index]),
-                    3.0/(knots[index+4]-knots[index+1]));
+                    static_cast<double>(degree)/(knots[index+degree+1]-knots[index+1]));
             for(std::size_t index=0;index<second.size();++index)
                 second[index]=scaled(subtract(first[index+1],first[index]),
-                    2.0/(firstKnots[index+3]-firstKnots[index+1]));
+                    static_cast<double>(degree-1)
+                        /(firstKnots[index+degree]-firstKnots[index+1]));
             for(std::size_t index=0;index<third.size();++index)
                 third[index]=scaled(subtract(second[index+1],second[index]),
-                    1.0/(secondKnots[index+2]-secondKnots[index+1]));
+                    static_cast<double>(degree-2)
+                        /(secondKnots[index+degree-1]-secondKnots[index+1]));
         }
 
         DifferentialSample at(const double parameter) const {
             DifferentialSample result;
-            result.position=evaluate(spline.controls,knots,3,parameter);
-            const auto r1=evaluate(first,firstKnots,2,parameter);
-            const auto r2=evaluate(second,secondKnots,1,parameter);
-            const auto r3=evaluate(third,thirdKnots,0,parameter);
+            result.position=evaluate(spline.controls,knots,spline.degree,parameter);
+            const auto r1=evaluate(first,firstKnots,spline.degree-1,parameter);
+            const auto r2=evaluate(second,secondKnots,spline.degree-2,parameter);
+            const auto r3=evaluate(third,thirdKnots,spline.degree-3,parameter);
             const auto speed=length(r1);
             if(speed<=1e-15) throw std::runtime_error("singular spline parameter speed");
             result.tangent=scaled(r1,1.0/speed);
@@ -312,7 +317,8 @@ namespace {
     }
 
     Spline halfEntityControlSpline(const Snapshot &snapshot,const Spline &original) {
-        if(original.controls.size()<=6||original.lastSource<=original.firstSource+1)
+        if(original.degree!=3||original.controls.size()<=6
+           ||original.lastSource<=original.firstSource+1)
             return original;
         const auto interiorEntityCount=original.lastSource-original.firstSource-1;
         const auto interiorControlCount=(interiorEntityCount+1)/2;
@@ -343,7 +349,7 @@ namespace {
             const SourceComposite &source,const unsigned samplesPerSpan) {
         if(samplesPerSpan==0) throw std::runtime_error("ordered deviation needs samples");
         const SplineEvaluator evaluator(candidate);
-        const auto spans=candidate.controls.size()-3;
+        const auto spans=candidate.controls.size()-candidate.degree;
         const auto sampleCount=spans*samplesPerSpan;
         std::vector<Point> positions;
         std::vector<double> distances;
@@ -391,7 +397,7 @@ namespace {
             const OrderedDeviationProxy &proxy) {
         const SplineEvaluator evaluator(candidate);
         const auto sampleCount=proxy.sourcePositions.size()-1;
-        const auto spans=candidate.controls.size()-3;
+        const auto spans=candidate.controls.size()-candidate.degree;
         auto maximum=0.0;
         for(std::size_t sample=0;sample<=sampleCount;++sample) {
             const auto parameter=static_cast<double>(spans)*sample/sampleCount;
@@ -418,12 +424,13 @@ namespace {
         const auto velocity=feedPerMinute/60.0;
         const SplineEvaluator evaluator(spline);
         constexpr unsigned SAMPLES_PER_SPAN=128;
-        const auto sampleCount=(spline.controls.size()-3)*SAMPLES_PER_SPAN;
+        const auto spans=spline.controls.size()-spline.degree;
+        const auto sampleCount=spans*SAMPLES_PER_SPAN;
         std::vector<FeedProfilePoint> profile;
         profile.reserve(sampleCount+1);
         Point previousPosition{};
         for(std::size_t index=0;index<=sampleCount;++index) {
-            const auto parameter=static_cast<double>(spline.controls.size()-3)*index/sampleCount;
+            const auto parameter=static_cast<double>(spans)*index/sampleCount;
             const auto sample=evaluator.at(parameter);
             FeedProfilePoint point;
             if(index>0) point.distance=profile.back().distance
@@ -568,23 +575,26 @@ namespace {
     Measurement measure(Spline spline,const unsigned samplesPerSpan=32) {
         if(samplesPerSpan==0) throw std::runtime_error("spline measurement needs samples");
         const auto count=spline.controls.size();
-        const auto maximumParameter=static_cast<double>(count-3);
-        std::vector<double> knots(count+4,maximumParameter);
-        std::fill_n(knots.begin(),4,0.0);
-        for(std::size_t index=4;index<count;++index) knots[index]=index-3;
+        const auto degree=spline.degree;
+        const auto maximumParameter=static_cast<double>(count-degree);
+        std::vector<double> knots(count+degree+1,maximumParameter);
+        std::fill_n(knots.begin(),degree+1,0.0);
+        for(std::size_t index=degree+1;index<count;++index) knots[index]=index-degree;
         std::vector<double> firstKnots(knots.begin()+1,knots.end()-1);
         std::vector<double> secondKnots(firstKnots.begin()+1,firstKnots.end()-1);
         std::vector<double> thirdKnots(secondKnots.begin()+1,secondKnots.end()-1);
         std::vector<Point> first(count-1),second(count-2),third(count-3);
         for(std::size_t index=0;index<first.size();++index)
             first[index]=scaled(subtract(spline.controls[index+1],spline.controls[index]),
-                3.0/(knots[index+4]-knots[index+1]));
+                static_cast<double>(degree)/(knots[index+degree+1]-knots[index+1]));
         for(std::size_t index=0;index<second.size();++index)
             second[index]=scaled(subtract(first[index+1],first[index]),
-                2.0/(firstKnots[index+3]-firstKnots[index+1]));
+                static_cast<double>(degree-1)
+                    /(firstKnots[index+degree]-firstKnots[index+1]));
         for(std::size_t index=0;index<third.size();++index)
             third[index]=scaled(subtract(second[index+1],second[index]),
-                1.0/(secondKnots[index+2]-secondKnots[index+1]));
+                static_cast<double>(degree-2)
+                    /(secondKnots[index+degree-1]-secondKnots[index+1]));
 
         Measurement result{.spline=std::move(spline)};
         result.length=result.spline.boundaries.empty()?0.0:result.spline.boundaries.back();
@@ -599,19 +609,19 @@ namespace {
             ?result.maximumControlSpacing/result.minimumControlSpacing
             :std::numeric_limits<double>::infinity();
         result.minimumParameterSpeed=std::numeric_limits<double>::infinity();
-        std::vector<double> spanMaximumDerivative(count-3,0.0);
-        std::vector<double> spanLengths(count-3,0.0);
-        for(std::size_t span=0;span+3<count;++span) {
+        std::vector<double> spanMaximumDerivative(count-degree,0.0);
+        std::vector<double> spanLengths(count-degree,0.0);
+        for(std::size_t span=0;span+degree<count;++span) {
             double previousSpeed=0.0;
             double previousNormalDerivative=0.0;
             for(unsigned sample=0;sample<=samplesPerSpan;++sample) {
                 auto parameter=static_cast<double>(span)
                     +static_cast<double>(sample)/samplesPerSpan;
-                if(sample==samplesPerSpan&&span+4<count)
+                if(sample==samplesPerSpan&&span+degree+1<count)
                     parameter=std::nextafter(parameter,static_cast<double>(span));
-                const auto r1=evaluate(first,firstKnots,2,parameter);
-                const auto r2=evaluate(second,secondKnots,1,parameter);
-                const auto r3=evaluate(third,thirdKnots,0,parameter);
+                const auto r1=evaluate(first,firstKnots,degree-1,parameter);
+                const auto r2=evaluate(second,secondKnots,degree-2,parameter);
+                const auto r3=evaluate(third,thirdKnots,degree-3,parameter);
                 const auto speed=length(r1);
                 const auto distanceStep=sample>0
                     ?(previousSpeed+speed)*0.5/samplesPerSpan:0.0;
@@ -679,7 +689,8 @@ namespace {
     Measurement relaxInteriorControls(const Measurement &original,
             const double programmedScale,const double maximumDisplacementInP) {
         auto best=original;
-        if(best.spline.controls.size()<=6||best.length<0.35||best.length>0.8
+        if(best.spline.degree!=3||best.spline.controls.size()<=6
+           ||best.length<0.35||best.length>0.8
            ||best.derivativeVelocityCap>=0.35) return best;
         const auto originalControls=original.spline.controls;
         for(const auto fraction:{0.25,0.125,0.0625,0.03125}) {
@@ -741,7 +752,8 @@ namespace {
             .maximumSourceDeviation=originalDeviation.maximum,
             .candidateLength=originalDeviation.candidateLength,
         };
-        if(original.spline.controls.size()<=6||!std::isfinite(maximumCurveDeviationInP)
+        if(original.spline.degree!=3||original.spline.controls.size()<=6
+           ||!std::isfinite(maximumCurveDeviationInP)
            ||maximumCurveDeviationInP<=0.0
            ||original.maximumNormalCurvatureDerivative<=0.0
            ||original.integratedNormalCurvatureDerivative<=0.0) {
@@ -751,7 +763,7 @@ namespace {
         }
         const auto deviationLimit=programmedScale*maximumCurveDeviationInP;
         const auto deviationProxy=makeOrderedDeviationProxy(
-            source,original.spline.controls.size()-3,24);
+            source,original.spline.controls.size()-original.spline.degree,24);
         const auto score=[&](const Measurement &measurement) {
             const auto peak=measurement.maximumNormalCurvatureDerivative
                 /original.maximumNormalCurvatureDerivative;
@@ -765,7 +777,7 @@ namespace {
         const SplineEvaluator originalEvaluator(original.spline);
         const auto startGeometry=originalEvaluator.at(0.0);
         const auto endGeometry=originalEvaluator.at(
-            static_cast<double>(original.spline.controls.size()-3));
+            static_cast<double>(original.spline.controls.size()-original.spline.degree));
         const auto consider=[&](Spline candidateSpline) {
             if(best.candidateEvaluations>=MAXIMUM_CANDIDATE_EVALUATIONS) {
                 best.budgetExhausted=true;
@@ -873,7 +885,8 @@ namespace {
     EndpointErrors endpointErrors(const Spline &original,const Spline &candidate) {
         const SplineEvaluator originalEvaluator(original);
         const SplineEvaluator candidateEvaluator(candidate);
-        const auto maximumParameter=static_cast<double>(original.controls.size()-3);
+        const auto maximumParameter=static_cast<double>(
+            original.controls.size()-original.degree);
         const auto originalStart=originalEvaluator.at(0.0);
         const auto candidateStart=candidateEvaluator.at(0.0);
         const auto originalEnd=originalEvaluator.at(maximumParameter);
@@ -952,7 +965,7 @@ namespace {
             totalSeconds+=optimized.computationSeconds;
             output<<spline.id<<','<<spline.horizon<<','<<spline.firstSource<<','
                 <<spline.lastSource<<','<<spline.controls.size()<<','
-                <<spline.controls.size()-3<<','<<eligible<<','<<improved<<','
+                <<spline.controls.size()-spline.degree<<','<<eligible<<','<<improved<<','
                 <<source.length<<','<<optimized.originalLength<<','
                 <<optimized.candidateLength<<','
                 <<optimized.candidateLength-optimized.originalLength<<','
@@ -1035,7 +1048,8 @@ namespace {
                 <<spline.lastSource<<','
                 <<spline.lastSource-spline.firstSource-1<<','
                 <<spline.controls.size()<<','<<candidateSpline.controls.size()<<','
-                <<spline.controls.size()-3<<','<<candidateSpline.controls.size()-3<<','
+                <<spline.controls.size()-spline.degree<<','
+                <<candidateSpline.controls.size()-candidateSpline.degree<<','
                 <<original.maximumCurvature<<','<<candidate.maximumCurvature<<','
                 <<curvatureRatio<<','<<original.maximumCurvatureDerivative<<','
                 <<candidate.maximumCurvatureDerivative<<','<<derivativeRatio<<','
@@ -1075,7 +1089,7 @@ namespace {
     std::vector<CurvatureDerivativeProfilePoint> curvatureDerivativeProfile(
             const Spline &spline) {
         constexpr std::size_t SAMPLES_PER_SPAN=128;
-        const auto spans=spline.controls.size()-3;
+        const auto spans=spline.controls.size()-spline.degree;
         const auto sampleCount=spans*SAMPLES_PER_SPAN;
         const SplineEvaluator evaluator(spline);
         std::vector<CurvatureDerivativeProfilePoint> result;
@@ -1189,7 +1203,9 @@ namespace {
         if(!input) throw std::runtime_error("could not open geometry snapshot");
         std::string word;
         input>>word;
-        if(word!="ngc_spline_geometry_v1") throw std::runtime_error("unsupported snapshot");
+        const auto version2=word=="ngc_spline_geometry_v2";
+        if(!version2&&word!="ngc_spline_geometry_v1")
+            throw std::runtime_error("unsupported snapshot");
         std::size_t primitiveCount=0;
         input>>word>>primitiveCount;
         if(word!="primitive_count") throw std::runtime_error("malformed primitive count");
@@ -1217,8 +1233,9 @@ namespace {
         for(std::size_t index=0;index<splineCount;++index) {
             Spline spline;
             std::size_t controlCount=0,boundaryCount=0;
-            input>>word>>spline.id>>spline.horizon>>spline.firstSource>>spline.lastSource
-                >>controlCount>>boundaryCount;
+            input>>word>>spline.id>>spline.horizon>>spline.firstSource>>spline.lastSource;
+            if(version2) input>>spline.degree;
+            input>>controlCount>>boundaryCount;
             if(word!="spline") throw std::runtime_error("malformed spline record");
             spline.controls.resize(controlCount);
             for(auto &control:spline.controls) {
@@ -1254,7 +1271,8 @@ int main(const int argc,char **argv) {
             writeFeedProfile(optimized.measurement.spline,feedPerMinute,argv[6]);
             const SplineEvaluator originalEvaluator(original.spline);
             const SplineEvaluator optimizedEvaluator(optimized.measurement.spline);
-            const auto maximumParameter=static_cast<double>(original.spline.controls.size()-3);
+            const auto maximumParameter=static_cast<double>(
+                original.spline.controls.size()-original.spline.degree);
             const auto originalStart=originalEvaluator.at(0.0);
             const auto optimizedStart=optimizedEvaluator.at(0.0);
             const auto originalEnd=originalEvaluator.at(maximumParameter);
@@ -1373,7 +1391,7 @@ int main(const int argc,char **argv) {
             const auto &spline=measurement.spline;
             output<<spline.id<<','<<spline.horizon<<','<<spline.firstSource<<','
                 <<spline.lastSource<<','<<spline.controls.size()<<','
-                <<spline.controls.size()-3<<','
+                <<spline.controls.size()-spline.degree<<','
                 <<(spline.boundaries.empty()?0:spline.boundaries.size()-1)<<','
                 <<measurement.length<<','<<measurement.minimumControlSpacing<<','
                 <<measurement.maximumControlSpacing<<','<<measurement.spacingRatio<<','
