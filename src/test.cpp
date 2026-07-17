@@ -26,7 +26,6 @@
 #include "machine/OwningSpscChannel.h"
 #include "machine/PreparedGeometry.h"
 #include "machine/SpscChannel.h"
-#include "machine/ToolpathRecorder.h"
 #include "machine/ToolTable.h"
 #include "machine/TrajectoryExecutionDriver.h"
 #include "memory/Memory.h"
@@ -101,12 +100,6 @@ namespace {
         require(machine.pathTolerance().has_value(), "G64 P should establish a path tolerance");
         requireNear(*machine.pathTolerance(), 1.0 / 25.4,
                     "G64 P should be converted into configured machine units");
-
-        ngc::ToolpathRecorder recorder;
-        recorder.consume(commands.front(), {}, std::nullopt, true, machine.pathTolerance());
-        require(recorder.g64Active(0), "preview recording should retain the command's G64 flag");
-        requireNear(*recorder.g64Tolerance(0), 1.0 / 25.4,
-                    "preview recording should retain the active G64 tolerance");
 
         execute(machine, "G61\n");
         require(!machine.pathTolerance(), "leaving G64 should clear its path tolerance");
@@ -409,11 +402,11 @@ namespace {
         for(int attempt=0;attempt<3000&&!worker.compiled();++attempt)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         require(worker.compiled(),"multi-packet immediate preview should compile");
-        const auto initialRevision=worker.lock([&] { return worker.toolpath().revision(); });
+        const auto initialRevision=worker.lock([&] { return worker.preparedPreview().revision; });
         require(worker.execute(),"multi-packet immediate preview should start execution");
         bool finished=false;
         for(int attempt=0;attempt<10000;++attempt) {
-            const auto revision=worker.lock([&] { return worker.toolpath().revision(); });
+            const auto revision=worker.lock([&] { return worker.preparedPreview().revision; });
             if(revision>initialRevision&&!worker.busy()) {
                 finished=true;
                 break;
@@ -427,26 +420,109 @@ namespace {
         });
         require(error==messages.end(),error==messages.end()?"":
                 "multi-packet immediate preview failed: "+error->text);
-        require(worker.lock([&] { return worker.toolpath().commands().size()==COMMANDS; }),
-                "multi-packet immediate preview should retain every canonical command");
         require(worker.lock([&] {
-            const auto &toolpath=worker.toolpath();
-            for(std::size_t index=0;index<toolpath.commands().size();++index)
-                if(!toolpath.g64Active(index)||toolpath.g64Tolerance(index)!=0.001) return false;
-            return true;
+            const auto &scene=worker.preparedPreview();
+            auto commands=std::size_t{};
+            for(const auto &slice:scene.continuousSlices) {
+                commands+=slice.commands.size();
+                for(const auto &record:slice.commands)
+                    if(record.metadata.pathMode!=ngc::ExecutablePathMode::Continuous
+                       ||record.metadata.pathTolerance!=0.001) return false;
+            }
+            commands+=scene.standaloneCommands.size();
+            return commands==COMMANDS;
         }),"geometry-only preview should retain G64/P metadata for display blending");
         const auto preparedRevision=worker.lock([&] {
             require(!worker.preparedPreview().continuousSlices.empty(),
                     "geometry-only preview should publish prepared slices");
             return worker.preparedPreview().revision;
         });
-        require(worker.clearToolpath(),"Clear Preview should succeed while Preview is idle");
+        require(worker.clearPreview(),"Clear Preview should succeed while Preview is idle");
         require(worker.lock([&] {
-            return worker.toolpath().commands().empty()
-                &&worker.preparedPreview().continuousSlices.empty()
+            return worker.preparedPreview().continuousSlices.empty()
                 &&worker.preparedPreview().standaloneCommands.empty()
                 &&worker.preparedPreview().revision>preparedRevision;
         }),"Clear Preview should clear both canonical and prepared display geometry");
+        worker.join();
+    }
+
+    void testGeometryProducerBlendsAcrossMotionModeChanges() {
+        Worker worker(UNIT);
+        require(worker.compile({{
+            "G64 P0.1\nG1 F60 X10\nG2 X20 I5\nG1 X30\n",
+            "preview-mixed-motion-g64.ngc"}}),
+            "mixed-motion G64 preview should start compilation");
+        for(int attempt = 0; attempt < 3000 && !worker.compiled(); ++attempt)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        require(worker.compiled(), "mixed-motion G64 preview should compile");
+        const auto initialRevision = worker.lock([&] { return worker.preparedPreview().revision; });
+        require(worker.execute(), "mixed-motion G64 preview should start execution");
+        auto finished = false;
+        for(int attempt = 0; attempt < 3000; ++attempt) {
+            const auto revision = worker.lock([&] { return worker.preparedPreview().revision; });
+            if(revision > initialRevision && !worker.busy()) {
+                finished = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(finished, "mixed-motion G64 preview should finish");
+        const auto messages = worker.statusMessages();
+        const auto error = std::ranges::find_if(messages, [](const auto &message) {
+            return message.kind == ngc::InterpreterStatusKind::Error;
+        });
+        require(error == messages.end(), error == messages.end() ? ""
+            : "mixed-motion G64 preview failed: " + error->text);
+        worker.lock([&] {
+            const auto &slices = worker.preparedPreview().continuousSlices;
+            require(!slices.empty(), "mixed-motion G64 preview should publish continuous geometry");
+            auto junctionBlends = std::size_t{0};
+            for(const auto &slice : slices)
+                junctionBlends += std::ranges::count_if(slice.pieces, [](const auto &piece) {
+                    return piece.kind == ngc::PreparedPieceKind::JunctionBlend;
+                });
+            require(junctionBlends == 2,
+                    "G1-to-G2 and G2-to-G1 must both produce junction blends");
+        });
+        worker.join();
+    }
+
+    void testGeometryProducerPreparesStandalonePreviewMotion() {
+        Worker worker(UNIT);
+        require(worker.compile({{
+            "G0 X1\nG61\nG1 F60 X2\nG2 X3 I0.5\nG61.1\nG1 X4\n",
+            "preview-standalone-motion.ngc"}}),
+            "standalone-motion preview should start compilation");
+        for(int attempt=0;attempt<3000&&!worker.compiled();++attempt)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        require(worker.compiled(),"standalone-motion preview should compile");
+        const auto initialRevision=worker.lock([&] {
+            return worker.preparedPreview().revision;
+        });
+        require(worker.execute(),"standalone-motion preview should start execution");
+        for(int attempt=0;attempt<3000;++attempt) {
+            if(worker.lock([&] {
+                    return worker.preparedPreview().revision>initialRevision;
+                })&&!worker.busy()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(!worker.busy(),"standalone-motion preview should finish");
+        worker.lock([&] {
+            const auto &commands=worker.preparedPreview().standaloneCommands;
+            require(commands.size()==4,
+                    "rapid and exact-stop source entities should remain standalone preview work");
+            require(std::ranges::all_of(commands,[](const auto &command) {
+                return command.displayGeometry!=nullptr;
+            }),"geometry producer should prepare every standalone preview motion");
+            require(std::holds_alternative<ngc::PreparedLineCurve>(commands[0].displayGeometry->value),
+                    "rapid preview should use a producer-prepared line");
+            require(std::holds_alternative<ngc::PreparedLineCurve>(commands[1].displayGeometry->value),
+                    "G61 line preview should use a producer-prepared line");
+            require(std::holds_alternative<ngc::PreparedArcCurve>(commands[2].displayGeometry->value),
+                    "G61 arc preview should use the shared producer-prepared arc");
+            require(std::holds_alternative<ngc::PreparedLineCurve>(commands[3].displayGeometry->value),
+                    "G61.1 line preview should use a producer-prepared line");
+        });
         worker.join();
     }
 
@@ -463,11 +539,11 @@ namespace {
         for(int attempt=0;attempt<3000&&!worker.compiled();++attempt)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         require(worker.compiled(),"geometry probe preview should compile");
-        const auto initialRevision=worker.lock([&] { return worker.toolpath().revision(); });
+        const auto initialRevision=worker.lock([&] { return worker.preparedPreview().revision; });
         require(worker.execute(),"geometry probe preview should start");
         bool finished=false;
         for(int attempt=0;attempt<3000;++attempt) {
-            const auto revision=worker.lock([&] { return worker.toolpath().revision(); });
+            const auto revision=worker.lock([&] { return worker.preparedPreview().revision; });
             if(revision>initialRevision&&!worker.busy()) {
                 finished=true;
                 break;
@@ -480,12 +556,18 @@ namespace {
             return message.kind==ngc::InterpreterStatusKind::Error;
         }),"canonical-target probe preview should not report an execution error");
         worker.lock([&] {
-            const auto &commands=worker.toolpath().commands();
+            const auto &commands=worker.preparedPreview().standaloneCommands;
             require(commands.size()==2,"probe preview should retain the probe and following line");
-            const auto *probe=std::get_if<ngc::ProbeMove>(&commands[0]);
+            const auto *probe=std::get_if<ngc::ProbeMove>(&commands[0].command.command);
             require(probe!=nullptr,"probe preview should retain canonical probe geometry");
-            requireNear(probe->target().z,-1.0,
-                        "probe preview endpoint should be the commanded probe target");
+            require(commands[0].displayGeometry!=nullptr,
+                    "geometry producer should prepare probe display geometry");
+            ngc::CurveEvaluationWorkspace workspace;
+            const auto endpoint=ngc::positionAtDistance(*commands[0].displayGeometry,
+                commands[0].displayGeometry->length,workspace)
+                -commands[0].command.presentation.activeToolOffset;
+            requireNear(endpoint.z,-1.0,
+                        "prepared probe preview endpoint should be the commanded tool-tip target");
         });
         worker.join();
     }
@@ -511,12 +593,12 @@ namespace {
         for(int attempt=0;attempt<5000&&!worker.compiled();++attempt)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         require(worker.compiled(),"adaptive-pockets geometry preview should compile");
-        const auto initialRevision=worker.lock([&] { return worker.toolpath().revision(); });
+        const auto initialRevision=worker.lock([&] { return worker.preparedPreview().revision; });
         const auto started=std::chrono::steady_clock::now();
         require(worker.execute(),"adaptive-pockets geometry preview should start");
         bool finished=false;
         for(int attempt=0;attempt<10000;++attempt) {
-            const auto revision=worker.lock([&] { return worker.toolpath().revision(); });
+            const auto revision=worker.lock([&] { return worker.preparedPreview().revision; });
             if(revision>initialRevision&&!worker.busy()) {
                 finished=true;
                 break;
@@ -534,11 +616,11 @@ namespace {
         require(error==messages.end(),error==messages.end()?"":
                 "adaptive-pockets geometry preview failed: "+error->text);
         require(worker.lock([&] {
-            const auto &toolpath=worker.toolpath();
-            return !toolpath.commands().empty()&&std::ranges::any_of(
-                std::views::iota(std::size_t{0},toolpath.commands().size()),
-                [&](const auto index) { return toolpath.g64Active(index); });
-        }),"adaptive-pockets preview should retain canonical motion and G64 display metadata");
+            const auto &slices=worker.preparedPreview().continuousSlices;
+            return std::ranges::any_of(slices,[](const auto &slice) {
+                return !slice.commands.empty();
+            });
+        }),"adaptive-pockets preview should retain prepared G64 motion");
         require(worker.lock([&] {
             return worker.preparedPreview().continuousSlices.size()>1;
         }),"adaptive-pockets geometry should reach Preview through multiple SPSC slices");
@@ -590,12 +672,12 @@ namespace {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         require(worker.compiled(), "1001 preview should compile");
 
-        const auto initialRevision = worker.lock([&] { return worker.toolpath().revision(); });
+        const auto initialRevision = worker.lock([&] { return worker.preparedPreview().revision; });
         const auto started = std::chrono::steady_clock::now();
         require(worker.execute(), "1001 preview should start execution");
         auto revision = initialRevision;
         for(int attempt = 0; attempt < 5000; ++attempt) {
-            revision = worker.lock([&] { return worker.toolpath().revision(); });
+            revision = worker.lock([&] { return worker.preparedPreview().revision; });
             if(revision > initialRevision && !worker.busy()) break;
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
         }
@@ -608,7 +690,10 @@ namespace {
             return message.kind==ngc::InterpreterStatusKind::Error;
         });
         require(error==messages.end(),error==messages.end()?"":"1001 preview failed: "+error->text);
-        require(worker.lock([&] { return !worker.toolpath().commands().empty(); }),
+        require(worker.lock([&] {
+            const auto &scene=worker.preparedPreview();
+            return !scene.continuousSlices.empty()||!scene.standaloneCommands.empty();
+        }),
                 "1001 preview should retain displayable canonical geometry");
         worker.join();
     }
@@ -1306,38 +1391,6 @@ namespace {
         requireCompleted(session, "dummy probe results should allow the tool-change program to finish");
     }
 
-    void testToolpathRecorderIsASeparateConsumer() {
-        const auto commands = run("G0 X1\nG1 F2 X3\n");
-        ngc::ToolpathRecorder recorder;
-
-        for(const auto &command : commands) {
-            recorder.consume(command);
-        }
-
-        require(recorder.commands().size() == 2, "toolpath recorder should retain commands supplied by its consumer");
-        std::size_t observed = 0;
-        recorder.foreachCommand([&](const ngc::MachineCommand &) { ++observed; });
-        require(observed == 2, "toolpath recorder should enumerate its recorded commands");
-
-        recorder.clear();
-        require(recorder.commands().empty(), "toolpath recorder should clear between preview runs");
-        require(recorder.workCoordinateSystems().empty(), "toolpath recorder should clear retained WCS frames");
-    }
-
-    void testToolpathRecorderRetainsUsedWorkCoordinateSystems() {
-        ngc::ToolpathRecorder recorder;
-        const ngc::MoveLine move { {}, { 1, 0, 0, 0, 0, 0 }, 1.0 };
-        recorder.consume(move, {}, ngc::WorkCoordinateSystem { "G59.3", { 10, 20, 30, 0, 0, 0 } });
-        recorder.consume(move, {}, ngc::WorkCoordinateSystem { "G54", { 1, 2, 3, 0, 0, 0 } });
-
-        require(recorder.workCoordinateSystems().size() == 2,
-                "preview should retain each WCS used by recorded motion");
-        require(recorder.workCoordinateSystems()[0].name == "G59.3",
-                "nested tool-change WCS should remain in preview metadata");
-        require(recorder.workCoordinateSystems()[1].name == "G54",
-                "final program WCS should remain in preview metadata");
-    }
-
     void testToolChangePreviewRetainsNestedAndFinalWorkCoordinateSystems() {
         std::ifstream toolChangeFile("autoload/tool_change.ngc");
         const std::string toolChangeSource {
@@ -1355,13 +1408,17 @@ namespace {
         ngc::MockMotionBackend backend;
         ngc::TrajectoryExecutionDriver driver(session, backend);
         require(driver.begin(1), "preview trajectory backend should start");
-        ngc::ToolpathRecorder recorder;
+        std::vector<ngc::WorkCoordinateSystem> systems;
         while(driver.state() == ngc::TrajectoryDriverState::Running) {
             for(int fill = 0; fill < 64; ++fill) {
                 if(!driver.pumpOne([](const auto &callback) { callback(); },
-                    [&](const ngc::MachineCommand &command, const ngc::ExecutionItem &) {
-                        recorder.consume(command, session.machine().toolOffset(), ngc::WorkCoordinateSystem {
-                            std::string(ngc::name(*session.machine().state().modeCoordSys)), session.machine().workOffset() });
+                    [&](const ngc::MachineCommand &, const ngc::ExecutionItem &) {
+                        const ngc::WorkCoordinateSystem candidate {
+                            std::string(ngc::name(*session.machine().state().modeCoordSys)),
+                            session.machine().workOffset() };
+                        if(std::ranges::none_of(systems,[&](const auto &value) {
+                                return value.name==candidate.name;
+                            })) systems.push_back(candidate);
                     })) break;
             }
             backend.runUntilIdle();
@@ -1370,35 +1427,10 @@ namespace {
 
         require(driver.state() == ngc::TrajectoryDriverState::Completed,
                 "tool-change WCS preview should complete through simulated probe barriers");
-        const auto &systems = recorder.workCoordinateSystems();
         require(std::ranges::find_if(systems, [](const auto &value) { return value.name == "G59.3"; }) != systems.end(),
                 "preview should retain G59.3 used inside the nested tool-change call");
         require(std::ranges::find_if(systems, [](const auto &value) { return value.name == "G54"; }) != systems.end(),
                 "preview should retain G54 selected by the main program after tool change");
-    }
-
-    void testToolpathRecorderAppliesPerCommandToolOffset() {
-        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::Preview);
-        ngc::ToolpathRecorder recorder;
-        compileSession(session,
-            "G43 H7 G1 F1 Z3\n"
-            "G49 G1 Z4\n");
-
-        for(int i = 0; i < 2; i++) {
-            const auto event = session.next();
-            const auto command = std::get_if<ngc::MachineCommand>(&event);
-            require(command != nullptr, "tool-offset preview should emit a motion command");
-            recorder.consume(*command, session.machine().toolOffset());
-        }
-
-        requireCompleted(session, "tool-offset preview should complete");
-        require(recorder.commands().size() == 2, "tool-offset preview should retain both motions");
-
-        const auto *compensated = std::get_if<ngc::MoveLine>(&recorder.commands()[0]);
-        const auto *uncompensated = std::get_if<ngc::MoveLine>(&recorder.commands()[1]);
-        require(compensated != nullptr && uncompensated != nullptr, "tool-offset preview should retain line motions");
-        requireNear(compensated->to().z, 3.0, "G43 preview endpoint should be the cutter-tip position");
-        requireNear(uncompensated->to().z, 4.0, "G49 preview endpoint should not retain the previous tool offset");
     }
 
     void testSpscChannelIsBoundedAndOrdered() {
@@ -1818,7 +1850,6 @@ namespace {
         session.begin();
         ngc::MockMotionBackend backend;
         ngc::TrajectoryExecutionDriver driver(session, backend);
-        ngc::ToolpathRecorder recorder;
         require(driver.begin(1), "preview-prefix backend should start");
 
         PreviewPipelineMeasurement result;
@@ -1828,7 +1859,7 @@ namespace {
                 if(!driver.pumpOne([](const auto &callback) { callback(); },
                     [&](const ngc::MachineCommand &command, const ngc::ExecutionItem &) {
                         ++result.commands;
-                        recorder.consume(command, session.machine().toolOffset());
+                        (void)command;
                     })) break;
             }
             backend.runUntilIdle();
@@ -4206,6 +4237,8 @@ int main() {
         std::cerr << "checkpoint snapshots (temporarily skipped)\n";
         std::cerr << "checkpoint preview\n";
         testImmediatePreviewBuildsGeometryWithoutTrajectoryExecution();
+        testGeometryProducerBlendsAcrossMotionModeChanges();
+        testGeometryProducerPreparesStandalonePreviewMotion();
         testGeometryPreviewResolvesProbeAtCanonicalTarget();
         testAdaptivePocketsGeometryPreviewAvoidsTrajectoryExecution();
         testIncrementalGeometryDefersAndDoesNotRebuildAnchorSection();
@@ -4232,10 +4265,7 @@ int main() {
         testIncrementalSessionControlFlow();
         testProbeCommandAndBarrier();
         testAutomaticToolChangeReachesProbeBarrier();
-        testToolpathRecorderIsASeparateConsumer();
-        testToolpathRecorderRetainsUsedWorkCoordinateSystems();
         testToolChangePreviewRetainsNestedAndFinalWorkCoordinateSystems();
-        testToolpathRecorderAppliesPerCommandToolOffset();
         testSpscChannelIsBoundedAndOrdered();
         testOwningSpscChannelTransfersMoveOnlyValues();
         testMockMotionBackendUsesProductionTransportContract();

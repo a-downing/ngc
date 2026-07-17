@@ -88,27 +88,6 @@ namespace ngc {
             return (left - right).length() <= 1e-12;
         }
 
-        static bool samePresentation(const TrajectoryCommandPresentation &left,
-                                     const TrajectoryCommandPresentation &right) {
-            if(left.tool.number != right.tool.number || left.tool.offset.x != right.tool.offset.x
-               || left.tool.offset.y != right.tool.offset.y || left.tool.offset.z != right.tool.offset.z
-               || left.tool.offset.a != right.tool.offset.a || left.tool.offset.b != right.tool.offset.b
-               || left.tool.offset.c != right.tool.offset.c || left.tool.diameter != right.tool.diameter
-               || left.activeToolOffset.x != right.activeToolOffset.x
-               || left.activeToolOffset.y != right.activeToolOffset.y
-               || left.activeToolOffset.z != right.activeToolOffset.z
-               || left.activeToolOffset.a != right.activeToolOffset.a
-               || left.activeToolOffset.b != right.activeToolOffset.b
-               || left.activeToolOffset.c != right.activeToolOffset.c
-               || left.modalGCodes != right.modalGCodes)
-                return false;
-            if(left.workCoordinateSystem.has_value() != right.workCoordinateSystem.has_value()) return false;
-            if(left.workCoordinateSystem && (left.workCoordinateSystem->name != right.workCoordinateSystem->name
-                || (left.workCoordinateSystem->offset - right.workCoordinateSystem->offset).length() > 0.0))
-                return false;
-            return true;
-        }
-
         static bool continuousMotion(const PreparedCommandRecord &record) {
             if(record.metadata.pathMode != ExecutablePathMode::Continuous) return false;
             return std::visit([](const auto &command) {
@@ -348,10 +327,7 @@ namespace ngc {
             standalone.epoch = m_epoch;
             standalone.sequence = m_sequence++;
             standalone.command = std::move(record);
-            if(const auto *line = std::get_if<MoveLine>(&standalone.command.command))
-                standalone.displayGeometry = prepareDisplayCurve(MachineCommand{*line});
-            else if(const auto *arc = std::get_if<MoveArc>(&standalone.command.command))
-                standalone.displayGeometry = prepareDisplayCurve(MachineCommand{*arc});
+            standalone.displayGeometry = prepareDisplayCurve(standalone.command.command);
             if(!publish(std::move(standalone))) return false;
             ++m_diagnostics.standaloneCommandsPublished;
             return true;
@@ -363,7 +339,7 @@ namespace ngc {
                 const auto scale = record.metadata.pathTolerance.value_or(0.001);
                 const auto compatible = !m_continuous.empty()
                     &&m_continuousScale && std::abs(*m_continuousScale - scale) <= 0.0
-                    &&m_continuousPresentation && samePresentation(
+                    &&m_continuousPresentation && sameProtectedTrajectoryPresentation(
                         *m_continuousPresentation, record.presentation)
                     &&commandEnd(m_continuous.back().command)
                     &&commandStart(record.command)

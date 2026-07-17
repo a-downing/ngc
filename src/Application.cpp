@@ -1,6 +1,5 @@
 #include "Application.h"
 #include "PreviewSpline.h"
-#include "machine/ArcInterpolation.h"
 
 #include <filesystem>
 #include <fstream>
@@ -11,6 +10,9 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <ranges>
 #include <numbers>
 #include <numeric>
@@ -20,6 +22,7 @@
 #include <iterator>
 #include <sstream>
 #include <unordered_set>
+#include <thread>
 
 #include <expected>
 
@@ -162,8 +165,31 @@ class ApplicationImpl final {
         double maximumClusterGeometricJerk = 0.0;
         std::vector<glm::dvec3> darkPoints;
         std::vector<glm::dvec3> lightPoints;
+        std::optional<glm::dvec3> visibleCentroid;
+        glm::dvec3 sceneMinimum{};
+        glm::dvec3 sceneMaximum{};
+        bool hasSceneGeometry = false;
         std::array<BufferedRange, static_cast<std::size_t>(PreviewBatch::Count)> bufferedRanges{};
     } m_previewRenderCache;
+    struct PreviewViewSnapshot {
+        glm::dquat orientation { 1.0, 0.0, 0.0, 0.0 };
+        glm::dvec3 pivot{};
+        glm::dvec2 pan{};
+        double halfHeight = 1.0;
+        double aspect = 1.0;
+        int viewportWidth = 1;
+        int viewportHeight = 1;
+        std::uint64_t previewRevision = 0;
+        std::uint64_t generation = 0;
+    };
+    std::mutex m_previewVisibilityMutex;
+    std::condition_variable m_previewVisibilityCv;
+    std::thread m_previewVisibilityThread;
+    PreviewViewSnapshot m_requestedPreviewView;
+    bool m_hasRequestedPreviewView = false;
+    bool m_stopPreviewVisibility = false;
+    std::optional<PreviewRenderCache> m_readyPreviewRenderCache;
+    std::uint64_t m_readyPreviewGeneration = 0;
     struct ExecutedJerkTooth {
         glm::dvec3 position{};
         glm::dvec3 normal{};
@@ -188,6 +214,10 @@ class ApplicationImpl final {
 
     static constexpr double MACHINE_TRIAD_LENGTH = 2.0;
     static constexpr double WORK_TRIAD_LENGTH = 1.0;
+    static constexpr auto PREVIEW_VISIBILITY_PERIOD = std::chrono::milliseconds(100);
+    static constexpr double PREVIEW_VISIBILITY_MARGIN = 0.12;
+    static constexpr double PREVIEW_CURVE_ERROR_PIXELS = 2.0;
+    static constexpr int PREVIEW_CURVE_MAX_SUBDIVISION_DEPTH = 13;
 
     static glm::dvec3 displayOffset(const glm::dvec3 &offset) {
         return { offset.x, -offset.y, offset.z };
@@ -317,6 +347,7 @@ public:
         if(m_glGenBuffers && m_glDeleteBuffers && m_glBindBuffer && m_glBufferData) {
             m_glGenBuffers(1, &m_previewGeometryBuffer);
         }
+        m_previewVisibilityThread = std::thread(&ApplicationImpl::previewVisibilityWork, this);
         auto result = m_tools.load();
 
         if(!result) {
@@ -352,6 +383,12 @@ public:
     }
 
     void terminate() {
+        {
+            std::scoped_lock lock(m_previewVisibilityMutex);
+            m_stopPreviewVisibility = true;
+        }
+        m_previewVisibilityCv.notify_one();
+        if(m_previewVisibilityThread.joinable()) m_previewVisibilityThread.join();
         m_simulation.join();
         m_worker.join();
         if(m_glDeleteBuffers) {
@@ -431,45 +468,10 @@ public:
     }
 
     void fitToolpathToView(const int width, const int height) {
-        glm::dvec3 minimum(std::numeric_limits<double>::max());
-        glm::dvec3 maximum(std::numeric_limits<double>::lowest());
-        bool hasGeometry = false;
-
-        const auto include = [&](const glm::dvec3 &point) {
-            minimum = glm::min(minimum, point);
-            maximum = glm::max(maximum, point);
-            hasGeometry = true;
-        };
-
-        m_worker.lock([&] {
-            m_worker.toolpath().foreachCommand([&](const ngc::MachineCommand &command) {
-                std::visit([&](const auto &value) {
-                    using T = std::decay_t<decltype(value)>;
-
-                    if constexpr(std::same_as<T, ngc::MoveLine>) {
-                        include({ value.from().x, value.from().y, value.from().z });
-                        include({ value.to().x, value.to().y, value.to().z });
-                    } else if constexpr(std::same_as<T, ngc::ProbeMove>) {
-                        include({ value.from().x, value.from().y, value.from().z });
-                        include({ value.target().x, value.target().y, value.target().z });
-                    } else if constexpr(std::same_as<T, ngc::MoveArc>) {
-                        const glm::dvec3 from { value.from().x, value.from().y, value.from().z };
-                        const glm::dvec3 to { value.to().x, value.to().y, value.to().z };
-                        const glm::dvec3 center { value.center().x, value.center().y, value.center().z };
-                        const auto radius = std::max(glm::length(from - center), glm::length(to - center));
-                        include(from);
-                        include(to);
-                        include(center - glm::dvec3(radius));
-                        include(center + glm::dvec3(radius));
-                    }
-                }, command);
-            });
-        });
-
-        if(!hasGeometry) {
-            minimum = { -1.0, -1.0, -1.0 };
-            maximum = { 1.0, 1.0, 1.0 };
-        }
+        auto minimum = m_previewRenderCache.hasSceneGeometry
+            ? m_previewRenderCache.sceneMinimum : glm::dvec3(-1.0);
+        auto maximum = m_previewRenderCache.hasSceneGeometry
+            ? m_previewRenderCache.sceneMaximum : glm::dvec3(1.0);
 
         m_modelPivot = (minimum + maximum) * 0.5;
         m_viewPan = { 0.0, 0.0 };
@@ -479,129 +481,15 @@ public:
         m_viewHalfHeight = radius * 1.1 / std::min(aspect, 1.0);
     }
 
-    void pickRotationPivot(const int width, const int height, const int viewportLeft, const int viewportTop) {
-        constexpr double PICK_RADIUS_PIXELS = 30.0;
-        const auto aspect = static_cast<double>(width) / height;
-        const glm::dvec2 mouse { m_mouseX - viewportLeft, m_mouseY - viewportTop };
-        auto bestDistanceSquared = PICK_RADIUS_PIXELS * PICK_RADIUS_PIXELS;
-        std::optional<glm::dvec3> bestPoint;
+    PreviewRenderCache buildPreviewGeometry(const ngc::PreparedPreviewScene &preparedScene,
+                                            const PreviewViewSnapshot &view) const {
+            PreviewRenderCache cache;
 
-        const auto project = [&](const glm::dvec3 &point) {
-            const auto transformed = m_modelOrientation * displayOffset(point - m_modelPivot);
-            const auto ndcX = (transformed.x + m_viewPan.x) / (m_viewHalfHeight * aspect);
-            const auto ndcY = (transformed.z + m_viewPan.y) / m_viewHalfHeight;
-            return glm::dvec2((ndcX + 1.0) * width * 0.5, (1.0 - ndcY) * height * 0.5);
-        };
-
-        const auto segmentHit = [&](const glm::dvec3 &from, const glm::dvec3 &to) {
-            const auto screenFrom = project(from);
-            const auto screenTo = project(to);
-            const auto screenSegment = screenTo - screenFrom;
-            const auto lengthSquared = glm::dot(screenSegment, screenSegment);
-            const auto t = lengthSquared > 0.0
-                ? std::clamp(glm::dot(mouse - screenFrom, screenSegment) / lengthSquared, 0.0, 1.0)
-                : 0.0;
-            const auto difference = mouse - glm::mix(screenFrom, screenTo, t);
-            return std::pair { glm::dot(difference, difference), t };
-        };
-
-        const auto considerSegment = [&](const glm::dvec3 &from, const glm::dvec3 &to) {
-            const auto [distanceSquared, t] = segmentHit(from, to);
-
-            if(distanceSquared < bestDistanceSquared) {
-                bestDistanceSquared = distanceSquared;
-                bestPoint = glm::mix(from, to, t);
-            }
-        };
-
-        const auto considerTriadAxis = [&](const glm::dvec3 &origin, const glm::dvec3 &axisEnd) {
-            const auto [distanceSquared, _] = segmentHit(origin, axisEnd);
-
-            // Triads are drawn over the toolpath, so give them priority when
-            // their projected geometry is equally close to the cursor.
-            if(distanceSquared <= bestDistanceSquared) {
-                bestDistanceSquared = distanceSquared;
-                bestPoint = origin;
-            }
-        };
-
-        m_worker.lock([&] {
-            m_worker.toolpath().foreachCommand([&](const ngc::MachineCommand &command) {
-                std::visit([&](const auto &value) {
-                    using T = std::decay_t<decltype(value)>;
-
-                    if constexpr(std::same_as<T, ngc::MoveLine>) {
-                        considerSegment(
-                            { value.from().x, value.from().y, value.from().z },
-                            { value.to().x, value.to().y, value.to().z });
-                    } else if constexpr(std::same_as<T, ngc::ProbeMove>) {
-                        considerSegment(
-                            { value.from().x, value.from().y, value.from().z },
-                            { value.target().x, value.target().y, value.target().z });
-                    } else if constexpr(std::same_as<T, ngc::MoveArc>) {
-                        interpolate(value, 60, [&](const glm::dvec3 &from, const glm::dvec3 &to, bool, bool) {
-                            considerSegment(from, to);
-                        });
-                    }
-                }, command);
-            });
-
-            const glm::dvec3 machineOrigin { 0.0, 0.0, 0.0 };
-            considerTriadAxis(machineOrigin, machineOrigin + glm::dvec3(MACHINE_TRIAD_LENGTH, 0.0, 0.0));
-            considerTriadAxis(machineOrigin, machineOrigin + glm::dvec3(0.0, MACHINE_TRIAD_LENGTH, 0.0));
-            considerTriadAxis(machineOrigin, machineOrigin + glm::dvec3(0.0, 0.0, MACHINE_TRIAD_LENGTH));
-            for(const auto &workCoordinateSystem : m_worker.toolpath().workCoordinateSystems()) {
-                const auto &offset = workCoordinateSystem.offset;
-                const glm::dvec3 workOrigin { offset.x, offset.y, offset.z };
-                considerTriadAxis(workOrigin, workOrigin + glm::dvec3(WORK_TRIAD_LENGTH, 0.0, 0.0));
-                considerTriadAxis(workOrigin, workOrigin + glm::dvec3(0.0, WORK_TRIAD_LENGTH, 0.0));
-                considerTriadAxis(workOrigin, workOrigin + glm::dvec3(0.0, 0.0, WORK_TRIAD_LENGTH));
-            }
-        });
-
-        if(bestPoint) {
-            // Preserve the current model transform while changing the point
-            // about which subsequent rotations are applied.
-            const auto compensation = m_modelOrientation * displayOffset(*bestPoint - m_modelPivot);
-            m_viewPan.x += compensation.x;
-            m_viewPan.y += compensation.z;
-            m_modelPivot = *bestPoint;
-        }
-    }
-
-    void rebuildPreviewRenderCache() {
-        if(m_worker.busy()) return;
-
-        auto cacheRebuilt = false;
-        m_worker.lock([&] {
-            const auto &toolpath = m_worker.toolpath();
-            if(m_previewRenderCache.revision == toolpath.revision()) return;
-
-            auto &cache = m_previewRenderCache;
-            cache.feedLines.clear();
-            cache.rapidLines.clear();
-            cache.g53FeedLines.clear();
-            cache.g53RapidLines.clear();
-            cache.arcLines.clear();
-            cache.probeLines.clear();
-            cache.g64SplineLines.clear();
-            cache.g64ClusterSplineLines.clear();
-            cache.g64ControlPolygon.clear();
-            cache.g64ControlPoints.clear();
-            cache.clusterGeometricJerkComb.clear();
-            cache.maximumClusterGeometricJerk=0.0;
-            cache.darkPoints.clear();
-            cache.lightPoints.clear();
-
-            const auto point = [](const ngc::position_t &value) {
-                return glm::dvec3(value.x, value.y, value.z);
-            };
             const auto segment = [](auto &vertices, const glm::dvec3 &from, const glm::dvec3 &to) {
                 vertices.push_back(from);
                 vertices.push_back(to);
             };
 
-            const auto &preparedScene = m_worker.preparedPreview();
             const auto offsetPoint = [](const ngc::position_t &value,
                                         const ngc::position_t &offset) {
                 return glm::dvec3(value.x - offset.x, value.y - offset.y,
@@ -615,6 +503,81 @@ public:
                     ? ngc::position_t{} : found->presentation.activeToolOffset;
             };
             ngc::CurveEvaluationWorkspace curveWorkspace;
+            const auto projectToPixels = [&](const glm::dvec3 &point) {
+                const auto transformed = view.orientation * displayOffset(point - view.pivot);
+                const auto ndcX = (transformed.x + view.pan.x)
+                    / (view.halfHeight * view.aspect);
+                const auto ndcY = (transformed.z + view.pan.y) / view.halfHeight;
+                return glm::dvec2(ndcX * view.viewportWidth * 0.5,
+                                  ndcY * view.viewportHeight * 0.5);
+            };
+            const auto pointChordDistance = [](const glm::dvec2 &point,
+                                               const glm::dvec2 &from,
+                                               const glm::dvec2 &to) {
+                const auto chord = to - from;
+                const auto lengthSquared = glm::dot(chord, chord);
+                if(lengthSquared <= 1e-24) return glm::length(point - from);
+                const auto parameter = std::clamp(
+                    glm::dot(point - from, chord) / lengthSquared, 0.0, 1.0);
+                return glm::length(point - glm::mix(from, to, parameter));
+            };
+            const auto appendCurve = [&](const ngc::PreparedCurve &curve,
+                                         const double fromDistance,
+                                         const double toDistance,
+                                         const ngc::position_t &offset,
+                                         std::vector<glm::dvec3> &vertices,
+                                         const bool adaptive) {
+                const auto position = [&](const double distance) {
+                    return offsetPoint(ngc::positionAtDistance(
+                        curve, distance, curveWorkspace), offset);
+                };
+                const auto beginning = position(fromDistance);
+                const auto ending = position(toDistance);
+                if(!adaptive) {
+                    segment(vertices, beginning, ending);
+                    return std::pair { beginning, ending };
+                }
+                constexpr int initialSegments = 8;
+                auto initialDepth = 0;
+                for(auto count = initialSegments; count > 1; count /= 2) ++initialDepth;
+                const auto emit = [&](auto &&self, const double from,
+                                      const glm::dvec3 &fromPoint, const double to,
+                                      const glm::dvec3 &toPoint, const int depth) -> void {
+                    const auto quarterDistance = std::lerp(from, to, 0.25);
+                    const auto middleDistance = std::midpoint(from, to);
+                    const auto threeQuarterDistance = std::lerp(from, to, 0.75);
+                    const auto quarterPoint = position(quarterDistance);
+                    const auto middlePoint = position(middleDistance);
+                    const auto threeQuarterPoint = position(threeQuarterDistance);
+                    const auto screenFrom = projectToPixels(fromPoint);
+                    const auto screenTo = projectToPixels(toPoint);
+                    const auto error = std::max({
+                        pointChordDistance(projectToPixels(quarterPoint), screenFrom, screenTo),
+                        pointChordDistance(projectToPixels(middlePoint), screenFrom, screenTo),
+                        pointChordDistance(projectToPixels(threeQuarterPoint), screenFrom, screenTo),
+                    });
+                    if(depth >= PREVIEW_CURVE_MAX_SUBDIVISION_DEPTH
+                       || error <= PREVIEW_CURVE_ERROR_PIXELS) {
+                        segment(vertices, fromPoint, toPoint);
+                        return;
+                    }
+                    self(self, from, fromPoint, middleDistance, middlePoint, depth + 1);
+                    self(self, middleDistance, middlePoint, to, toPoint, depth + 1);
+                };
+                auto segmentBeginning = beginning;
+                for(int initialSegment = 0; initialSegment < initialSegments; ++initialSegment) {
+                    const auto segmentFrom = std::lerp(fromDistance, toDistance,
+                        static_cast<double>(initialSegment) / initialSegments);
+                    const auto segmentTo = std::lerp(fromDistance, toDistance,
+                        static_cast<double>(initialSegment + 1) / initialSegments);
+                    const auto segmentEnding = initialSegment + 1 == initialSegments
+                        ? ending : position(segmentTo);
+                    emit(emit, segmentFrom, segmentBeginning, segmentTo, segmentEnding,
+                         initialDepth);
+                    segmentBeginning = segmentEnding;
+                }
+                return std::pair { beginning, ending };
+            };
             for(const auto &slice : preparedScene.continuousSlices) {
                 for(const auto &piece : slice.pieces) {
                     if(!piece.curve) continue;
@@ -625,20 +588,11 @@ public:
                             ? &cache.g64SplineLines
                             : piece.kind == ngc::PreparedPieceKind::RetainedArcSection
                                 ? &cache.arcLines : &cache.feedLines;
-                    const auto intervals = std::clamp<std::size_t>(
-                        static_cast<std::size_t>(std::ceil(piece.length() / 0.01)), 1, 8192);
-                    auto previous = offsetPoint(ngc::positionAtDistance(*piece.curve,
-                        piece.curveFrom, curveWorkspace), offset);
-                    cache.darkPoints.push_back(previous);
-                    for(std::size_t interval = 1; interval <= intervals; ++interval) {
-                        const auto distance = std::lerp(piece.curveFrom, piece.curveTo,
-                            static_cast<double>(interval) / static_cast<double>(intervals));
-                        const auto current = offsetPoint(ngc::positionAtDistance(
-                            *piece.curve, distance, curveWorkspace), offset);
-                        segment(*vertices, previous, current);
-                        previous = current;
-                    }
-                    cache.lightPoints.push_back(previous);
+                    const auto [beginning, ending] = appendCurve(
+                        *piece.curve, piece.curveFrom, piece.curveTo, offset, *vertices,
+                        piece.kind != ngc::PreparedPieceKind::RetainedLineSection);
+                    cache.darkPoints.push_back(beginning);
+                    cache.lightPoints.push_back(ending);
 
                     if(const auto *spline = std::get_if<ngc::PreparedSplineCurve>(
                             &piece.curve->value)) {
@@ -672,47 +626,245 @@ public:
                 }
             }
 
-            /* Preview geometry is prepared on the worker thread. The recorder
-               loop below renders only commands outside executable G64 windows. */
-            const auto &commands = toolpath.commands();
-            for(std::size_t commandIndex = 0; commandIndex < commands.size(); ++commandIndex) {
-                const auto &command = commands[commandIndex];
-                if(toolpath.g64Active(commandIndex)
-                   && (std::holds_alternative<ngc::MoveLine>(command)
-                       || std::holds_alternative<ngc::MoveArc>(command))) continue;
-                if(const auto line = std::get_if<ngc::MoveLine>(&command)) {
-                    auto *vertices = &cache.feedLines;
+            for(const auto &standalone : preparedScene.standaloneCommands) {
+                if(!standalone.displayGeometry) continue;
+                const auto &command = standalone.command.command;
+                auto *vertices = &cache.feedLines;
+                auto showEndpoints = true;
+                if(const auto *line = std::get_if<ngc::MoveLine>(&command)) {
                     const auto rapid = line->speed() == -1.0;
-                    if(line->machineCoordinates()) vertices = rapid ? &cache.g53RapidLines : &cache.g53FeedLines;
+                    if(line->machineCoordinates())
+                        vertices = rapid ? &cache.g53RapidLines : &cache.g53FeedLines;
                     else if(rapid) vertices = &cache.rapidLines;
-                    const auto from = point(line->from());
-                    const auto to = point(line->to());
-                    segment(*vertices, from, to);
-                    cache.darkPoints.push_back(from);
-                    cache.darkPoints.push_back(to);
-                } else if(const auto probe = std::get_if<ngc::ProbeMove>(&command)) {
-                    segment(cache.probeLines, point(probe->from()), point(probe->target()));
-                } else if(const auto arc = std::get_if<ngc::MoveArc>(&command)) {
-                    interpolate(*arc, 60, [&](const glm::dvec3 &from, const glm::dvec3 &to,
-                                              const bool startPoint, const bool endPoint) {
-                        segment(cache.arcLines, from, to);
-                        if(startPoint) cache.darkPoints.push_back(from);
-                        if(endPoint) cache.lightPoints.push_back(to);
-                    });
+                } else if(std::holds_alternative<ngc::MoveArc>(command)) {
+                    vertices = &cache.arcLines;
+                } else if(std::holds_alternative<ngc::ProbeMove>(command)) {
+                    vertices = &cache.probeLines;
+                    showEndpoints = false;
+                } else continue;
+
+                const auto &curve = *standalone.displayGeometry;
+                const auto offset = standalone.command.presentation.activeToolOffset;
+                const auto [beginning, ending] = appendCurve(
+                    curve, 0.0, curve.length, offset, *vertices,
+                    std::holds_alternative<ngc::MoveArc>(command));
+                if(showEndpoints) {
+                    cache.darkPoints.push_back(beginning);
+                    cache.lightPoints.push_back(ending);
                 }
             }
 
-            cache.revision = toolpath.revision();
-            cacheRebuilt = true;
-        });
-        if(!cacheRebuilt || !m_glBindBuffer || !m_glBufferData) return;
-        const auto upload = [&](const GLuint buffer, const std::vector<glm::dvec3> &vertices) {
-            if(buffer == 0) return;
-            m_glBindBuffer(GL_ARRAY_BUFFER_VALUE, buffer);
-            m_glBufferData(GL_ARRAY_BUFFER_VALUE,
-                           static_cast<std::ptrdiff_t>(vertices.size() * sizeof(glm::dvec3)),
-                           vertices.empty() ? nullptr : vertices.data(), GL_STATIC_DRAW_VALUE);
+            cache.revision = preparedScene.revision;
+            const std::array geometry {
+                &cache.feedLines, &cache.rapidLines, &cache.g53FeedLines,
+                &cache.g53RapidLines, &cache.arcLines, &cache.probeLines,
+                &cache.g64SplineLines, &cache.g64ClusterSplineLines,
+            };
+            for(const auto *vertices : geometry) {
+                for(const auto &vertex : *vertices) {
+                    if(!cache.hasSceneGeometry) {
+                        cache.sceneMinimum = vertex;
+                        cache.sceneMaximum = vertex;
+                        cache.hasSceneGeometry = true;
+                    } else {
+                        cache.sceneMinimum = glm::min(cache.sceneMinimum, vertex);
+                        cache.sceneMaximum = glm::max(cache.sceneMaximum, vertex);
+                    }
+                }
+            }
+            return cache;
+    }
+
+    static std::optional<std::pair<double, double>> clipPreviewSegment(
+        const glm::dvec2 &from, const glm::dvec2 &to, const double limit) {
+        auto first = 0.0;
+        auto last = 1.0;
+        const auto delta = to - from;
+        const auto clip = [&](const double direction, const double distance) {
+            if(std::abs(direction) < 1e-15) return distance >= 0.0;
+            const auto parameter = distance / direction;
+            if(direction < 0.0) {
+                if(parameter > last) return false;
+                first = std::max(first, parameter);
+            } else {
+                if(parameter < first) return false;
+                last = std::min(last, parameter);
+            }
+            return true;
         };
+        if(!clip(-delta.x, from.x + limit)
+           || !clip(delta.x, limit - from.x)
+           || !clip(-delta.y, from.y + limit)
+           || !clip(delta.y, limit - from.y)) return std::nullopt;
+        return std::pair { first, last };
+    }
+
+    PreviewRenderCache cullPreviewGeometry(const PreviewRenderCache &source,
+                                             const PreviewViewSnapshot &view) const {
+        PreviewRenderCache visible;
+        visible.revision = source.revision;
+        visible.sceneMinimum = source.sceneMinimum;
+        visible.sceneMaximum = source.sceneMaximum;
+        visible.hasSceneGeometry = source.hasSceneGeometry;
+        const auto project = [&](const glm::dvec3 &point) {
+            const auto transformed = view.orientation * displayOffset(point - view.pivot);
+            return glm::dvec2(
+                (transformed.x + view.pan.x) / (view.halfHeight * view.aspect),
+                (transformed.z + view.pan.y) / view.halfHeight);
+        };
+
+        glm::dvec3 weightedCentroid{};
+        auto centroidWeight = 0.0;
+        const auto cullLines = [&](const std::vector<glm::dvec3> &input,
+                                   std::vector<glm::dvec3> &output,
+                                   const bool includeInCentroid) {
+            output.reserve(input.size());
+            for(std::size_t index = 1; index < input.size(); index += 2) {
+                const auto &from = input[index - 1];
+                const auto &to = input[index];
+                const auto projectedFrom = project(from);
+                const auto projectedTo = project(to);
+                if(!clipPreviewSegment(projectedFrom, projectedTo,
+                        1.0 + PREVIEW_VISIBILITY_MARGIN)) continue;
+                output.push_back(from);
+                output.push_back(to);
+                if(!includeInCentroid) continue;
+                const auto clipped = clipPreviewSegment(projectedFrom, projectedTo, 1.0);
+                if(!clipped) continue;
+                const auto [first, last] = *clipped;
+                const auto clippedFrom = glm::mix(projectedFrom, projectedTo, first);
+                const auto clippedTo = glm::mix(projectedFrom, projectedTo, last);
+                const auto weight = glm::length(clippedTo - clippedFrom);
+                if(weight <= 1e-15) continue;
+                weightedCentroid += glm::mix(from, to, (first + last) * 0.5) * weight;
+                centroidWeight += weight;
+            }
+        };
+        const auto cullPoints = [&](const std::vector<glm::dvec3> &input,
+                                    std::vector<glm::dvec3> &output) {
+            output.reserve(input.size());
+            for(const auto &point : input) {
+                const auto projected = project(point);
+                if(std::abs(projected.x) <= 1.0 + PREVIEW_VISIBILITY_MARGIN
+                   && std::abs(projected.y) <= 1.0 + PREVIEW_VISIBILITY_MARGIN)
+                    output.push_back(point);
+            }
+        };
+
+        cullLines(source.feedLines, visible.feedLines, true);
+        cullLines(source.rapidLines, visible.rapidLines, true);
+        cullLines(source.g53FeedLines, visible.g53FeedLines, true);
+        cullLines(source.g53RapidLines, visible.g53RapidLines, true);
+        cullLines(source.arcLines, visible.arcLines, true);
+        cullLines(source.probeLines, visible.probeLines, true);
+        cullLines(source.g64SplineLines, visible.g64SplineLines, true);
+        cullLines(source.g64ClusterSplineLines, visible.g64ClusterSplineLines, true);
+        cullLines(source.g64ControlPolygon, visible.g64ControlPolygon, false);
+        cullPoints(source.g64ControlPoints, visible.g64ControlPoints);
+        cullPoints(source.darkPoints, visible.darkPoints);
+        cullPoints(source.lightPoints, visible.lightPoints);
+        if(centroidWeight > 0.0) visible.visibleCentroid = weightedCentroid / centroidWeight;
+
+        visible.clusterGeometricJerkComb.reserve(source.clusterGeometricJerkComb.size());
+        for(const auto &sample : source.clusterGeometricJerkComb) {
+            const auto projected = project(sample.position);
+            if(std::abs(projected.x) > 1.0 + PREVIEW_VISIBILITY_MARGIN
+               || std::abs(projected.y) > 1.0 + PREVIEW_VISIBILITY_MARGIN) continue;
+            visible.maximumClusterGeometricJerk = std::max(
+                visible.maximumClusterGeometricJerk, sample.magnitude);
+            visible.clusterGeometricJerkComb.push_back(sample);
+        }
+        return visible;
+    }
+
+    void previewVisibilityWork() {
+        ngc::PreparedPreviewScene scene;
+        bool hasScene = false;
+        std::uint64_t processedGeneration = 0;
+        auto nextBuild = std::chrono::steady_clock::now();
+        for(;;) {
+            PreviewViewSnapshot view;
+            {
+                std::unique_lock lock(m_previewVisibilityMutex);
+                m_previewVisibilityCv.wait(lock, [&] {
+                    return m_stopPreviewVisibility
+                        || (m_hasRequestedPreviewView
+                            && m_requestedPreviewView.generation != processedGeneration);
+                });
+                if(m_stopPreviewVisibility) return;
+                const auto now = std::chrono::steady_clock::now();
+                if(now < nextBuild) {
+                    m_previewVisibilityCv.wait_until(lock, nextBuild,
+                        [&] { return m_stopPreviewVisibility; });
+                    if(m_stopPreviewVisibility) return;
+                }
+                view = m_requestedPreviewView;
+            }
+
+            if(!hasScene || scene.revision != view.previewRevision) {
+                scene = m_worker.lock([&] { return m_worker.preparedPreview(); });
+                hasScene = true;
+                view.previewRevision = scene.revision;
+            }
+            const auto source = buildPreviewGeometry(scene, view);
+            auto visible = cullPreviewGeometry(source, view);
+            {
+                std::scoped_lock lock(m_previewVisibilityMutex);
+                if(m_stopPreviewVisibility) return;
+                if(view.generation >= m_readyPreviewGeneration) {
+                    m_readyPreviewGeneration = view.generation;
+                    m_readyPreviewRenderCache = std::move(visible);
+                }
+                processedGeneration = view.generation;
+            }
+            nextBuild = std::chrono::steady_clock::now() + PREVIEW_VISIBILITY_PERIOD;
+        }
+    }
+
+    void requestPreviewVisibility(const double aspect, const int width, const int height) {
+        const auto revision = m_worker.lock([&] { return m_worker.preparedPreview().revision; });
+        std::scoped_lock lock(m_previewVisibilityMutex);
+        const auto changed = !m_hasRequestedPreviewView
+            || m_requestedPreviewView.orientation != m_modelOrientation
+            || m_requestedPreviewView.pivot != m_modelPivot
+            || m_requestedPreviewView.pan != m_viewPan
+            || m_requestedPreviewView.halfHeight != m_viewHalfHeight
+            || m_requestedPreviewView.aspect != aspect
+            || m_requestedPreviewView.viewportWidth != width
+            || m_requestedPreviewView.viewportHeight != height
+            || m_requestedPreviewView.previewRevision != revision;
+        if(!changed) return;
+        m_requestedPreviewView.orientation = m_modelOrientation;
+        m_requestedPreviewView.pivot = m_modelPivot;
+        m_requestedPreviewView.pan = m_viewPan;
+        m_requestedPreviewView.halfHeight = m_viewHalfHeight;
+        m_requestedPreviewView.aspect = aspect;
+        m_requestedPreviewView.viewportWidth = width;
+        m_requestedPreviewView.viewportHeight = height;
+        m_requestedPreviewView.previewRevision = revision;
+        ++m_requestedPreviewView.generation;
+        m_hasRequestedPreviewView = true;
+        m_previewVisibilityCv.notify_one();
+    }
+
+    void consumePreviewVisibilityResult() {
+        std::optional<PreviewRenderCache> ready;
+        {
+            std::scoped_lock lock(m_previewVisibilityMutex);
+            if(!m_readyPreviewRenderCache) return;
+            ready = std::move(m_readyPreviewRenderCache);
+            m_readyPreviewRenderCache.reset();
+        }
+        if(ready->visibleCentroid) {
+            const auto compensation = m_modelOrientation
+                * displayOffset(*ready->visibleCentroid - m_modelPivot);
+            m_viewPan.x += compensation.x;
+            m_viewPan.y += compensation.z;
+            m_modelPivot = *ready->visibleCentroid;
+        }
+        m_previewRenderCache = std::move(*ready);
+        if(!m_glBindBuffer || !m_glBufferData || m_previewGeometryBuffer == 0) return;
+
         std::vector<glm::dvec3> previewVertices;
         const std::array previewBatches {
             std::pair {PreviewBatch::Feed, &m_previewRenderCache.feedLines},
@@ -737,12 +889,15 @@ public:
             range = { previewVertices.size(), vertices->size() };
             previewVertices.insert(previewVertices.end(), vertices->begin(), vertices->end());
         }
-        upload(m_previewGeometryBuffer, previewVertices);
+        m_glBindBuffer(GL_ARRAY_BUFFER_VALUE, m_previewGeometryBuffer);
+        m_glBufferData(GL_ARRAY_BUFFER_VALUE,
+                       static_cast<std::ptrdiff_t>(previewVertices.size() * sizeof(glm::dvec3)),
+                       previewVertices.empty() ? nullptr : previewVertices.data(),
+                       GL_STATIC_DRAW_VALUE);
         m_glBindBuffer(GL_ARRAY_BUFFER_VALUE, 0);
     }
 
     void render3D() {
-        rebuildPreviewRenderCache();
         int windowWidth, windowHeight, framebufferWidth, framebufferHeight;
         glfwGetWindowSize(m_window, &windowWidth, &windowHeight);
         glfwGetFramebufferSize(m_window, &framebufferWidth, &framebufferHeight);
@@ -766,10 +921,6 @@ public:
 
         if(navigationActive && ImGui::IsKeyPressed(ImGuiKey_F, false)) {
             fitToolpathToView(width, height);
-        }
-
-        if(navigationActive && ImGui::IsMouseClicked(ImGuiMouseButton_Middle) && !ctrl && !shift) {
-            pickRotationPivot(width, height, viewportLeft, viewportTop);
         }
 
         if(navigationActive && middleDown && !ctrl && !shift) {
@@ -808,6 +959,9 @@ public:
             m_viewHalfHeight = newHalfHeight;
         }
 
+        requestPreviewVisibility(aspect, width, height);
+        consumePreviewVisibilityResult();
+
         glMatrixMode(GL_PROJECTION);
         glLoadIdentity();
         glOrtho(-m_viewHalfHeight * aspect, m_viewHalfHeight * aspect,
@@ -837,13 +991,23 @@ public:
 
         auto coordinates = m_worker.lock([&] {
             const auto &machine = m_worker.machine();
-            return CoordinateDisplay {
+            CoordinateDisplay result {
                 .active = {
                     .name = std::string(ngc::name(*machine.state().modeCoordSys)),
                     .offset = machine.workOffset(),
                 },
-                .used = m_worker.toolpath().workCoordinateSystems(),
+                .used = {},
             };
+            for(const auto &presentation : m_worker.preparedPreview().presentations) {
+                if(!presentation.workCoordinateSystem) continue;
+                const auto &candidate = *presentation.workCoordinateSystem;
+                const auto found = std::ranges::find_if(result.used, [&](const auto &value) {
+                    return value.name == candidate.name;
+                });
+                if(found == result.used.end()) result.used.push_back(candidate);
+                else *found = candidate;
+            }
+            return result;
         });
         const auto simulationCoordinates = m_simulation.snapshot();
         const auto continuingStatus=m_lastJerkCombStatus==ngc::SimulationStatus::Running
@@ -1129,25 +1293,6 @@ public:
             drawToolWireframe(simulation.toolPose);
     }
 
-    void interpolate(const ngc::MoveArc &arc, int circleResolution, const std::function<void(const glm::dvec3 &start, const glm::dvec3 &end, const bool startPoint, const bool endPoint)> &callback) {
-        const auto geometry = ngc::simulation_detail::arcGeometry(arc);
-        const auto sweep = geometry ? geometry->sweep : 0.0;
-        const auto segments = geometry && circleResolution > 0
-            ? std::max(1, static_cast<int>(std::ceil(sweep * circleResolution / (2.0 * std::numbers::pi))))
-            : 1;
-
-        auto previous = arc.from();
-        for(int i = 1; i <= segments; i++) {
-            const auto current = ngc::simulation_detail::interpolate(arc, static_cast<double>(i) / segments);
-            callback(
-                { previous.x, previous.y, previous.z },
-                { current.x, current.y, current.z },
-                i == 1,
-                i == segments);
-            previous = current;
-        }
-    }
-
     void renderErrorWindow() {
         ImGui::OpenPopup("Error");
 
@@ -1202,7 +1347,7 @@ public:
         ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::BeginDisabled(m_worker.busy());
-        if(ImGui::Button("Clear Preview")) m_worker.clearToolpath();
+        if(ImGui::Button("Clear Preview")) m_worker.clearPreview();
         ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::Checkbox("Cluster jerk comb", &m_showClusterGeometricJerkComb);

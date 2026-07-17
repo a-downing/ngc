@@ -33,7 +33,7 @@ InterpreterSession
     -> GeometryStreamProducer
     -> PreparedGeometryForwardChannel (owning NRT SPSC)
     -> Worker
-       -> ToolpathRecorder
+       -> PreparedPreviewScene
        -> PreviewGeometryCollector
     -> OpenGL presentation
 ```
@@ -43,10 +43,33 @@ It captures presentation metadata, prepares continuous geometry, resolves
 ordering barriers through feedback messages, and publishes immutable owning
 messages.
 
-`Worker` records canonical commands for ordinary preview presentation and
-retains the prepared curves used to draw smoothed G64 geometry. It returns a
-canonical target result for preview probes so interpretation can continue
-without a backend.
+`Worker` retains the producer's prepared slices, standalone prepared motion,
+and presentation metadata as Preview's sole geometry representation. It
+returns a canonical target result for preview probes so interpretation can
+continue without a backend.
+
+### Preview presentation
+
+The OpenGL presentation does not submit the complete prepared scene every
+frame. A dedicated NRT visibility thread snapshots a completed
+`PreparedPreviewScene` revision and rebuilds visible CPU draw batches at no
+more than 10 Hz while the camera or preview changes. Segment/viewport
+intersection uses a small off-screen margin so ordinary camera motion does not
+expose gaps between updates.
+
+Lines remain exact single display segments. Arcs and splines each start with
+eight ordered sections and adaptively subdivide to a two-pixel projected chord
+error under a fixed recursion bound. Tessellation therefore follows viewport
+size, orientation, and zoom without changing prepared geometry. The visibility
+pass also computes a length-weighted centroid of path geometry clipped to the
+actual viewport; camera rotation uses that centroid while compensating pan so
+updating the pivot does not move the current view.
+
+The visibility thread performs CPU work only and publishes complete replacement
+batches. The render thread alone uploads a ready batch to the OpenGL buffer and
+draws the feed, rapid, G53, arc, probe, spline/control, and endpoint ranges.
+Full-scene bounds remain available for fit-to-view even though off-screen path
+segments are not submitted for drawing.
 
 ### Timed simulation and future execution
 

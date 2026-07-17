@@ -8,6 +8,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <variant>
 #include <vector>
 
@@ -38,6 +39,33 @@ namespace ngc {
         std::vector<std::string> modalGCodes;
         std::vector<BlockExecution> activeBlocks;
     };
+
+    inline bool sameProtectedTrajectoryPresentation(
+            const TrajectoryCommandPresentation &left,
+            const TrajectoryCommandPresentation &right) {
+        const auto samePosition = [](const position_t &a, const position_t &b) {
+            return (a - b).length() <= 1e-12;
+        };
+        if(!samePosition(left.activeToolOffset, right.activeToolOffset)) return false;
+        if(left.tool.number != right.tool.number || left.tool.diameter != right.tool.diameter
+           || !samePosition(left.tool.offset, right.tool.offset)) return false;
+        if(left.workCoordinateSystem.has_value() != right.workCoordinateSystem.has_value()) return false;
+        if(left.workCoordinateSystem
+           && (left.workCoordinateSystem->name != right.workCoordinateSystem->name
+               || !samePosition(left.workCoordinateSystem->offset,
+                                right.workCoordinateSystem->offset))) return false;
+        const auto protectedModes = [](const std::vector<std::string> &modes) {
+            std::vector<std::string_view> result;
+            for(const auto &mode : modes) {
+                if(mode == "G0" || mode == "G1" || mode == "G2" || mode == "G3"
+                   || mode == "G38.2" || mode == "G38.3" || mode == "G38.4"
+                   || mode == "G38.5") continue;
+                result.push_back(mode);
+            }
+            return result;
+        };
+        return protectedModes(left.modalGCodes) == protectedModes(right.modalGCodes);
+    }
 
     struct PreparedLineCurve {
         position_t from{};

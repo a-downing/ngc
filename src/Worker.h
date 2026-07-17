@@ -9,7 +9,6 @@
 
 #include "evaluator/InterpreterSession.h"
 #include "machine/GeometryStreamProducer.h"
-#include "machine/ToolpathRecorder.h"
 #include "machine/PreparedGeometry.h"
 #include "memory/Vars.h"
 
@@ -19,7 +18,6 @@ class Worker {
     std::thread m_thread;
 
     ngc::InterpreterSession m_session;
-    ngc::ToolpathRecorder m_toolpath;
     ngc::PreparedPreviewScene m_preparedPreview;
     std::unordered_map<ngc::Var, double> m_parameterSnapshot;
 
@@ -51,7 +49,6 @@ public:
     }
 
     const ngc::Machine &machine() const { return m_session.machine(); }
-    const ngc::ToolpathRecorder &toolpath() const { return m_toolpath; }
     const ngc::PreparedPreviewScene &preparedPreview() const { return m_preparedPreview; }
 
     bool compiled() const {
@@ -125,10 +122,9 @@ public:
         return m_session.statusMessages();
     }
 
-    bool clearToolpath() {
+    bool clearPreview() {
         std::scoped_lock lock(m_mutex);
         if(m_busy) return false;
-        m_toolpath.clear();
         const auto revision = m_preparedPreview.revision + 1;
         m_preparedPreview = {};
         m_preparedPreview.revision = revision;
@@ -178,10 +174,8 @@ private:
         {
             std::scoped_lock lock(m_mutex);
             m_session.begin();
-            m_toolpath.clear();
         }
 
-        ngc::ToolpathRecorder preview;
         ngc::PreviewGeometryCollector preparedPreview;
         ngc::PreparedGeometryForwardChannel forward;
         ngc::GeometryFeedbackChannel feedback;
@@ -193,14 +187,7 @@ private:
             auto message = std::make_unique<const ngc::GeometryFeedback>(std::move(value));
             return feedback.waitPush(std::move(message), [&] { return cancelled.load(); });
         };
-        const auto record = [&](const ngc::PreparedCommandRecord &command) {
-            if(!command.presentationActivation) return;
-            auto canonical = command.command;
-            preview.consume(std::move(canonical), command.presentation.activeToolOffset,
-                command.presentation.workCoordinateSystem.value_or(ngc::WorkCoordinateSystem{}),
-                command.metadata.pathMode == ngc::ExecutablePathMode::Continuous,
-                command.metadata.pathTolerance);
-        };
+        std::optional<ngc::ProbeMove> pendingProbe;
 
         auto complete = false;
         while(!complete) {
@@ -210,28 +197,23 @@ private:
             std::visit([&](const auto &value) {
                 using T = std::decay_t<decltype(value)>;
                 if constexpr(std::same_as<T, ngc::PreparedGeometrySlice>) {
-                    for(const auto &command : value.commands) record(command);
                     retainForPreview = true;
                 } else if constexpr(std::same_as<T, ngc::PreparedStandaloneCommand>) {
-                    record(value.command);
+                    if(const auto *probe = std::get_if<ngc::ProbeMove>(&value.command.command))
+                        pendingProbe = *probe;
                     retainForPreview = true;
                 } else if constexpr(std::same_as<T, ngc::PreparedSynchronizationFence>) {
                     if(!sendFeedback(ngc::ReleaseSynchronization{value.epoch, value.fence}))
                         failure = "preview could not release an interpreter synchronization fence";
                 } else if constexpr(std::same_as<T, ngc::PreparedProbeFence>) {
-                    const auto commands = preview.commands();
-                    const auto probe = std::ranges::find_if(commands, [&](const auto &command) {
-                        const auto *candidate = std::get_if<ngc::ProbeMove>(&command);
-                        return candidate && candidate->id() == value.commandId;
-                    });
-                    if(probe == commands.end()) {
+                    if(!pendingProbe || pendingProbe->id() != value.commandId) {
                         failure = std::format("preview probe fence {} has no preceding probe", value.commandId);
                     } else {
-                        const auto &move = std::get<ngc::ProbeMove>(*probe);
                         if(!sendFeedback(ngc::DeliverProbeResult{value.epoch, {
-                                move.id(), ngc::ProbeStatus::Triggered,
-                                move.target(), move.target()}}))
+                                pendingProbe->id(), ngc::ProbeStatus::Triggered,
+                                pendingProbe->target(), pendingProbe->target()}}))
                             failure = "preview could not return its canonical probe result";
+                        pendingProbe.reset();
                     }
                 } else if constexpr(std::same_as<T, ngc::PreparedFailure>) {
                     failure = std::format("preview continuous geometry preparation failed: {}", value.error);
@@ -254,7 +236,6 @@ private:
         }
 
         std::scoped_lock lock(m_mutex);
-        m_toolpath.replace(std::move(preview));
         auto completedPreview = preparedPreview.finish();
         completedPreview.revision = m_preparedPreview.revision + 1;
         m_preparedPreview = std::move(completedPreview);

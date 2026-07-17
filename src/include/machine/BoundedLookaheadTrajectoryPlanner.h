@@ -318,28 +318,6 @@ namespace ngc {
             };
         }
 
-        static bool sameProtectedPresentation(const TrajectoryCommandPresentation &left,
-                                               const TrajectoryCommandPresentation &right) {
-            if(!samePosition(left.activeToolOffset,right.activeToolOffset)) return false;
-            if(left.tool.number!=right.tool.number||left.tool.diameter!=right.tool.diameter
-               ||!samePosition(left.tool.offset,right.tool.offset)) return false;
-            if(left.workCoordinateSystem.has_value()!=right.workCoordinateSystem.has_value()) return false;
-            if(left.workCoordinateSystem&&
-               (left.workCoordinateSystem->name!=right.workCoordinateSystem->name
-                ||!samePosition(left.workCoordinateSystem->offset,right.workCoordinateSystem->offset))) return false;
-            const auto protectedModes=[](const std::vector<std::string> &modes) {
-                std::vector<std::string_view> result;
-                for(const auto &mode:modes) {
-                    if(mode=="G0"||mode=="G1"||mode=="G2"||mode=="G3"
-                       ||mode=="G38.2"||mode=="G38.3"||mode=="G38.4"||mode=="G38.5") continue;
-                    result.push_back(mode);
-                }
-                return result;
-            };
-            if(protectedModes(left.modalGCodes)!=protectedModes(right.modalGCodes)) return false;
-            return true;
-        }
-
         static double maximumAxisVelocity(const AxisPolynomialSpan &span,
                                           const double position_t::*component) {
             const auto at = [&](const double u) {
@@ -603,7 +581,7 @@ namespace ngc {
             const auto nextStart=motionStart(input.command);
             return continuousMotion(input) && continuousMotion(m_window.front())
                 && input.metadata.pathTolerance == m_window.front().metadata.pathTolerance
-                &&sameProtectedPresentation(input.presentation,m_window.back().presentation)
+                &&sameProtectedTrajectoryPresentation(input.presentation,m_window.back().presentation)
                 &&previousEnd&&nextStart&&samePosition(*previousEnd,*nextStart);
         }
 

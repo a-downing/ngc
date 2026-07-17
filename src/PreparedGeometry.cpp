@@ -453,6 +453,8 @@ namespace ngc {
             using T = std::decay_t<decltype(value)>;
             if constexpr(std::same_as<T, MoveLine>) return lineCurve(value.from(), value.to());
             else if constexpr(std::same_as<T, MoveArc>) return arcCurve(value);
+            else if constexpr(std::same_as<T, ProbeMove>)
+                return lineCurve(value.from(), value.target());
             else return {};
         }, command);
     }
