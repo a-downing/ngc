@@ -26,11 +26,11 @@
 #include "machine/OwningSpscChannel.h"
 #include "machine/PreparedGeometry.h"
 #include "machine/SpscChannel.h"
+#include "machine/SplineHandleOptimization.h"
 #include "machine/ToolTable.h"
 #include "machine/TrajectoryExecutionDriver.h"
 #include "memory/Memory.h"
 #include "parser/Program.h"
-#include "PreviewSpline.h"
 #include "SimulationWorker.h"
 #include "Worker.h"
 
@@ -2238,137 +2238,53 @@ namespace {
                 "taking mock jerk diagnostics should consume the incremental samples");
     }
 
-    void testPreviewJunctionUsesOneSixControlSpline() {
-        const ngc::experimental::JunctionEntity incoming {
-            .length = 10.0,
-            .stateAtDistance = [](const double distance) {
-                return ngc::experimental::JunctionState {
-                    .position={distance,0.0,0.0},.tangent={1.0,0.0,0.0},.curvature={} };
-            },
+    void testPreparedArcJunctionMatchesSourceCurvature() {
+        constexpr double RADIUS=0.05;
+        const ngc::position_t first{RADIUS,0,0,0,0,0};
+        const ngc::position_t junction{0,RADIUS,0,0,0,0};
+        const ngc::position_t last{-RADIUS,0,0,0,0,0};
+        const auto arcRecord=[](const ngc::PreparedCommandId id,
+                                const ngc::position_t &from,
+                                const ngc::position_t &to) {
+            ngc::PreparedCommandRecord record;
+            record.id=id;
+            record.command=ngc::MoveArc{from,to,{0,0,0},{0,0,1},60.0};
+            return record;
         };
-        const ngc::experimental::JunctionEntity outgoing {
-            .length = 10.0,
-            .stateAtDistance = [](const double distance) {
-                return ngc::experimental::JunctionState {
-                    .position={10.0,distance,0.0},.tangent={0.0,1.0,0.0},.curvature={} };
-            },
+        const std::array<ngc::PreparedCommandRecord,2> records{
+            arcRecord(1,first,junction),arcRecord(2,junction,last),
         };
-        constexpr double scale=1.0;
-        const auto blend=ngc::experimental::fitJunction(incoming,outgoing,scale);
-        require(blend.has_value(),"preview corner should fit a single clamped spline");
-        require(blend->controlPoints.size()==6,
-                "a preview blend should have two clamped endpoint and four interior controls");
-        requireNear(blend->incomingTrim,3.0,
-                    "a long incoming entity should be trimmed by three times P");
-        requireNear(blend->outgoingTrim,3.0,
-                    "a long outgoing entity should be trimmed by three times P");
-        const auto &controls=blend->controlPoints;
-        const std::array expectedControls {
-            glm::dvec3(7,0,0),glm::dvec3(8,0,0),glm::dvec3(9,0,0),
-            glm::dvec3(10,1,0),glm::dvec3(10,2,0),glm::dvec3(10,3,0),
-        };
-        for(std::size_t control=0;control<expectedControls.size();++control)
-            require(glm::length(controls[control]-expectedControls[control])<1e-9,
-                    "line blend controls should be sampled at 3P, 2P, P / P, 2P, 3P");
-        require(std::ranges::none_of(controls,[](const auto &control) {
-            return glm::length(control-glm::dvec3(10,0,0))<1e-9;
-        }),"the junction should not be a spline control point");
-        require(glm::length(controls[1]-controls[0]-glm::dvec3(scale,0,0))<1e-9,
-                "incoming line controls should be spaced by its local P");
-        require(glm::length(controls[2]-controls[1]-glm::dvec3(scale,0,0))<1e-9,
-                "the first three incoming controls should remain equally spaced");
-        require(glm::length(controls[5]-controls[4]-glm::dvec3(0,scale,0))<1e-9,
-                "outgoing line controls should be spaced by its local P");
-        require(glm::length(controls[4]-controls[3]-glm::dvec3(0,scale,0))<1e-9,
-                "the last three outgoing controls should remain equally spaced");
+        const auto prepared=ngc::prepareContinuousGeometry(records,0.1,first);
+        require(prepared.has_value(),prepared?"":prepared.error());
+        require(prepared->pieces.size()==3
+                    &&prepared->pieces[0].kind==ngc::PreparedPieceKind::RetainedArcSection
+                    &&prepared->pieces[1].kind==ngc::PreparedPieceKind::JunctionBlend
+                    &&prepared->pieces[2].kind==ngc::PreparedPieceKind::RetainedArcSection,
+                "two long arcs should produce retained sections around one junction blend");
 
-        const ngc::experimental::JunctionEntity curvedIncoming {
-            .length=10.0,
-            .stateAtDistance=[](const double distance) {
-                constexpr double radius=5.0;
-                const auto angle=(distance-10.0)/radius;
-                return ngc::experimental::JunctionState {
-                    .position={radius*std::sin(angle),radius*(1.0-std::cos(angle)),0.0},
-                    .tangent={std::cos(angle),std::sin(angle),0.0},
-                    .curvature={-std::sin(angle)/radius,std::cos(angle)/radius,0.0} };
-            },
-        };
-        const ngc::experimental::JunctionEntity curvedOutgoing {
-            .length=10.0,
-            .stateAtDistance=[](const double distance) {
-                constexpr double radius=5.0;
-                const auto angle=distance/radius;
-                return ngc::experimental::JunctionState {
-                    .position={radius*std::sin(angle),radius*(1.0-std::cos(angle)),0.0},
-                    .tangent={std::cos(angle),std::sin(angle),0.0},
-                    .curvature={-std::sin(angle)/radius,std::cos(angle)/radius,0.0} };
-            },
-        };
-        const auto curvedBlend=ngc::experimental::fitJunction(curvedIncoming,curvedOutgoing,scale);
-        require(curvedBlend.has_value(),"curved neighboring entities should produce a blend");
-        const auto geometricCurvature=[](const glm::dvec3 velocity,const glm::dvec3 acceleration) {
-            const auto speed=glm::length(velocity);
-            const auto tangent=velocity/speed;
-            return (acceleration-tangent*glm::dot(acceleration,tangent))/(speed*speed);
-        };
-        const auto &curvedControls=curvedBlend->controlPoints;
-        const auto incomingVelocity=3.0*(curvedControls[1]-curvedControls[0]);
-        const auto incomingAcceleration=3.0*curvedControls[2]-9.0*curvedControls[1]
-            +6.0*curvedControls[0];
-        const auto outgoingVelocity=3.0*(curvedControls[5]-curvedControls[4]);
-        const auto outgoingAcceleration=6.0*curvedControls[5]-9.0*curvedControls[4]
-            +3.0*curvedControls[3];
-        require(glm::length(geometricCurvature(incomingVelocity,incomingAcceleration)
-                            -curvedIncoming.stateAtDistance(7.0).curvature)<1e-9,
-                "incoming cubic B-spline endpoint should match arc curvature");
-        require(glm::length(geometricCurvature(outgoingVelocity,outgoingAcceleration)
-                            -curvedOutgoing.stateAtDistance(3.0).curvature)<1e-9,
-                "outgoing cubic B-spline endpoint should match arc curvature");
-        require(glm::length(curvedControls[1]-curvedControls[0])<scale
-                    &&glm::length(curvedControls[5]-curvedControls[4])<scale,
-                "arc geometry should shorten tangent handles when that better follows the arc");
-        const auto incomingControlDeparture=
-            glm::length(curvedControls[2]-curvedIncoming.stateAtDistance(9.0).position);
-        const auto outgoingControlDeparture=
-            glm::length(curvedControls[3]-curvedOutgoing.stateAtDistance(1.0).position);
-        require(std::max(incomingControlDeparture,outgoingControlDeparture)<0.25*scale,
-                "optimized curved controls should remain close to the neighboring arc geometry");
-        require(std::max(incomingControlDeparture,outgoingControlDeparture)>1e-6,
-                "curved handle optimization should improve on the initial nearby-point fit");
-
-        const auto lineEntity=[](const glm::dvec3 from,const glm::dvec3 tangent,const double length) {
-            return ngc::experimental::JunctionEntity {
-                .length=length,
-                .stateAtDistance=[=](const double distance) {
-                    return ngc::experimental::JunctionState {
-                        .position=from+tangent*distance,.tangent=tangent,.curvature={} };
-                },
-            };
-        };
-        const auto longBefore=lineEntity({0,0,0},{1,0,0},12.0);
-        const auto shortEntity=lineEntity({12,0,0},{0,1,0},3.0);
-        const auto longAfter=lineEntity({12,3,0},{1,0,0},12.0);
-        const auto intoShort=ngc::experimental::fitJunction(longBefore,shortEntity,scale);
-        const auto outOfShort=ngc::experimental::fitJunction(shortEntity,longAfter,scale);
-        require(intoShort&&outOfShort,"both sides of a short entity should produce local blends");
-        requireNear(intoShort->outgoingScale,0.5,"a short entity should use length divided by six");
-        requireNear(outOfShort->incomingScale,0.5,"both sides should use the same short-entity scale");
-        const auto &leftMidpoint=intoShort->controlPoints;
-        const auto &rightMidpoint=outOfShort->controlPoints;
-        require(glm::length(leftMidpoint[5]-rightMidpoint[0])<1e-9,
-                "neighboring blends should meet at the short entity midpoint");
-        require(glm::length((leftMidpoint[5]-leftMidpoint[4])
-                            -(rightMidpoint[1]-rightMidpoint[0]))<1e-9,
-                "neighboring short-entity blends should share their midpoint tangent scale");
-        require(glm::length((leftMidpoint[5]-2.0*leftMidpoint[4]+leftMidpoint[3])
-                            -(rightMidpoint[2]-2.0*rightMidpoint[1]+rightMidpoint[0]))<1e-8,
-                "neighboring short-entity blends should be C2 at the midpoint");
-
-        const auto differentShort=lineEntity({12,3,0},{1,0,0},6.0);
-        const auto unequal=ngc::experimental::fitJunction(shortEntity,differentShort,scale);
-        require(unequal.has_value(),"unequal short sides should produce a blend");
-        requireNear(unequal->incomingScale,0.5,"incoming side should retain its own local scale");
-        requireNear(unequal->outgoingScale,1.0,"outgoing side should retain its own local scale");
+        ngc::CurveEvaluationWorkspace workspace;
+        const auto &incoming=prepared->pieces[0];
+        const auto &blend=prepared->pieces[1];
+        const auto &outgoing=prepared->pieces[2];
+        const auto incomingCurvature=ngc::curvatureAtDistance(
+            *incoming.curve,incoming.curveTo,workspace);
+        const auto blendStartCurvature=ngc::curvatureAtDistance(
+            *blend.curve,blend.curveFrom,workspace);
+        const auto blendEndCurvature=ngc::curvatureAtDistance(
+            *blend.curve,blend.curveTo,workspace);
+        const auto outgoingCurvature=ngc::curvatureAtDistance(
+            *outgoing.curve,outgoing.curveFrom,workspace);
+        require((blendStartCurvature-incomingCurvature).length()<1e-8,
+                "an arc-to-arc junction blend must match incoming arc curvature");
+        require((blendEndCurvature-outgoingCurvature).length()<1e-8,
+                "an arc-to-arc junction blend must match outgoing arc curvature");
+        require(blendStartCurvature.length()>19.0&&blendEndCurvature.length()>19.0,
+                "arc junction blend endpoint curvature must not collapse to zero");
+        require(std::abs(incoming.geometricSamples.back().normalSharpness)<1e-8,
+                "constant-curvature arc samples should have zero normal sharpness");
+        require(std::abs(incoming.geometricSamples.back().fullGeometricJerkCoefficient
+                         -1.0/(RADIUS*RADIUS))<1e-6,
+                "prepared samples must retain the tangential curvature-squared jerk component");
     }
 
     void testBoundedPlannerExecutesPiecewiseG64Geometry() {
@@ -2478,39 +2394,6 @@ namespace {
             "cubic control conditioning should reduce control-polygon third-difference energy");
     }
 
-    void testGeometricJerkCombIncludesTangentialComponent() {
-        // One cubic Bezier span for q(t)=(t,t^2). At t=0 its curvature is 2,
-        // normal sharpness is zero, and q''' is the tangential vector (-4,0).
-        const ngc::experimental::JunctionBlend parabola{
-            .controlPoints={
-                {0.0,0.0,0.0},{1.0/3.0,0.0,0.0},
-                {2.0/3.0,1.0/3.0,0.0},{1.0,1.0,0.0},
-            },
-            .degree=3,
-        };
-        const std::array feedSections{
-            ngc::experimental::ClusterFeedSection{.length=1.0,.speed=6.0},
-        };
-        const auto comb=ngc::experimental::sampleGeometricJerkComb(
-            parabola,feedSections,100.0);
-        require(comb.size()==65,
-                "one planner piece should show exactly its 65 jerk sample points");
-        requireNear(comb.front().magnitude,4.0,
-                    "geometric jerk comb should measure the complete q''' magnitude");
-        requireNear(comb.front().normalMagnitude,0.0,
-                    "symmetric parabola endpoint should have zero normal sharpness");
-        requireNear(comb.front().tangentialMagnitude,4.0,
-                    "geometric jerk comb must retain the tangential kappa-squared component");
-        requireNear(comb.front().programmedSpeed,6.0,
-                    "geometric jerk comb should retain the owning programmed feed");
-        require(comb.front().geometricSpeedLimit<comb.front().programmedSpeed,
-                "a sample whose geometric jerk cap is below feed should be marked limiting");
-        requireNear(comb.front().normalDirection.x,0.0,
-                    "comb display tooth should follow the curvature normal");
-        requireNear(comb.front().normalDirection.y,1.0,
-                    "comb display tooth should follow the curvature normal");
-    }
-
     void testMicroEntityClusterCollapsesToOneSpline() {
         constexpr double SCALE=0.05;
         const std::array lengths{1.0,0.02,0.01,1.0,0.06,1.0};
@@ -2564,53 +2447,6 @@ namespace {
                     &&std::abs(denseControlDistances.back()-0.0975)<1e-12,
                 "dense tiny entities should use one midpoint control per entity");
 
-        const auto previewLine=[](const glm::dvec3 start,const glm::dvec3 tangent) {
-            return ngc::experimental::JunctionEntity {
-                .length=1.0,
-                .stateAtDistance=[=](const double distance) {
-                    return ngc::experimental::JunctionState {
-                        .position=start+tangent*distance,.tangent=tangent,.curvature={} };
-                },
-                .linear=true,
-            };
-        };
-        const auto previewIncoming=previewLine({0,0,0},{1,0,0});
-        const auto previewOutgoing=previewLine({1.02,0.01,0},{1,0.1,0});
-        require(!ngc::experimental::fitJunction(previewIncoming,previewOutgoing,SCALE),
-                "an ordinary preview junction should require a shared canonical endpoint");
-        require(ngc::experimental::fitJunction(
-                    previewIncoming,previewOutgoing,SCALE,false).has_value(),
-                "a detected micro-cluster should bridge its separated long-entity endpoints");
-
-        const auto clusterLine=[](const double from,const double length) {
-            return ngc::experimental::JunctionEntity{
-                .length=length,
-                .stateAtDistance=[=](const double distance) {
-                    return ngc::experimental::JunctionState{
-                        .position={from+distance,0,0},.tangent={1,0,0},.curvature={}};
-                },
-                .linear=true,
-            };
-        };
-        const std::array clusterEntities{
-            clusterLine(0.0,1.0),clusterLine(1.0,0.2),
-            clusterLine(1.2,0.2),clusterLine(1.4,1.0),
-        };
-        const auto directCluster=ngc::experimental::buildEvenlySpacedControlCluster(
-            clusterEntities,0,3,SCALE);
-        require(directCluster&&directCluster->degree==5
-                    &&directCluster->controlPoints.size()==10
-                    &&std::abs(directCluster->controlPoints.front().x-0.85)<1e-12
-                    &&std::abs(directCluster->controlPoints.back().x-1.55)<1e-12,
-                "preview clusters should reconstruct the selected quintic reference");
-        const std::array shortClusterEntities{
-            clusterLine(0.0,1.0),clusterLine(1.0,0.04),clusterLine(1.04,1.0),
-        };
-        const auto omittedShortCluster=ngc::experimental::buildEvenlySpacedControlCluster(
-            shortClusterEntities,0,2,SCALE);
-        require(omittedShortCluster&&omittedShortCluster->controlPoints.size()==6,
-                "a short run totaling less than 6P should add no interior controls");
-
         const ngc::position_t p0{0,0,0,0,0,0},p1{1,0,0,0,0,0};
         const ngc::position_t p2{1.04,0.004,0,0,0,0},p3{2,0.1,0,0,0,0};
         const std::array<ngc::MachineCommand,3> commands{
@@ -2659,26 +2495,6 @@ namespace {
         require(quintic!=(*fittedStrip)->splineGeometry.end()
                     &&quintic->controls.size()==16,
                 "a variable-control short-entity strip should use the selected quintic fitter");
-        std::vector<ngc::experimental::JunctionEntity> previewStrip;
-        previewStrip.push_back(clusterLine(0.0,1.0));
-        auto previewPosition=1.0;
-        for(unsigned segment=0;segment<8;++segment) {
-            previewStrip.push_back(clusterLine(previewPosition,0.04));
-            previewPosition+=0.04;
-        }
-        previewStrip.push_back(clusterLine(previewPosition,1.0));
-        const auto previewFitted=ngc::experimental::buildEvenlySpacedControlCluster(
-            previewStrip,0,previewStrip.size()-1,SCALE);
-        require(previewFitted&&previewFitted->degree==quintic->degree
-                    &&previewFitted->controlPoints.size()==quintic->controls.size(),
-                "preview and simulation should select the same spline degree and layout");
-        for(std::size_t control=0;control<quintic->controls.size();++control) {
-            const auto &previewControl=previewFitted->controlPoints[control];
-            const auto &plannedControl=quintic->controls[control];
-            require(glm::length(previewControl-glm::dvec3(
-                        plannedControl.x,plannedControl.y,plannedControl.z))<1e-12,
-                    "preview and simulation should use identical reconstructed XYZ controls");
-        }
     }
 
     void testRollingContinuousHorizonsPreserveMovingPvaBoundary() {
@@ -4278,10 +4094,9 @@ int main() {
         testInfiniteJerkTrajectoryTimeMatchesAnalyticLine();
         testExactStopPlannerEnforcesIndependentAxisLimits();
         testBoundedLookaheadCarriesG64MetadataAndSingleCommandExactStops();
-        testPreviewJunctionUsesOneSixControlSpline();
+        testPreparedArcJunctionMatchesSourceCurvature();
         testShortLineMidpointCurvatureInference();
         testCubicSplineInteriorControlConditioning();
-        testGeometricJerkCombIncludesTangentialComponent();
         testMicroEntityClusterCollapsesToOneSpline();
         testBoundedPlannerExecutesPiecewiseG64Geometry();
         testRollingContinuousHorizonsPreserveMovingPvaBoundary();

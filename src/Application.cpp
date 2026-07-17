@@ -1,5 +1,4 @@
 #include "Application.h"
-#include "PreviewSpline.h"
 
 #include <filesystem>
 #include <fstream>
@@ -149,6 +148,16 @@ class ApplicationImpl final {
         std::size_t count = 0;
     };
 
+    struct GeometricJerkCombSample {
+        glm::dvec3 position{};
+        glm::dvec3 normalDirection{};
+        double magnitude = 0.0;
+        double normalMagnitude = 0.0;
+        double tangentialMagnitude = 0.0;
+        double geometricSpeedLimit = std::numeric_limits<double>::infinity();
+        double programmedSpeed = 0.0;
+    };
+
     struct PreviewRenderCache {
         std::optional<std::uint64_t> revision;
         std::vector<glm::dvec3> feedLines;
@@ -161,7 +170,7 @@ class ApplicationImpl final {
         std::vector<glm::dvec3> g64ClusterSplineLines;
         std::vector<glm::dvec3> g64ControlPolygon;
         std::vector<glm::dvec3> g64ControlPoints;
-        std::vector<ngc::experimental::GeometricJerkCombSample> clusterGeometricJerkComb;
+        std::vector<GeometricJerkCombSample> clusterGeometricJerkComb;
         double maximumClusterGeometricJerk = 0.0;
         std::vector<glm::dvec3> darkPoints;
         std::vector<glm::dvec3> lightPoints;
@@ -608,7 +617,7 @@ public:
                         const auto curvature = glm::dvec3(sample.curvature.x,
                             sample.curvature.y, sample.curvature.z);
                         const auto curvatureLength = glm::length(curvature);
-                        ngc::experimental::GeometricJerkCombSample displaySample;
+                        GeometricJerkCombSample displaySample;
                         displaySample.position = offsetPoint(sample.position, offset);
                         if(curvatureLength > 1e-15)
                             displaySample.normalDirection = curvature / curvatureLength;

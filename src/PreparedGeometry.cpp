@@ -7,6 +7,7 @@
 #include <limits>
 #include <numeric>
 #include <stdexcept>
+#include <tuple>
 
 #include "machine/SplineHandleOptimization.h"
 #include "machine/SplineReconstruction.h"
@@ -424,7 +425,8 @@ namespace ngc {
             return tangentAtDistance(*entity.curve, distance, workspace);
         }
 
-        std::vector<position_t> sixControlBlend(const SourceEntity &incoming,
+        std::vector<position_t> curvatureMatchedSixControlBlend(
+                                                const SourceEntity &incoming,
                                                 const SourceEntity &outgoing,
                                                 const double incomingScale,
                                                 const double outgoingScale,
@@ -435,12 +437,67 @@ namespace ngc {
             const auto end = sourcePosition(outgoing, endDistance, workspace);
             const auto startTangent = sourceTangent(incoming, startDistance, workspace);
             const auto endTangent = sourceTangent(outgoing, endDistance, workspace);
+            const auto startCurvature = curvatureAtDistance(
+                *incoming.curve, startDistance, workspace);
+            const auto endCurvature = curvatureAtDistance(
+                *outgoing.curve, endDistance, workspace);
+            const auto fittedHandle = [](const position_t &endpoint,
+                                         const position_t &tangent,
+                                         const position_t &curvature,
+                                         const position_t &twoStepsInside,
+                                         const double fallbackScale,
+                                         const double fallbackTangentDistance) {
+                const auto delta = twoStepsInside - endpoint;
+                auto tangentDistance = dot(delta, tangent);
+                if(tangentDistance * fallbackTangentDistance <= 0.0)
+                    tangentDistance = fallbackTangentDistance;
+                const auto normalDelta = delta - scaled(tangent, tangentDistance);
+                const auto curvatureSquared = dot(curvature, curvature);
+                auto handle = fallbackScale;
+                if(curvatureSquared > 1e-18) {
+                    const auto handleSquared = dot(normalDelta, curvature)
+                        / (3.0 * curvatureSquared);
+                    if(handleSquared > 1e-18)
+                        handle = std::clamp(std::sqrt(handleSquared),
+                            fallbackScale * 0.25, fallbackScale * 2.0);
+                }
+                return std::pair{handle, tangentDistance};
+            };
+            auto [incomingHandle, incomingTangentDistance] = fittedHandle(
+                start, startTangent, startCurvature,
+                sourcePosition(incoming, incoming.length - incomingScale, workspace),
+                incomingScale, 2.0 * incomingScale);
+            auto [outgoingHandle, outgoingTangentDistance] = fittedHandle(
+                end, endTangent, endCurvature,
+                sourcePosition(outgoing, outgoingScale, workspace),
+                outgoingScale, -2.0 * outgoingScale);
+            const auto xyzLength = [](const position_t &value) {
+                return std::hypot(value.x, value.y, value.z);
+            };
+            if(xyzLength(startCurvature) > 1e-12 || xyzLength(endCurvature) > 1e-12) {
+                const auto endpoint = [](const position_t &position,
+                                         const position_t &tangent,
+                                         const position_t &curvature) {
+                    return spline_detail::Endpoint3{
+                        .position={position.x, position.y, position.z},
+                        .tangent={tangent.x, tangent.y, tangent.z},
+                        .curvature={curvature.x, curvature.y, curvature.z},
+                    };
+                };
+                std::tie(incomingHandle, outgoingHandle) = spline_detail::optimizeHandles(
+                    endpoint(start, startTangent, startCurvature),
+                    endpoint(end, endTangent, endCurvature),
+                    incomingTangentDistance, outgoingTangentDistance,
+                    incomingHandle, outgoingHandle, incomingScale, outgoingScale);
+            }
             return {
                 start,
-                start + scaled(startTangent, incomingScale),
-                start + scaled(startTangent, 2.0 * incomingScale),
-                end - scaled(endTangent, 2.0 * outgoingScale),
-                end - scaled(endTangent, outgoingScale),
+                start + scaled(startTangent, incomingHandle),
+                start + scaled(startTangent, incomingTangentDistance)
+                    + scaled(startCurvature, 3.0 * incomingHandle * incomingHandle),
+                end + scaled(endTangent, outgoingTangentDistance)
+                    + scaled(endCurvature, 3.0 * outgoingHandle * outgoingHandle),
+                end - scaled(endTangent, outgoingHandle),
                 end,
             };
         }
@@ -687,8 +744,8 @@ namespace ngc {
                 const auto right = cluster;
                 const auto leftScale = sourceScale(entities[index], blendScale);
                 const auto rightScale = sourceScale(entities[right], blendScale);
-                auto controls = sixControlBlend(entities[index], entities[right], leftScale,
-                                                rightScale, workspace);
+                auto controls = curvatureMatchedSixControlBlend(
+                    entities[index], entities[right], leftScale, rightScale, workspace);
                 if(right > index + 1) {
                     std::vector<double> interiorLengths;
                     auto interiorLength = 0.0;
@@ -783,7 +840,7 @@ namespace ngc {
             }
             const auto &incoming = entities[index];
             const auto &outgoing = entities[index + 1];
-            const auto controls = sixControlBlend(incoming, outgoing,
+            const auto controls = curvatureMatchedSixControlBlend(incoming, outgoing,
                 sourceScale(incoming, blendScale), sourceScale(outgoing, blendScale), workspace);
             auto curve = splineCurve(controls, 3,
                 effort.lengthTableIntervalsPerKnotSpan);
