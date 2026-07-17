@@ -2,8 +2,10 @@
 
 #include <filesystem>
 #include <fstream>
+#include <format>
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <print>
 #include <string>
 #include <cmath>
@@ -133,6 +135,7 @@ class ApplicationImpl final {
     double m_mouseDX = 0.0;
     double m_mouseDY = 0.0;
     double m_scrollDelta = 0.0;
+    bool m_rotationDragHasPivot = false;
 
     glm::dquat m_modelOrientation { 1.0, 0.0, 0.0, 0.0 };
     glm::dvec2 m_viewPan { 0.0, 0.0 };
@@ -194,6 +197,8 @@ class ApplicationImpl final {
     std::mutex m_previewVisibilityMutex;
     std::condition_variable m_previewVisibilityCv;
     std::thread m_previewVisibilityThread;
+    std::atomic<std::uint64_t> m_latestPreviewGeneration{0};
+    std::atomic_bool m_stopPreviewVisibilityRequested{false};
     PreviewViewSnapshot m_requestedPreviewView;
     bool m_hasRequestedPreviewView = false;
     bool m_stopPreviewVisibility = false;
@@ -225,8 +230,8 @@ class ApplicationImpl final {
     static constexpr double WORK_TRIAD_LENGTH = 1.0;
     static constexpr auto PREVIEW_VISIBILITY_PERIOD = std::chrono::milliseconds(100);
     static constexpr double PREVIEW_VISIBILITY_MARGIN = 0.12;
-    static constexpr double PREVIEW_CURVE_ERROR_PIXELS = 2.0;
-    static constexpr int PREVIEW_CURVE_MAX_SUBDIVISION_DEPTH = 13;
+    static constexpr double PREVIEW_CURVE_ERROR_PIXELS = 0.5;
+    static constexpr std::size_t PREVIEW_CURVE_MAXIMUM_SUBDIVISION_NODES = 1U << 20;
 
     static glm::dvec3 displayOffset(const glm::dvec3 &offset) {
         return { offset.x, -offset.y, offset.z };
@@ -392,6 +397,7 @@ public:
     }
 
     void terminate() {
+        m_stopPreviewVisibilityRequested.store(true, std::memory_order_release);
         {
             std::scoped_lock lock(m_previewVisibilityMutex);
             m_stopPreviewVisibility = true;
@@ -490,9 +496,66 @@ public:
         m_viewHalfHeight = radius * 1.1 / std::min(aspect, 1.0);
     }
 
-    PreviewRenderCache buildPreviewGeometry(const ngc::PreparedPreviewScene &preparedScene,
-                                            const PreviewViewSnapshot &view) const {
+    bool pickToolpathRotationPivot(const int width, const int height,
+                                   const int viewportLeft, const int viewportTop) {
+        constexpr double PICK_RADIUS_PIXELS=30.0;
+        const auto aspect=static_cast<double>(width)/height;
+        const glm::dvec2 mouse{m_mouseX-viewportLeft,m_mouseY-viewportTop};
+        auto bestDistanceSquared=PICK_RADIUS_PIXELS*PICK_RADIUS_PIXELS;
+        std::optional<glm::dvec3> bestPoint;
+        const auto project=[&](const glm::dvec3 &point) {
+            const auto transformed=m_modelOrientation*displayOffset(point-m_modelPivot);
+            const auto ndcX=(transformed.x+m_viewPan.x)/(m_viewHalfHeight*aspect);
+            const auto ndcY=(transformed.z+m_viewPan.y)/m_viewHalfHeight;
+            return glm::dvec2((ndcX+1.0)*width*0.5,(1.0-ndcY)*height*0.5);
+        };
+        const auto consider=[&](const glm::dvec3 &from,const glm::dvec3 &to) {
+            const auto screenFrom=project(from);
+            const auto screenTo=project(to);
+            const auto screenSegment=screenTo-screenFrom;
+            const auto lengthSquared=glm::dot(screenSegment,screenSegment);
+            const auto parameter=lengthSquared>0.0
+                ?std::clamp(glm::dot(mouse-screenFrom,screenSegment)/lengthSquared,0.0,1.0)
+                :0.0;
+            const auto difference=mouse-glm::mix(screenFrom,screenTo,parameter);
+            const auto distanceSquared=glm::dot(difference,difference);
+            if(distanceSquared>=bestDistanceSquared) return;
+            bestDistanceSquared=distanceSquared;
+            bestPoint=glm::mix(from,to,parameter);
+        };
+        const std::array toolpathLines{
+            &m_previewRenderCache.feedLines,&m_previewRenderCache.rapidLines,
+            &m_previewRenderCache.g53FeedLines,&m_previewRenderCache.g53RapidLines,
+            &m_previewRenderCache.arcLines,&m_previewRenderCache.probeLines,
+            &m_previewRenderCache.g64SplineLines,
+            &m_previewRenderCache.g64ClusterSplineLines,
+        };
+        for(const auto *lines:toolpathLines)
+            for(std::size_t index=1;index<lines->size();index+=2)
+                consider((*lines)[index-1],(*lines)[index]);
+        if(!bestPoint) return false;
+
+        // Preserve the current screen transform while making the selected
+        // toolpath point the sole pivot for this rotation drag.
+        const auto compensation=m_modelOrientation*displayOffset(*bestPoint-m_modelPivot);
+        m_viewPan.x+=compensation.x;
+        m_viewPan.y+=compensation.z;
+        m_modelPivot=*bestPoint;
+        return true;
+    }
+
+    std::expected<PreviewRenderCache, std::string> buildPreviewGeometry(
+            const ngc::PreparedPreviewScene &preparedScene,
+            const PreviewViewSnapshot &view,
+            const bool rejectOutsideView) const {
             PreviewRenderCache cache;
+            std::size_t subdivisionNodes = 0;
+
+            const auto cancelled = [&] {
+                return m_stopPreviewVisibilityRequested.load(std::memory_order_acquire)
+                    || m_latestPreviewGeneration.load(std::memory_order_acquire)
+                        != view.generation;
+            };
 
             const auto segment = [](auto &vertices, const glm::dvec3 &from, const glm::dvec3 &to) {
                 vertices.push_back(from);
@@ -520,75 +583,81 @@ public:
                 return glm::dvec2(ndcX * view.viewportWidth * 0.5,
                                   ndcY * view.viewportHeight * 0.5);
             };
-            const auto pointChordDistance = [](const glm::dvec2 &point,
-                                               const glm::dvec2 &from,
-                                               const glm::dvec2 &to) {
-                const auto chord = to - from;
-                const auto lengthSquared = glm::dot(chord, chord);
-                if(lengthSquared <= 1e-24) return glm::length(point - from);
-                const auto parameter = std::clamp(
-                    glm::dot(point - from, chord) / lengthSquared, 0.0, 1.0);
-                return glm::length(point - glm::mix(from, to, parameter));
-            };
             const auto appendCurve = [&](const ngc::PreparedCurve &curve,
                                          const double fromDistance,
                                          const double toDistance,
                                          const ngc::position_t &offset,
                                          std::vector<glm::dvec3> &vertices,
-                                         const bool adaptive) {
+                                         const bool adaptive)
+                    -> std::expected<std::pair<glm::dvec3, glm::dvec3>, std::string> {
                 const auto position = [&](const double distance) {
                     return offsetPoint(ngc::positionAtDistance(
                         curve, distance, curveWorkspace), offset);
                 };
+                if(cancelled()) return std::unexpected("cancelled");
                 const auto beginning = position(fromDistance);
                 const auto ending = position(toDistance);
                 if(!adaptive) {
                     segment(vertices, beginning, ending);
                     return std::pair { beginning, ending };
                 }
-                constexpr int initialSegments = 8;
-                auto initialDepth = 0;
-                for(auto count = initialSegments; count > 1; count /= 2) ++initialDepth;
-                const auto emit = [&](auto &&self, const double from,
-                                      const glm::dvec3 &fromPoint, const double to,
-                                      const glm::dvec3 &toPoint, const int depth) -> void {
-                    const auto quarterDistance = std::lerp(from, to, 0.25);
-                    const auto middleDistance = std::midpoint(from, to);
-                    const auto threeQuarterDistance = std::lerp(from, to, 0.75);
-                    const auto quarterPoint = position(quarterDistance);
-                    const auto middlePoint = position(middleDistance);
-                    const auto threeQuarterPoint = position(threeQuarterDistance);
+                const auto pixelsPerWorldUnit = std::max(
+                    view.viewportWidth / (2.0 * view.halfHeight * view.aspect),
+                    view.viewportHeight / (2.0 * view.halfHeight));
+                const auto regionOutsideView = [&](const glm::dvec3 &fromPoint,
+                                                   const glm::dvec3 &toPoint,
+                                                   const double screenError) {
+                    if(!rejectOutsideView) return false;
                     const auto screenFrom = projectToPixels(fromPoint);
                     const auto screenTo = projectToPixels(toPoint);
-                    const auto error = std::max({
-                        pointChordDistance(projectToPixels(quarterPoint), screenFrom, screenTo),
-                        pointChordDistance(projectToPixels(middlePoint), screenFrom, screenTo),
-                        pointChordDistance(projectToPixels(threeQuarterPoint), screenFrom, screenTo),
-                    });
-                    if(depth >= PREVIEW_CURVE_MAX_SUBDIVISION_DEPTH
-                       || error <= PREVIEW_CURVE_ERROR_PIXELS) {
-                        segment(vertices, fromPoint, toPoint);
-                        return;
-                    }
-                    self(self, from, fromPoint, middleDistance, middlePoint, depth + 1);
-                    self(self, middleDistance, middlePoint, to, toPoint, depth + 1);
+                    const auto horizontalLimit = view.viewportWidth * 0.5
+                        * (1.0 + PREVIEW_VISIBILITY_MARGIN);
+                    const auto verticalLimit = view.viewportHeight * 0.5
+                        * (1.0 + PREVIEW_VISIBILITY_MARGIN);
+                    return std::max(screenFrom.x, screenTo.x) + screenError < -horizontalLimit
+                        || std::min(screenFrom.x, screenTo.x) - screenError > horizontalLimit
+                        || std::max(screenFrom.y, screenTo.y) + screenError < -verticalLimit
+                        || std::min(screenFrom.y, screenTo.y) - screenError > verticalLimit;
                 };
-                auto segmentBeginning = beginning;
-                for(int initialSegment = 0; initialSegment < initialSegments; ++initialSegment) {
-                    const auto segmentFrom = std::lerp(fromDistance, toDistance,
-                        static_cast<double>(initialSegment) / initialSegments);
-                    const auto segmentTo = std::lerp(fromDistance, toDistance,
-                        static_cast<double>(initialSegment + 1) / initialSegments);
-                    const auto segmentEnding = initialSegment + 1 == initialSegments
-                        ? ending : position(segmentTo);
-                    emit(emit, segmentFrom, segmentBeginning, segmentTo, segmentEnding,
-                         initialDepth);
-                    segmentBeginning = segmentEnding;
-                }
+                const auto emit = [&](auto &&self, const double from,
+                                      const glm::dvec3 &fromPoint, const double to,
+                                      const glm::dvec3 &toPoint)
+                        -> std::expected<void, std::string> {
+                    if(cancelled()) return std::unexpected("cancelled");
+                    if(++subdivisionNodes > PREVIEW_CURVE_MAXIMUM_SUBDIVISION_NODES)
+                        return std::unexpected(std::format(
+                            "preview curve tessellation exceeded {} subdivision nodes",
+                            PREVIEW_CURVE_MAXIMUM_SUBDIVISION_NODES));
+                    const auto worldError = ngc::chordErrorBound(
+                        curve, from, to, curveWorkspace);
+                    // Orthographic projection cannot amplify a spatial error by more than
+                    // the largest pixels-per-world-unit scale. This makes the prepared
+                    // curve's conservative chord bound the screen-space acceptance proof.
+                    const auto screenError = worldError * pixelsPerWorldUnit;
+                    if(!std::isfinite(screenError) || screenError < 0.0)
+                        return std::unexpected(
+                            "preview curve tessellation produced a non-finite error bound");
+                    if(regionOutsideView(fromPoint, toPoint, screenError)) return {};
+                    if(screenError <= PREVIEW_CURVE_ERROR_PIXELS) {
+                        segment(vertices, fromPoint, toPoint);
+                        return {};
+                    }
+                    const auto middleDistance = std::midpoint(from, to);
+                    if(!(middleDistance > from && middleDistance < to))
+                        return std::unexpected(
+                            "preview curve tessellation exhausted floating-point distance resolution");
+                    const auto middlePoint = position(middleDistance);
+                    if(auto left = self(self, from, fromPoint, middleDistance, middlePoint); !left)
+                        return left;
+                    return self(self, middleDistance, middlePoint, to, toPoint);
+                };
+                if(auto emitted = emit(emit, fromDistance, beginning, toDistance, ending); !emitted)
+                    return std::unexpected(emitted.error());
                 return std::pair { beginning, ending };
             };
             for(const auto &slice : preparedScene.continuousSlices) {
                 for(const auto &piece : slice.pieces) {
+                    if(cancelled()) return std::unexpected("cancelled");
                     if(!piece.curve) continue;
                     const auto offset = commandOffset(slice, piece.primaryCommand);
                     auto *vertices = piece.kind == ngc::PreparedPieceKind::ClusterSpline
@@ -597,9 +666,11 @@ public:
                             ? &cache.g64SplineLines
                             : piece.kind == ngc::PreparedPieceKind::RetainedArcSection
                                 ? &cache.arcLines : &cache.feedLines;
-                    const auto [beginning, ending] = appendCurve(
+                    const auto appended = appendCurve(
                         *piece.curve, piece.curveFrom, piece.curveTo, offset, *vertices,
                         piece.kind != ngc::PreparedPieceKind::RetainedLineSection);
+                    if(!appended) return std::unexpected(appended.error());
+                    const auto &[beginning, ending] = *appended;
                     cache.darkPoints.push_back(beginning);
                     cache.lightPoints.push_back(ending);
 
@@ -636,6 +707,7 @@ public:
             }
 
             for(const auto &standalone : preparedScene.standaloneCommands) {
+                if(cancelled()) return std::unexpected("cancelled");
                 if(!standalone.displayGeometry) continue;
                 const auto &command = standalone.command.command;
                 auto *vertices = &cache.feedLines;
@@ -654,9 +726,11 @@ public:
 
                 const auto &curve = *standalone.displayGeometry;
                 const auto offset = standalone.command.presentation.activeToolOffset;
-                const auto [beginning, ending] = appendCurve(
+                const auto appended = appendCurve(
                     curve, 0.0, curve.length, offset, *vertices,
                     std::holds_alternative<ngc::MoveArc>(command));
+                if(!appended) return std::unexpected(appended.error());
+                const auto &[beginning, ending] = *appended;
                 if(showEndpoints) {
                     cache.darkPoints.push_back(beginning);
                     cache.lightPoints.push_back(ending);
@@ -681,6 +755,7 @@ public:
                     }
                 }
             }
+            if(cancelled()) return std::unexpected("cancelled");
             return cache;
     }
 
@@ -708,9 +783,15 @@ public:
         return std::pair { first, last };
     }
 
-    PreviewRenderCache cullPreviewGeometry(const PreviewRenderCache &source,
-                                             const PreviewViewSnapshot &view) const {
+    std::optional<PreviewRenderCache> cullPreviewGeometry(
+            const PreviewRenderCache &source,
+            const PreviewViewSnapshot &view) const {
         PreviewRenderCache visible;
+        const auto cancelled = [&] {
+            return m_stopPreviewVisibilityRequested.load(std::memory_order_acquire)
+                || m_latestPreviewGeneration.load(std::memory_order_acquire)
+                    != view.generation;
+        };
         visible.revision = source.revision;
         visible.sceneMinimum = source.sceneMinimum;
         visible.sceneMaximum = source.sceneMaximum;
@@ -729,6 +810,7 @@ public:
                                    const bool includeInCentroid) {
             output.reserve(input.size());
             for(std::size_t index = 1; index < input.size(); index += 2) {
+                if(cancelled()) return false;
                 const auto &from = input[index - 1];
                 const auto &to = input[index];
                 const auto projectedFrom = project(from);
@@ -748,34 +830,38 @@ public:
                 weightedCentroid += glm::mix(from, to, (first + last) * 0.5) * weight;
                 centroidWeight += weight;
             }
+            return true;
         };
         const auto cullPoints = [&](const std::vector<glm::dvec3> &input,
                                     std::vector<glm::dvec3> &output) {
             output.reserve(input.size());
             for(const auto &point : input) {
+                if(cancelled()) return false;
                 const auto projected = project(point);
                 if(std::abs(projected.x) <= 1.0 + PREVIEW_VISIBILITY_MARGIN
                    && std::abs(projected.y) <= 1.0 + PREVIEW_VISIBILITY_MARGIN)
                     output.push_back(point);
             }
+            return true;
         };
 
-        cullLines(source.feedLines, visible.feedLines, true);
-        cullLines(source.rapidLines, visible.rapidLines, true);
-        cullLines(source.g53FeedLines, visible.g53FeedLines, true);
-        cullLines(source.g53RapidLines, visible.g53RapidLines, true);
-        cullLines(source.arcLines, visible.arcLines, true);
-        cullLines(source.probeLines, visible.probeLines, true);
-        cullLines(source.g64SplineLines, visible.g64SplineLines, true);
-        cullLines(source.g64ClusterSplineLines, visible.g64ClusterSplineLines, true);
-        cullLines(source.g64ControlPolygon, visible.g64ControlPolygon, false);
-        cullPoints(source.g64ControlPoints, visible.g64ControlPoints);
-        cullPoints(source.darkPoints, visible.darkPoints);
-        cullPoints(source.lightPoints, visible.lightPoints);
+        if(!cullLines(source.feedLines, visible.feedLines, true)
+           ||!cullLines(source.rapidLines, visible.rapidLines, true)
+           ||!cullLines(source.g53FeedLines, visible.g53FeedLines, true)
+           ||!cullLines(source.g53RapidLines, visible.g53RapidLines, true)
+           ||!cullLines(source.arcLines, visible.arcLines, true)
+           ||!cullLines(source.probeLines, visible.probeLines, true)
+           ||!cullLines(source.g64SplineLines, visible.g64SplineLines, true)
+           ||!cullLines(source.g64ClusterSplineLines, visible.g64ClusterSplineLines, true)
+           ||!cullLines(source.g64ControlPolygon, visible.g64ControlPolygon, false)
+           ||!cullPoints(source.g64ControlPoints, visible.g64ControlPoints)
+           ||!cullPoints(source.darkPoints, visible.darkPoints)
+           ||!cullPoints(source.lightPoints, visible.lightPoints)) return std::nullopt;
         if(centroidWeight > 0.0) visible.visibleCentroid = weightedCentroid / centroidWeight;
 
         visible.clusterGeometricJerkComb.reserve(source.clusterGeometricJerkComb.size());
         for(const auto &sample : source.clusterGeometricJerkComb) {
+            if(cancelled()) return std::nullopt;
             const auto projected = project(sample.position);
             if(std::abs(projected.x) > 1.0 + PREVIEW_VISIBILITY_MARGIN
                || std::abs(projected.y) > 1.0 + PREVIEW_VISIBILITY_MARGIN) continue;
@@ -789,6 +875,9 @@ public:
     void previewVisibilityWork() {
         ngc::PreparedPreviewScene scene;
         bool hasScene = false;
+        bool hasCompleteSceneBounds = false;
+        glm::dvec3 completeSceneMinimum{};
+        glm::dvec3 completeSceneMaximum{};
         std::uint64_t processedGeneration = 0;
         auto nextBuild = std::chrono::steady_clock::now();
         for(;;) {
@@ -813,16 +902,39 @@ public:
             if(!hasScene || scene.revision != view.previewRevision) {
                 scene = m_worker.lock([&] { return m_worker.preparedPreview(); });
                 hasScene = true;
+                hasCompleteSceneBounds = false;
                 view.previewRevision = scene.revision;
             }
-            const auto source = buildPreviewGeometry(scene, view);
-            auto visible = cullPreviewGeometry(source, view);
+            auto source = buildPreviewGeometry(
+                scene, view, hasCompleteSceneBounds);
+            if(!source) {
+                if(source.error() != "cancelled")
+                    std::println(stderr, "Preview geometry rebuild failed: {}", source.error());
+                std::scoped_lock lock(m_previewVisibilityMutex);
+                processedGeneration = view.generation;
+                continue;
+            }
+            if(!hasCompleteSceneBounds && source->hasSceneGeometry) {
+                completeSceneMinimum = source->sceneMinimum;
+                completeSceneMaximum = source->sceneMaximum;
+                hasCompleteSceneBounds = true;
+            } else if(hasCompleteSceneBounds) {
+                source->sceneMinimum = completeSceneMinimum;
+                source->sceneMaximum = completeSceneMaximum;
+                source->hasSceneGeometry = true;
+            }
+            auto visible = cullPreviewGeometry(*source, view);
+            if(!visible) {
+                std::scoped_lock lock(m_previewVisibilityMutex);
+                processedGeneration = view.generation;
+                continue;
+            }
             {
                 std::scoped_lock lock(m_previewVisibilityMutex);
                 if(m_stopPreviewVisibility) return;
                 if(view.generation >= m_readyPreviewGeneration) {
                     m_readyPreviewGeneration = view.generation;
-                    m_readyPreviewRenderCache = std::move(visible);
+                    m_readyPreviewRenderCache = std::move(*visible);
                 }
                 processedGeneration = view.generation;
             }
@@ -852,6 +964,8 @@ public:
         m_requestedPreviewView.viewportHeight = height;
         m_requestedPreviewView.previewRevision = revision;
         ++m_requestedPreviewView.generation;
+        m_latestPreviewGeneration.store(
+            m_requestedPreviewView.generation, std::memory_order_release);
         m_hasRequestedPreviewView = true;
         m_previewVisibilityCv.notify_one();
     }
@@ -864,7 +978,7 @@ public:
             ready = std::move(m_readyPreviewRenderCache);
             m_readyPreviewRenderCache.reset();
         }
-        if(ready->visibleCentroid) {
+        if(ready->visibleCentroid&&!m_rotationDragHasPivot) {
             const auto compensation = m_modelOrientation
                 * displayOffset(*ready->visibleCentroid - m_modelPivot);
             m_viewPan.x += compensation.x;
@@ -932,7 +1046,13 @@ public:
             fitToolpathToView(width, height);
         }
 
-        if(navigationActive && middleDown && !ctrl && !shift) {
+        if(ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) {
+            m_rotationDragHasPivot=navigationActive&&!ctrl&&!shift
+                &&pickToolpathRotationPivot(width,height,viewportLeft,viewportTop);
+        }
+        if(!middleDown) m_rotationDragHasPivot=false;
+
+        if(navigationActive&&middleDown&&!ctrl&&!shift&&m_rotationDragHasPivot) {
             const auto horizontal = glm::angleAxis(-m_mouseDX * 0.01, glm::dvec3(0.0, 0.0, 1.0));
             const auto vertical = glm::angleAxis(-m_mouseDY * 0.01, glm::dvec3(1.0, 0.0, 0.0));
             m_modelOrientation = glm::normalize(vertical * horizontal * m_modelOrientation);
@@ -1358,6 +1478,18 @@ public:
         ImGui::BeginDisabled(m_worker.busy());
         if(ImGui::Button("Clear Preview")) m_worker.clearPreview();
         ImGui::EndDisabled();
+        ImGui::SameLine();
+        ImGui::BeginDisabled(!m_previewRenderCache.hasSceneGeometry);
+        if(ImGui::Button("Fit Toolpath to View")) {
+            const auto width=std::max(static_cast<int>(std::round(
+                m_viewportRect.z-m_viewportRect.x)),1);
+            const auto height=std::max(static_cast<int>(std::round(
+                m_viewportRect.w-m_viewportRect.y)),1);
+            fitToolpathToView(width,height);
+        }
+        ImGui::EndDisabled();
+        if(ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
+            ImGui::SetTooltip("Fit the complete preview toolpath to the viewport (F).");
         ImGui::SameLine();
         ImGui::Checkbox("Cluster jerk comb", &m_showClusterGeometricJerkComb);
         if(ImGui::IsItemHovered())
