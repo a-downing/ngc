@@ -30,7 +30,7 @@ namespace ngc {
         std::size_t candidateBudgetMultiplier = 1;
         // Production defaults remain bounded. Standalone offline profiles may
         // raise these ceilings to measure difficult high-jerk horizons.
-        unsigned maximumLocalCorrectionPasses = 24;
+        unsigned maximumLocalCorrectionPasses = 32;
         std::size_t geometryVerificationBudgetMultiplier = 36;
         bool capLargeHorizonVelocitySearch = true;
         double curvatureDerivativeVelocityCapMultiplier = 1.0;

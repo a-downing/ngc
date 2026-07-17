@@ -258,9 +258,15 @@ namespace ngc {
         }
 
         std::optional<RollingSplit> rollingSplit(const MachineCommand &command,
-                                                  const double blendScale) const {
+                                                  const double programmedScale) const {
             const auto length=continuousMotionLength(command);
-            if(!length||*length<6.0*blendScale*(1.0-1e-10)) return std::nullopt;
+            // A rolling anchor is valid only inside the exact retained middle
+            // of a line that is genuinely longer than the complete 6P blend
+            // allocation. Using the entity's automatic min(P, length / 6)
+            // scale makes every short line satisfy this test by equality and
+            // lets a rolling boundary cut through a spline cluster.
+            if(!length||*length<=6.0*programmedScale*(1.0+1e-10))
+                return std::nullopt;
             const auto splitDistance=*length/2.0;
             return std::visit([&](const auto &value) -> std::optional<RollingSplit> {
                 using T=std::decay_t<decltype(value)>;
@@ -752,7 +758,7 @@ namespace ngc {
                 const auto entityScale=m_window[index].continuousScaleOverride>0.0
                     ?m_window[index].continuousScaleOverride:std::min(blendScale,*length/6.0);
                 if(auto candidate=std::holds_alternative<MoveLine>(m_window[index].command)
-                        ?rollingSplit(m_window[index].command,entityScale):std::nullopt;
+                        ?rollingSplit(m_window[index].command,blendScale):std::nullopt;
                    candidate&&nominalDuration+candidate->prefixLength/feed
                         >=m_exactStop.limits().lookaheadDuration
                    &&(allowTerminalStop||totalNominalDuration-nominalDuration

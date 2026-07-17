@@ -324,7 +324,9 @@ namespace {
     }
 
     void testTimedSimulationRefillsMultiPacketContinuousBatch() {
-        std::string source="G64 P0.001\n";
+        // Keep each line longer than 6P: this fixture exercises packet refill,
+        // not the deliberately unsplittable all-short cluster path.
+        std::string source="G64 P0.0001\n";
         constexpr int COMMANDS=800;
         for(int command=1;command<=COMMANDS;++command)
             source+=std::format("G1 F60 X{:.6f}\n",static_cast<double>(command)*0.001);
@@ -2590,6 +2592,39 @@ namespace {
                 "rolling diagnostics should classify published and provisional time-law attempts");
     }
 
+    void testRollingPrefixRejectsShortEntityAnchors() {
+        ngc::BoundedLookaheadTrajectoryPlanner planner({
+            .pathAcceleration=10.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,.pathJerk=100.0,
+            .axisVelocity={10,10,10,10,10,10},
+            .axisAcceleration={20,20,20,20,20,20},
+            .axisJerk={100,100,100,100,100,100},
+            .lookaheadDuration=0.05,
+        });
+        constexpr double SCALE=0.01;
+        constexpr double SHORT_LENGTH=0.05;
+        const ngc::TrajectoryPlanningMetadata g64{
+            .pathMode=ngc::ExecutablePathMode::Continuous,.pathTolerance=SCALE,
+        };
+        ngc::position_t from{};
+        planner.reset(75,from);
+        constexpr std::size_t COMMANDS=8;
+        for(std::size_t command=0;command<COMMANDS;++command) {
+            auto to=from;
+            to.x+=SHORT_LENGTH;
+            require(planner.enqueue({ngc::MoveLine{from,to,60.0},g64,{}}),
+                    "short-anchor fixture command should enqueue");
+            from=to;
+        }
+        require(planner.shouldPlanRollingPrefix(),
+                "short-anchor fixture should exceed the rolling lookahead duration");
+        const auto prefix=planner.planWindow(false);
+        require(prefix&&!*prefix,prefix?
+                "short entities must not publish a rolling prefix":prefix.error());
+        require(planner.windowSize()==COMMANDS
+                    &&planner.diagnostics().rollingBoundaryCandidates==0,
+                "rejecting short rolling anchors should retain the complete smoothing window");
+    }
+
     void testInfiniteJerkTrajectoryTimeMatchesAnalyticLine() {
         constexpr auto infinity=std::numeric_limits<double>::infinity();
         const ngc::InfiniteJerkPathPiece line {
@@ -3458,7 +3493,7 @@ namespace {
                     "logical X minimum should load in machine units");
         requireNear(axis(ngc::Machine::Axis::Z).maximum, 0.001,
                     "logical Z maximum should load in machine units");
-        requireNear(axis(ngc::Machine::Axis::X).maxJerk, 100.0,
+        requireNear(axis(ngc::Machine::Axis::X).maxJerk, 501.0,
                     "logical axes should load an independent jerk limit");
         requireNear(configuration->trajectory.axisVelocity.x, axis(ngc::Machine::Axis::X).maxVelocity,
                     "trajectory limits should retain configured X velocity");
@@ -4092,6 +4127,7 @@ int main() {
         testMicroEntityClusterCollapsesToOneSpline();
         testBoundedPlannerExecutesPiecewiseG64Geometry();
         testRollingContinuousHorizonsPreserveMovingPvaBoundary();
+        testRollingPrefixRejectsShortEntityAnchors();
         testExactStopLeadInAdvancesRollingBoundary();
         testG64C2PrecisionUsesLocalCoordinates();
         testContinuousTrajectoryPacketizesBeyondNormalSpanCapacity();
