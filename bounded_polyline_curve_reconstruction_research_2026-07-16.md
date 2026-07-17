@@ -289,9 +289,9 @@ axis acceleration = q'(s) a + q''(s) x
 dx/ds = 2a
 ```
 
-At each geometry query it analytically intersects the aggregate path-acceleration ball and every per-axis acceleration interval, applies programmed-feed and per-axis velocity caps, propagates forward and backward maximum squared-speed envelopes, and integrates `dt = 2 ds / (v0 + v1)`. Successive uniform refinements must converge in duration. Exact circular/helical arc curvature comes from analytic first and second parameter derivatives; B-spline curvature uses the existing analytic arc-length derivative. The calculation does not call Clarabel and does not use Ruckig to choose local transitions. It is opt-in through `compileContinuous()` and never enters normal planning, `PlanChunk`, `MotionBackend`, or RT execution.
+At each geometry query it analytically intersects the aggregate path-acceleration ball and every per-axis acceleration interval, applies programmed-feed and per-axis velocity caps, propagates forward and backward maximum squared-speed envelopes, and integrates `dt = 2 ds / (v0 + v1)`. Successive uniform refinements must converge in duration. Exact circular/helical arc curvature comes from analytic first and second parameter derivatives; B-spline curvature uses the existing analytic arc-length derivative. The calculation does not call an external optimizer and does not use Ruckig to choose local transitions. It is opt-in through `compileContinuous()` and never enters normal planning, `PlanChunk`, `MotionBackend`, or RT execution.
 
-The direct result is a numerically converged acceleration-only comparison, not an executable trajectory or a formal continuous lower-bound certificate. It is nevertheless a more relevant infinite-jerk asymptote than the earlier Clarabel export because it uses the same complete smoothed geometry while removing jerk-derived local caps. Recorded full-horizon results are:
+The direct result is a numerically converged acceleration-only comparison, not an executable trajectory or a formal continuous lower-bound certificate. It uses the same complete smoothed geometry while removing jerk-derived local caps. Recorded full-horizon results are:
 
 | Program | Jerk multiplier | Verified planner | Direct infinite-jerk | Planner excess |
 | --- | ---: | ---: | ---: | ---: |
@@ -592,7 +592,7 @@ Completed in production with a bit-exact result cache rather than a Chebyshev au
 
 ### Experiment F: offline optimality oracle
 
-Use the existing Clarabel-oriented tooling or a separate SLP/SCP model to compute discretized lower bounds and seeds. If repeated fixed-sparsity QPs become useful, [OSQP](https://osqp.org/docs/) supports cached factorization, warm starts, and vector/matrix-value updates. This remains an offline comparison path; a discretized optimizer result is not an executable proof.
+Use a separate offline SLP/SCP model to compute discretized lower bounds and seeds if that research becomes useful again. If repeated fixed-sparsity QPs become useful, [OSQP](https://osqp.org/docs/) supports cached factorization, warm starts, and vector/matrix-value updates. A discretized optimizer result is not an executable proof.
 
 ## 10. Approaches that should not be imported uncritically
 

@@ -8,7 +8,9 @@
 #include <unordered_map>
 
 #include "evaluator/InterpreterSession.h"
+#include "machine/GeometryStreamProducer.h"
 #include "machine/ToolpathRecorder.h"
+#include "machine/PreparedGeometry.h"
 #include "memory/Vars.h"
 
 class Worker {
@@ -18,6 +20,7 @@ class Worker {
 
     ngc::InterpreterSession m_session;
     ngc::ToolpathRecorder m_toolpath;
+    ngc::PreparedPreviewScene m_preparedPreview;
     std::unordered_map<ngc::Var, double> m_parameterSnapshot;
 
     bool m_doJoin = false;
@@ -49,6 +52,7 @@ public:
 
     const ngc::Machine &machine() const { return m_session.machine(); }
     const ngc::ToolpathRecorder &toolpath() const { return m_toolpath; }
+    const ngc::PreparedPreviewScene &preparedPreview() const { return m_preparedPreview; }
 
     bool compiled() const {
         std::scoped_lock lock(m_mutex);
@@ -125,6 +129,9 @@ public:
         std::scoped_lock lock(m_mutex);
         if(m_busy) return false;
         m_toolpath.clear();
+        const auto revision = m_preparedPreview.revision + 1;
+        m_preparedPreview = {};
+        m_preparedPreview.revision = revision;
         return true;
     }
 
@@ -174,65 +181,83 @@ private:
             m_toolpath.clear();
         }
 
-        // Preview consumes canonical geometry directly. Timed polynomial
-        // planning, constraint verification, packetization, and backend
-        // execution belong to Simulation/RealRun and provide no display data.
         ngc::ToolpathRecorder preview;
-        for(;;) {
-            if(joinRequested()) {
-                m_session.stop();
-                break;
-            }
+        ngc::PreviewGeometryCollector preparedPreview;
+        ngc::PreparedGeometryForwardChannel forward;
+        ngc::GeometryFeedbackChannel feedback;
+        std::atomic<bool> cancelled = false;
+        ngc::GeometryStreamProducer producer(m_session, forward, feedback, cancelled);
+        std::thread geometryThread([&] { (void)producer.run(1); });
+        std::optional<std::string> failure;
+        const auto sendFeedback = [&](ngc::GeometryFeedback value) {
+            auto message = std::make_unique<const ngc::GeometryFeedback>(std::move(value));
+            return feedback.waitPush(std::move(message), [&] { return cancelled.load(); });
+        };
+        const auto record = [&](const ngc::PreparedCommandRecord &command) {
+            if(!command.presentationActivation) return;
+            auto canonical = command.command;
+            preview.consume(std::move(canonical), command.presentation.activeToolOffset,
+                command.presentation.workCoordinateSystem.value_or(ngc::WorkCoordinateSystem{}),
+                command.metadata.pathMode == ngc::ExecutablePathMode::Continuous,
+                command.metadata.pathTolerance);
+        };
 
-            auto event=m_session.next([&](const auto &callback) {
-                std::scoped_lock lock(m_mutex);
-                callback();
-            });
-            if(auto *command=std::get_if<ngc::MachineCommand>(&event)) {
-                ngc::position_t activeToolOffset;
-                ngc::WorkCoordinateSystem workCoordinateSystem;
-                bool g64Active=false;
-                std::optional<double> g64Tolerance;
-                {
-                    std::scoped_lock lock(m_mutex);
-                    activeToolOffset=m_session.machine().toolOffset();
-                    workCoordinateSystem={
-                        std::string(name(*m_session.machine().state().modeCoordSys)),
-                        m_session.machine().workOffset()};
-                    g64Active=m_session.machine().state().modePath==ngc::GCPath::G64;
-                    g64Tolerance=m_session.machine().pathTolerance();
+        auto complete = false;
+        while(!complete) {
+            ngc::PreparedForwardMessage message;
+            if(!forward.waitPop(message, [&] { return cancelled.load(); })) break;
+            auto retainForPreview = false;
+            std::visit([&](const auto &value) {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr(std::same_as<T, ngc::PreparedGeometrySlice>) {
+                    for(const auto &command : value.commands) record(command);
+                    retainForPreview = true;
+                } else if constexpr(std::same_as<T, ngc::PreparedStandaloneCommand>) {
+                    record(value.command);
+                    retainForPreview = true;
+                } else if constexpr(std::same_as<T, ngc::PreparedSynchronizationFence>) {
+                    if(!sendFeedback(ngc::ReleaseSynchronization{value.epoch, value.fence}))
+                        failure = "preview could not release an interpreter synchronization fence";
+                } else if constexpr(std::same_as<T, ngc::PreparedProbeFence>) {
+                    const auto commands = preview.commands();
+                    const auto probe = std::ranges::find_if(commands, [&](const auto &command) {
+                        const auto *candidate = std::get_if<ngc::ProbeMove>(&command);
+                        return candidate && candidate->id() == value.commandId;
+                    });
+                    if(probe == commands.end()) {
+                        failure = std::format("preview probe fence {} has no preceding probe", value.commandId);
+                    } else {
+                        const auto &move = std::get<ngc::ProbeMove>(*probe);
+                        if(!sendFeedback(ngc::DeliverProbeResult{value.epoch, {
+                                move.id(), ngc::ProbeStatus::Triggered,
+                                move.target(), move.target()}}))
+                            failure = "preview could not return its canonical probe result";
+                    }
+                } else if constexpr(std::same_as<T, ngc::PreparedFailure>) {
+                    failure = std::format("preview continuous geometry preparation failed: {}", value.error);
+                    complete = true;
+                } else if constexpr(std::same_as<T, ngc::PreparedProgramEnd>) {
+                    complete = true;
                 }
-                std::optional<ngc::ProbeMove> probe;
-                if(const auto *value=std::get_if<ngc::ProbeMove>(command)) probe=*value;
-                preview.consume(std::move(*command),activeToolOffset,std::move(workCoordinateSystem),
-                    g64Active,g64Tolerance);
-                if(probe) {
-                    // Geometry preview assumes contact at the canonical probe
-                    // target. Physical tool length/contact simulation belongs
-                    // only to timed execution.
-                    const auto result=ngc::ProbeResult{
-                        probe->id(),ngc::ProbeStatus::Triggered,probe->target(),probe->target()};
-                    std::scoped_lock lock(m_mutex);
-                    m_session.provideProbeResult(result);
-                }
-            } else if(std::holds_alternative<ngc::InterpreterCompleted>(event)) {
-                break;
-            } else if(std::holds_alternative<ngc::InterpreterError>(event)) {
-                break;
-            } else if(const auto *waiting=std::get_if<ngc::InterpreterWaitingForProbe>(&event)) {
-                {
-                    std::scoped_lock lock(m_mutex);
-                    m_session.reportError(std::format(
-                        "preview reached probe barrier {} without its canonical probe command",
-                        waiting->commandId));
-                }
-                m_session.stop();
-                break;
+            }, *message);
+            if(retainForPreview) preparedPreview.consume(std::move(*message));
+            if(failure) {
+                cancelled.store(true);
+                forward.notifyAll();
+                feedback.notifyAll();
             }
+        }
+        if(geometryThread.joinable()) geometryThread.join();
+        if(failure) {
+            std::scoped_lock lock(m_mutex);
+            m_session.reportError(*failure);
         }
 
         std::scoped_lock lock(m_mutex);
         m_toolpath.replace(std::move(preview));
+        auto completedPreview = preparedPreview.finish();
+        completedPreview.revision = m_preparedPreview.revision + 1;
+        m_preparedPreview = std::move(completedPreview);
         refreshParameterSnapshot();
         m_busy = false;
     }

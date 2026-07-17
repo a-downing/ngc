@@ -604,52 +604,6 @@ namespace {
         },command);
     }
 
-    void writeModel(const std::filesystem::path &path,
-                    const ngc::ContinuousAccelerationOracleModel &model) {
-        std::ofstream output(path,std::ios::binary|std::ios::trunc);
-        if(!output) throw std::runtime_error(std::format("could not open {}",path.string()));
-        output.precision(17);
-        output<<"ngc_clarabel_trajectory_oracle_v3\n";
-        output<<"path_acceleration "<<model.pathAcceleration<<'\n';
-        output<<"axis_acceleration "<<model.axisAcceleration.x<<' '
-              <<model.axisAcceleration.y<<' '<<model.axisAcceleration.z<<' '
-              <<model.axisAcceleration.a<<' '<<model.axisAcceleration.b<<' '
-              <<model.axisAcceleration.c<<'\n';
-        output<<"path_jerk "<<model.pathJerk<<'\n';
-        output<<"axis_jerk "<<model.axisJerk.x<<' '
-              <<model.axisJerk.y<<' '<<model.axisJerk.z<<' '
-              <<model.axisJerk.a<<' '<<model.axisJerk.b<<' '
-              <<model.axisJerk.c<<'\n';
-        output<<"planner_duration "<<model.plannerDuration<<'\n';
-        output<<"piece_count "<<model.pieceTiming.size()<<'\n';
-        for(std::size_t index=0;index<model.pieceTiming.size();++index) {
-            const auto &piece=model.pieceTiming[index];
-            output<<"piece "<<index<<' '<<piece.input<<' '<<piece.length<<' '
-                  <<piece.velocityLimit<<' '<<piece.accelerationLimit<<' '<<piece.jerkLimit<<' '
-                  <<piece.entryVelocity<<' '<<piece.entryAcceleration<<' '
-                  <<piece.exitVelocity<<' '<<piece.exitAcceleration<<' '<<piece.duration<<'\n';
-        }
-        output<<"segment_count "<<model.segments.size()<<'\n';
-        for(const auto &segment:model.segments) {
-            output<<"segment "<<segment.piece<<' '<<segment.input<<' '
-                  <<segment.length<<' '<<segment.velocityLimit<<' '
-                  <<segment.tangent.x<<' '<<segment.tangent.y<<' '
-                  <<segment.tangent.z<<' '<<segment.tangent.a<<' '
-                  <<segment.tangent.b<<' '<<segment.tangent.c<<' '
-                  <<segment.curvature.x<<' '<<segment.curvature.y<<' '
-                  <<segment.curvature.z<<' '<<segment.curvature.a<<' '
-                  <<segment.curvature.b<<' '<<segment.curvature.c<<' '
-                  <<segment.curvatureDerivative.x<<' '
-                  <<segment.curvatureDerivative.y<<' '
-                  <<segment.curvatureDerivative.z<<' '
-                  <<segment.curvatureDerivative.a<<' '
-                  <<segment.curvatureDerivative.b<<' '
-                  <<segment.curvatureDerivative.c<<'\n';
-        }
-        output.flush();
-        if(!output) throw std::runtime_error(std::format("incomplete write to {}",path.string()));
-    }
-
     void writeGeometrySnapshot(const std::filesystem::path &path,
             const std::span<const ngc::MachineCommand> commands,
             const std::span<const CapturedSplineTrace> splines) {
@@ -702,7 +656,7 @@ namespace {
 int main(const int argc,char **argv) {
     try {
         if(argc<3||argc>8) {
-            std::cerr<<"usage: ngc_g64_oracle_export <program.ngc> <model.txt> "
+            std::cerr<<"usage: ngc_g64_oracle_export <program.ngc> <diagnostic-path> "
                 "[machine.toml] [jerk-multiplier] [--rolling|--rolling-only] "
                 "[--effort=current|replay|no-replay|replay-shadow|global-time-cache|local-time-cache|derivative125|derivative150|derivative200|derivative250|derivative300|no-derivative-cap|velocity6|velocity8|velocity10|velocity12|combined|combined20|combined40|medium|high|extreme] "
                 "[--trace-slow]\n";
@@ -719,7 +673,7 @@ int main(const int argc,char **argv) {
         effort.captureSplineGeometry=traceSlow;
         if(argc==8&&!traceSlow) throw std::runtime_error("the final argument must be --trace-slow");
         const std::filesystem::path sourcePath=argv[1];
-        const std::filesystem::path modelPath=argv[2];
+        const std::filesystem::path diagnosticPath=argv[2];
         const std::filesystem::path configurationPath=argc>=4?argv[3]:"machine.toml";
         auto jerkMultiplier=1.0;
         if(argc>=5) {
@@ -912,8 +866,8 @@ int main(const int argc,char **argv) {
             printTimeLawDiagnostics("rolling suffix probes",
                 diagnostics.rollingSuffixProbeTimeLaw);
             if(traceSlow) {
-                writeGeometrySnapshot(modelPath,window.commands,capturedSplines);
-                writePieceTimingSnapshot(modelPath,plannedPieces);
+                writeGeometrySnapshot(diagnosticPath,window.commands,capturedSplines);
+                writePieceTimingSnapshot(diagnosticPath,plannedPieces);
                 printSlowRuns(executedSpans);
                 printSlowPieceRuns(plannedPieces);
                 printLimitingPieces(std::move(plannedPieces));
@@ -926,20 +880,18 @@ int main(const int argc,char **argv) {
         ngc::ExactStopTrajectoryPlanner planner(trajectoryLimits);
         planner.setContinuousPlanningEffort(effort);
         planner.reset(1,startPosition(window.commands.front()));
-        ngc::ContinuousAccelerationOracleModel model;
         ngc::InfiniteJerkTrajectoryTimeResult infiniteJerkTime;
         const auto planningStart=std::chrono::steady_clock::now();
-        const auto plan=planner.compileContinuous(window.commands,*window.blendScale,&model,
+        const auto plan=planner.compileContinuous(window.commands,*window.blendScale,
             std::nullopt,std::nullopt,{},12U,&infiniteJerkTime);
         const auto planningEnd=std::chrono::steady_clock::now();
         if(!plan) throw std::runtime_error(plan.error());
-        const auto writingStart=std::chrono::steady_clock::now();
-        writeModel(modelPath,model);
-        const auto writingEnd=std::chrono::steady_clock::now();
+        auto plannerDuration=0.0;
+        for(const auto &piece:(*plan)->pieceTiming) plannerDuration+=piece.duration;
         std::size_t normalSpans=0;
         for(const auto &chunk:(*plan)->chunks) normalSpans+=chunk.normalMotion.size;
         std::cout<<std::format(
-            "exported {} oracle segments from {} motions and {} verified spans; "
+            "planned {} motions into {} verified spans; "
             "planner duration={} s; "
             "smoothed-path infinite-jerk duration={} s (gap={} s, {}%); "
             "infinite-jerk last-refinement delta={} s intervals={} refinements={}; "
@@ -952,11 +904,10 @@ int main(const int argc,char **argv) {
             "iteration-limit hits={} maximum iterations={}; arc inverse queries={} endpoints={} "
             "exact cache hits={} construction integrals={} inverse integrals={} Newton iterations={} "
             "seed convergences={} bisections={} iteration-limit hits={} maximum iterations={}; "
-            "plan calculation wall={} s; "
-            "model write wall={} s\n",
-            model.segments.size(),window.commands.size(),normalSpans,model.plannerDuration,
-            infiniteJerkTime.duration,model.plannerDuration-infiniteJerkTime.duration,
-            100.0*(model.plannerDuration/infiniteJerkTime.duration-1.0),
+            "plan calculation wall={} s\n",
+            window.commands.size(),normalSpans,plannerDuration,
+            infiniteJerkTime.duration,plannerDuration-infiniteJerkTime.duration,
+            100.0*(plannerDuration/infiniteJerkTime.duration-1.0),
             infiniteJerkTime.estimatedDurationError,infiniteJerkTime.intervals,
             infiniteJerkTime.refinements,
             (*plan)->velocityOnlySeedDuration,
@@ -980,11 +931,10 @@ int main(const int argc,char **argv) {
             (*plan)->arcInverse.safeguardedBisections,
             (*plan)->arcInverse.iterationLimitHits,
             (*plan)->arcInverse.maximumNewtonIterations,
-            std::chrono::duration<double>(planningEnd-planningStart).count(),
-            std::chrono::duration<double>(writingEnd-writingStart).count());
+            std::chrono::duration<double>(planningEnd-planningStart).count());
         printTimeLawDiagnostics("full horizon",(*plan)->timeLaw);
         printCorrectionPassDetails("full horizon",(*plan)->timeLaw);
-        if(rolling) runRolling(model.plannerDuration);
+        if(rolling) runRolling(plannerDuration);
         return 0;
     } catch(const std::exception &error) {
         std::cerr<<"ERROR: "<<error.what()<<'\n';

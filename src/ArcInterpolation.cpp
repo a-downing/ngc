@@ -22,6 +22,10 @@ namespace ngc::simulation_detail {
             return { value.x*amount, value.y*amount, value.z*amount,
                      value.a*amount, value.b*amount, value.c*amount };
         }
+        double positionDot(const position_t &left, const position_t &right) {
+            return left.x*right.x+left.y*right.y+left.z*right.z
+                +left.a*right.a+left.b*right.b+left.c*right.c;
+        }
 
         double adaptiveSimpson(const std::function<double(double)> &function,
                                const double from, const double to, const double tolerance,
@@ -128,6 +132,31 @@ namespace ngc::simulation_detail {
         return {xyz.x,xyz.y,xyz.z,0.0,0.0,0.0};
     }
 
+    position_t ArcReference::thirdDerivative(const double requestedParameter) const {
+        const auto parameter = std::clamp(requestedParameter, 0.0, 1.0);
+        if(!m_geometry) return {};
+        const auto &geometry = *m_geometry;
+        const auto start = rotate(geometry.startArm, geometry.sweep*parameter,
+                                  geometry.axisUnit);
+        const auto end = rotate(geometry.endArm,
+            -geometry.sweep*(1.0-parameter), geometry.axisUnit);
+        const auto startDerivative = scale(
+            cross(geometry.axisUnit, start), geometry.sweep);
+        const auto endDerivative = scale(
+            cross(geometry.axisUnit, end), geometry.sweep);
+        const auto startSecond = scale(
+            cross(geometry.axisUnit, startDerivative), geometry.sweep);
+        const auto endSecond = scale(
+            cross(geometry.axisUnit, endDerivative), geometry.sweep);
+        const auto startThird = scale(
+            cross(geometry.axisUnit, startSecond), geometry.sweep);
+        const auto endThird = scale(
+            cross(geometry.axisUnit, endSecond), geometry.sweep);
+        const auto xyz = scale(startSecond,-3.0)+scale(startThird,1.0-parameter)
+            +scale(endSecond,3.0)+scale(endThird,parameter);
+        return {xyz.x,xyz.y,xyz.z,0.0,0.0,0.0};
+    }
+
     double ArcReference::integratedLength(const double from, const double to,
                                           const bool inverseEvaluation) const {
         if(to <= from) return 0.0;
@@ -222,6 +251,26 @@ namespace ngc::simulation_detail {
             +first.a*second.a+first.b*second.b+first.c*second.c;
         return scaled(second,1.0/speedSquared)
             -scaled(first,firstSecond/(speedSquared*speedSquared));
+    }
+
+    position_t ArcReference::curvatureDerivativeAtDistance(const double distance) const {
+        const auto parameter=parameterAtDistance(distance);
+        const auto first=derivative(parameter);
+        const auto second=secondDerivative(parameter);
+        const auto third=thirdDerivative(parameter);
+        const auto speed=first.length();
+        if(speed<=1e-15) return {};
+        const auto firstSecond=positionDot(first,second);
+        const auto secondSquared=positionDot(second,second);
+        const auto firstThird=positionDot(first,third);
+        const auto inverseSpeed2=1.0/(speed*speed);
+        const auto inverseSpeed4=inverseSpeed2*inverseSpeed2;
+        const auto inverseSpeed6=inverseSpeed4*inverseSpeed2;
+        const auto parameterDerivative=scaled(third,inverseSpeed2)
+            +scaled(second,-3.0*firstSecond*inverseSpeed4)
+            +scaled(first,-(secondSquared+firstThird)*inverseSpeed4)
+            +scaled(first,4.0*firstSecond*firstSecond*inverseSpeed6);
+        return scaled(parameterDerivative,1.0/speed);
     }
 
     double ArcReference::chordErrorBound(const double fromDistance, const double toDistance) const {

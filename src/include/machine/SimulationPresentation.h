@@ -8,6 +8,7 @@
 
 #include "evaluator/InterpreterStatus.h"
 #include "machine/BoundedLookaheadTrajectoryPlanner.h"
+#include "machine/GeometryStreamProducer.h"
 #include "machine/MachineCommand.h"
 #include "machine/MotionBackend.h"
 
@@ -32,6 +33,7 @@ namespace ngc {
         double maximumWakeLatenessSeconds = 0.0;
         double maximumTickExecutionSeconds = 0.0;
         TrajectoryPlanningDiagnostics trajectoryPlanning;
+        GeometryStreamDiagnostics geometryStream;
         bool hasActiveMotion = false;
         bool jogging = false;
         JointMask homedJoints = 0;

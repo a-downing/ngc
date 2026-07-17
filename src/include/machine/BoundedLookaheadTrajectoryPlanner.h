@@ -18,33 +18,18 @@
 
 #include "machine/ExactStopTrajectoryPlanner.h"
 #include "machine/ArcInterpolation.h"
+#include "machine/PreparedGeometry.h"
 #include "evaluator/InterpreterSession.h"
 
 namespace ngc {
-    enum class ExecutablePathMode { ExactStop, Continuous };
-
-    struct TrajectoryPlanningMetadata {
-        ExecutablePathMode pathMode = ExecutablePathMode::ExactStop;
-        std::optional<double> pathTolerance;
-    };
-
-    struct TrajectoryCommandPresentation {
-        ToolGeometry tool{};
-        position_t activeToolOffset{};
-        std::optional<WorkCoordinateSystem> workCoordinateSystem;
-        std::vector<std::string> modalGCodes;
-        std::vector<BlockExecution> activeBlocks;
-    };
-
+    // Compatibility input retained for the current command-window planner.
+    // PreparedCommandRecord is the transport representation; conversion into
+    // this value is deliberately owned by the planning side.
     struct TrajectoryPlannerInput {
         MachineCommand command;
         TrajectoryPlanningMetadata metadata;
         TrajectoryCommandPresentation presentation;
-        // False only for the retained second half of a rolling split. Its
-        // original source command was already activated by the preceding horizon.
         bool presentationActivation = true;
-        // Preserves the original entity's G64 scale when a rolling boundary
-        // divides it into two one-sided halves.
         double continuousScaleOverride = 0.0;
     };
 
@@ -116,6 +101,7 @@ namespace ngc {
     private:
         ExactStopTrajectoryPlanner m_exactStop;
         std::deque<TrajectoryPlannerInput> m_window;
+        std::optional<PreparedContinuousGeometry> m_preparedWindow;
         TrajectoryPlanningDiagnostics m_diagnostics;
         MotionState m_continuousBoundary{};
         std::string m_lastRollingCandidateError;
@@ -557,6 +543,7 @@ namespace ngc {
 
         void reset(const EpochId epoch, const position_t &position = {}) {
             m_window.clear();
+            m_preparedWindow.reset();
             m_exactStop.reset(epoch, position);
             m_continuousBoundary={position,{},{}};
             m_lastRollingCandidateError.clear();
@@ -594,6 +581,7 @@ namespace ngc {
                 ||m_continuousBoundary.acceleration.length()>1e-10);
         }
         bool shouldPlanRollingPrefix() const {
+            if(m_preparedWindow) return false;
             if(m_window.size()<m_nextRollingAttemptWindowSize||m_window.size()<2
                ||!std::ranges::all_of(m_window,continuousMotion)) return false;
             auto nominalDuration=0.0;
@@ -626,6 +614,21 @@ namespace ngc {
             m_window.push_back(std::move(input));
             m_diagnostics.maximumWindowCommands = std::max(
                 m_diagnostics.maximumWindowCommands, m_window.size());
+            return true;
+        }
+
+        bool enqueuePrepared(const PreparedGeometrySlice &slice) {
+            if(m_preparedWindow || !m_window.empty()) return false;
+            PreparedContinuousGeometry geometry;
+            geometry.commands=slice.commands;
+            geometry.pieces=slice.pieces;
+            geometry.diagnostics.pathLength=slice.pathLength;
+            geometry.diagnostics.nominalDuration=slice.nominalDuration;
+            for(const auto &record:slice.commands)
+                if(!enqueue(TrajectoryPlannerInput{record.command,record.metadata,
+                        record.presentation,record.presentationActivation,
+                        record.continuousScaleOverride})) return false;
+            m_preparedWindow=std::move(geometry);
             return true;
         }
 
@@ -676,7 +679,8 @@ namespace ngc {
             const auto allContinuous=std::ranges::all_of(m_window,continuousMotion);
             const auto movingBoundary=m_continuousBoundary.velocity.length()>1e-10
                 ||m_continuousBoundary.acceleration.length()>1e-10;
-            if(!allContinuous||(m_window.size()<2&&!movingBoundary)) return planOne();
+            if(!allContinuous||(!m_preparedWindow&&m_window.size()<2&&!movingBoundary))
+                return planOne();
             const auto started=std::chrono::steady_clock::now();
             constexpr double DEFAULT_BLEND_SCALE=0.001;
             const auto blendScale=std::max(
@@ -813,7 +817,7 @@ namespace ngc {
                     suffixProbe.setProgressCallback(m_exactStop.progressCallback());
                     suffixProbe.reset(1,split.position);
                     auto suffix=suffixProbe.compileContinuous(
-                        suffixProbeCommands,blendScale,nullptr,boundary,std::nullopt,
+                        suffixProbeCommands,blendScale,boundary,std::nullopt,
                         suffixProbeScales,ROLLING_VELOCITY_SEARCH_ITERATIONS);
                     m_diagnostics.timeLaw+=suffixProbe.lastTimeLawDiagnostics();
                     m_diagnostics.rollingSuffixProbeTimeLaw+=
@@ -825,7 +829,7 @@ namespace ngc {
                     }
                     auto prefixPlanner=m_exactStop;
                     auto prefix=prefixPlanner.compileContinuous(
-                        prefixCommands,blendScale,nullptr,m_continuousBoundary,boundary,
+                        prefixCommands,blendScale,m_continuousBoundary,boundary,
                         prefixScales,ROLLING_VELOCITY_SEARCH_ITERATIONS);
                     m_diagnostics.timeLaw+=prefixPlanner.lastTimeLawDiagnostics();
                     m_diagnostics.rollingPrefixProbeTimeLaw+=
@@ -875,9 +879,13 @@ namespace ngc {
                 commands.push_back(input.command);
                 scales.push_back(input.continuousScaleOverride);
             }
-            auto continuous=m_exactStop.compileContinuous(
-                commands,blendScale,nullptr,m_continuousBoundary,std::nullopt,scales,
-                movingBoundary?ROLLING_VELOCITY_SEARCH_ITERATIONS:12U);
+            auto continuous=m_preparedWindow
+                ?m_exactStop.compileContinuous(*m_preparedWindow,blendScale,
+                    m_continuousBoundary,std::nullopt,
+                    movingBoundary?ROLLING_VELOCITY_SEARCH_ITERATIONS:12U)
+                :m_exactStop.compileContinuous(commands,blendScale,
+                    m_continuousBoundary,std::nullopt,scales,
+                    movingBoundary?ROLLING_VELOCITY_SEARCH_ITERATIONS:12U);
             m_diagnostics.timeLaw+=m_exactStop.lastTimeLawDiagnostics();
             if(!continuous) return std::unexpected(std::format(
                 "fatal continuous-motion compilation failure: {}; cause: {}",context,continuous.error()));
@@ -887,6 +895,7 @@ namespace ngc {
                 inputs.push_back(std::move(m_window.front()));
                 m_window.pop_front();
             }
+            m_preparedWindow.reset();
             const auto &terminal=(*continuous)->chunks.back().branchState;
             m_continuousBoundary=terminal;
             return finalize(std::move(*continuous),std::move(inputs));

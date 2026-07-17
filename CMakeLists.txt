@@ -46,6 +46,7 @@ add_library(ngc_core STATIC
         src/ArcInterpolation.cpp
         src/InfiniteJerkTrajectoryTime.cpp
         src/MachineConfiguration.cpp
+        src/PreparedGeometry.cpp
         src/ExactStopTrajectoryPlanner.cpp
         src/Evaluator.cpp
         src/Machine.cpp

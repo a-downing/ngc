@@ -12,6 +12,7 @@
 #include "machine/MotionBackend.h"
 #include "machine/ArcInterpolation.h"
 #include "machine/InfiniteJerkTrajectoryTime.h"
+#include "machine/PreparedGeometry.h"
 
 namespace ngc {
     enum class ContinuousVelocityLimitCause {
@@ -73,28 +74,6 @@ namespace ngc {
         double curvatureDerivativeFiniteDifferenceFine = 0.0;
         double curvatureDerivativeFiniteDifferenceCoarseStep = 0.0;
         double curvatureDerivativeFiniteDifferenceFineStep = 0.0;
-    };
-
-    struct ContinuousAccelerationOracleSegment {
-        std::size_t piece = 0;
-        std::size_t input = 0;
-        double length = 0.0;
-        double velocityLimit = 0.0;
-        position_t tangent{};
-        position_t curvature{};
-        position_t curvatureDerivative{};
-    };
-
-    // Optional NRT-only data for the standalone Clarabel comparison tool.
-    // This is deliberately not part of PlanChunk or MotionBackend.
-    struct ContinuousAccelerationOracleModel {
-        double pathAcceleration = 0.0;
-        position_t axisAcceleration{};
-        double pathJerk = 0.0;
-        position_t axisJerk{};
-        double plannerDuration = 0.0;
-        std::vector<ContinuousPieceTimingDiagnostic> pieceTiming;
-        std::vector<ContinuousAccelerationOracleSegment> segments;
     };
 
     // NRT-only cost evidence for the safeguarded spline arc-length inverse.
@@ -317,6 +296,10 @@ namespace ngc {
         position_t m_position{};
         std::function<void()> m_progressCallback;
         TimeLawDiagnostics m_lastTimeLawDiagnostics;
+        // Non-owning only for the duration of the prepared overload. This lets
+        // the established timing/proof implementation consume immutable
+        // prepared pieces without duplicating that safety-critical machinery.
+        const PreparedContinuousGeometry *m_preparedGeometry = nullptr;
 
     public:
         explicit ExactStopTrajectoryPlanner(TrajectoryLimits limits = {});
@@ -345,10 +328,19 @@ namespace ngc {
         std::expected<PlanChunk, std::string> compile(const MachineCommand &command);
         std::expected<std::unique_ptr<ContinuousTrajectoryPlan>, std::string> compileContinuous(
             std::span<const MachineCommand> commands, double blendScale,
-            ContinuousAccelerationOracleModel *oracleModel = nullptr,
             std::optional<MotionState> startState = std::nullopt,
             std::optional<MotionState> endState = std::nullopt,
             std::span<const double> scaleOverrides = {},
+            unsigned velocitySearchIterations = 12,
+            InfiniteJerkTrajectoryTimeResult *infiniteJerkTime = nullptr);
+        // Prepared geometry is immutable and may be constructed by a different
+        // NRT thread. Timing consumes its command metadata here while keeping
+        // all dynamic limits, time laws, proof, packetization, and stop-tail
+        // generation on the planning owner.
+        std::expected<std::unique_ptr<ContinuousTrajectoryPlan>, std::string> compileContinuous(
+            const PreparedContinuousGeometry &geometry, double blendScale,
+            std::optional<MotionState> startState = std::nullopt,
+            std::optional<MotionState> endState = std::nullopt,
             unsigned velocitySearchIterations = 12,
             InfiniteJerkTrajectoryTimeResult *infiniteJerkTime = nullptr);
         std::expected<TriggeredMove, std::string> compileTriggeredMove(

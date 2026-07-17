@@ -601,191 +601,85 @@ public:
                 vertices.push_back(to);
             };
 
-            std::vector<ngc::experimental::JunctionEntity> splineEntities;
-            std::optional<double> splineScale;
-            const auto flushSpline = [&] {
-                if(!splineScale) return;
-                const auto vector=[](const glm::dvec3 &value) {
-                    return ngc::spline_detail::Vector3{value.x,value.y,value.z};
-                };
-                std::vector<double> entityLengths;
-                entityLengths.reserve(splineEntities.size());
-                for(const auto &entity:splineEntities) entityLengths.push_back(entity.length);
-                const auto clusters=ngc::spline_detail::detectShortEntitySplineClusters(
-                    entityLengths,*splineScale);
-                constexpr auto NO_CLUSTER=std::numeric_limits<std::size_t>::max();
-                std::vector<std::size_t> clusterRight(splineEntities.size(),NO_CLUSTER);
-                std::vector<bool> collapsed(splineEntities.size(),false);
-                std::vector<bool> suppressedJunction(
-                    splineEntities.empty()?0:splineEntities.size()-1,false);
-                for(const auto &cluster:clusters) {
-                    clusterRight[cluster.left]=cluster.right;
-                    for(auto entity=cluster.firstInterior;entity<=cluster.lastInterior;++entity)
-                        collapsed[entity]=true;
-                    for(auto junction=cluster.left;junction<cluster.right;++junction)
-                        suppressedJunction[junction]=true;
-                }
-                for(std::size_t i=1;i+1<splineEntities.size();++i) {
-                    auto &previous=splineEntities[i-1];
-                    auto &current=splineEntities[i];
-                    auto &next=splineEntities[i+1];
-                    if(collapsed[i-1]||collapsed[i]||collapsed[i+1]
-                       ||!previous.linear||!current.linear||!next.linear
-                       ||previous.length>6.0 * *splineScale*(1.0+1e-12)
-                       ||current.length>6.0 * *splineScale*(1.0+1e-12)
-                       ||next.length>6.0 * *splineScale*(1.0+1e-12)) continue;
-                    const auto minimumLength=std::min({previous.length,current.length,next.length});
-                    const auto maximumLength=std::max({previous.length,current.length,next.length});
-                    if(minimumLength<=1e-12||maximumLength>1.5*minimumLength) continue;
-                    const auto curvature=ngc::spline_detail::inferShortLineMidpointCurvature(
-                        vector(previous.stateAtDistance(previous.length).tangent),
-                        vector(current.stateAtDistance(0.5*current.length).tangent),
-                        vector(next.stateAtDistance(0.0).tangent),current.length);
-                    if(curvature) current.midpointCurvature=glm::dvec3(
-                        (*curvature)[0],(*curvature)[1],(*curvature)[2]);
-                }
-                for(std::size_t junction=0;junction+1<splineEntities.size();++junction) {
-                    auto outgoing=junction+1;
-                    auto cluster=false;
-                    if(clusterRight[junction]!=NO_CLUSTER) {
-                        outgoing=clusterRight[junction];
-                        cluster=true;
-                    } else if(suppressedJunction[junction]) continue;
-                    if(cluster) {
-                        const auto fitted=ngc::experimental::buildEvenlySpacedControlCluster(
-                            splineEntities,junction,outgoing,*splineScale);
-                        if(!fitted) continue;
-                        ngc::experimental::tessellateJunction(
-                            *fitted,cache.g64ClusterSplineLines);
-                        std::vector<ngc::experimental::ClusterFeedSection> feedSections;
-                        feedSections.reserve(outgoing-junction+1);
-                        feedSections.push_back({fitted->incomingTrim,
-                            splineEntities[junction].programmedSpeed/60.0});
-                        for(auto entity=junction+1;entity<outgoing;++entity)
-                            feedSections.push_back({splineEntities[entity].length,
-                                splineEntities[entity].programmedSpeed/60.0});
-                        feedSections.push_back({fitted->outgoingTrim,
-                            splineEntities[outgoing].programmedSpeed/60.0});
-                        auto comb=ngc::experimental::sampleGeometricJerkComb(
-                            *fitted,feedSections,m_pathJerk);
-                        for(const auto &sample:comb)
-                            cache.maximumClusterGeometricJerk=std::max(
-                                cache.maximumClusterGeometricJerk,sample.magnitude);
-                        cache.clusterGeometricJerkComb.insert(
-                            cache.clusterGeometricJerkComb.end(),comb.begin(),comb.end());
-                        cache.g64ControlPoints.insert(cache.g64ControlPoints.end(),
-                            fitted->controlPoints.begin(),fitted->controlPoints.end());
-                        for(std::size_t control=1;control<fitted->controlPoints.size();++control)
-                            segment(cache.g64ControlPolygon,fitted->controlPoints[control-1],
-                                fitted->controlPoints[control]);
-                        continue;
+            const auto &preparedScene = m_worker.preparedPreview();
+            const auto offsetPoint = [](const ngc::position_t &value,
+                                        const ngc::position_t &offset) {
+                return glm::dvec3(value.x - offset.x, value.y - offset.y,
+                                  value.z - offset.z);
+            };
+            const auto commandOffset = [](const ngc::PreparedGeometrySlice &slice,
+                                          const ngc::PreparedCommandId id) {
+                const auto found = std::ranges::find_if(slice.commands,
+                    [id](const auto &command) { return command.id == id; });
+                return found == slice.commands.end()
+                    ? ngc::position_t{} : found->presentation.activeToolOffset;
+            };
+            ngc::CurveEvaluationWorkspace curveWorkspace;
+            for(const auto &slice : preparedScene.continuousSlices) {
+                for(const auto &piece : slice.pieces) {
+                    if(!piece.curve) continue;
+                    const auto offset = commandOffset(slice, piece.primaryCommand);
+                    auto *vertices = piece.kind == ngc::PreparedPieceKind::ClusterSpline
+                        ? &cache.g64ClusterSplineLines
+                        : piece.kind == ngc::PreparedPieceKind::JunctionBlend
+                            ? &cache.g64SplineLines
+                            : piece.kind == ngc::PreparedPieceKind::RetainedArcSection
+                                ? &cache.arcLines : &cache.feedLines;
+                    const auto intervals = std::clamp<std::size_t>(
+                        static_cast<std::size_t>(std::ceil(piece.length() / 0.01)), 1, 8192);
+                    auto previous = offsetPoint(ngc::positionAtDistance(*piece.curve,
+                        piece.curveFrom, curveWorkspace), offset);
+                    cache.darkPoints.push_back(previous);
+                    for(std::size_t interval = 1; interval <= intervals; ++interval) {
+                        const auto distance = std::lerp(piece.curveFrom, piece.curveTo,
+                            static_cast<double>(interval) / static_cast<double>(intervals));
+                        const auto current = offsetPoint(ngc::positionAtDistance(
+                            *piece.curve, distance, curveWorkspace), offset);
+                        segment(*vertices, previous, current);
+                        previous = current;
                     }
-                    const auto blend = ngc::experimental::fitJunction(
-                        splineEntities[junction],splineEntities[outgoing],*splineScale);
-                    if(!blend) continue;
-                    const auto shortEntity=splineEntities[junction].length<=6.0 * *splineScale
-                        ||splineEntities[outgoing].length<=6.0 * *splineScale;
-                    auto &splineLines=shortEntity
-                        ? cache.g64ClusterSplineLines : cache.g64SplineLines;
-                    ngc::experimental::tessellateJunction(*blend, splineLines);
-                    cache.g64ControlPoints.insert(cache.g64ControlPoints.end(),
-                                                  blend->controlPoints.begin(), blend->controlPoints.end());
-                    for(std::size_t control = 1; control < blend->controlPoints.size(); ++control) {
-                        segment(cache.g64ControlPolygon, blend->controlPoints[control - 1],
-                                blend->controlPoints[control]);
-                    }
-                }
-                splineEntities.clear();
-                splineScale.reset();
-            };
-            const auto beginSpline = [&](const std::optional<double> programmedScale) {
-                constexpr double DEFAULT_EXPERIMENTAL_SCALE = 0.001;
-                const auto scale = std::max(programmedScale.value_or(DEFAULT_EXPERIMENTAL_SCALE), 1e-9);
-                if(splineScale && std::abs(*splineScale - scale) > 1e-12) flushSpline();
-                splineScale = scale;
-            };
-            const auto lineEntity = [](const glm::dvec3 &from,const glm::dvec3 &to,
-                                       const double programmedSpeed) {
-                const auto delta = to - from;
-                const auto length = glm::length(delta);
-                const auto tangent = length > 1e-12 ? delta / length : glm::dvec3(1.0, 0.0, 0.0);
-                return ngc::experimental::JunctionEntity {
-                    .length = length,
-                    .stateAtDistance = [=](const double distance) {
-                        return ngc::experimental::JunctionState {
-                            .position = from + tangent * std::clamp(distance, 0.0, length),
-                            .tangent = tangent,
-                            .curvature = {},
-                        };
-                    },
-                    .programmedSpeed = programmedSpeed,
-                    .linear = true,
-                };
-            };
-            const auto arcEntity = [&](const ngc::MoveArc &arc) {
-                const auto length = ngc::simulation_detail::pathLength(arc);
-                const auto positionAt = [arc, length](const double distance) {
-                    const auto value = ngc::simulation_detail::interpolate(
-                        arc, length > 1e-12 ? std::clamp(distance / length, 0.0, 1.0) : 0.0);
-                    return glm::dvec3(value.x, value.y, value.z);
-                };
-                const auto geometryAt = [=](const double distance) {
-                        const auto s = std::clamp(distance, 0.0, length);
-                        const auto h = std::clamp(length * 1e-4, 1e-7, std::max(length * 0.01, 1e-7));
-                        glm::dvec3 p0, p1, p2;
-                        bool useFirstTangent = false;
-                        bool useLastTangent = false;
-                        if(s <= h) {
-                            p0 = positionAt(s);
-                            p1 = positionAt(std::min(s + h, length));
-                            p2 = positionAt(std::min(s + 2.0 * h, length));
-                            useFirstTangent = true;
-                        } else if(s + h >= length) {
-                            p0 = positionAt(std::max(s - 2.0 * h, 0.0));
-                            p1 = positionAt(std::max(s - h, 0.0));
-                            p2 = positionAt(s);
-                            useLastTangent = true;
-                        } else {
-                            p0 = positionAt(s - h);
-                            p1 = positionAt(s);
-                            p2 = positionAt(s + h);
-                        }
-                        const auto firstDelta = p1 - p0;
-                        const auto secondDelta = p2 - p1;
-                        const auto firstLength = glm::length(firstDelta);
-                        const auto secondLength = glm::length(secondDelta);
-                        const auto firstTangent = firstDelta / std::max(firstLength, 1e-15);
-                        const auto secondTangent = secondDelta / std::max(secondLength, 1e-15);
-                        auto tangent = useFirstTangent ? firstTangent
-                                     : useLastTangent ? secondTangent
-                                     : glm::normalize(firstTangent + secondTangent);
-                        auto curvature = (secondTangent - firstTangent)
-                            / std::max(0.5 * (firstLength + secondLength), 1e-15);
-                        curvature -= tangent * glm::dot(curvature, tangent);
-                        return ngc::experimental::JunctionState {
-                            .position = positionAt(s), .tangent = tangent, .curvature = curvature };
-                };
-                return ngc::experimental::JunctionEntity {
-                    .length = length,
-                    .stateAtDistance = [=](const double distance) {
-                        const auto s=std::clamp(distance,0.0,length);
-                        auto result=geometryAt(s);
-                        const auto step=std::clamp(length*1e-3,1e-7,
-                            std::max(length*1e-2,1e-7));
-                        const auto from=std::max(0.0,s-step);
-                        const auto to=std::min(length,s+step);
-                        if(to-from>1e-15)
-                            result.curvatureDerivative=
-                                (geometryAt(to).curvature-geometryAt(from).curvature)/(to-from);
-                        return result;
-                    },
-                    .programmedSpeed = arc.speed(),
-                };
-            };
+                    cache.lightPoints.push_back(previous);
 
+                    if(const auto *spline = std::get_if<ngc::PreparedSplineCurve>(
+                            &piece.curve->value)) {
+                        for(const auto &control : spline->controls)
+                            cache.g64ControlPoints.push_back(offsetPoint(control, offset));
+                        for(std::size_t control = 1; control < spline->controls.size(); ++control)
+                            segment(cache.g64ControlPolygon,
+                                offsetPoint(spline->controls[control - 1], offset),
+                                offsetPoint(spline->controls[control], offset));
+                    }
+                    if(piece.kind != ngc::PreparedPieceKind::ClusterSpline) continue;
+                    for(const auto &sample : piece.geometricSamples) {
+                        const auto curvature = glm::dvec3(sample.curvature.x,
+                            sample.curvature.y, sample.curvature.z);
+                        const auto curvatureLength = glm::length(curvature);
+                        ngc::experimental::GeometricJerkCombSample displaySample;
+                        displaySample.position = offsetPoint(sample.position, offset);
+                        if(curvatureLength > 1e-15)
+                            displaySample.normalDirection = curvature / curvatureLength;
+                        displaySample.magnitude = sample.fullGeometricJerkCoefficient;
+                        displaySample.normalMagnitude = sample.normalSharpness;
+                        displaySample.tangentialMagnitude = curvatureLength * curvatureLength;
+                        displaySample.programmedSpeed = piece.programmedFeed;
+                        if(m_pathJerk > 0.0 && displaySample.magnitude > 1e-15)
+                            displaySample.geometricSpeedLimit = std::cbrt(
+                                m_pathJerk / displaySample.magnitude);
+                        cache.maximumClusterGeometricJerk = std::max(
+                            cache.maximumClusterGeometricJerk, displaySample.magnitude);
+                        cache.clusterGeometricJerkComb.push_back(displaySample);
+                    }
+                }
+            }
+
+            /* Preview geometry is prepared on the worker thread. The recorder
+               loop below renders only commands outside executable G64 windows. */
             const auto &commands = toolpath.commands();
             for(std::size_t commandIndex = 0; commandIndex < commands.size(); ++commandIndex) {
                 const auto &command = commands[commandIndex];
+                if(toolpath.g64Active(commandIndex)
+                   && (std::holds_alternative<ngc::MoveLine>(command)
+                       || std::holds_alternative<ngc::MoveArc>(command))) continue;
                 if(const auto line = std::get_if<ngc::MoveLine>(&command)) {
                     auto *vertices = &cache.feedLines;
                     const auto rapid = line->speed() == -1.0;
@@ -796,47 +690,17 @@ public:
                     segment(*vertices, from, to);
                     cache.darkPoints.push_back(from);
                     cache.darkPoints.push_back(to);
-                    if(toolpath.g64Active(commandIndex) && !rapid && !line->machineCoordinates()) {
-                        beginSpline(toolpath.g64Tolerance(commandIndex));
-                        splineEntities.push_back(lineEntity(from,to,line->speed()));
-                    } else {
-                        flushSpline();
-                    }
                 } else if(const auto probe = std::get_if<ngc::ProbeMove>(&command)) {
-                    flushSpline();
                     segment(cache.probeLines, point(probe->from()), point(probe->target()));
                 } else if(const auto arc = std::get_if<ngc::MoveArc>(&command)) {
-                    auto arcRenderResolution = 60;
-                    if(toolpath.g64Active(commandIndex)) {
-                        beginSpline(toolpath.g64Tolerance(commandIndex));
-                        splineEntities.push_back(arcEntity(*arc));
-                        const auto geometry = ngc::simulation_detail::arcGeometry(*arc);
-                        if(geometry) {
-                            const auto radius = std::sqrt(geometry->startArm.x * geometry->startArm.x
-                                + geometry->startArm.y * geometry->startArm.y
-                                + geometry->startArm.z * geometry->startArm.z);
-                            const auto displayTolerance = std::max(*splineScale * 0.02, 1e-9);
-                            if(radius > displayTolerance) {
-                                const auto halfAngle = std::acos(std::clamp(
-                                    1.0 - displayTolerance / radius, -1.0, 1.0));
-                                if(halfAngle > 0.0) {
-                                    arcRenderResolution = std::clamp(
-                                        static_cast<int>(std::ceil(std::numbers::pi / halfAngle)), 60, 8192);
-                                }
-                            }
-                        }
-                    } else flushSpline();
-                    interpolate(*arc, arcRenderResolution, [&](const glm::dvec3 &from, const glm::dvec3 &to,
+                    interpolate(*arc, 60, [&](const glm::dvec3 &from, const glm::dvec3 &to,
                                               const bool startPoint, const bool endPoint) {
                         segment(cache.arcLines, from, to);
                         if(startPoint) cache.darkPoints.push_back(from);
                         if(endPoint) cache.lightPoints.push_back(to);
                     });
-                } else {
-                    flushSpline();
                 }
             }
-            flushSpline();
 
             cache.revision = toolpath.revision();
             cacheRebuilt = true;

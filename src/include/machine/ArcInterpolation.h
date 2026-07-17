@@ -62,10 +62,12 @@ namespace ngc::simulation_detail {
         position_t position(double parameter) const;
         position_t derivative(double parameter) const;
         position_t secondDerivative(double parameter) const;
+        position_t thirdDerivative(double parameter) const;
         double parameterAtDistance(double distance) const;
         position_t positionAtDistance(double distance) const;
         position_t tangentAtDistance(double distance) const;
         position_t curvatureAtDistance(double distance) const;
+        position_t curvatureDerivativeAtDistance(double distance) const;
         double chordErrorBound(double fromDistance, double toDistance) const;
         double curvatureAccelerationBound() const;
     };

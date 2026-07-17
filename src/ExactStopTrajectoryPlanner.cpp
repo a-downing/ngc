@@ -1819,7 +1819,6 @@ namespace ngc {
     std::expected<std::unique_ptr<ContinuousTrajectoryPlan>, std::string>
     ExactStopTrajectoryPlanner::compileContinuous(
             const std::span<const MachineCommand> commands, const double blendScale,
-            ContinuousAccelerationOracleModel *oracleModel,
             std::optional<MotionState> requestedStartState,
             std::optional<MotionState> requestedEndState,
             const std::span<const double> scaleOverrides,
@@ -2329,7 +2328,7 @@ namespace ngc {
 
         std::vector<GeometryPiece> pieces;
         pieces.reserve(entities.size()*2-1);
-        for(std::size_t index=0;index<entities.size();++index) {
+        if(!m_preparedGeometry) for(std::size_t index=0;index<entities.size();++index) {
             if((index&15U)==0) reportProgress();
             if(collapsedEntity[index]) continue;
             const auto exactFrom=index==0?0.0:3.0*scales[index];
@@ -2486,6 +2485,71 @@ namespace ngc {
                     return spline->chordErrorBound(from,to);
                 },
             });
+        }
+        if(m_preparedGeometry) {
+            pieces.clear();
+            pieces.reserve(m_preparedGeometry->pieces.size());
+            auto workspace=std::make_shared<CurveEvaluationWorkspace>();
+            const auto inputFor=[&](const PreparedCommandId id)
+                    ->std::expected<std::size_t,std::string> {
+                const auto found=std::ranges::find_if(m_preparedGeometry->commands,
+                    [id](const auto &command) { return command.id==id; });
+                if(found==m_preparedGeometry->commands.end())
+                    return std::unexpected(std::format(
+                        "prepared piece references unknown command {}",id));
+                return static_cast<std::size_t>(found-m_preparedGeometry->commands.begin());
+            };
+            for(const auto &prepared:m_preparedGeometry->pieces) {
+                if(!prepared.curve||prepared.length()<=1e-12)
+                    return std::unexpected("prepared continuous path contains an invalid piece");
+                const auto primaryId=prepared.activationCommands.empty()
+                    ?prepared.primaryCommand:prepared.activationCommands.front();
+                const auto primary=inputFor(primaryId);
+                if(!primary) return std::unexpected(primary.error());
+                std::vector<std::size_t> activations;
+                for(const auto id:prepared.activationCommands) {
+                    const auto input=inputFor(id);
+                    if(!input) return std::unexpected(input.error());
+                    if(*input!=*primary) activations.push_back(*input);
+                }
+                const auto curve=prepared.curve;
+                const auto from=prepared.curveFrom;
+                const auto length=prepared.length();
+                pieces.push_back({
+                    .input=*primary,
+                    .activationInputs=std::move(activations),
+                    .length=length,
+                    .speed=prepared.programmedFeed,
+                    .linear=prepared.geometricallyLinear,
+                    .sampleAt=[curve,workspace,from,length](const double distance) {
+                        const auto source=from+std::clamp(distance,0.0,length);
+                        return PathSample{positionAtDistance(*curve,source,*workspace),
+                            tangentAtDistance(*curve,source,*workspace)};
+                    },
+                    .curvatureAt=[curve,workspace,from,length](const double distance) {
+                        return curvatureAtDistance(*curve,
+                            from+std::clamp(distance,0.0,length),*workspace);
+                    },
+                    .infiniteJerkCurvatureAt=infiniteJerkTime
+                        ?std::function<position_t(double)>{[curve,workspace,from,length](
+                                const double distance) {
+                            return curvatureAtDistance(*curve,
+                                from+std::clamp(distance,0.0,length),*workspace);
+                        }}:std::function<position_t(double)>{},
+                    .curvatureDerivativeAt=[curve,workspace,from,length](const double distance) {
+                        return curvatureDerivativeAtDistance(*curve,
+                            from+std::clamp(distance,0.0,length),*workspace);
+                    },
+                    .positionAt=[curve,workspace,from,length](const double distance) {
+                        return positionAtDistance(*curve,
+                            from+std::clamp(distance,0.0,length),*workspace);
+                    },
+                    .chordErrorBound=[curve,workspace,from,length](const double a,const double b) {
+                        return chordErrorBound(*curve,from+std::clamp(a,0.0,length),
+                            from+std::clamp(b,0.0,length),*workspace);
+                    },
+                });
+            }
         }
         if(pieces.empty()) return std::unexpected("continuous path produced no geometry");
         timeLawRecorder.instrumentation.configureCache(
@@ -3772,39 +3836,6 @@ namespace ngc {
                 startMismatch[0],startMismatch[1],startMismatch[2],
                 endMismatch[0],endMismatch[1],endMismatch[2]));
 
-        if(oracleModel) {
-            ContinuousAccelerationOracleModel model;
-            model.pathAcceleration=m_limits.pathAcceleration;
-            model.axisAcceleration=m_limits.axisAcceleration;
-            model.pathJerk=m_limits.pathJerk;
-            model.axisJerk=m_limits.axisJerk;
-            model.pieceTiming=result->pieceTiming;
-            for(const auto &timing:result->pieceTiming) model.plannerDuration+=timing.duration;
-            for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
-                const auto &piece=pieces[pieceIndex];
-                // Thirty-two intervals per geometry piece let the oracle represent
-                // acceleration, cruise, and braking inside long retained lines,
-                // while also exposing curved-piece acceleration cones. This work
-                // exists only when the optional development model is requested.
-                constexpr std::size_t subdivisions=32;
-                const auto length=piece.length/static_cast<double>(subdivisions);
-                for(std::size_t subdivision=0;subdivision<subdivisions;++subdivision) {
-                    const auto distance=length*(static_cast<double>(subdivision)+0.5);
-                    const auto sample=piece.sampleAt(distance);
-                    model.segments.push_back({
-                        .piece=pieceIndex,
-                        .input=piece.input,
-                        .length=length,
-                        .velocityLimit=localLimits[pieceIndex].velocity,
-                        .tangent=sample.tangent,
-                        .curvature=piece.curvatureAt(distance),
-                        .curvatureDerivative=piece.curvatureDerivativeAt(distance),
-                    });
-                }
-            }
-            *oracleModel=std::move(model);
-        }
-
         result->chunks.reserve((normalSpans.size()+MAX_NORMAL_SPANS_PER_CHUNK-1)
             /MAX_NORMAL_SPANS_PER_CHUNK);
         auto predecessor=m_previousBranch;
@@ -3856,6 +3887,32 @@ namespace ngc {
         result->timeLaw=timeLawRecorder.instrumentation.diagnostics;
         result->splineInverse=splineInverseDiagnostics;
         result->arcInverse=arcInverseDiagnostics;
+        return result;
+    }
+
+    std::expected<std::unique_ptr<ContinuousTrajectoryPlan>, std::string>
+    ExactStopTrajectoryPlanner::compileContinuous(
+            const PreparedContinuousGeometry &geometry, const double blendScale,
+            std::optional<MotionState> startState,
+            std::optional<MotionState> endState,
+            const unsigned velocitySearchIterations,
+            InfiniteJerkTrajectoryTimeResult *infiniteJerkTime) {
+        if(geometry.commands.empty())
+            return std::unexpected("prepared continuous geometry is empty");
+        std::vector<MachineCommand> commands;
+        std::vector<double> scaleOverrides;
+        commands.reserve(geometry.commands.size());
+        scaleOverrides.reserve(geometry.commands.size());
+        for(const auto &command : geometry.commands) {
+            commands.push_back(command.command);
+            scaleOverrides.push_back(command.continuousScaleOverride);
+        }
+        if(m_preparedGeometry)
+            return std::unexpected("nested prepared continuous compilation is not supported");
+        m_preparedGeometry=&geometry;
+        auto result=compileContinuous(commands, blendScale, std::move(startState),
+            std::move(endState), scaleOverrides, velocitySearchIterations, infiniteJerkTime);
+        m_preparedGeometry=nullptr;
         return result;
     }
 

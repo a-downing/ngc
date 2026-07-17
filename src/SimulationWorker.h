@@ -10,6 +10,7 @@
 #include <deque>
 #include <mutex>
 #include <map>
+#include <memory>
 #include <ranges>
 #include <thread>
 #include <tuple>
@@ -22,7 +23,8 @@
 #include "machine/MockMotionBackend.h"
 #include "machine/SimulationPresentation.h"
 #include "machine/ToolTable.h"
-#include "machine/TrajectoryExecutionDriver.h"
+#include "machine/GeometryStreamProducer.h"
+#include "machine/PreparedTrajectoryExecutionDriver.h"
 #include "WindowsServoPacer.h"
 
 class SimulationWorker {
@@ -40,9 +42,14 @@ class SimulationWorker {
     mutable std::mutex m_mutex;
     std::condition_variable m_cv;
     std::thread m_thread;
+    std::thread m_geometryThread;
     ngc::InterpreterSession m_session;
     ngc::MockMotionBackend m_backend;
-    ngc::TrajectoryExecutionDriver m_driver;
+    ngc::PreparedGeometryForwardChannel m_geometryForward;
+    ngc::GeometryFeedbackChannel m_geometryFeedback;
+    std::atomic<bool> m_geometryCancelled{false};
+    std::unique_ptr<ngc::GeometryStreamProducer> m_geometryProducer;
+    ngc::PreparedTrajectoryExecutionDriver m_driver;
     ngc::TrajectoryLimits m_limits;
     ngc::SimulationSnapshot m_snapshot;
     using ChunkKey = std::pair<ngc::EpochId, ngc::ChunkId>;
@@ -82,7 +89,8 @@ public:
     explicit SimulationWorker(const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch,
                               const ngc::TrajectoryLimits limits = {},
                               const ngc::SimulationTiming timing = {})
-        : m_session(unit, ngc::InterpretationMode::Simulation), m_driver(m_session, m_backend, limits),
+        : m_session(unit, ngc::InterpretationMode::Simulation),
+          m_driver(m_backend, m_geometryForward, m_geometryFeedback, m_geometryCancelled, limits),
           m_limits(limits), m_servoPeriod(timing.servoPeriod), m_schedulerPeriod(timing.schedulerPeriod),
           m_servoTicksPerSchedulerPeriod(static_cast<std::uint32_t>(
               std::max(1.0, std::round(timing.schedulerPeriod / timing.servoPeriod)))) {
@@ -93,7 +101,8 @@ public:
     }
     explicit SimulationWorker(const ngc::MachineConfiguration &configuration)
         : m_session(configuration.unit, ngc::InterpretationMode::Simulation),
-          m_driver(m_session, m_backend, configuration.trajectory), m_limits(configuration.trajectory),
+          m_driver(m_backend, m_geometryForward, m_geometryFeedback, m_geometryCancelled,
+                   configuration.trajectory), m_limits(configuration.trajectory),
           m_axes(configuration.axes), m_joints(configuration.joints), m_homing(configuration.homing),
           m_servoPeriod(configuration.simulation.servoPeriod),
           m_schedulerPeriod(configuration.simulation.schedulerPeriod),
@@ -780,6 +789,23 @@ private:
         updateHomingToolPose();
     }
 
+    void joinGeometry(const bool cancel) {
+        if(cancel) m_geometryCancelled.store(true, std::memory_order_release);
+        m_session.requestStop();
+        m_geometryForward.notifyAll();
+        m_geometryFeedback.notifyAll();
+        if(m_geometryThread.joinable()) m_geometryThread.join();
+        if(m_geometryProducer) {
+            std::scoped_lock lock(m_mutex);
+            m_snapshot.geometryStream = m_geometryProducer->diagnostics();
+        }
+        m_geometryProducer.reset();
+        ngc::PreparedForwardMessage forward;
+        while(m_geometryForward.tryPop(forward)) { }
+        ngc::PreparedFeedbackMessage feedback;
+        while(m_geometryFeedback.tryPop(feedback)) { }
+    }
+
     void work() {
         using clock = std::chrono::steady_clock;
         for(;;) {
@@ -831,12 +857,19 @@ private:
             m_session.compile([](const auto &callback) { callback(); });
             if(preserve) m_session.beginContinuation(); else m_session.begin();
             m_backend.clearTrajectoryDiagnostics();
-            if(!m_driver.begin(m_nextEpoch++, startingPosition)) {
+            m_geometryCancelled.store(false, std::memory_order_release);
+            const auto epoch = m_nextEpoch++;
+            if(!m_driver.begin(epoch, startingPosition)) {
                 m_session.reportError("simulation trajectory driver failed to initialize its backend control channels");
                 m_session.stop();
                 lock.lock(); m_snapshot.status = ngc::SimulationStatus::Error; m_snapshot.error = "motion backend control channel is full"; m_running = false; lock.unlock();
                 continue;
             }
+            m_geometryProducer = std::make_unique<ngc::GeometryStreamProducer>(
+                m_session, m_geometryForward, m_geometryFeedback, m_geometryCancelled);
+            m_geometryThread = std::thread([this, epoch] {
+                (void)m_geometryProducer->run(epoch);
+            });
 
             std::atomic<bool> stopExecutor{false};
             std::atomic<std::uint64_t> servoTicks{0};
@@ -935,7 +968,7 @@ private:
                 copyTimingSnapshot();
             });
             struct PlanningProgressReset {
-                ngc::TrajectoryExecutionDriver &driver;
+                ngc::PreparedTrajectoryExecutionDriver &driver;
                 ~PlanningProgressReset() { driver.setPlanningProgressCallback({}); }
             } planningProgressReset{m_driver};
 
@@ -948,7 +981,12 @@ private:
                     executorRefillRequested.store(false,std::memory_order_release);
                     lock.unlock();
                     executor.join();
+                    joinGeometry(true);
                     m_session.stop();
+                    {
+                        std::scoped_lock statusLock(m_mutex);
+                        m_snapshot.statusMessages = m_session.statusMessages();
+                    }
                     if(joining) return;
                     break;
                 }
@@ -977,7 +1015,6 @@ private:
                 ngc::ExecutionSnapshot backendSnapshot;
                 while(m_backend.tryTakeSnapshot(backendSnapshot)) applyBackendSnapshot(backendSnapshot);
                 copyTimingSnapshot();
-                m_snapshot.statusMessages=m_session.statusMessages();
                 auto state = m_driver.state();
                 const auto pacingError = executorError.load(std::memory_order_acquire);
                 if(pacingError != 0) {
@@ -986,35 +1023,43 @@ private:
                     m_running = false;
                 } else if(m_snapshot.status == ngc::SimulationStatus::Error) {
                     m_running = false;
-                } else if(state == ngc::TrajectoryDriverState::Error) {
+                } else if(state == ngc::PreparedDriverState::Error) {
                     m_snapshot.status = ngc::SimulationStatus::Error;
                     m_snapshot.error = *m_driver.error(); m_running = false;
-                } else if(state == ngc::TrajectoryDriverState::Completed) {
+                } else if(state == ngc::PreparedDriverState::Completed) {
                     for(const auto &[id,block]:m_deferredCompletedBlocks) {
                         (void)id;
                         completeBlock(block);
                     }
                     m_deferredCompletedBlocks.clear();
                     m_snapshot.status = ngc::SimulationStatus::Completed;
-                    m_snapshot.activeModalGCodes = m_session.machine().activeModalGCodes();
-                    const auto tool = m_session.machine().toolGeometry();
-                    m_snapshot.toolPosition = m_snapshot.machinePosition - tool.offset;
-                    m_snapshot.toolPose = { tool, m_snapshot.machinePosition, m_snapshot.toolPosition };
                     m_running = false;
                 }
-                if(state != ngc::TrajectoryDriverState::Running || !m_running) {
+                if(state != ngc::PreparedDriverState::Running || !m_running) {
                     stopExecutor.store(true, std::memory_order_release);
                     executorRefillRequested.store(false,std::memory_order_release);
                     lock.unlock();
                     executor.join();
+                    joinGeometry(state == ngc::PreparedDriverState::Error);
+                    if(state == ngc::PreparedDriverState::Error && m_driver.error())
+                        m_session.reportError(*m_driver.error());
                     m_session.stop();
+                    if(state == ngc::PreparedDriverState::Completed
+                       ||state == ngc::PreparedDriverState::Error) {
+                        std::scoped_lock sessionLock(m_mutex);
+                        m_snapshot.statusMessages = m_session.statusMessages();
+                        m_snapshot.activeModalGCodes = m_session.machine().activeModalGCodes();
+                        const auto tool = m_session.machine().toolGeometry();
+                        m_snapshot.toolPosition = m_snapshot.machinePosition - tool.offset;
+                        m_snapshot.toolPose = { tool, m_snapshot.machinePosition, m_snapshot.toolPosition };
+                    }
                     break;
                 }
 
                 bool filled = false;
                 for(int fill = 0; fill < 64; ++fill) {
                     lock.unlock();
-                    const auto pumped=m_driver.pumpOne([](const auto &callback) { callback(); },
+                    const auto pumped=m_driver.pumpOne(
                         [&](const auto &command, const auto &chunk, const auto &,
                             const auto &presentation, const ngc::SpanId activationSpan) {
                             std::scoped_lock presentationLock(m_mutex);
@@ -1023,17 +1068,20 @@ private:
                         [&](const auto &lifecycle) {
                             std::scoped_lock presentationLock(m_mutex);
                             observeLifecycle(lifecycle);
+                        },
+                        [&](const auto &status) {
+                            std::scoped_lock presentationLock(m_mutex);
+                            m_snapshot.statusMessages.push_back(status);
                         });
                     lock.lock();
                     if(!pumped) break;
                     filled = true;
                     if(m_join||m_stop||m_paused) break;
                 }
-                m_snapshot.statusMessages = m_session.statusMessages();
                 m_snapshot.trajectoryPlanning = m_driver.planningDiagnostics();
                 executorRefillRequested.store(false,std::memory_order_release);
                 state = m_driver.state();
-                if(state == ngc::TrajectoryDriverState::Error) {
+                if(state == ngc::PreparedDriverState::Error) {
                     m_snapshot.status = ngc::SimulationStatus::Error;
                     m_snapshot.error = *m_driver.error();
                     m_running = false;
@@ -1043,7 +1091,14 @@ private:
                     executorRefillRequested.store(false,std::memory_order_release);
                     lock.unlock();
                     executor.join();
+                    joinGeometry(true);
+                    if(state == ngc::PreparedDriverState::Error && m_driver.error())
+                        m_session.reportError(*m_driver.error());
                     m_session.stop();
+                    {
+                        std::scoped_lock statusLock(m_mutex);
+                        m_snapshot.statusMessages = m_session.statusMessages();
+                    }
                     break;
                 }
                 if(filled) {
