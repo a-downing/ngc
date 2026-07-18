@@ -1005,8 +1005,9 @@ namespace ngc {
                 std::size_t splineDegree = 3;
                 if(controls.size() > 6) {
                     // The shared solver is intentionally selected here, just as
-                    // it is for timed cluster preparation. The source callback
-                    // is immutable and contains no dynamic motion limits.
+                    // it is for timed cluster preparation. Velocity-targeted
+                    // fitting receives the same typed machine limits in Preview
+                    // and Simulation; no consumer reconstructs the controls.
                     spline_detail::SplineReconstructionSource source;
                     source.length = sourceLength;
                     source.positionAt = [&](double distance) {
@@ -1024,9 +1025,13 @@ namespace ngc {
                     };
                     source.chordErrorBound = [](double, double) { return 0.0; };
                     source.boundaries.reserve(sourceFeeds.size() + 1);
+                    source.programmedFeeds.reserve(sourceFeeds.size());
                     source.boundaries.push_back(0.0);
-                    for(const auto &range : sourceFeeds)
+                    for(const auto &range : sourceFeeds) {
                         source.boundaries.push_back(range.to);
+                        source.programmedFeeds.push_back(range.programmedFeed);
+                    }
+                    source.velocityLimits=effort.splineVelocityLimits;
                     const auto startDistance = entities[index].length - 3.0 * leftScale;
                     const auto endDistance = 3.0 * rightScale;
                     source.startTangent = tangentAtDistance(

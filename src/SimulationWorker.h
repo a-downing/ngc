@@ -28,6 +28,18 @@
 #include "WindowsServoPacer.h"
 
 class SimulationWorker {
+    static ngc::GeometryStreamPolicy geometryPolicy(const ngc::TrajectoryLimits &limits) {
+        ngc::GeometryStreamPolicy result;
+        result.splineVelocityLimits={
+            .pathAcceleration=limits.pathAcceleration,
+            .pathJerk=limits.pathJerk,
+            .axisVelocity=limits.axisVelocity,
+            .axisAcceleration=limits.axisAcceleration,
+            .axisJerk=limits.axisJerk,
+        };
+        return result;
+    }
+
     static constexpr std::size_t MAX_PENDING_JOG_CONTROLS = 16;
     struct ChunkPresentation {
         ngc::ToolGeometry tool{};
@@ -44,12 +56,12 @@ class SimulationWorker {
     std::thread m_thread;
     std::thread m_geometryThread;
     ngc::InterpreterSession m_session;
+    ngc::GeometryStreamPolicy m_geometryPolicy;
     ngc::MockMotionBackend m_backend;
     ngc::PreparedGeometryForwardChannel m_geometryForward;
     ngc::GeometryFeedbackChannel m_geometryFeedback;
     std::atomic<bool> m_geometryCancelled{false};
     std::unique_ptr<ngc::GeometryStreamProducer> m_geometryProducer;
-    ngc::GeometryStreamPolicy m_geometryPolicy;
     ngc::PreparedTrajectoryExecutionDriver m_driver;
     ngc::TrajectoryLimits m_limits;
     ngc::SimulationSnapshot m_snapshot;
@@ -103,6 +115,7 @@ public:
                               const ngc::TrajectoryLimits limits = {},
                               const ngc::SimulationTiming timing = {})
         : m_session(unit, ngc::InterpretationMode::Simulation),
+          m_geometryPolicy(geometryPolicy(limits)),
           m_driver(m_backend, m_geometryForward, m_geometryFeedback, m_geometryCancelled, limits),
           m_limits(limits), m_servoPeriod(timing.servoPeriod), m_schedulerPeriod(timing.schedulerPeriod),
           m_servoTicksPerSchedulerPeriod(static_cast<std::uint32_t>(
@@ -114,6 +127,7 @@ public:
     }
     explicit SimulationWorker(const ngc::MachineConfiguration &configuration)
         : m_session(configuration.unit, ngc::InterpretationMode::Simulation),
+          m_geometryPolicy(geometryPolicy(configuration.trajectory)),
           m_driver(m_backend, m_geometryForward, m_geometryFeedback, m_geometryCancelled,
                    configuration.trajectory), m_limits(configuration.trajectory),
           m_axes(configuration.axes), m_joints(configuration.joints), m_homing(configuration.homing),

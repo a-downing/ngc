@@ -49,6 +49,7 @@ namespace {
             case SplineFitSolver::CoordinateSearch: return "coordinate";
             case SplineFitSolver::UniformBandedFairness: return "uniform";
             case SplineFitSolver::PeakTargetedBandedFairness: return "peak-targeted";
+            case SplineFitSolver::VelocityTargetedBandedFairness: return "velocity-targeted";
         }
         return "unknown";
     }
@@ -63,8 +64,10 @@ namespace {
         if(argument=="coordinate") return SplineFitSolver::CoordinateSearch;
         if(argument=="uniform") return SplineFitSolver::UniformBandedFairness;
         if(argument=="peak-targeted") return SplineFitSolver::PeakTargetedBandedFairness;
+        if(argument=="velocity-targeted")
+            return SplineFitSolver::VelocityTargetedBandedFairness;
         return std::unexpected(
-            "unknown smoother; expected coordinate, uniform, or peak-targeted");
+            "unknown smoother; expected coordinate, uniform, peak-targeted, or velocity-targeted");
     }
 }
 
@@ -72,7 +75,7 @@ int main(const int argc,char **argv) {
     if(argc>5) {
         std::println(stderr,"usage: ngc_simulation_diagnostic [program.ngc] "
             "[maximum-program-seconds] [tick-multiplier] "
-            "[--smoother=coordinate|uniform|peak-targeted]");
+            "[--smoother=coordinate|uniform|peak-targeted|velocity-targeted]");
         return 2;
     }
     const std::filesystem::path program=argc>1?argv[1]:"adaptive_pockets.ngc";

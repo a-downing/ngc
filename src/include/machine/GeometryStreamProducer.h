@@ -36,6 +36,7 @@ namespace ngc {
         double publishNominalDuration = 0.25;
         spline_detail::SplineFitSolver splineFitSolver =
             spline_detail::continuousSplineFitSolver();
+        spline_detail::SplineVelocityLimits splineVelocityLimits;
     };
 
     struct GeometryStreamDiagnostics {
@@ -53,7 +54,7 @@ namespace ngc {
         std::string lastFailure;
     };
 
-    // Owns all calls into the active interpreter and the feed-independent
+    // Owns all calls into the active interpreter and the shared prepared-
     // geometry builder. It publishes only immutable NRT messages; the backend
     // is intentionally not visible from this class.
     class GeometryStreamProducer {
@@ -230,7 +231,8 @@ namespace ngc {
                 .certifySourceTube = false,
                 .generateSamples = true,
                 .lengthTableIntervalsPerKnotSpan = 32,
-                .splineFitSolver = m_policy.splineFitSolver };
+                .splineFitSolver = m_policy.splineFitSolver,
+                .splineVelocityLimits = m_policy.splineVelocityLimits };
             auto prepared = m_geometryPathMode == ExecutablePathMode::ExactStop
                 ? prepareExactStopGeometry(m_continuous, start, effort)
                 : prepareContinuousGeometry(m_continuous,

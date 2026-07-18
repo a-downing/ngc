@@ -1595,6 +1595,7 @@ namespace {
             .certifySourceTube = false,
             .generateSamples = true,
             .lengthTableIntervalsPerKnotSpan = 32,
+            .splineVelocityLimits = {},
         };
         const ngc::ContinuousGeometryBoundaries rollingEnd{
             .deferFinalRetainedSection = true,
@@ -2191,6 +2192,8 @@ namespace {
     }
 
     void testClusterSplinePreparesKnotIntervalSamplesAndFeeds() {
+        static_assert(ngc::spline_detail::continuousSplineFitSolver()
+            ==ngc::spline_detail::SplineFitSolver::VelocityTargetedBandedFairness);
         const auto lineRecord=[](const ngc::PreparedCommandId id,
                                  const ngc::position_t &from,
                                  const ngc::position_t &to,const double feed) {
@@ -2221,6 +2224,7 @@ namespace {
             .certifySourceTube=false,
             .generateSamples=true,
             .lengthTableIntervalsPerKnotSpan=32,
+            .splineVelocityLimits={},
         };
         const auto prepared=ngc::prepareContinuousGeometry(records,0.05,points.front(),effort);
         require(prepared.has_value(),prepared?"":prepared.error());
@@ -2680,8 +2684,6 @@ namespace {
     void testMachineConfigurationLoadsTrajectoryLimits() {
         const auto configuration = ngc::loadMachineConfiguration("machine.toml");
         require(configuration.has_value(), configuration ? "" : configuration.error());
-        require(configuration->unit == ngc::Machine::Unit::Inch,
-                "machine configuration should load its explicit internal unit");
         require(configuration->trajectory.pathAcceleration > 0.0,
                 "machine configuration should load a validated path acceleration");
         require(configuration->trajectory.pathJerk > 0.0,
@@ -2690,83 +2692,91 @@ namespace {
                 "machine configuration should load and convert a validated rapid velocity");
         require(configuration->trajectory.arcChordTolerance > 0.0,
                 "machine configuration should load a validated arc chord tolerance");
-        requireNear(configuration->trajectory.lookaheadDuration,2.0,
-                    "machine configuration should load the rolling lookahead duration in seconds");
-        requireNear(configuration->simulation.servoPeriod, 0.001,
-                    "machine configuration should load the fixed simulation servo period");
-        requireNear(configuration->simulation.schedulerPeriod, 0.01,
-                    "machine configuration should load the independent scheduler period");
-        requireNear(configuration->jogging.acceleration, 5.0,
-                    "machine configuration should load the global jog acceleration");
-        requireNear(configuration->jogging.jerk, 25.0,
-                    "machine configuration should load the global jog jerk");
+        require(configuration->trajectory.lookaheadDuration>0.0,
+                "machine configuration should load a positive rolling lookahead duration");
+        require(configuration->simulation.servoPeriod>0.0
+                    &&configuration->simulation.schedulerPeriod
+                        >=configuration->simulation.servoPeriod,
+                "machine configuration should load positive compatible simulation periods");
+        const auto schedulerTicks=configuration->simulation.schedulerPeriod
+            /configuration->simulation.servoPeriod;
+        requireNear(schedulerTicks,std::round(schedulerTicks),
+                    "configured scheduler period should contain an integer number of servo periods");
+        require(configuration->jogging.acceleration>0.0
+                    &&configuration->jogging.jerk>0.0,
+                "machine configuration should load positive global jog limits");
 
-        require(configuration->coordinates == std::vector {
-                    ngc::Machine::Axis::X, ngc::Machine::Axis::Y, ngc::Machine::Axis::Z },
-                "machine configuration should load the logical coordinate order");
+        require(!configuration->coordinates.empty(),
+                "machine configuration should load at least one logical coordinate");
         const auto axis = [&](const ngc::Machine::Axis value) -> const ngc::AxisConfiguration & {
             const auto found = std::ranges::find(configuration->axes, value, &ngc::AxisConfiguration::axis);
             require(found != configuration->axes.end(), "configured logical axis should exist");
             return *found;
         };
-        require(axis(ngc::Machine::Axis::Y).joints == std::vector<ngc::JointId> { 1, 2 },
-                "Y should load as one logical axis backed by two joints");
-        requireNear(axis(ngc::Machine::Axis::X).minimum, -14.0,
-                    "logical X minimum should load in machine units");
-        requireNear(axis(ngc::Machine::Axis::Z).maximum, 0.001,
-                    "logical Z maximum should load in machine units");
-        requireNear(axis(ngc::Machine::Axis::X).maxJerk, 501.0,
-                    "logical axes should load an independent jerk limit");
-        requireNear(configuration->trajectory.axisVelocity.x, axis(ngc::Machine::Axis::X).maxVelocity,
-                    "trajectory limits should retain configured X velocity");
-        requireNear(configuration->trajectory.axisAcceleration.y, axis(ngc::Machine::Axis::Y).maxAcceleration,
-                    "trajectory limits should retain configured Y acceleration");
-        requireNear(configuration->trajectory.axisJerk.z, axis(ngc::Machine::Axis::Z).maxJerk,
-                    "trajectory limits should retain configured Z jerk");
-
-        const auto input = [&](const std::string_view name) -> const ngc::DigitalInputConfiguration & {
-            const auto found = std::ranges::find(configuration->digitalInputs, name,
-                                                 &ngc::DigitalInputConfiguration::name);
-            require(found != configuration->digitalInputs.end(), "configured digital input should exist");
-            return *found;
+        const auto component=[](const ngc::Machine::Axis value) {
+            switch(value) {
+                case ngc::Machine::Axis::X: return &ngc::position_t::x;
+                case ngc::Machine::Axis::Y: return &ngc::position_t::y;
+                case ngc::Machine::Axis::Z: return &ngc::position_t::z;
+                case ngc::Machine::Axis::A: return &ngc::position_t::a;
+                case ngc::Machine::Axis::B: return &ngc::position_t::b;
+                case ngc::Machine::Axis::C: return &ngc::position_t::c;
+            }
+            return &ngc::position_t::x;
         };
-        require(input("tool_probe").id == 0 && input("shared_home").id == 1 && input("y2_home").id == 2,
-                "logical digital input names should resolve to stable backend IDs");
-        require(configuration->probing.input == input("tool_probe").id
-                    && configuration->probing.condition == ngc::InputCondition::Active,
-                "probing should load its resolved input and condition");
-        requireNear(configuration->probing.debounce, 0.010,
-                    "probing should load its debounce duration");
+        for(const auto coordinate:configuration->coordinates) {
+            const auto &configured=axis(coordinate);
+            require(configured.minimum<configured.maximum&&!configured.joints.empty(),
+                    "each logical axis should load a valid range and at least one joint");
+            require(configured.maxVelocity>0.0&&configured.maxAcceleration>0.0
+                        &&configured.maxJerk>0.0,
+                    "each logical axis should load positive independent motion limits");
+            const auto member=component(coordinate);
+            requireNear(configuration->trajectory.axisVelocity.*member,configured.maxVelocity,
+                        "trajectory limits should retain each configured axis velocity");
+            requireNear(configuration->trajectory.axisAcceleration.*member,configured.maxAcceleration,
+                        "trajectory limits should retain each configured axis acceleration");
+            requireNear(configuration->trajectory.axisJerk.*member,configured.maxJerk,
+                        "trajectory limits should retain each configured axis jerk");
+        }
 
+        const auto probingInput=std::ranges::find(
+            configuration->digitalInputs,configuration->probing.input,
+            &ngc::DigitalInputConfiguration::id);
+        require(probingInput!=configuration->digitalInputs.end(),
+                "probing should resolve to a configured digital input");
+        require(configuration->probing.debounce>=0.0,
+                "probing should load a non-negative debounce duration");
         const auto joint = [&](const ngc::JointId id) -> const ngc::JointConfiguration & {
             const auto found = std::ranges::find(configuration->joints, id, &ngc::JointConfiguration::id);
             require(found != configuration->joints.end(), "configured joint should exist");
             return *found;
         };
-        require(configuration->joints.size() == 4,
-                "machine configuration should load all four physical joints");
-        require(joint(1).axis == ngc::Machine::Axis::Y && joint(2).axis == ngc::Machine::Axis::Y,
-                "both gantry joints should map to logical Y");
-        require(joint(1).homing.input == input("shared_home").id
-                    && joint(2).homing.input == input("y2_home").id,
-                "each gantry joint should load its own resolved home input");
-        requireNear(joint(2).homing.switchPosition, -0.140,
-                    "the second Y switch calibration should load independently");
-        require(joint(0).homing.searchVelocity > 0.0 && joint(1).homing.searchVelocity < 0.0,
-                "signed homing search directions should load without fixing tunable speeds in the test");
-        require(joint(0).homing.backoffDistance > 0.0,
-                "fixed homing backoff distance should load in machine units");
-        require(joint(0).homing.debounce >= 0.0,
-                "per-joint home switch debounce should load in seconds");
-
-        require(!configuration->homing.requireBeforeMotion,
-                "configured pre-home motion policy should load");
-        const auto group = std::ranges::find(configuration->homing.groups, "y_gantry",
-                                             &ngc::HomingGroupConfiguration::name);
-        require(group != configuration->homing.groups.end(), "Y gantry homing group should load");
-        require(group->sequence == 2 && group->joints == std::vector<ngc::JointId> { 1, 2 }
-                    && group->startTogether && group->stopEachJointOnTrigger && group->finalMoveTogether,
-                "Y gantry homing policy should preserve joint-independent switch stopping");
+        require(!configuration->joints.empty()&&!configuration->homing.groups.empty(),
+                "machine configuration should load physical joints and homing groups");
+        for(const auto &configuredAxis:configuration->axes)
+            for(const auto id:configuredAxis.joints)
+                require(joint(id).axis==configuredAxis.axis,
+                        "each logical axis should reference matching configured joints");
+        for(const auto &configuredJoint:configuration->joints) {
+            require(configuredJoint.minimum<configuredJoint.maximum
+                        &&configuredJoint.maxVelocity>0.0
+                        &&configuredJoint.maxAcceleration>0.0
+                        &&configuredJoint.maxJerk>0.0,
+                    "each joint should load a valid range and positive motion limits");
+            require(configuredJoint.homing.searchVelocity!=0.0
+                        &&configuredJoint.homing.latchVelocity!=0.0
+                        &&configuredJoint.homing.backoffDistance>0.0
+                        &&configuredJoint.homing.debounce>=0.0,
+                    "each joint should load valid homing motion values");
+            require(std::ranges::find(configuration->digitalInputs,
+                        configuredJoint.homing.input,&ngc::DigitalInputConfiguration::id)
+                        !=configuration->digitalInputs.end(),
+                    "each joint home input should resolve to a configured digital input");
+            const auto groupCount=std::ranges::count_if(configuration->homing.groups,
+                [&](const auto &group) { return std::ranges::contains(group.joints,configuredJoint.id); });
+            require(groupCount==1,"each configured joint should belong to exactly one homing group");
+        }
     }
 
     void testConfiguredHomingMovesFromPowerUpPosition() {

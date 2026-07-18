@@ -163,18 +163,84 @@ namespace ngc {
             double integratedNormalCurvatureDerivative=0.0;
             double maximumCurvature=0.0;
             double maximumDeviation=0.0;
+            double minimumPermissibleVelocity=std::numeric_limits<double>::infinity();
+            double estimatedVelocityLimitedDuration=0.0;
         };
+
+        std::vector<double> knotIntervalFeeds(const SplineFitSource &source,
+                                               const std::size_t spans) {
+            std::vector<double> result(spans,std::numeric_limits<double>::infinity());
+            if(source.boundaries.size()!=source.programmedFeeds.size()+1
+               ||source.boundaries.empty()) return result;
+            auto sourceIndex=std::size_t{0};
+            for(std::size_t span=0;span<spans;++span) {
+                const auto sourceFrom=source.length*static_cast<double>(span)/spans;
+                const auto sourceTo=source.length*static_cast<double>(span+1)/spans;
+                while(sourceIndex+1<source.programmedFeeds.size()
+                      &&source.boundaries[sourceIndex+1]<=sourceFrom)
+                    ++sourceIndex;
+                for(auto candidate=sourceIndex;
+                    candidate<source.programmedFeeds.size()
+                        &&source.boundaries[candidate]<sourceTo;
+                    ++candidate) {
+                    const auto overlapFrom=std::max(
+                        sourceFrom,source.boundaries[candidate]);
+                    const auto overlapTo=std::min(
+                        sourceTo,source.boundaries[candidate+1]);
+                    if(overlapTo>overlapFrom)
+                        result[span]=std::min(
+                            result[span],source.programmedFeeds[candidate]);
+                }
+            }
+            return result;
+        }
+
+        double permissibleVelocity(const SplineFitSource &source,
+                const double programmedFeed,
+                const position_t &tangent,const position_t &curvature,
+                const position_t &curvatureDerivative) {
+            auto result=programmedFeed;
+            const auto reduce=[&](const double candidate) {
+                if(std::isfinite(candidate)&&candidate>0.0) result=std::min(result,candidate);
+            };
+            const auto &limits=source.velocityLimits;
+            for(const auto component:AXIS_COMPONENTS) {
+                const auto tangentComponent=std::abs(tangent.*component);
+                const auto axisVelocity=limits.axisVelocity.*component;
+                if(tangentComponent>1e-15&&std::isfinite(axisVelocity))
+                    reduce(axisVelocity/tangentComponent);
+                const auto curvatureComponent=std::abs(curvature.*component);
+                const auto axisAcceleration=limits.axisAcceleration.*component;
+                if(curvatureComponent>1e-15&&std::isfinite(axisAcceleration))
+                    reduce(std::sqrt(axisAcceleration/curvatureComponent));
+                const auto derivativeComponent=std::abs(curvatureDerivative.*component);
+                const auto axisJerk=limits.axisJerk.*component;
+                if(derivativeComponent>1e-15&&std::isfinite(axisJerk))
+                    reduce(std::cbrt(axisJerk/derivativeComponent));
+            }
+            const auto curvatureMagnitude=curvature.length();
+            if(curvatureMagnitude>1e-15&&std::isfinite(limits.pathAcceleration))
+                reduce(std::sqrt(limits.pathAcceleration/curvatureMagnitude));
+            const auto derivativeMagnitude=curvatureDerivative.length();
+            if(derivativeMagnitude>1e-15&&std::isfinite(limits.pathJerk))
+                reduce(std::cbrt(limits.pathJerk/derivativeMagnitude));
+            return result;
+        }
 
         SplineFitMeasurement measureSplineFit(const FittingSpline &spline,
                                               const SplineFitSource &source,
-                                              const unsigned samplesPerSpan) {
+                                              const unsigned samplesPerSpan,
+                                              const bool measureVelocity=false) {
             const auto first=spline.derivative();
             const auto second=first.derivative();
             const auto third=second.derivative();
             const auto spans=spline.controls.size()-spline.degree;
+            const auto intervalFeeds=measureVelocity
+                ?knotIntervalFeeds(source,spans):std::vector<double>{};
             SplineFitMeasurement result;
             auto previous=spline.at(0.0);
             auto previousNormal=0.0;
+            auto previousVelocity=std::numeric_limits<double>::infinity();
             for(std::size_t sample=0;sample<=spans*samplesPerSpan;++sample) {
                 const auto parameter=static_cast<double>(sample)/samplesPerSpan;
                 const auto position=spline.at(parameter);
@@ -204,6 +270,19 @@ namespace ngc {
                 const auto derivative=scaled(parameterDerivative,1.0/speed);
                 const auto normal=subtract(derivative,
                     scaled(tangent,positionDot(tangent,derivative))).length();
+                auto permissible=std::numeric_limits<double>::infinity();
+                if(measureVelocity) {
+                    const auto interval=std::min(spans-1,
+                        static_cast<std::size_t>(std::floor(parameter)));
+                    auto programmedFeed=intervalFeeds[interval];
+                    if(interval>0&&parameter==static_cast<double>(interval))
+                        programmedFeed=std::min(
+                            programmedFeed,intervalFeeds[interval-1]);
+                    permissible=permissibleVelocity(source,programmedFeed,
+                        tangent,curvature,derivative);
+                    result.minimumPermissibleVelocity=std::min(
+                        result.minimumPermissibleVelocity,permissible);
+                }
                 result.maximumNormalCurvatureDerivative=std::max(
                     result.maximumNormalCurvatureDerivative,normal);
                 result.maximumCurvature=std::max(result.maximumCurvature,curvature.length());
@@ -213,9 +292,19 @@ namespace ngc {
                     const auto distance=subtract(position,previous).length();
                     result.integratedNormalCurvatureDerivative+=
                         0.5*(previousNormal+normal)*distance;
+                    if(measureVelocity) {
+                        const auto intervalVelocity=std::min(previousVelocity,permissible);
+                        if(!std::isinf(intervalVelocity)) {
+                            if(std::isfinite(intervalVelocity)&&intervalVelocity>0.0)
+                                result.estimatedVelocityLimitedDuration+=distance/intervalVelocity;
+                            else result.estimatedVelocityLimitedDuration=
+                                std::numeric_limits<double>::infinity();
+                        }
+                    }
                 }
                 previous=position;
                 previousNormal=normal;
+                previousVelocity=permissible;
             }
             return result;
         }
@@ -284,15 +373,33 @@ namespace ngc {
             const auto lastFree=initial.controls.size()-FIXED_CONTROLS_PER_END;
             if(lastFree<=firstFree) return SplineFitResult{std::move(initial),0};
             const auto limit=programmedScale;
-            const auto original=measureSplineFit(initial,source,32);
+            const auto velocityTargeted=
+                solver==SplineFitSolver::VelocityTargetedBandedFairness;
+            const auto original=measureSplineFit(initial,source,32,velocityTargeted);
             if(original.maximumDeviation>limit*(1.0+1e-9))
                 return std::unexpected("initial quintic exceeds the programmed G64 scale");
-            const auto score=[&](const SplineFitMeasurement &measurement) {
+            const auto normalSharpnessScore=[&](const SplineFitMeasurement &measurement) {
                 const auto peak=measurement.maximumNormalCurvatureDerivative
                     /std::max(original.maximumNormalCurvatureDerivative,1e-30);
                 const auto integral=measurement.integratedNormalCurvatureDerivative
                     /std::max(original.integratedNormalCurvatureDerivative,1e-30);
                 return 0.65*peak+0.35*integral;
+            };
+            const auto score=[&](const SplineFitMeasurement &measurement) {
+                if(!velocityTargeted) return normalSharpnessScore(measurement);
+                if(!std::isfinite(measurement.estimatedVelocityLimitedDuration)
+                   ||measurement.estimatedVelocityLimitedDuration<=0.0)
+                    return std::numeric_limits<double>::infinity();
+                const auto duration=measurement.estimatedVelocityLimitedDuration
+                    /std::max(original.estimatedVelocityLimitedDuration,1e-30);
+                auto bottleneck=1.0;
+                if(std::isfinite(original.minimumPermissibleVelocity)
+                   &&original.minimumPermissibleVelocity>0.0
+                   &&std::isfinite(measurement.minimumPermissibleVelocity)
+                   &&measurement.minimumPermissibleVelocity>0.0)
+                    bottleneck=original.minimumPermissibleVelocity
+                        /measurement.minimumPermissibleVelocity;
+                return 0.8*duration+0.2*bottleneck;
             };
             const auto acceptable=[&](const SplineFitMeasurement &measurement) {
                 return measurement.maximumDeviation<=0.98*limit
@@ -421,7 +528,8 @@ namespace ngc {
                 auto candidate=solve(fairnessWeight,uniformRowWeights);
                 ++result.candidateCount;
                 if(!candidate) continue;
-                const auto measurement=measureSplineFit(*candidate,source,8);
+                const auto measurement=measureSplineFit(
+                    *candidate,source,8,velocityTargeted);
                 if(!acceptable(measurement)) continue;
                 const auto candidateScore=score(measurement);
                 const auto utilization=measurement.maximumDeviation/limit;
@@ -509,7 +617,7 @@ namespace ngc {
                     }
                 }
             }
-            const auto verified=measureSplineFit(result.spline,source,256);
+            const auto verified=measureSplineFit(result.spline,source,256,velocityTargeted);
             if(verified.maximumDeviation>limit*(1.0+1e-9))
                 return std::unexpected("banded quintic exceeds the programmed G64 scale");
             return result;

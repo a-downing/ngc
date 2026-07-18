@@ -18,6 +18,7 @@ class Worker {
     std::thread m_thread;
 
     ngc::InterpreterSession m_session;
+    ngc::GeometryStreamPolicy m_geometryPolicy;
     ngc::PreparedPreviewScene m_preparedPreview;
     std::unordered_map<ngc::Var, double> m_parameterSnapshot;
 
@@ -27,8 +28,10 @@ class Worker {
     bool m_busy = false;
 
 public:
-    explicit Worker(const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch)
-        : m_session(unit, ngc::InterpretationMode::Preview) {
+    explicit Worker(const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch,
+                    ngc::GeometryStreamPolicy geometryPolicy = {})
+        : m_session(unit, ngc::InterpretationMode::Preview),
+          m_geometryPolicy(std::move(geometryPolicy)) {
         refreshParameterSnapshot();
         m_thread = std::thread(&Worker::work, this);
     }
@@ -175,7 +178,8 @@ private:
         ngc::PreparedGeometryForwardChannel forward;
         ngc::GeometryFeedbackChannel feedback;
         std::atomic<bool> cancelled = false;
-        ngc::GeometryStreamProducer producer(m_session, forward, feedback, cancelled);
+        ngc::GeometryStreamProducer producer(
+            m_session, forward, feedback, cancelled, m_geometryPolicy);
         std::thread geometryThread([&] { (void)producer.run(1); });
         std::optional<std::string> failure;
         const auto sendFeedback = [&](ngc::GeometryFeedback value) {

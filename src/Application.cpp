@@ -67,6 +67,18 @@
 #include "gui/tool_table_strings_t.h"
 
 class ApplicationImpl final {
+    static ngc::GeometryStreamPolicy geometryPolicy(const ngc::TrajectoryLimits &limits) {
+        ngc::GeometryStreamPolicy result;
+        result.splineVelocityLimits={
+            .pathAcceleration=limits.pathAcceleration,
+            .pathJerk=limits.pathJerk,
+            .axisVelocity=limits.axisVelocity,
+            .axisAcceleration=limits.axisAcceleration,
+            .axisJerk=limits.axisJerk,
+        };
+        return result;
+    }
+
     using GlGenBuffersProc = void (APIENTRY *)(GLsizei, GLuint *);
     using GlDeleteBuffersProc = void (APIENTRY *)(GLsizei, const GLuint *);
     using GlBindBufferProc = void (APIENTRY *)(GLenum, GLuint);
@@ -403,7 +415,7 @@ public:
         : m_window(window), m_simulationTiming(configuration.simulation),
           m_joggingConfiguration(configuration.jogging), m_machineUnit(configuration.unit),
           m_axes(configuration.axes), m_joints(configuration.joints),
-          m_worker(configuration.unit),
+          m_worker(configuration.unit,geometryPolicy(configuration.trajectory)),
           m_simulation(configuration),
           m_simulatedRapidSpeed(configuration.trajectory.rapidSpeed),
           m_pathJerk(configuration.trajectory.pathJerk) { }

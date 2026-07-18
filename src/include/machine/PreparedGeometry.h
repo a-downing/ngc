@@ -220,6 +220,7 @@ namespace ngc {
         std::size_t lengthTableIntervalsPerKnotSpan = 32;
         spline_detail::SplineFitSolver splineFitSolver =
             spline_detail::continuousSplineFitSolver();
+        spline_detail::SplineVelocityLimits splineVelocityLimits;
     };
 
     // Selects the open boundaries of an incremental continuous-geometry
