@@ -261,6 +261,8 @@ namespace ngc {
                 referenced.push_back(piece.primaryCommand);
                 referenced.insert(referenced.end(),piece.activationCommands.begin(),
                     piece.activationCommands.end());
+                referenced.insert(referenced.end(),piece.sourceCommands.begin(),
+                    piece.sourceCommands.end());
                 activated.insert(activated.end(),piece.activationCommands.begin(),
                     piece.activationCommands.end());
                 result.diagnostics.pathLength+=piece.length();
@@ -677,6 +679,8 @@ namespace ngc {
                 return !piece.curve||piece.length()<=1e-12
                     ||!knownCommand(piece.primaryCommand)
                     ||std::ranges::any_of(piece.activationCommands,
+                        [&](const auto id) { return !knownCommand(id); })
+                    ||std::ranges::any_of(piece.sourceCommands,
                         [&](const auto id) { return !knownCommand(id); })
                     ||std::ranges::any_of(geometry.pieces,
                         [&](const auto &retained) { return retained.id==piece.id; });

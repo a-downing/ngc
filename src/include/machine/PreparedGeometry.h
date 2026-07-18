@@ -180,6 +180,11 @@ namespace ngc {
         bool geometricallyLinear = false;
         PreparedCommandId primaryCommand = 0;
         std::vector<PreparedCommandId> activationCommands;
+        // Source entities whose geometry this piece represents. This is
+        // deliberately separate from activationCommands: a junction blend
+        // involves both adjacent source entities while presentation activates
+        // only at the owning command boundary.
+        std::vector<PreparedCommandId> sourceCommands;
         std::vector<PreparedGeometricSample> geometricSamples;
         // Continuous timing treats each cluster-spline knot interval as one
         // timing interval and requires its prepared samples and feed. The

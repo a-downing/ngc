@@ -487,10 +487,18 @@ namespace {
             const auto &slices = worker.preparedPreview().continuousSlices;
             require(!slices.empty(), "mixed-motion G64 preview should publish continuous geometry");
             auto junctionBlends = std::size_t{0};
-            for(const auto &slice : slices)
-                junctionBlends += std::ranges::count_if(slice.pieces, [](const auto &piece) {
-                    return piece.kind == ngc::PreparedPieceKind::JunctionBlend;
-                });
+            for(const auto &slice : slices) {
+                for(const auto &piece : slice.pieces) {
+                    if(piece.kind != ngc::PreparedPieceKind::JunctionBlend) continue;
+                    ++junctionBlends;
+                    require(piece.sourceCommands.size() == 2,
+                            "each preview junction blend should identify both source entities");
+                    require(std::ranges::all_of(piece.sourceCommands, [&](const auto id) {
+                        return std::ranges::any_of(slice.commands,
+                            [id](const auto &record) { return record.id == id; });
+                    }), "a preview slice should retain command presentation for every blend source entity");
+                }
+            }
             require(junctionBlends == 2,
                     "G1-to-G2 and G2-to-G1 must both produce junction blends");
         });
@@ -2142,6 +2150,9 @@ namespace {
                     &&prepared->pieces[1].kind==ngc::PreparedPieceKind::JunctionBlend
                     &&prepared->pieces[2].kind==ngc::PreparedPieceKind::RetainedArcSection,
                 "two long arcs should produce retained sections around one junction blend");
+        require(prepared->pieces[1].sourceCommands
+                    ==std::vector<ngc::PreparedCommandId>{1,2},
+                "a junction blend should retain both adjacent source entities for preview selection");
 
         ngc::CurveEvaluationWorkspace workspace;
         const auto &incoming=prepared->pieces[0];
@@ -2207,6 +2218,10 @@ namespace {
         });
         require(found!=prepared->pieces.end(),
                 "mixed-feed short source entities should produce a cluster spline");
+        std::vector<ngc::PreparedCommandId> expectedSourceCommands(records.size());
+        std::iota(expectedSourceCommands.begin(),expectedSourceCommands.end(),1);
+        require(found->sourceCommands==expectedSourceCommands,
+                "a cluster spline should retain every reconstructed source entity for preview selection");
         const auto *spline=std::get_if<ngc::PreparedSplineCurve>(&found->curve->value);
         require(spline&&spline->degree==5,
                 "the focused cluster sampling case should use quintic reconstruction");

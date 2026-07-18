@@ -174,6 +174,7 @@ namespace ngc {
             for(const auto &piece : m_pendingPieces) {
                 retained.insert(piece.primaryCommand);
                 retained.insert(piece.activationCommands.begin(), piece.activationCommands.end());
+                retained.insert(piece.sourceCommands.begin(), piece.sourceCommands.end());
             }
             std::erase_if(m_commandRecords, [&](const auto &entry) {
                 return !retained.contains(entry.first);
@@ -194,6 +195,7 @@ namespace ngc {
             for(const auto &piece : slice.pieces) {
                 referenced.insert(piece.primaryCommand);
                 referenced.insert(piece.activationCommands.begin(), piece.activationCommands.end());
+                referenced.insert(piece.sourceCommands.begin(), piece.sourceCommands.end());
             }
             for(const auto id : referenced) {
                 const auto found = m_commandRecords.find(id);

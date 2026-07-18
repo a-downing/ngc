@@ -96,9 +96,10 @@ class ApplicationImpl final {
                 && (*completedLines)[line] != 0;
         }
         bool current(const int line) const { return currentLine == line; }
-        ImVec4 highlight(const int line) const {
+        ImVec4 highlight(const int line, const bool previewSelected = false) const {
             if(current(line)) return {0.75f, 0.55f, 0.08f, 0.75f};
             if(active(line)) return {0.65f, 0.38f, 0.08f, 0.55f};
+            if(previewSelected) return {0.08f, 0.45f, 0.75f, 0.72f};
             if(completed(line)) return {0.15f, 0.45f, 0.22f, 0.55f};
             return {0, 0, 0, 0};
         }
@@ -190,6 +191,23 @@ class ApplicationImpl final {
         double programmedSpeed = 0.0;
     };
 
+    struct PreviewSourceLine {
+        std::string source;
+        int line = 0;
+
+        bool operator==(const PreviewSourceLine &) const = default;
+    };
+
+    struct PreviewSelectionTarget {
+        std::vector<PreviewSourceLine> sourceLines;
+    };
+
+    struct PreviewSelectableSegment {
+        glm::dvec3 from{};
+        glm::dvec3 to{};
+        std::size_t target = 0;
+    };
+
     struct PreviewRenderCache {
         std::optional<std::uint64_t> revision;
         std::vector<glm::dvec3> feedLines;
@@ -206,12 +224,16 @@ class ApplicationImpl final {
         double maximumClusterGeometricJerk = 0.0;
         std::vector<glm::dvec3> darkPoints;
         std::vector<glm::dvec3> lightPoints;
+        std::vector<PreviewSelectionTarget> selectionTargets;
+        std::vector<PreviewSelectableSegment> selectableSegments;
         std::optional<glm::dvec3> visibleCentroid;
         glm::dvec3 sceneMinimum{};
         glm::dvec3 sceneMaximum{};
         bool hasSceneGeometry = false;
         std::array<BufferedRange, static_cast<std::size_t>(PreviewBatch::Count)> bufferedRanges{};
     } m_previewRenderCache;
+    std::vector<PreviewSourceLine> m_previewSelectedSourceLines;
+    std::optional<PreviewSourceLine> m_previewSelectionScrollLine;
     struct PreviewViewSnapshot {
         glm::dquat orientation { 1.0, 0.0, 0.0, 0.0 };
         glm::dvec3 pivot{};
@@ -559,6 +581,57 @@ public:
         return true;
     }
 
+    void clearPreviewSelection() {
+        m_previewSelectedSourceLines.clear();
+        m_previewSelectionScrollLine.reset();
+    }
+
+    void selectPreviewGeometry(const int width, const int height,
+                               const int viewportLeft, const int viewportTop) {
+        constexpr double PICK_RADIUS_PIXELS = 9.0;
+        const auto aspect = static_cast<double>(width) / height;
+        const auto mouse = glm::dvec2(m_mouseX, m_mouseY);
+        const auto project = [&](const glm::dvec3 &point) {
+            const auto transformed = m_modelOrientation * displayOffset(point - m_modelPivot);
+            const auto ndcX = (transformed.x + m_viewPan.x) / (m_viewHalfHeight * aspect);
+            const auto ndcY = (transformed.z + m_viewPan.y) / m_viewHalfHeight;
+            return glm::dvec2(
+                viewportLeft + (ndcX + 1.0) * width * 0.5,
+                viewportTop + (1.0 - ndcY) * height * 0.5);
+        };
+
+        auto bestDistanceSquared = PICK_RADIUS_PIXELS * PICK_RADIUS_PIXELS;
+        std::optional<std::size_t> bestTarget;
+        for(const auto &segment : m_previewRenderCache.selectableSegments) {
+            if(segment.target >= m_previewRenderCache.selectionTargets.size()) continue;
+            const auto from = project(segment.from);
+            const auto to = project(segment.to);
+            const auto direction = to - from;
+            const auto lengthSquared = glm::dot(direction, direction);
+            const auto parameter = lengthSquared > 0.0
+                ? std::clamp(glm::dot(mouse - from, direction) / lengthSquared, 0.0, 1.0)
+                : 0.0;
+            const auto difference = mouse - glm::mix(from, to, parameter);
+            const auto distanceSquared = glm::dot(difference, difference);
+            if(distanceSquared >= bestDistanceSquared) continue;
+            bestDistanceSquared = distanceSquared;
+            bestTarget = segment.target;
+        }
+
+        clearPreviewSelection();
+        if(!bestTarget) return;
+        m_previewSelectedSourceLines =
+            m_previewRenderCache.selectionTargets[*bestTarget].sourceLines;
+        if(!m_previewSelectedSourceLines.empty()) {
+            const auto mainSource = m_programSource.empty()
+                ? std::string_view{} : std::string_view(std::get<1>(m_programSource.back()));
+            const auto mainLine = std::ranges::find_if(m_previewSelectedSourceLines,
+                [&](const auto &line) { return line.source == mainSource; });
+            m_previewSelectionScrollLine = mainLine == m_previewSelectedSourceLines.end()
+                ? m_previewSelectedSourceLines.front() : *mainLine;
+        }
+    }
+
     std::expected<PreviewRenderCache, std::string> buildPreviewGeometry(
             const ngc::PreparedPreviewScene &preparedScene,
             const PreviewViewSnapshot &view,
@@ -589,6 +662,32 @@ public:
                 return found == slice.commands.end()
                     ? ngc::position_t{} : found->presentation.activeToolOffset;
             };
+            const auto appendSourceLine = [](std::vector<PreviewSourceLine> &lines,
+                                             const ngc::PreparedCommandRecord &record) {
+                if(record.presentation.activeBlocks.empty()) return;
+                const auto &block = record.presentation.activeBlocks.back();
+                const PreviewSourceLine candidate{block.source, block.line};
+                if(candidate.line > 0 && !std::ranges::contains(lines, candidate))
+                    lines.push_back(candidate);
+            };
+            const auto storeSelectionTarget = [&](std::vector<PreviewSourceLine> lines)
+                    -> std::optional<std::size_t> {
+                if(lines.empty()) return std::nullopt;
+                cache.selectionTargets.push_back({std::move(lines)});
+                return cache.selectionTargets.size() - 1;
+            };
+            const auto continuousSelectionTarget = [&](const ngc::PreparedGeometrySlice &slice,
+                                                        const ngc::PreparedPathPiece &piece) {
+                std::vector<PreviewSourceLine> lines;
+                const auto appendCommand = [&](const ngc::PreparedCommandId id) {
+                    const auto found = std::ranges::find_if(slice.commands,
+                        [id](const auto &command) { return command.id == id; });
+                    if(found != slice.commands.end()) appendSourceLine(lines, *found);
+                };
+                if(piece.sourceCommands.empty()) appendCommand(piece.primaryCommand);
+                else for(const auto id : piece.sourceCommands) appendCommand(id);
+                return storeSelectionTarget(std::move(lines));
+            };
             ngc::CurveEvaluationWorkspace curveWorkspace;
             const auto projectToPixels = [&](const glm::dvec3 &point) {
                 const auto transformed = view.orientation * displayOffset(point - view.pivot);
@@ -603,7 +702,8 @@ public:
                                          const double toDistance,
                                          const ngc::position_t &offset,
                                          std::vector<glm::dvec3> &vertices,
-                                         const bool adaptive)
+                                         const bool adaptive,
+                                         const std::optional<std::size_t> selectionTarget)
                     -> std::expected<std::pair<glm::dvec3, glm::dvec3>, std::string> {
                 const auto position = [&](const double distance) {
                     return offsetPoint(ngc::positionAtDistance(
@@ -612,8 +712,14 @@ public:
                 if(cancelled()) return std::unexpected("cancelled");
                 const auto beginning = position(fromDistance);
                 const auto ending = position(toDistance);
+                const auto appendSegment = [&](const glm::dvec3 &from,
+                                               const glm::dvec3 &to) {
+                    segment(vertices, from, to);
+                    if(selectionTarget)
+                        cache.selectableSegments.push_back({from, to, *selectionTarget});
+                };
                 if(!adaptive) {
-                    segment(vertices, beginning, ending);
+                    appendSegment(beginning, ending);
                     return std::pair { beginning, ending };
                 }
                 const auto pixelsPerWorldUnit = std::max(
@@ -654,7 +760,7 @@ public:
                             "preview curve tessellation produced a non-finite error bound");
                     if(regionOutsideView(fromPoint, toPoint, screenError)) return {};
                     if(screenError <= PREVIEW_CURVE_ERROR_PIXELS) {
-                        segment(vertices, fromPoint, toPoint);
+                        appendSegment(fromPoint, toPoint);
                         return {};
                     }
                     const auto middleDistance = std::midpoint(from, to);
@@ -675,6 +781,7 @@ public:
                     if(cancelled()) return std::unexpected("cancelled");
                     if(!piece.curve) continue;
                     const auto offset = commandOffset(slice, piece.primaryCommand);
+                    const auto selectionTarget = continuousSelectionTarget(slice, piece);
                     auto *vertices = piece.kind == ngc::PreparedPieceKind::ClusterSpline
                         ? &cache.g64ClusterSplineLines
                         : piece.kind == ngc::PreparedPieceKind::JunctionBlend
@@ -683,7 +790,8 @@ public:
                                 ? &cache.arcLines : &cache.feedLines;
                     const auto appended = appendCurve(
                         *piece.curve, piece.curveFrom, piece.curveTo, offset, *vertices,
-                        piece.kind != ngc::PreparedPieceKind::RetainedLineSection);
+                        piece.kind != ngc::PreparedPieceKind::RetainedLineSection,
+                        selectionTarget);
                     if(!appended) return std::unexpected(appended.error());
                     const auto &[beginning, ending] = *appended;
                     cache.darkPoints.push_back(beginning);
@@ -741,9 +849,14 @@ public:
 
                 const auto &curve = *standalone.displayGeometry;
                 const auto offset = standalone.command.presentation.activeToolOffset;
+                std::vector<PreviewSourceLine> sourceLines;
+                appendSourceLine(sourceLines, standalone.command);
+                const auto selectionTarget = std::holds_alternative<ngc::MoveLine>(command)
+                    || std::holds_alternative<ngc::MoveArc>(command)
+                    ? storeSelectionTarget(std::move(sourceLines)) : std::nullopt;
                 const auto appended = appendCurve(
                     curve, 0.0, curve.length, offset, *vertices,
-                    std::holds_alternative<ngc::MoveArc>(command));
+                    std::holds_alternative<ngc::MoveArc>(command), selectionTarget);
                 if(!appended) return std::unexpected(appended.error());
                 const auto &[beginning, ending] = *appended;
                 if(showEndpoints) {
@@ -811,6 +924,7 @@ public:
         visible.sceneMinimum = source.sceneMinimum;
         visible.sceneMaximum = source.sceneMaximum;
         visible.hasSceneGeometry = source.hasSceneGeometry;
+        visible.selectionTargets = source.selectionTargets;
         const auto project = [&](const glm::dvec3 &point) {
             const auto transformed = view.orientation * displayOffset(point - view.pivot);
             return glm::dvec2(
@@ -872,6 +986,13 @@ public:
            ||!cullPoints(source.g64ControlPoints, visible.g64ControlPoints)
            ||!cullPoints(source.darkPoints, visible.darkPoints)
            ||!cullPoints(source.lightPoints, visible.lightPoints)) return std::nullopt;
+        visible.selectableSegments.reserve(source.selectableSegments.size());
+        for(const auto &segment : source.selectableSegments) {
+            if(cancelled()) return std::nullopt;
+            if(clipPreviewSegment(project(segment.from), project(segment.to),
+                                  1.0 + PREVIEW_VISIBILITY_MARGIN))
+                visible.selectableSegments.push_back(segment);
+        }
         if(centroidWeight > 0.0) visible.visibleCentroid = weightedCentroid / centroidWeight;
 
         visible.clusterGeometricJerkComb.reserve(source.clusterGeometricJerkComb.size());
@@ -1000,6 +1121,7 @@ public:
             m_viewPan.y += compensation.z;
             m_modelPivot = *ready->visibleCentroid;
         }
+        if(m_previewRenderCache.revision != ready->revision) clearPreviewSelection();
         m_previewRenderCache = std::move(*ready);
         if(!m_glBindBuffer || !m_glBufferData || m_previewGeometryBuffer == 0) return;
 
@@ -1060,6 +1182,9 @@ public:
         if(navigationActive && ImGui::IsKeyPressed(ImGuiKey_F, false)) {
             fitToolpathToView(width, height);
         }
+
+        if(navigationActive && ImGui::IsMouseClicked(ImGuiMouseButton_Left))
+            selectPreviewGeometry(width, height, viewportLeft, viewportTop);
 
         if(ImGui::IsMouseClicked(ImGuiMouseButton_Middle)) {
             m_rotationDragHasPivot=navigationActive&&!ctrl&&!shift
@@ -1420,6 +1545,19 @@ public:
                     GL_LINES, 1.0f, 1.0f, 0.4f, 10, 0x5555);
         drawPreview(PreviewBatch::Rapid, m_previewRenderCache.rapidLines,
                     GL_LINES, 0.4f, 0.4f, 1.0f, 4, 0x5555);
+        if(!m_previewSelectedSourceLines.empty()) {
+            glLineWidth(5.0f);
+            glColor4d(1.0, 0.72, 0.08, 0.95);
+            glBegin(GL_LINES);
+            for(const auto &segment : m_previewRenderCache.selectableSegments) {
+                if(segment.target >= m_previewRenderCache.selectionTargets.size()
+                   || m_previewRenderCache.selectionTargets[segment.target].sourceLines
+                        != m_previewSelectedSourceLines) continue;
+                glVertex3dv(glm::value_ptr(segment.from));
+                glVertex3dv(glm::value_ptr(segment.to));
+            }
+            glEnd();
+        }
         glEnable(GL_POINT_SMOOTH);
         glPointSize(3.0f);
         drawPreview(PreviewBatch::DarkPoints, m_previewRenderCache.darkPoints,
@@ -1449,6 +1587,7 @@ public:
     }
 
     void rebuildMainProgramLines() {
+        clearPreviewSelection();
         m_mainProgramLines.clear();
         if(m_programSource.empty()) return;
 
@@ -1479,7 +1618,10 @@ public:
         ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::BeginDisabled(m_worker.busy());
-        if(ImGui::Button("Clear Preview")) m_worker.clearPreview();
+        if(ImGui::Button("Clear Preview")) {
+            m_worker.clearPreview();
+            clearPreviewSelection();
+        }
         ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::BeginDisabled(!m_previewRenderCache.hasSceneGeometry);
@@ -1597,6 +1739,10 @@ public:
             }
         } else {
             const auto lineState = sourceLineExecutionState(simulation, name);
+            const auto previewSelected = [&](const int line) {
+                return std::ranges::contains(
+                    m_previewSelectedSourceLines, PreviewSourceLine{name, line});
+            };
 
             ImGuiListClipper clipper;
             clipper.Begin(static_cast<int>(m_mainProgramLines.size()));
@@ -1604,15 +1750,28 @@ public:
                && *lineState.currentLine <= static_cast<int>(m_mainProgramLines.size())) {
                 clipper.IncludeItemByIndex(*lineState.currentLine - 1);
             }
+            if(m_previewSelectionScrollLine
+               && m_previewSelectionScrollLine->source == name
+               && m_previewSelectionScrollLine->line > 0
+               && m_previewSelectionScrollLine->line
+                    <= static_cast<int>(m_mainProgramLines.size()))
+                clipper.IncludeItemByIndex(m_previewSelectionScrollLine->line - 1);
             while(clipper.Step()) {
                 for(int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
                     const auto lineNumber = index + 1;
                     const auto active = lineState.active(lineNumber);
                     const auto completed = lineState.completed(lineNumber);
-                    ImGui::PushStyleColor(ImGuiCol_Header, lineState.highlight(lineNumber));
+                    const auto selectedByPreview = previewSelected(lineNumber);
+                    ImGui::PushStyleColor(ImGuiCol_Header,
+                                          lineState.highlight(lineNumber, selectedByPreview));
                     ImGui::Selectable(std::format("{:5}  {}", lineNumber, m_mainProgramLines[index]).c_str(),
-                                      active || completed);
+                                      active || completed || selectedByPreview);
                     if(lineState.current(lineNumber)) ImGui::SetScrollHereY(0.5f);
+                    if(m_previewSelectionScrollLine
+                       && *m_previewSelectionScrollLine == PreviewSourceLine{name, lineNumber}) {
+                        if(!lineState.current(lineNumber)) ImGui::SetScrollHereY(0.5f);
+                        m_previewSelectionScrollLine.reset();
+                    }
                     ImGui::PopStyleColor();
                 }
             }

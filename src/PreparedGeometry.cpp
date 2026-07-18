@@ -808,6 +808,7 @@ namespace ngc {
                 prepared.geometricallyLinear = linear;
                 prepared.primaryCommand = record.id;
                 prepared.activationCommands = {record.id};
+                prepared.sourceCommands = {record.id};
                 if(effort.generateSamples) samplePiece(prepared, workspace);
                 expected = end;
                 return prepared;
@@ -897,6 +898,7 @@ namespace ngc {
                             const double from, const double to, const double feed,
                             const bool linear, const PreparedCommandId primary,
                             std::vector<PreparedCommandId> activations,
+                            std::vector<PreparedCommandId> sources,
                             const std::span<const ClusterSourceFeedRange> clusterSourceFeeds = {})
                 -> std::expected<void, std::string> {
             if(!curve || to - from <= 1e-12 || !std::isfinite(to - from))
@@ -911,6 +913,7 @@ namespace ngc {
             piece.geometricallyLinear = linear || curve->geometricallyLinear;
             piece.primaryCommand = primary;
             piece.activationCommands = std::move(activations);
+            piece.sourceCommands = std::move(sources);
             if(kind == PreparedPieceKind::ClusterSpline) {
                 if(auto prepared = prepareClusterKnotIntervals(
                         piece, clusterSourceFeeds, workspace, effort.generateSamples); !prepared)
@@ -946,7 +949,8 @@ namespace ngc {
                                                           : PreparedPieceKind::RetainedArcSection;
                 if(auto added = addPiece(kind, entities[index].curve, from, to,
                                          entities[index].feed, entities[index].linear,
-                                         entities[index].id, {entities[index].id}); !added)
+                                         entities[index].id, {entities[index].id},
+                                         {entities[index].id}); !added)
                     return std::unexpected(added.error());
             }
             if(index + 1 == entities.size()) continue;
@@ -1048,9 +1052,13 @@ namespace ngc {
                 std::vector<PreparedCommandId> activations;
                 for(std::size_t command = index + 1; command <= right; ++command)
                     activations.push_back(entities[command].id);
+                std::vector<PreparedCommandId> sources;
+                for(std::size_t command = index; command <= right; ++command)
+                    sources.push_back(entities[command].id);
                 if(auto added = addPiece(PreparedPieceKind::ClusterSpline, curve, 0.0,
                                          curve->length, (entities[index].feed + entities[right].feed) / 2.0,
                                          false, entities[index].id, std::move(activations),
+                                         std::move(sources),
                                          sourceFeeds); !added)
                     return std::unexpected(added.error());
                 index = right - 1;
@@ -1065,7 +1073,8 @@ namespace ngc {
             if(!curve) return std::unexpected("junction blend spline construction failed");
             if(auto added = addPiece(PreparedPieceKind::JunctionBlend, curve, 0.0, curve->length,
                                      (incoming.feed + outgoing.feed) / 2.0, false,
-                                     outgoing.id, {outgoing.id}); !added)
+                                     outgoing.id, {outgoing.id},
+                                     {incoming.id, outgoing.id}); !added)
                 return std::unexpected(added.error());
         }
         if(result.pieces.empty()) return std::unexpected("continuous path produced no geometry");
