@@ -15,6 +15,7 @@
 #include <memory>
 #include <numbers>
 #include <numeric>
+#include <span>
 #include <tuple>
 #include <type_traits>
 #include <vector>
@@ -807,6 +808,8 @@ namespace ngc {
             double length=0.0;
             double speed=0.0;
             bool linear=false;
+            std::span<const PreparedGeometricSample> geometricSamples{};
+            double geometricSampleDistanceOffset=0.0;
             std::function<PathSample(double)> sampleAt;
             std::function<position_t(double)> curvatureAt;
             std::function<position_t(double)> infiniteJerkCurvatureAt;
@@ -1187,39 +1190,78 @@ namespace ngc {
         reportProgress();
 
         std::vector<GeometryPiece> pieces;
-        pieces.reserve(geometry.pieces.size());
-            auto workspace=std::make_shared<CurveEvaluationWorkspace>();
-            const auto inputFor=[&](const PreparedCommandId id)
-                    ->std::expected<std::size_t,std::string> {
-                const auto found=std::ranges::find_if(geometry.commands,
-                    [id](const auto &command) { return command.id==id; });
-                if(found==geometry.commands.end())
+        auto timingPieceCount=std::size_t{0};
+        for(const auto &prepared:geometry.pieces)
+            timingPieceCount+=prepared.kind==PreparedPieceKind::ClusterSpline
+                ?prepared.clusterKnotIntervals.size():1;
+        pieces.reserve(timingPieceCount);
+        auto workspace=std::make_shared<CurveEvaluationWorkspace>();
+        const auto inputFor=[&](const PreparedCommandId id)
+                ->std::expected<std::size_t,std::string> {
+            const auto found=std::ranges::find_if(geometry.commands,
+                [id](const auto &command) { return command.id==id; });
+            if(found==geometry.commands.end())
+                return std::unexpected(std::format(
+                    "prepared piece references unknown command {}",id));
+            return static_cast<std::size_t>(found-geometry.commands.begin());
+        };
+        for(const auto &prepared:geometry.pieces) {
+            if(!prepared.curve||prepared.length()<=1e-12||prepared.programmedFeed<=0.0)
+                return std::unexpected("prepared continuous path contains an invalid piece");
+            if(prepared.geometricSamples.size()<2)
+                return std::unexpected(std::format(
+                    "prepared continuous piece {} has no usable geometric samples",
+                    prepared.id));
+            const auto primaryId=prepared.activationCommands.empty()
+                ?prepared.primaryCommand:prepared.activationCommands.front();
+            const auto primary=inputFor(primaryId);
+            if(!primary) return std::unexpected(primary.error());
+            std::vector<std::size_t> activations;
+            for(const auto id:prepared.activationCommands) {
+                const auto input=inputFor(id);
+                if(!input) return std::unexpected(input.error());
+                if(*input!=*primary) activations.push_back(*input);
+            }
+            const auto appendTimingPiece=[&](
+                    const double from,const double to,const double speed,
+                    const std::span<const PreparedGeometricSample> samples,
+                    std::vector<std::size_t> activationInputs)
+                    ->std::expected<void,std::string> {
+                const auto length=to-from;
+                const auto sampleOffset=from-prepared.curveFrom;
+                if(!std::isfinite(length)||length<=1e-12
+                   ||!std::isfinite(speed)||speed<=0.0)
                     return std::unexpected(std::format(
-                        "prepared piece references unknown command {}",id));
-                return static_cast<std::size_t>(found-geometry.commands.begin());
-            };
-            for(const auto &prepared:geometry.pieces) {
-                if(!prepared.curve||prepared.length()<=1e-12||prepared.programmedFeed<=0.0)
-                    return std::unexpected("prepared continuous path contains an invalid piece");
-                const auto primaryId=prepared.activationCommands.empty()
-                    ?prepared.primaryCommand:prepared.activationCommands.front();
-                const auto primary=inputFor(primaryId);
-                if(!primary) return std::unexpected(primary.error());
-                std::vector<std::size_t> activations;
-                for(const auto id:prepared.activationCommands) {
-                    const auto input=inputFor(id);
-                    if(!input) return std::unexpected(input.error());
-                    if(*input!=*primary) activations.push_back(*input);
-                }
+                        "prepared continuous piece {} has an invalid timing interval",
+                        prepared.id));
+                if(samples.size()<2)
+                    return std::unexpected(std::format(
+                        "prepared continuous piece {} timing interval has no geometric samples",
+                        prepared.id));
+                const auto distanceTolerance=std::max(1e-10,prepared.length()*1e-10);
+                if(!std::isfinite(samples.front().distance)
+                   ||!std::isfinite(samples.back().distance)
+                   ||std::abs(samples.front().distance-sampleOffset)>distanceTolerance
+                   ||std::abs(samples.back().distance-(sampleOffset+length))>distanceTolerance)
+                    return std::unexpected(std::format(
+                        "prepared continuous piece {} timing samples do not match their interval",
+                        prepared.id));
+                for(std::size_t sample=1;sample<samples.size();++sample)
+                    if(!std::isfinite(samples[sample].distance)
+                       ||samples[sample].distance<=samples[sample-1].distance)
+                        return std::unexpected(std::format(
+                            "prepared continuous piece {} timing samples are not ordered",
+                            prepared.id));
+
                 const auto curve=prepared.curve;
-                const auto from=prepared.curveFrom;
-                const auto length=prepared.length();
                 pieces.push_back({
                     .input=*primary,
-                    .activationInputs=std::move(activations),
+                    .activationInputs=std::move(activationInputs),
                     .length=length,
-                    .speed=prepared.programmedFeed,
+                    .speed=speed,
                     .linear=prepared.geometricallyLinear,
+                    .geometricSamples=samples,
+                    .geometricSampleDistanceOffset=sampleOffset,
                     .sampleAt=[curve,workspace,from,length](const double distance) {
                         const auto source=from+std::clamp(distance,0.0,length);
                         return PathSample{positionAtDistance(*curve,source,*workspace),
@@ -1248,6 +1290,53 @@ namespace ngc {
                             from+std::clamp(b,0.0,length),*workspace);
                     },
                 });
+                return {};
+            };
+
+            if(prepared.kind!=PreparedPieceKind::ClusterSpline) {
+                if(auto appended=appendTimingPiece(prepared.curveFrom,prepared.curveTo,
+                        prepared.programmedFeed,prepared.geometricSamples,
+                        std::move(activations)); !appended)
+                    return std::unexpected(appended.error());
+                continue;
+            }
+            if(prepared.clusterKnotIntervals.empty())
+                return std::unexpected(std::format(
+                    "prepared cluster spline {} has no knot intervals",prepared.id));
+            const auto expectedSampleCount=16*prepared.clusterKnotIntervals.size()+1;
+            if(prepared.geometricSamples.size()!=expectedSampleCount)
+                return std::unexpected(std::format(
+                    "prepared cluster spline {} has {} geometric samples; expected {}",
+                    prepared.id,prepared.geometricSamples.size(),expectedSampleCount));
+            auto expectedFrom=prepared.curveFrom;
+            for(std::size_t intervalIndex=0;
+                    intervalIndex<prepared.clusterKnotIntervals.size();++intervalIndex) {
+                const auto &interval=prepared.clusterKnotIntervals[intervalIndex];
+                if(std::abs(interval.curveFrom-expectedFrom)>1e-10
+                   ||interval.curveTo<=interval.curveFrom)
+                    return std::unexpected(std::format(
+                        "prepared cluster spline {} knot interval {} is not contiguous",
+                        prepared.id,intervalIndex));
+                if(interval.geometricSampleCount!=17
+                   ||interval.firstGeometricSample>prepared.geometricSamples.size()
+                   ||interval.geometricSampleCount
+                        >prepared.geometricSamples.size()-interval.firstGeometricSample)
+                    return std::unexpected(std::format(
+                        "prepared cluster spline {} knot interval {} does not provide 17 samples",
+                        prepared.id,intervalIndex));
+                const auto samples=std::span{prepared.geometricSamples}.subspan(
+                    interval.firstGeometricSample,interval.geometricSampleCount);
+                auto intervalActivations=intervalIndex==0
+                    ?std::move(activations):std::vector<std::size_t>{};
+                if(auto appended=appendTimingPiece(interval.curveFrom,interval.curveTo,
+                        interval.programmedFeed,samples,std::move(intervalActivations)); !appended)
+                    return std::unexpected(appended.error());
+                expectedFrom=interval.curveTo;
+            }
+            if(std::abs(expectedFrom-prepared.curveTo)>1e-10)
+                return std::unexpected(std::format(
+                    "prepared cluster spline {} knot intervals do not cover the curve",
+                    prepared.id));
         }
         if(pieces.empty()) return std::unexpected("continuous path produced no geometry");
         timeLawRecorder.instrumentation.configureCache(
@@ -1369,13 +1458,12 @@ namespace ngc {
                     limits.velocityCause=cause;
                 }
             };
-            constexpr unsigned SAMPLES=64;
             CurvatureDerivativeDiagnostic derivativeDiagnostic;
-            for(unsigned sampleIndex=0;sampleIndex<=SAMPLES;++sampleIndex) {
-                const auto distance=piece.length*static_cast<double>(sampleIndex)/SAMPLES;
-                const auto sample=piece.sampleAt(distance);
-                const auto curvature=piece.curvatureAt(distance);
-                const auto curvatureDerivative=piece.curvatureDerivativeAt(distance);
+            for(const auto &geometric:piece.geometricSamples) {
+                const auto distance=geometric.distance-piece.geometricSampleDistanceOffset;
+                const PathSample sample{geometric.position,geometric.tangent};
+                const auto &curvature=geometric.curvature;
+                const auto &curvatureDerivative=geometric.curvatureDerivative;
                 const auto derivativeMagnitude=curvatureDerivative.length();
                 if(derivativeMagnitude>derivativeDiagnostic.analyticMagnitude) {
                     derivativeDiagnostic.distance=distance;
@@ -1473,12 +1561,12 @@ namespace ngc {
         pieceStartGeometry.reserve(pieces.size());
         pieceEndGeometry.reserve(pieces.size());
         for(const auto &piece:pieces) {
-            const auto start=piece.sampleAt(0.0);
-            const auto end=piece.sampleAt(piece.length);
-            pieceStartGeometry.push_back({start.tangent,piece.curvatureAt(0.0),
-                piece.curvatureDerivativeAt(0.0)});
-            pieceEndGeometry.push_back({end.tangent,piece.curvatureAt(piece.length),
-                piece.curvatureDerivativeAt(piece.length)});
+            const auto &start=piece.geometricSamples.front();
+            const auto &end=piece.geometricSamples.back();
+            pieceStartGeometry.push_back({start.tangent,start.curvature,
+                start.curvatureDerivative});
+            pieceEndGeometry.push_back({end.tangent,end.curvature,
+                end.curvatureDerivative});
         }
         timeLawRecorder.instrumentation.diagnostics.endpointFeasibility
             .cachedGeometryEndpoints+=2*pieces.size();

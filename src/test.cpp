@@ -2240,6 +2240,51 @@ namespace {
         }
         requireNear(minimumIntervalFeed,0.5,
                     "a knot interval overlapping the slow source entity should retain its minimum feed");
+
+        std::vector<std::pair<double,double>> expectedTimingIntervals;
+        for(const auto &piece:prepared->pieces) {
+            if(piece.kind==ngc::PreparedPieceKind::ClusterSpline) {
+                for(const auto &interval:piece.clusterKnotIntervals)
+                    expectedTimingIntervals.emplace_back(
+                        interval.curveTo-interval.curveFrom,interval.programmedFeed);
+            } else {
+                expectedTimingIntervals.emplace_back(piece.length(),piece.programmedFeed);
+            }
+        }
+        ngc::TrajectoryCompiler compiler({
+            .pathAcceleration=20.0,.rapidSpeed=199.8,.arcChordTolerance=0.0001,
+            .pathJerk=501.0,
+            .axisVelocity={3.333333333,3.333333333,3.333333333,
+                           3.333333333,3.333333333,3.333333333},
+            .axisAcceleration={20,20,20,20,20,20},
+            .axisJerk={501,501,501,501,501,501},
+        });
+        compiler.reset(94,points.front());
+        const auto planned=compiler.compileContinuous(*prepared,0.05);
+        require(planned&&*planned,planned?"":planned.error());
+        require((*planned)->pieceTiming.size()==expectedTimingIntervals.size(),
+                "continuous timing should create one timing interval per cluster knot interval");
+        for(std::size_t interval=0;interval<expectedTimingIntervals.size();++interval) {
+            requireNear((*planned)->pieceTiming[interval].length,
+                        expectedTimingIntervals[interval].first,
+                        "continuous timing interval length should match prepared geometry");
+            requireNear((*planned)->pieceTiming[interval].programmedVelocityLimit,
+                        expectedTimingIntervals[interval].second,
+                        "continuous timing interval should use its prepared programmed feed");
+        }
+
+        auto missingSamples=*prepared;
+        const auto missingCluster=std::ranges::find_if(
+            missingSamples.pieces,[](const auto &piece) {
+                return piece.kind==ngc::PreparedPieceKind::ClusterSpline;
+            });
+        require(missingCluster!=missingSamples.pieces.end(),
+                "focused missing-sample case requires a cluster spline");
+        missingCluster->geometricSamples.clear();
+        compiler.reset(95,points.front());
+        const auto rejected=compiler.compileContinuous(missingSamples,0.05);
+        require(!rejected&&rejected.error().contains("no usable geometric samples"),
+                "continuous timing must reject missing producer samples without a fallback");
     }
 
     void testCollinearJunctionBlendUsesLinearTiming() {

@@ -181,9 +181,9 @@ namespace ngc {
         PreparedCommandId primaryCommand = 0;
         std::vector<PreparedCommandId> activationCommands;
         std::vector<PreparedGeometricSample> geometricSamples;
-        // Preparation-only metadata for cluster splines. The cluster-wide
-        // programmedFeed remains authoritative until timing deliberately
-        // adopts these knot-interval feeds and boundaries.
+        // Continuous timing treats each cluster-spline knot interval as one
+        // timing interval and requires its prepared samples and feed. The
+        // cluster-wide programmedFeed remains presentation/slice metadata.
         std::vector<PreparedClusterKnotInterval> clusterKnotIntervals;
 
         double length() const { return std::max(0.0, curveTo - curveFrom); }
