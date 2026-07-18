@@ -186,7 +186,6 @@ namespace ngc {
     };
 
     struct GeometryPreparationEffort {
-        bool captureSplineGeometry = false;
         bool certifySourceTube = true;
         bool generateSamples = true;
         std::size_t lengthTableIntervalsPerKnotSpan = 32;

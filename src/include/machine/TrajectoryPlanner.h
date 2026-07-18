@@ -104,8 +104,6 @@ namespace ngc {
         TimeLawDiagnostics publishedTimeLaw;
         TimeLawDiagnostics rollingPrefixProbeTimeLaw;
         TimeLawDiagnostics rollingSuffixProbeTimeLaw;
-        SplineInverseDiagnostics publishedSplineInverse;
-        simulation_detail::ArcInverseDiagnostics publishedArcInverse;
     };
 
     // NRT-only compatible command horizon. RT capacity is imposed later while
@@ -121,7 +119,6 @@ namespace ngc {
         TrajectoryPlanningDiagnostics m_diagnostics;
         MotionState m_continuousBoundary{};
         std::string m_lastRollingCandidateError;
-        std::size_t m_nextRollingAttemptWindowSize = 2;
         std::optional<double> m_lastRollingVelocityFraction;
         std::string m_planningActivity;
         std::string m_lastContinuousPlanSummary;
@@ -144,36 +141,6 @@ namespace ngc {
         static std::string formatPosition(const position_t &value) {
             return std::format("[X={} Y={} Z={} A={} B={} C={}]",
                 value.x,value.y,value.z,value.a,value.b,value.c);
-        }
-
-        static void accumulateSplineInverse(SplineInverseDiagnostics &total,
-                                             const SplineInverseDiagnostics &value) {
-            total.constructionIntegralEvaluations+=value.constructionIntegralEvaluations;
-            total.queries+=value.queries;
-            total.endpointQueries+=value.endpointQueries;
-            total.exactCacheHits+=value.exactCacheHits;
-            total.inverseIntegralEvaluations+=value.inverseIntegralEvaluations;
-            total.newtonIterations+=value.newtonIterations;
-            total.seedConvergences+=value.seedConvergences;
-            total.safeguardedBisections+=value.safeguardedBisections;
-            total.iterationLimitHits+=value.iterationLimitHits;
-            total.maximumNewtonIterations=std::max(
-                total.maximumNewtonIterations,value.maximumNewtonIterations);
-        }
-
-        static void accumulateArcInverse(simulation_detail::ArcInverseDiagnostics &total,
-                                         const simulation_detail::ArcInverseDiagnostics &value) {
-            total.constructionIntegralEvaluations+=value.constructionIntegralEvaluations;
-            total.queries+=value.queries;
-            total.endpointQueries+=value.endpointQueries;
-            total.exactCacheHits+=value.exactCacheHits;
-            total.inverseIntegralEvaluations+=value.inverseIntegralEvaluations;
-            total.newtonIterations+=value.newtonIterations;
-            total.seedConvergences+=value.seedConvergences;
-            total.safeguardedBisections+=value.safeguardedBisections;
-            total.iterationLimitHits+=value.iterationLimitHits;
-            total.maximumNewtonIterations=std::max(
-                total.maximumNewtonIterations,value.maximumNewtonIterations);
         }
 
         static std::string inputLocation(const TrajectoryPlannerInput &input) {
@@ -250,113 +217,6 @@ namespace ngc {
         static double positionDot(const position_t &left,const position_t &right) {
             return left.x*right.x+left.y*right.y+left.z*right.z
                 +left.a*right.a+left.b*right.b+left.c*right.c;
-        }
-
-        struct RollingSplit {
-            MachineCommand prefix;
-            MachineCommand suffix;
-            double prefixLength = 0.0;
-            double suffixLength = 0.0;
-            position_t position{};
-            position_t tangent{};
-            position_t curvature{};
-            double velocityLimit = 0.0;
-        };
-
-        static std::optional<double> continuousMotionLength(const MachineCommand &command) {
-            return std::visit([](const auto &value) -> std::optional<double> {
-                using T=std::decay_t<decltype(value)>;
-                if constexpr(std::same_as<T,MoveLine>) return (value.to()-value.from()).length();
-                else if constexpr(std::same_as<T,MoveArc>) {
-                    simulation_detail::ArcReference reference(value);
-                    if(reference.valid()) return reference.length();
-                    return std::nullopt;
-                } else return std::nullopt;
-            },command);
-        }
-
-        static double continuousFeed(const MachineCommand &command) {
-            return std::visit([](const auto &value) {
-                using T=std::decay_t<decltype(value)>;
-                if constexpr(std::same_as<T,MoveLine>||std::same_as<T,MoveArc>)
-                    return value.speed()/60.0;
-                else return 0.0;
-            },command);
-        }
-
-        std::optional<RollingSplit> rollingSplit(const MachineCommand &command,
-                                                  const double programmedScale) const {
-            const auto length=continuousMotionLength(command);
-            // A rolling anchor is valid only inside the exact retained middle
-            // of a line that is genuinely longer than the complete 6P blend
-            // allocation. Using the entity's automatic min(P, length / 6)
-            // scale makes every short line satisfy this test by equality and
-            // lets a rolling boundary cut through a spline cluster.
-            if(!length||*length<=6.0*programmedScale*(1.0+1e-10))
-                return std::nullopt;
-            const auto splitDistance=*length/2.0;
-            return std::visit([&](const auto &value) -> std::optional<RollingSplit> {
-                using T=std::decay_t<decltype(value)>;
-                position_t position;
-                position_t tangent;
-                position_t curvature{};
-                MachineCommand prefix=value;
-                MachineCommand suffix=value;
-                if constexpr(std::same_as<T,MoveLine>) {
-                    const auto delta=value.to()-value.from();
-                    tangent=scalePosition(delta,1.0 / *length);
-                    position=value.from()+scalePosition(tangent,splitDistance);
-                    prefix=MoveLine{value.from(),position,value.speed(),value.machineCoordinates()};
-                    suffix=MoveLine{position,value.to(),value.speed(),value.machineCoordinates()};
-                } else if constexpr(std::same_as<T,MoveArc>) {
-                    simulation_detail::ArcReference reference(value);
-                    if(!reference.valid()) return std::nullopt;
-                    position=reference.positionAtDistance(splitDistance);
-                    tangent=reference.tangentAtDistance(splitDistance);
-                    const auto step=std::clamp(*length*1e-5,1e-8,
-                        std::max(*length*1e-3,1e-8));
-                    const auto from=std::max(0.0,splitDistance-step);
-                    const auto to=std::min(*length,splitDistance+step);
-                    if(to-from<=1e-15) return std::nullopt;
-                    curvature=scalePosition(reference.tangentAtDistance(to)
-                        -reference.tangentAtDistance(from),1.0/(to-from));
-                    curvature=curvature-scalePosition(tangent,
-                        positionDot(curvature,tangent));
-                    prefix=MoveArc{value.from(),position,value.center(),value.axis(),value.speed()};
-                    suffix=MoveArc{position,value.to(),value.center(),value.axis(),value.speed()};
-                } else return std::nullopt;
-
-                auto velocityLimit=continuousFeed(command);
-                const auto &limits=m_compiler.limits();
-                for(const auto component:AXIS_COMPONENTS) {
-                    const auto tangentComponent=std::abs(tangent.*component);
-                    if(tangentComponent>1e-15)
-                        velocityLimit=std::min(velocityLimit,
-                            limits.axisVelocity.*component/tangentComponent);
-                    const auto curvatureComponent=std::abs(curvature.*component);
-                    if(curvatureComponent>1e-15)
-                        velocityLimit=std::min(velocityLimit,std::sqrt(
-                            limits.axisAcceleration.*component/curvatureComponent));
-                }
-                if(const auto magnitude=curvature.length();magnitude>1e-15)
-                    velocityLimit=std::min(velocityLimit,
-                        std::sqrt(limits.pathAcceleration/magnitude));
-                if(!std::isfinite(velocityLimit)||velocityLimit<=0.0) return std::nullopt;
-                return RollingSplit{
-                    .prefix=std::move(prefix),.suffix=std::move(suffix),
-                    .prefixLength=splitDistance,.suffixLength=*length-splitDistance,
-                    .position=position,.tangent=tangent,.curvature=curvature,
-                    .velocityLimit=velocityLimit,
-                };
-            },command);
-        }
-
-        static MotionState splitBoundaryState(const RollingSplit &split,const double velocity) {
-            return {
-                split.position,
-                scalePosition(split.tangent,velocity),
-                scalePosition(split.curvature,velocity*velocity),
-            };
         }
 
         static PreparedGeometryBoundary preparedBoundary(
@@ -728,7 +588,6 @@ namespace ngc {
             m_compiler.reset(epoch, position);
             m_continuousBoundary={position,{},{}};
             m_lastRollingCandidateError.clear();
-            m_nextRollingAttemptWindowSize=2;
             m_lastRollingVelocityFraction.reset();
             m_planningActivity.clear();
             m_lastContinuousPlanSummary.clear();
@@ -786,38 +645,14 @@ namespace ngc {
                 ||m_continuousBoundary.acceleration.length()>1e-10);
         }
         bool shouldPlanRollingPrefix() const {
-            if(m_preparedWindow) {
-                if(m_preparedChainEnded) return true;
-                return m_preparedWindow->diagnostics.nominalDuration
-                    >=2.0*m_compiler.limits().lookaheadDuration;
-            }
-            if(m_window.size()<m_nextRollingAttemptWindowSize||m_window.size()<2
-               ||!std::ranges::all_of(m_window,continuousMotion)) return false;
-            auto nominalDuration=0.0;
-            for(const auto &input:m_window) {
-                const auto length=continuousMotionLength(input.command);
-                const auto feed=continuousFeed(input.command);
-                if(!length||feed<=0.0) return false;
-                nominalDuration+=*length/feed;
-            }
-            return nominalDuration>=2.0*m_compiler.limits().lookaheadDuration;
+            if(!m_preparedWindow) return false;
+            if(m_preparedChainEnded) return true;
+            return m_preparedWindow->diagnostics.nominalDuration
+                >=2.0*m_compiler.limits().lookaheadDuration;
         }
-        static bool eligibleForLookahead(const TrajectoryPlannerInput &input) {
-            return continuousMotion(input);
-        }
-
-        bool canAppend(const TrajectoryPlannerInput &input) const {
-            if(m_window.empty()) return true;
-            const auto previousEnd=motionEnd(m_window.back().command);
-            const auto nextStart=motionStart(input.command);
-            return continuousMotion(input) && continuousMotion(m_window.front())
-                && input.metadata.pathTolerance == m_window.front().metadata.pathTolerance
-                &&sameProtectedTrajectoryPresentation(input.presentation,m_window.back().presentation)
-                &&previousEnd&&nextStart&&samePosition(*previousEnd,*nextStart);
-        }
-
         bool enqueue(TrajectoryPlannerInput input) {
             if(continuousMotion(input)) {
+                if(!m_preparedWindow) return false;
                 ++m_diagnostics.continuousModeInputs;
             }
             m_window.push_back(std::move(input));
@@ -1011,10 +846,6 @@ namespace ngc {
                 const auto activeInputs=std::ranges::count_if(inputs,[](const auto &input) {
                     return input.presentationActivation;
                 });
-                accumulateSplineInverse(
-                    m_diagnostics.publishedSplineInverse,continuous->splineInverse);
-                accumulateArcInverse(
-                    m_diagnostics.publishedArcInverse,continuous->arcInverse);
                 m_diagnostics.publishedTimeLaw+=continuous->timeLaw;
                 if(m_continuousDiagnosticCallback)
                     m_continuousDiagnosticCallback(*continuous,inputs);
@@ -1197,159 +1028,9 @@ namespace ngc {
                 return finalized;
             }
 
-            std::vector<std::tuple<std::size_t,RollingSplit,double>> splitCandidates;
-            auto totalNominalDuration=0.0;
-            for(const auto &input:m_window) {
-                const auto length=continuousMotionLength(input.command);
-                const auto feed=continuousFeed(input.command);
-                if(length&&feed>0.0) totalNominalDuration+=*length/feed;
-            }
-            auto nominalDuration=0.0;
-            for(std::size_t index=0;index<m_window.size();++index) {
-                const auto length=continuousMotionLength(m_window[index].command);
-                const auto feed=continuousFeed(m_window[index].command);
-                if(!length||feed<=0.0) break;
-                const auto entityScale=m_window[index].continuousScaleOverride>0.0
-                    ?m_window[index].continuousScaleOverride:std::min(blendScale,*length/6.0);
-                if(auto candidate=std::holds_alternative<MoveLine>(m_window[index].command)
-                        ?rollingSplit(m_window[index].command,blendScale):std::nullopt;
-                   candidate&&nominalDuration+candidate->prefixLength/feed
-                        >=m_compiler.limits().lookaheadDuration
-                   &&(allowTerminalStop||totalNominalDuration-nominalDuration
-                        -candidate->prefixLength/feed>=m_compiler.limits().lookaheadDuration)) {
-                    splitCandidates.emplace_back(index,std::move(*candidate),entityScale);
-                    if(splitCandidates.size()>=8) break;
-                }
-                nominalDuration+=*length/feed;
-            }
-
-            for(const auto &[splitIndex,split,splitScale]:splitCandidates) {
-                std::vector<MachineCommand> prefixCommands;
-                prefixCommands.reserve(splitIndex+1);
-                for(std::size_t index=0;index<splitIndex;++index)
-                    prefixCommands.push_back(m_window[index].command);
-                prefixCommands.push_back(split.prefix);
-                std::vector<double> prefixScales;
-                prefixScales.reserve(splitIndex+1);
-                for(std::size_t index=0;index<splitIndex;++index)
-                    prefixScales.push_back(m_window[index].continuousScaleOverride);
-                prefixScales.push_back(splitScale);
-
-                std::vector<MachineCommand> suffixProbeCommands{split.suffix};
-                std::vector<double> suffixProbeScales{splitScale};
-                auto suffixProbeDuration=split.suffixLength
-                    /continuousFeed(split.suffix);
-                for(std::size_t index=splitIndex+1;
-                    index<m_window.size()
-                        &&suffixProbeDuration<m_compiler.limits().lookaheadDuration;++index) {
-                    suffixProbeCommands.push_back(m_window[index].command);
-                    suffixProbeScales.push_back(m_window[index].continuousScaleOverride);
-                    const auto length=continuousMotionLength(m_window[index].command);
-                    const auto feed=continuousFeed(m_window[index].command);
-                    if(length&&feed>0.0) suffixProbeDuration+=*length/feed;
-                }
-
-                std::unique_ptr<ContinuousTrajectoryPlan> selected;
-                std::optional<TrajectoryCompiler> selectedPlanner;
-                MotionState selectedBoundary;
-                auto selectedVelocityFraction=0.0;
-                const auto initialVelocityFraction=m_lastRollingVelocityFraction
-                    ?std::min(1.0,2.0 * *m_lastRollingVelocityFraction):1.0;
-                for(unsigned attempt=0;attempt<6&&!selected;++attempt) {
-                    const auto velocityFraction=initialVelocityFraction*std::pow(0.5,attempt);
-                    const auto velocity=split.velocityLimit*velocityFraction;
-                    if(velocity<split.velocityLimit*0.01) break;
-                    ++m_diagnostics.rollingBoundaryCandidates;
-                    const auto boundary=splitBoundaryState(split,velocity);
-                    TrajectoryCompiler suffixProbe(m_compiler.limits());
-                    suffixProbe.setContinuousPlanningEffort(
-                        m_compiler.continuousPlanningEffort());
-                    suffixProbe.setProgressCallback(m_compiler.progressCallback());
-                    suffixProbe.reset(1,split.position);
-                    auto suffix=suffixProbe.compileContinuous(
-                        suffixProbeCommands,blendScale,boundary,std::nullopt,
-                        suffixProbeScales,ROLLING_VELOCITY_SEARCH_ITERATIONS);
-                    m_diagnostics.timeLaw+=suffixProbe.lastTimeLawDiagnostics();
-                    m_diagnostics.rollingSuffixProbeTimeLaw+=
-                        suffixProbe.lastTimeLawDiagnostics();
-                    if(!suffix) {
-                        ++m_diagnostics.rollingSuffixProbeFailures;
-                        m_lastRollingCandidateError="suffix: "+suffix.error();
-                        continue;
-                    }
-                    auto prefixPlanner=m_compiler;
-                    auto prefix=prefixPlanner.compileContinuous(
-                        prefixCommands,blendScale,m_continuousBoundary,boundary,
-                        prefixScales,ROLLING_VELOCITY_SEARCH_ITERATIONS);
-                    m_diagnostics.timeLaw+=prefixPlanner.lastTimeLawDiagnostics();
-                    m_diagnostics.rollingPrefixProbeTimeLaw+=
-                        prefixPlanner.lastTimeLawDiagnostics();
-                    if(!prefix) {
-                        ++m_diagnostics.rollingPrefixProbeFailures;
-                        m_lastRollingCandidateError="prefix: "+prefix.error();
-                        continue;
-                    }
-                    selected=std::move(*prefix);
-                    selectedPlanner=std::move(prefixPlanner);
-                    selectedBoundary=boundary;
-                    selectedVelocityFraction=velocityFraction;
-                }
-                if(selected&&selectedPlanner) {
-                    std::vector<TrajectoryPlannerInput> inputs;
-                    inputs.reserve(splitIndex+1);
-                    for(std::size_t index=0;index<=splitIndex;++index)
-                        inputs.push_back(m_window[index]);
-                    for(std::size_t index=0;index<splitIndex;++index) m_window.pop_front();
-                    m_window.front().command=split.suffix;
-                    m_window.front().presentationActivation=false;
-                    m_window.front().continuousScaleOverride=splitScale;
-                    m_compiler=std::move(*selectedPlanner);
-                    m_continuousBoundary=selectedBoundary;
-                    m_lastRollingVelocityFraction=selectedVelocityFraction;
-                    m_lastRollingCandidateError.clear();
-                    m_nextRollingAttemptWindowSize=m_window.size()+1;
-                    return finalize(std::move(selected),std::move(inputs));
-                }
-            }
-
-            if(!allowTerminalStop) {
-                const auto planningSeconds=std::chrono::duration<double>(
-                    std::chrono::steady_clock::now()-started).count();
-                m_diagnostics.totalPlanningSeconds+=planningSeconds;
-                m_diagnostics.rollingSearchSeconds+=planningSeconds;
-                m_nextRollingAttemptWindowSize=m_window.size()+4;
-                return std::unique_ptr<PlannedExecution>{};
-            }
-
-            std::vector<MachineCommand> commands;
-            std::vector<double> scales;
-            commands.reserve(m_window.size());
-            scales.reserve(m_window.size());
-            for(const auto &input:m_window) {
-                commands.push_back(input.command);
-                scales.push_back(input.continuousScaleOverride);
-            }
-            auto continuous=m_preparedWindow
-                ?m_compiler.compileContinuous(*m_preparedWindow,blendScale,
-                    m_continuousBoundary,std::nullopt,
-                    movingBoundary?ROLLING_VELOCITY_SEARCH_ITERATIONS:12U)
-                :m_compiler.compileContinuous(commands,blendScale,
-                    m_continuousBoundary,std::nullopt,scales,
-                    movingBoundary?ROLLING_VELOCITY_SEARCH_ITERATIONS:12U);
-            m_diagnostics.timeLaw+=m_compiler.lastTimeLawDiagnostics();
-            if(!continuous) return std::unexpected(std::format(
-                "fatal continuous-motion compilation failure: {}; cause: {}",context,continuous.error()));
-            std::vector<TrajectoryPlannerInput> inputs;
-            inputs.reserve(m_window.size());
-            while(!m_window.empty()) {
-                inputs.push_back(std::move(m_window.front()));
-                m_window.pop_front();
-            }
-            m_preparedWindow.reset();
-            const auto &terminal=(*continuous)->chunks.back().branchState;
-            m_continuousBoundary=terminal;
-            return finalize(std::move(*continuous),std::move(inputs));
-        }
+            return std::unexpected(
+                "continuous motion requires prepared geometry");
+       }
 
         bool shouldPlanImmediately() const {
             return !m_window.empty() && !continuousMotion(m_window.front());

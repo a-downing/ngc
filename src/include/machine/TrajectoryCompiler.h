@@ -37,7 +37,6 @@ namespace ngc {
         double curvatureDerivativeVelocityCapMultiplier = 1.0;
         bool applyCurvatureDerivativeVelocityCap = true;
         bool measureCurvatureDerivativeNumerics = false;
-        bool captureSplineGeometry = false;
         bool measureStationVisitReplay = false;
         bool enableStationVisitReplay = true;
         bool shareTimeLawCacheAcrossCompilations = true;
@@ -74,22 +73,6 @@ namespace ngc {
         double curvatureDerivativeFiniteDifferenceFine = 0.0;
         double curvatureDerivativeFiniteDifferenceCoarseStep = 0.0;
         double curvatureDerivativeFiniteDifferenceFineStep = 0.0;
-    };
-
-    // NRT-only cost evidence for the safeguarded spline arc-length inverse.
-    // Exact-distance cache misses retain adaptive integration and the existing
-    // parameter bracket as their authority.
-    struct SplineInverseDiagnostics {
-        std::size_t constructionIntegralEvaluations = 0;
-        std::size_t queries = 0;
-        std::size_t endpointQueries = 0;
-        std::size_t exactCacheHits = 0;
-        std::size_t inverseIntegralEvaluations = 0;
-        std::size_t newtonIterations = 0;
-        std::size_t seedConvergences = 0;
-        std::size_t safeguardedBisections = 0;
-        std::size_t iterationLimitHits = 0;
-        std::size_t maximumNewtonIterations = 0;
     };
 
     // NRT-only cost evidence for calls into the scalar Ruckig position solver.
@@ -243,13 +226,6 @@ namespace ngc {
     }
 
     struct ContinuousTrajectoryPlan {
-        struct SplineGeometry {
-            std::size_t firstInput = 0;
-            std::size_t lastInput = 0;
-            std::size_t degree = 0;
-            std::vector<position_t> controls;
-            std::vector<double> pieceBoundaries;
-        };
         std::vector<PlanChunk> chunks;
         std::vector<SpanId> activationSpans;
         // NRT-only development evidence; never crosses MotionBackend.
@@ -262,10 +238,6 @@ namespace ngc {
         std::size_t geometryVerificationAttempts = 0;
         std::size_t geometryVerificationHighWater = 0;
         TimeLawDiagnostics timeLaw;
-        SplineInverseDiagnostics splineInverse;
-        simulation_detail::ArcInverseDiagnostics arcInverse;
-        // Optional NRT development snapshot; never crosses MotionBackend.
-        std::vector<SplineGeometry> splineGeometry;
     };
 
     struct TrajectoryLimits {
@@ -297,10 +269,6 @@ namespace ngc {
         position_t m_position{};
         std::function<void()> m_progressCallback;
         TimeLawDiagnostics m_lastTimeLawDiagnostics;
-        // Non-owning only for the duration of the prepared overload. This lets
-        // the established timing/proof implementation consume immutable
-        // prepared pieces without duplicating that safety-critical machinery.
-        const PreparedContinuousGeometry *m_preparedGeometry = nullptr;
 
     public:
         explicit TrajectoryCompiler(TrajectoryLimits limits = {});
@@ -329,13 +297,6 @@ namespace ngc {
         std::expected<PlanChunk, std::string> compile(
             const MachineCommand &command,
             const PreparedPathPiece *preparedPiece = nullptr);
-        std::expected<std::unique_ptr<ContinuousTrajectoryPlan>, std::string> compileContinuous(
-            std::span<const MachineCommand> commands, double blendScale,
-            std::optional<MotionState> startState = std::nullopt,
-            std::optional<MotionState> endState = std::nullopt,
-            std::span<const double> scaleOverrides = {},
-            unsigned velocitySearchIterations = 12,
-            InfiniteJerkTrajectoryTimeResult *infiniteJerkTime = nullptr);
         // Prepared geometry is immutable and may be constructed by a different
         // NRT thread. Timing consumes its command metadata here while keeping
         // all dynamic limits, time laws, proof, packetization, and stop-tail
