@@ -897,7 +897,8 @@ namespace ngc {
                     source.endCurvatureDerivative = curvatureDerivativeAtDistance(
                         *entities[right].curve, endDistance, workspace);
                     auto fitted = spline_detail::reconstructSpline(
-                        controls, source, blendScale, effort.certifySourceTube);
+                        controls, source, blendScale, effort.certifySourceTube,
+                        effort.splineFitSolver);
                     if(!fitted) return std::unexpected(fitted.error());
                     splineDegree = fitted->degree;
                     controls = std::move(fitted->controls);

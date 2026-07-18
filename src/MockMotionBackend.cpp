@@ -75,6 +75,7 @@ namespace ngc {
         struct PlanSlot {
             std::atomic<bool> occupied{false};
             ExecutionItem item{};
+            std::uint64_t normalMotionNanoseconds = 0;
         };
         std::array<PlanSlot, PLAN_CAPACITY> m_planSlots;
         SpscChannel<std::uint8_t, PLAN_CAPACITY> m_plans;
@@ -85,6 +86,8 @@ namespace ngc {
         FixedArray<SyntheticInputTransition, SYNTHETIC_INPUT_CAPACITY> m_pendingSyntheticInputs;
         ExecutionSnapshot m_snapshot;
         std::optional<std::uint8_t> m_active;
+        std::atomic<std::uint64_t> m_queuedNormalMotionNanoseconds{0};
+        std::atomic<std::uint32_t> m_queuedExecutionItems{0};
         bool m_stopping = false;
         std::uint32_t m_span = 0;
         std::uint32_t m_nextEvent = 0;
@@ -146,6 +149,23 @@ namespace ngc {
         };
         std::optional<JogRuntime> m_jog;
 
+        static std::uint64_t secondsToNanoseconds(const double seconds) {
+            constexpr auto scale=1.0e9;
+            if(!std::isfinite(seconds)||seconds<=0.0) return 0;
+            const auto maximum=static_cast<double>(std::numeric_limits<std::uint64_t>::max());
+            if(seconds>=maximum/scale) return std::numeric_limits<std::uint64_t>::max();
+            return static_cast<std::uint64_t>(std::llround(seconds*scale));
+        }
+
+        static std::uint64_t normalMotionNanoseconds(const ExecutionItem &item) {
+            const auto *chunk=std::get_if<PlanChunk>(&item);
+            if(!chunk) return 0;
+            auto seconds=0.0;
+            for(const auto &span:chunk->normalMotion)
+                seconds+=std::max(span.duration,0.0);
+            return secondsToNanoseconds(seconds);
+        }
+
     public:
         PublishResult publish(const ExecutionItem &item) noexcept {
             const auto valid = std::visit([](const auto &value) {
@@ -183,9 +203,17 @@ namespace ngc {
             for(std::uint8_t index = 0; index < m_planSlots.size(); ++index) {
                 bool expected = false;
                 if(!m_planSlots[index].occupied.compare_exchange_strong(expected, true, std::memory_order_acquire)) continue;
-                m_planSlots[index].item = item;
+                auto &slot=m_planSlots[index];
+                slot.item = item;
+                slot.normalMotionNanoseconds=normalMotionNanoseconds(item);
+                m_queuedNormalMotionNanoseconds.fetch_add(
+                    slot.normalMotionNanoseconds,std::memory_order_release);
+                m_queuedExecutionItems.fetch_add(1,std::memory_order_release);
                 if(m_plans.tryPush(index)) return PublishResult::Published;
-                m_planSlots[index].occupied.store(false, std::memory_order_release);
+                m_queuedNormalMotionNanoseconds.fetch_sub(
+                    slot.normalMotionNanoseconds,std::memory_order_acq_rel);
+                m_queuedExecutionItems.fetch_sub(1,std::memory_order_acq_rel);
+                slot.occupied.store(false, std::memory_order_release);
                 return PublishResult::Full;
             }
             return PublishResult::Full;
@@ -333,7 +361,53 @@ namespace ngc {
         }
         void release(const std::uint8_t index) { m_planSlots[index].occupied.store(false, std::memory_order_release); }
 
-        void publishSnapshot() { (void)m_snapshots.tryPush(m_snapshot); }
+        void accountForDequeued(const std::uint8_t index) {
+            m_queuedNormalMotionNanoseconds.fetch_sub(
+                m_planSlots[index].normalMotionNanoseconds,std::memory_order_acq_rel);
+            m_queuedExecutionItems.fetch_sub(1,std::memory_order_acq_rel);
+        }
+
+        template<typename Spans>
+        static double remainingDuration(const Spans &spans,const std::uint32_t current,
+                                        const double elapsed) {
+            if(current>=spans.size) return 0.0;
+            auto result=std::max(spans[current].duration-elapsed,0.0);
+            for(auto index=current+1;index<spans.size;++index)
+                result+=std::max(spans[index].duration,0.0);
+            return result;
+        }
+
+        void refreshBufferSnapshot() {
+            constexpr auto nanosecondsToSeconds=1.0e-9;
+            m_snapshot.activeNormalMotionRemainingSeconds=0.0;
+            m_snapshot.stopBranchRemainingSeconds=0.0;
+            m_snapshot.queuedNormalMotionSeconds=nanosecondsToSeconds
+                *static_cast<double>(m_queuedNormalMotionNanoseconds.load(
+                    std::memory_order_acquire));
+            m_snapshot.queuedExecutionItems=m_queuedExecutionItems.load(
+                std::memory_order_acquire);
+            if(m_active) if(const auto *chunk=std::get_if<PlanChunk>(&activeItem())) {
+                if(m_stopping)
+                    m_snapshot.stopBranchRemainingSeconds=remainingDuration(
+                        chunk->stopTail,m_span,m_spanElapsed);
+                else {
+                    m_snapshot.activeNormalMotionRemainingSeconds=remainingDuration(
+                        chunk->normalMotion,m_span,m_spanElapsed);
+                    m_snapshot.stopBranchRemainingSeconds=remainingDuration(
+                        chunk->stopTail,0,0.0);
+                }
+            }
+            m_snapshot.committedNormalMotionSeconds=
+                m_snapshot.state==BackendState::Running&&!m_stopping
+                ?m_snapshot.activeNormalMotionRemainingSeconds
+                    +m_snapshot.queuedNormalMotionSeconds
+                :0.0;
+        }
+
+        void publishSnapshot() {
+            refreshBufferSnapshot();
+            (void)m_snapshots.tryPush(m_snapshot);
+        }
 
         static double &axisComponent(position_t &position, const AxisId axis) {
             switch(axis) {
@@ -938,7 +1012,10 @@ namespace ngc {
                         if(m_active) release(*m_active);
                         m_active.reset();
                         std::uint8_t discarded;
-                        while(m_plans.tryPop(discarded)) release(discarded);
+                        while(m_plans.tryPop(discarded)) {
+                            accountForDequeued(discarded);
+                            release(discarded);
+                        }
                         m_stopping = false; m_span = 0; m_nextEvent = 0; m_spanElapsed = 0.0;
                         m_snapshot = {}; m_snapshot.epoch = value.nextEpoch;
                         m_snapshot.commandedJoints = commandedJoints;
@@ -971,6 +1048,7 @@ namespace ngc {
         void activateNext() {
             std::uint8_t index;
             if(!m_plans.tryPop(index)) return;
+            accountForDequeued(index);
             const auto &item = m_planSlots[index].item;
             if(itemEpoch(item) != m_snapshot.epoch) {
                 emit(ChunkRejected { itemEpoch(item), itemId(item) });
@@ -1007,6 +1085,7 @@ namespace ngc {
 
             std::uint8_t continuationIndex = 0;
             const auto hasContinuation = m_plans.tryPop(continuationIndex);
+            if(hasContinuation) accountForDequeued(continuationIndex);
             const auto &current = activeChunk();
             if(hasContinuation
                && itemEpoch(m_planSlots[continuationIndex].item) == current.epoch

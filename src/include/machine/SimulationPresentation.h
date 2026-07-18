@@ -43,6 +43,11 @@ namespace ngc {
         ChunkId trajectoryBackendChunk = 0;
         SpanId trajectoryBackendSpan = 0;
         double trajectoryBackendSpanProgress = 0.0;
+        double trajectoryBackendActiveNormalRemainingSeconds = 0.0;
+        double trajectoryBackendQueuedNormalSeconds = 0.0;
+        double trajectoryBackendCommittedNormalSeconds = 0.0;
+        double trajectoryBackendStopBranchSeconds = 0.0;
+        std::uint32_t trajectoryBackendQueuedExecutionItems = 0;
         BranchSequence trajectoryBackendLastBranch = 0;
         std::uint32_t trajectoryBackendFaultCode = 0;
         double trajectoryBackendVelocity = 0.0;

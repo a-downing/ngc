@@ -2034,6 +2034,19 @@ namespace {
         chunk.stopState.position.x = 1.0;
         require(backend.tryPublish(chunk) == ngc::PublishResult::Published,
                 "fixed-tick test chunk should publish");
+        ngc::PlanChunk continuation;
+        continuation.epoch=31;
+        continuation.id=2;
+        continuation.predecessorBranch=1;
+        continuation.branch=2;
+        require(continuation.normalMotion.push(linearSpan(3,1.0,3.0,0.02)),
+                "fixed-tick continuation should fit in its chunk");
+        require(continuation.stopTail.push(linearSpan(4,3.0,3.0,0.005)),
+                "fixed-tick continuation stop tail should fit in its chunk");
+        continuation.branchState.position.x=3.0;
+        continuation.stopState.position.x=3.0;
+        require(backend.tryPublish(continuation)==ngc::PublishResult::Published,
+                "fixed-tick continuation should publish");
         require(backend.trySubmit(ngc::StartRequest { 1, 31 }) == ngc::SubmitResult::Submitted,
                 "fixed-tick test backend should start");
 
@@ -2042,11 +2055,29 @@ namespace {
         while(backend.tryTakeSnapshot(snapshot)) { }
         requireNear(snapshot.commanded.position.x, 0.1,
                     "one 1 ms servo tick should advance one tenth of a 10 ms linear span");
+        requireNear(snapshot.activeNormalMotionRemainingSeconds,0.009,
+                    "backend status should report the active normal-motion remainder");
+        requireNear(snapshot.queuedNormalMotionSeconds,0.02,
+                    "backend status should report queued normal-motion time");
+        requireNear(snapshot.committedNormalMotionSeconds,0.029,
+                    "backend status should sum active and queued normal-motion time");
+        requireNear(snapshot.stopBranchRemainingSeconds,1e-6,
+                    "backend status should report stop-branch time separately");
+        require(snapshot.queuedExecutionItems==1,
+                "backend status should report one queued continuation");
 
         for(int tick = 0; tick < 9; ++tick) backend.advanceTick(0.001, tick == 8);
         while(backend.tryTakeSnapshot(snapshot)) { }
         requireNear(snapshot.commanded.position.x, 1.0,
                     "ten fixed servo ticks should complete the 10 ms span exactly");
+        requireNear(snapshot.activeNormalMotionRemainingSeconds,0.02,
+                    "continuation activation should transfer queued time to active time");
+        requireNear(snapshot.queuedNormalMotionSeconds,0.0,
+                    "continuation activation should remove its time from the queue");
+        requireNear(snapshot.committedNormalMotionSeconds,0.02,
+                    "committed time should remain continuous across a packet boundary");
+        require(snapshot.queuedExecutionItems==0,
+                "continuation activation should decrement the queued item count");
 
         ngc::MockMotionBackend jerkBackend;
         ngc::PlanChunk jerkChunk;

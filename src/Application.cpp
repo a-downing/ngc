@@ -2014,13 +2014,20 @@ public:
             };
             diagnosticText+=std::format(
                 "\nTrajectory backend: {} epoch={} chunk={} span={} progress={:.6f} "
-                "velocity={:.6g} acceleration={:.6g} branch={} fault={}",
+                "velocity={:.6g} acceleration={:.6g} branch={} fault={}\n"
+                "Committed normal motion: {:.6f} s (active {:.6f} s + queued {:.6f} s, "
+                "{} items)    Stop branch: {:.6f} s",
                 backendState(simulation.trajectoryBackendState),
                 simulation.trajectoryBackendEpoch,simulation.trajectoryBackendChunk,
                 simulation.trajectoryBackendSpan,simulation.trajectoryBackendSpanProgress,
                 simulation.trajectoryBackendVelocity,
                 simulation.trajectoryBackendAcceleration,
-                simulation.trajectoryBackendLastBranch,simulation.trajectoryBackendFaultCode);
+                simulation.trajectoryBackendLastBranch,simulation.trajectoryBackendFaultCode,
+                simulation.trajectoryBackendCommittedNormalSeconds,
+                simulation.trajectoryBackendActiveNormalRemainingSeconds,
+                simulation.trajectoryBackendQueuedNormalSeconds,
+                simulation.trajectoryBackendQueuedExecutionItems,
+                simulation.trajectoryBackendStopBranchSeconds);
             if(!simulation.trajectoryBackendSpanDetail.empty())
                 diagnosticText+="\nActive execution span: "+simulation.trajectoryBackendSpanDetail;
         }

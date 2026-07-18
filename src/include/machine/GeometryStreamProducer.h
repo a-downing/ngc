@@ -34,6 +34,8 @@ namespace ngc {
 
     struct GeometryStreamPolicy {
         double publishNominalDuration = 0.25;
+        spline_detail::SplineFitSolver splineFitSolver =
+            spline_detail::continuousSplineFitSolver();
     };
 
     struct GeometryStreamDiagnostics {
@@ -220,7 +222,8 @@ namespace ngc {
             const GeometryPreparationEffort effort{
                 .certifySourceTube = false,
                 .generateSamples = true,
-                .lengthTableIntervalsPerKnotSpan = 32 };
+                .lengthTableIntervalsPerKnotSpan = 32,
+                .splineFitSolver = m_policy.splineFitSolver };
             auto prepared = m_geometryPathMode == ExecutablePathMode::ExactStop
                 ? prepareExactStopGeometry(m_continuous, start, effort)
                 : prepareContinuousGeometry(m_continuous,

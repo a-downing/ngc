@@ -520,16 +520,16 @@ namespace ngc {
     std::expected<spline_detail::ReconstructedSpline,std::string>
     spline_detail::reconstructSpline(const std::span<const position_t> cubicControls,
             const SplineReconstructionSource &source,const double programmedScale,
-            const bool certifyTube) {
+            const bool certifyTube,const SplineFitSolver solver) {
         if(cubicControls.size()<=6
-           ||continuousSplineFitSolver()==SplineFitSolver::CubicBaseline)
+           ||solver==SplineFitSolver::CubicBaseline)
             return ReconstructedSpline{
                 .degree=3,
                 .controls={cubicControls.begin(),cubicControls.end()},
             };
         auto fitted=fitQuinticSpline(
             initialQuinticSpline(cubicControls.size()-3,source),source,programmedScale,
-            continuousSplineFitSolver());
+            solver);
         if(!fitted) return std::unexpected(fitted.error());
         if(certifyTube) {
             if(auto certified=certifySplineFitTube(

@@ -3,6 +3,7 @@
 #include <filesystem>
 #include <print>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -40,12 +41,52 @@ namespace {
             "failed to read "+path.string()+": "+source.error().what());
         return std::move(*source);
     }
+
+    const char *smootherName(const ngc::spline_detail::SplineFitSolver solver) {
+        using ngc::spline_detail::SplineFitSolver;
+        switch(solver) {
+            case SplineFitSolver::CubicBaseline: return "cubic";
+            case SplineFitSolver::CoordinateSearch: return "coordinate";
+            case SplineFitSolver::UniformBandedFairness: return "uniform";
+            case SplineFitSolver::PeakTargetedBandedFairness: return "peak-targeted";
+        }
+        return "unknown";
+    }
+
+    std::expected<ngc::spline_detail::SplineFitSolver,std::string> parseSmoother(
+            std::string_view argument) {
+        constexpr std::string_view prefix="--smoother=";
+        if(!argument.starts_with(prefix))
+            return std::unexpected("smoother option must use --smoother=<name>");
+        argument.remove_prefix(prefix.size());
+        using ngc::spline_detail::SplineFitSolver;
+        if(argument=="coordinate") return SplineFitSolver::CoordinateSearch;
+        if(argument=="uniform") return SplineFitSolver::UniformBandedFairness;
+        if(argument=="peak-targeted") return SplineFitSolver::PeakTargetedBandedFairness;
+        return std::unexpected(
+            "unknown smoother; expected coordinate, uniform, or peak-targeted");
+    }
 }
 
 int main(const int argc,char **argv) {
+    if(argc>5) {
+        std::println(stderr,"usage: ngc_simulation_diagnostic [program.ngc] "
+            "[maximum-program-seconds] [tick-multiplier] "
+            "[--smoother=coordinate|uniform|peak-targeted]");
+        return 2;
+    }
     const std::filesystem::path program=argc>1?argv[1]:"adaptive_pockets.ngc";
     const auto maximumProgramSeconds=argc>2?std::strtod(argv[2],nullptr):60.0;
     const auto multiplier=argc>3?std::atoi(argv[3]):10;
+    auto smoother=ngc::spline_detail::continuousSplineFitSolver();
+    if(argc>4) {
+        const auto parsed=parseSmoother(argv[4]);
+        if(!parsed) {
+            std::println(stderr,"{}",parsed.error());
+            return 2;
+        }
+        smoother=*parsed;
+    }
 
     auto configuration=ngc::loadMachineConfiguration("machine.toml");
     if(!configuration) {
@@ -73,13 +114,17 @@ int main(const int argc,char **argv) {
 
     SimulationWorker worker(*configuration);
     worker.setTickMultiplier(multiplier);
+    if(!worker.setSplineFitSolver(smoother)) {
+        std::println(stderr,"simulation worker rejected the smoother selection");
+        return 1;
+    }
     if(!worker.start(programs,tools,true)) {
         std::println(stderr,"simulation worker rejected the run");
         return 1;
     }
 
-    std::println("program={} multiplier={} stop_after={:.3f}s",
-        program.string(),multiplier,maximumProgramSeconds);
+    std::println("program={} multiplier={} stop_after={:.3f}s smoother={}",
+        program.string(),multiplier,maximumProgramSeconds,smootherName(smoother));
     ngc::EpochId lastEpoch=0;
     ngc::ChunkId lastChunk=0;
     ngc::SpanId lastSpan=0;
@@ -107,11 +152,17 @@ int main(const int argc,char **argv) {
                 ?std::string{"<none>"}:snapshot.activeBlocks.back().text;
             std::println(
                 "t={:.6f} backend={} epoch={} chunk={} span={} progress={:.6f} "
-                "v={:.9g} a={:.9g} xyz=[{:.9g},{:.9g},{:.9g}] block='{}'\n"
+                "v={:.9g} a={:.9g} committed={:.6f}s active={:.6f}s queued={:.6f}s "
+                "stop={:.6f}s queued_items={} xyz=[{:.9g},{:.9g},{:.9g}] block='{}'\n"
                 "  span_detail={}\n  driver={}\n  latest_plan={}",
                 snapshot.programElapsedSeconds,backendName(snapshot.trajectoryBackendState),
                 lastEpoch,lastChunk,lastSpan,snapshot.trajectoryBackendSpanProgress,
                 snapshot.trajectoryBackendVelocity,snapshot.trajectoryBackendAcceleration,
+                snapshot.trajectoryBackendCommittedNormalSeconds,
+                snapshot.trajectoryBackendActiveNormalRemainingSeconds,
+                snapshot.trajectoryBackendQueuedNormalSeconds,
+                snapshot.trajectoryBackendStopBranchSeconds,
+                snapshot.trajectoryBackendQueuedExecutionItems,
                 snapshot.machinePosition.x,snapshot.machinePosition.y,snapshot.machinePosition.z,
                 block,snapshot.trajectoryBackendSpanDetail,
                 snapshot.trajectoryDriverActivity,
@@ -120,21 +171,32 @@ int main(const int argc,char **argv) {
         const auto now=std::chrono::steady_clock::now();
         if(now-lastReport>=std::chrono::seconds(5)) {
             lastReport=now;
-            std::println("progress t={:.3f}s ticks={} status={} driver={}",
+            std::println("progress t={:.3f}s ticks={} status={} committed={:.6f}s "
+                "active={:.6f}s queued={:.6f}s queued_items={} driver={}",
                 snapshot.programElapsedSeconds,snapshot.servoTicks,
-                statusName(snapshot.status),snapshot.trajectoryDriverActivity);
+                statusName(snapshot.status),snapshot.trajectoryBackendCommittedNormalSeconds,
+                snapshot.trajectoryBackendActiveNormalRemainingSeconds,
+                snapshot.trajectoryBackendQueuedNormalSeconds,
+                snapshot.trajectoryBackendQueuedExecutionItems,
+                snapshot.trajectoryDriverActivity);
         }
         if(snapshot.status==ngc::SimulationStatus::Completed
            ||snapshot.status==ngc::SimulationStatus::Error
            ||snapshot.programElapsedSeconds>=maximumProgramSeconds) {
-            std::println("final status={} t={:.6f}s ticks={} error='{}'",
-                statusName(snapshot.status),snapshot.programElapsedSeconds,
-                snapshot.servoTicks,snapshot.error);
             break;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     worker.stop();
     worker.join();
+    const auto finalSnapshot=worker.snapshot();
+    const auto geometrySeconds=finalSnapshot.geometryStream.preparationSeconds;
+    const auto plannerSeconds=finalSnapshot.trajectoryPlanning.totalPlanningSeconds;
+    std::println("final status={} t={:.6f}s planned={:.6f}s "
+        "geometry_processing={:.6f}s planner_processing={:.6f}s "
+        "total_processing={:.6f}s ticks={} error='{}'",
+        statusName(finalSnapshot.status),finalSnapshot.programElapsedSeconds,
+        finalSnapshot.trajectoryPlanning.plannedDuration,geometrySeconds,plannerSeconds,
+        geometrySeconds+plannerSeconds,finalSnapshot.servoTicks,finalSnapshot.error);
     return 0;
 }

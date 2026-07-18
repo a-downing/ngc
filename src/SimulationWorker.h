@@ -49,6 +49,7 @@ class SimulationWorker {
     ngc::GeometryFeedbackChannel m_geometryFeedback;
     std::atomic<bool> m_geometryCancelled{false};
     std::unique_ptr<ngc::GeometryStreamProducer> m_geometryProducer;
+    ngc::GeometryStreamPolicy m_geometryPolicy;
     ngc::PreparedTrajectoryExecutionDriver m_driver;
     ngc::TrajectoryLimits m_limits;
     ngc::SimulationSnapshot m_snapshot;
@@ -240,6 +241,12 @@ public:
         m_executorTickMultiplier.store(m_tickMultiplier, std::memory_order_relaxed);
         m_snapshot.tickMultiplier = m_tickMultiplier;
     }
+    bool setSplineFitSolver(const ngc::spline_detail::SplineFitSolver solver) {
+        std::scoped_lock lock(m_mutex);
+        if(m_running || m_start || m_home || m_activeJog) return false;
+        m_geometryPolicy.splineFitSolver = solver;
+        return true;
+    }
     void setRapidSpeed(const double speed) {
         std::scoped_lock lock(m_mutex);
         m_limits.rapidSpeed = std::max(speed, 1e-6);
@@ -407,6 +414,12 @@ private:
         m_snapshot.trajectoryBackendChunk = backend.activeChunk;
         m_snapshot.trajectoryBackendSpan = backend.activeSpan;
         m_snapshot.trajectoryBackendSpanProgress = backend.spanProgress;
+        m_snapshot.trajectoryBackendActiveNormalRemainingSeconds =
+            backend.activeNormalMotionRemainingSeconds;
+        m_snapshot.trajectoryBackendQueuedNormalSeconds = backend.queuedNormalMotionSeconds;
+        m_snapshot.trajectoryBackendCommittedNormalSeconds = backend.committedNormalMotionSeconds;
+        m_snapshot.trajectoryBackendStopBranchSeconds = backend.stopBranchRemainingSeconds;
+        m_snapshot.trajectoryBackendQueuedExecutionItems = backend.queuedExecutionItems;
         m_snapshot.trajectoryBackendLastBranch = backend.lastBranch;
         m_snapshot.trajectoryBackendFaultCode = backend.faultCode;
         m_snapshot.trajectoryBackendVelocity = backend.commanded.velocity.length();
@@ -927,7 +940,8 @@ private:
                 continue;
             }
             m_geometryProducer = std::make_unique<ngc::GeometryStreamProducer>(
-                m_session, m_geometryForward, m_geometryFeedback, m_geometryCancelled);
+                m_session, m_geometryForward, m_geometryFeedback, m_geometryCancelled,
+                m_geometryPolicy);
             m_geometryThread = std::thread([this, epoch] {
                 (void)m_geometryProducer->run(epoch);
             });

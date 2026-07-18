@@ -307,6 +307,11 @@ namespace ngc {
         ChunkId activeChunk = 0;
         SpanId activeSpan = 0;
         double spanProgress = 0.0;
+        double activeNormalMotionRemainingSeconds = 0.0;
+        double queuedNormalMotionSeconds = 0.0;
+        double committedNormalMotionSeconds = 0.0;
+        double stopBranchRemainingSeconds = 0.0;
+        std::uint32_t queuedExecutionItems = 0;
         BranchSequence lastBranch = 0;
         MotionState commanded{};
         MotionState feedback{};

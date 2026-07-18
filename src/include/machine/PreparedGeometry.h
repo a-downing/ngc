@@ -16,6 +16,7 @@
 #include "evaluator/InterpreterSession.h"
 #include "machine/ArcInterpolation.h"
 #include "machine/MachineCommand.h"
+#include "machine/SplineReconstruction.h"
 
 namespace ngc {
     using GeometryEpoch = std::uint64_t;
@@ -189,6 +190,8 @@ namespace ngc {
         bool certifySourceTube = true;
         bool generateSamples = true;
         std::size_t lengthTableIntervalsPerKnotSpan = 32;
+        spline_detail::SplineFitSolver splineFitSolver =
+            spline_detail::continuousSplineFitSolver();
     };
 
     // Selects the open boundaries of an incremental continuous-geometry

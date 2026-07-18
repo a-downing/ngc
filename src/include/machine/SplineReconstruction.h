@@ -44,5 +44,6 @@ namespace ngc::spline_detail {
         std::span<const position_t> cubicControls,
         const SplineReconstructionSource &source,
         double programmedScale,
-        bool certifyTube);
+        bool certifyTube,
+        SplineFitSolver solver = continuousSplineFitSolver());
 }
