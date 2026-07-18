@@ -390,6 +390,16 @@ namespace ngc {
             };
         }
 
+        void appendGeometricSample(PreparedPathPiece &piece, const double distance,
+                                   const PreparedGeometryBoundary &boundary) {
+            const auto tangential = dot(boundary.tangent, boundary.curvatureDerivative);
+            const auto normal = boundary.curvatureDerivative
+                - scaled(boundary.tangent, tangential);
+            piece.geometricSamples.push_back({distance, boundary.position, boundary.tangent,
+                boundary.curvature, boundary.curvatureDerivative, normal.length(),
+                boundary.curvatureDerivative.length()});
+        }
+
         void samplePiece(PreparedPathPiece &piece, CurveEvaluationWorkspace &workspace) {
             constexpr unsigned SAMPLES = 64;
             piece.geometricSamples.reserve(SAMPLES + 1);
@@ -405,12 +415,131 @@ namespace ngc {
                     boundary = splineBoundaryAtParameter(
                         *spline, parameter, orderedSpline.parameterSpan);
                 } else boundary = boundaryAt(piece, workspace, distance);
-                const auto tangential = dot(boundary.tangent, boundary.curvatureDerivative);
-                const auto normal = boundary.curvatureDerivative - scaled(boundary.tangent, tangential);
-                piece.geometricSamples.push_back({ distance, boundary.position, boundary.tangent,
-                    boundary.curvature, boundary.curvatureDerivative, normal.length(),
-                    boundary.curvatureDerivative.length() });
+                appendGeometricSample(piece, distance, boundary);
             }
+        }
+
+        struct ClusterSourceFeedRange {
+            double from = 0.0;
+            double to = 0.0;
+            double programmedFeed = 0.0;
+        };
+
+        double splineDistanceAtParameter(const PreparedCurve &curve,
+                                         const PreparedSplineCurve &spline,
+                                         const double parameter,
+                                         const std::size_t parameterSpan) {
+            if(curve.geometricallyLinear) {
+                const auto beginning = derivativeAt(spline, 0.0, 0, 0);
+                const auto position = derivativeAt(spline, parameter, 0, parameterSpan);
+                return (position - beginning).length();
+            }
+            const auto found = std::lower_bound(
+                spline.parameters.begin(), spline.parameters.end(), parameter);
+            if(found != spline.parameters.end() && *found == parameter)
+                return spline.distances[static_cast<std::size_t>(
+                    std::distance(spline.parameters.begin(), found))];
+            if(found == spline.parameters.begin() || found == spline.parameters.end())
+                return parameter <= spline.parameters.front() ? 0.0 : curve.length;
+            const auto lower = static_cast<std::size_t>(
+                std::distance(spline.parameters.begin(), found) - 1);
+            return spline.distances[lower]
+                + integrateSpeed(spline, spline.parameters[lower], parameter,
+                                 nullptr, parameterSpan);
+        }
+
+        std::expected<void, std::string> prepareClusterKnotIntervals(
+                PreparedPathPiece &piece,
+                const std::span<const ClusterSourceFeedRange> sourceFeeds,
+                CurveEvaluationWorkspace &workspace,
+                const bool generateSamples) {
+            const auto *spline = std::get_if<PreparedSplineCurve>(&piece.curve->value);
+            if(!spline || spline->degree == 0 || spline->controls.size() <= spline->degree)
+                return std::unexpected("cluster spline has no knot intervals");
+            if(sourceFeeds.empty())
+                return std::unexpected("cluster spline has no source feed ranges");
+            const auto intervalCount = spline->controls.size() - spline->degree;
+            const auto sourceLength = sourceFeeds.back().to;
+            if(!std::isfinite(sourceLength) || sourceLength <= 1e-12)
+                return std::unexpected("cluster spline has an invalid source length");
+
+            std::vector<double> curveBoundaries(intervalCount + 1);
+            curveBoundaries.front() = piece.curveFrom;
+            for(std::size_t interval = 1; interval < intervalCount; ++interval)
+                curveBoundaries[interval] = piece.curveFrom + splineDistanceAtParameter(
+                    *piece.curve, *spline, static_cast<double>(interval), interval);
+            curveBoundaries.back() = piece.curveTo;
+            for(std::size_t interval = 0; interval < intervalCount; ++interval)
+                if(!std::isfinite(curveBoundaries[interval])
+                   || curveBoundaries[interval + 1] <= curveBoundaries[interval])
+                    return std::unexpected("cluster spline knot intervals are not ordered by distance");
+
+            constexpr std::size_t SAMPLE_INTERVALS = 16;
+            if(generateSamples)
+                piece.geometricSamples.reserve(SAMPLE_INTERVALS * intervalCount + 1);
+            piece.clusterKnotIntervals.reserve(intervalCount);
+            OrderedSplineInverseState orderedSpline;
+            auto sourceIndex = std::size_t{0};
+            for(std::size_t interval = 0; interval < intervalCount; ++interval) {
+                // Reconstruction maps composite source distance linearly onto
+                // the spline parameter domain [0, intervalCount]. Retain that
+                // provenance for feed attribution even though timing continues
+                // to use the cluster-wide PreparedPathPiece::programmedFeed.
+                const auto sourceFrom = sourceLength * static_cast<double>(interval)
+                    / static_cast<double>(intervalCount);
+                const auto sourceTo = sourceLength * static_cast<double>(interval + 1)
+                    / static_cast<double>(intervalCount);
+                while(sourceIndex + 1 < sourceFeeds.size()
+                      && sourceFeeds[sourceIndex].to <= sourceFrom)
+                    ++sourceIndex;
+                auto programmedFeed = std::numeric_limits<double>::infinity();
+                for(auto candidate = sourceIndex;
+                    candidate < sourceFeeds.size() && sourceFeeds[candidate].from < sourceTo;
+                    ++candidate) {
+                    const auto overlapFrom = std::max(sourceFrom, sourceFeeds[candidate].from);
+                    const auto overlapTo = std::min(sourceTo, sourceFeeds[candidate].to);
+                    if(overlapTo > overlapFrom)
+                        programmedFeed = std::min(
+                            programmedFeed, sourceFeeds[candidate].programmedFeed);
+                }
+                if(!std::isfinite(programmedFeed) || programmedFeed <= 0.0)
+                    return std::unexpected("cluster spline knot interval has no positive source feed");
+
+                PreparedClusterKnotInterval prepared{
+                    .curveFrom = curveBoundaries[interval],
+                    .curveTo = curveBoundaries[interval + 1],
+                    .programmedFeed = programmedFeed,
+                };
+                if(generateSamples) {
+                    prepared.firstGeometricSample = piece.geometricSamples.size();
+                    if(interval > 0) --prepared.firstGeometricSample;
+                    prepared.geometricSampleCount = SAMPLE_INTERVALS + 1;
+                    const auto firstSample = interval == 0 ? std::size_t{0} : std::size_t{1};
+                    for(std::size_t sample = firstSample; sample <= SAMPLE_INTERVALS; ++sample) {
+                        const auto fraction = static_cast<double>(sample)
+                            / static_cast<double>(SAMPLE_INTERVALS);
+                        auto curveDistance = std::lerp(
+                            prepared.curveFrom, prepared.curveTo, fraction);
+                        auto parameter = 0.0;
+                        auto parameterSpan = interval;
+                        if(piece.curve->geometricallyLinear) {
+                            parameter = static_cast<double>(interval) + fraction;
+                            curveDistance = piece.curveFrom + splineDistanceAtParameter(
+                                *piece.curve, *spline, parameter, parameterSpan);
+                        } else {
+                            parameter = splineParameterAtDistance(
+                                *piece.curve, *spline, curveDistance, workspace, &orderedSpline);
+                            parameterSpan = orderedSpline.parameterSpan;
+                        }
+                        const auto localDistance = curveDistance - piece.curveFrom;
+                        appendGeometricSample(piece, localDistance,
+                            splineBoundaryAtParameter(
+                                *spline, parameter, parameterSpan));
+                    }
+                }
+                piece.clusterKnotIntervals.push_back(prepared);
+            }
+            return {};
         }
 
         struct SourceEntity {
@@ -767,7 +896,9 @@ namespace ngc {
         auto addPiece = [&](const PreparedPieceKind kind, const std::shared_ptr<const PreparedCurve> &curve,
                             const double from, const double to, const double feed,
                             const bool linear, const PreparedCommandId primary,
-                            std::vector<PreparedCommandId> activations) -> std::expected<void, std::string> {
+                            std::vector<PreparedCommandId> activations,
+                            const std::span<const ClusterSourceFeedRange> clusterSourceFeeds = {})
+                -> std::expected<void, std::string> {
             if(!curve || to - from <= 1e-12 || !std::isfinite(to - from))
                 return std::unexpected("prepared geometry contains a zero-length piece");
             PreparedPathPiece piece;
@@ -780,7 +911,11 @@ namespace ngc {
             piece.geometricallyLinear = linear || curve->geometricallyLinear;
             piece.primaryCommand = primary;
             piece.activationCommands = std::move(activations);
-            if(effort.generateSamples) samplePiece(piece, workspace);
+            if(kind == PreparedPieceKind::ClusterSpline) {
+                if(auto prepared = prepareClusterKnotIntervals(
+                        piece, clusterSourceFeeds, workspace, effort.generateSamples); !prepared)
+                    return std::unexpected(prepared.error());
+            } else if(effort.generateSamples) samplePiece(piece, workspace);
             result.diagnostics.pathLength += piece.length();
             if(feed > 0.0) result.diagnostics.nominalDuration += piece.length() / feed;
             ++result.diagnostics.preparedPieces;
@@ -819,6 +954,17 @@ namespace ngc {
                 const auto right = cluster;
                 const auto leftScale = sourceScale(entities[index], blendScale);
                 const auto rightScale = sourceScale(entities[right], blendScale);
+                std::vector<ClusterSourceFeedRange> sourceFeeds;
+                sourceFeeds.reserve(right - index + 1);
+                auto sourceLength = 0.0;
+                const auto appendSourceFeed = [&](const double length, const double feed) {
+                    sourceFeeds.push_back({sourceLength, sourceLength + length, feed});
+                    sourceLength += length;
+                };
+                appendSourceFeed(3.0 * leftScale, entities[index].feed);
+                for(std::size_t entity = index + 1; entity < right; ++entity)
+                    appendSourceFeed(entities[entity].length, entities[entity].feed);
+                appendSourceFeed(3.0 * rightScale, entities[right].feed);
                 auto controls = curvatureMatchedSixControlBlend(
                     entities[index], entities[right], leftScale, rightScale, workspace);
                 if(right > index + 1) {
@@ -856,9 +1002,7 @@ namespace ngc {
                     // it is for timed cluster preparation. The source callback
                     // is immutable and contains no dynamic motion limits.
                     spline_detail::SplineReconstructionSource source;
-                    source.length = 3.0 * leftScale + 3.0 * rightScale;
-                    for(std::size_t entity = index + 1; entity < right; ++entity)
-                        source.length += entities[entity].length;
+                    source.length = sourceLength;
                     source.positionAt = [&](double distance) {
                         const auto leftLength = 3.0 * leftScale;
                         if(distance <= leftLength)
@@ -873,13 +1017,10 @@ namespace ngc {
                         return sourcePosition(entities[right], std::min(distance, 3.0 * rightScale), workspace);
                     };
                     source.chordErrorBound = [](double, double) { return 0.0; };
-                    source.boundaries = {0.0, 3.0 * leftScale};
-                    auto boundary = 3.0 * leftScale;
-                    for(std::size_t entity = index + 1; entity < right; ++entity) {
-                        boundary += entities[entity].length;
-                        source.boundaries.push_back(boundary);
-                    }
-                    source.boundaries.push_back(source.length);
+                    source.boundaries.reserve(sourceFeeds.size() + 1);
+                    source.boundaries.push_back(0.0);
+                    for(const auto &range : sourceFeeds)
+                        source.boundaries.push_back(range.to);
                     const auto startDistance = entities[index].length - 3.0 * leftScale;
                     const auto endDistance = 3.0 * rightScale;
                     source.startTangent = tangentAtDistance(
@@ -909,7 +1050,8 @@ namespace ngc {
                     activations.push_back(entities[command].id);
                 if(auto added = addPiece(PreparedPieceKind::ClusterSpline, curve, 0.0,
                                          curve->length, (entities[index].feed + entities[right].feed) / 2.0,
-                                         false, entities[index].id, std::move(activations)); !added)
+                                         false, entities[index].id, std::move(activations),
+                                         sourceFeeds); !added)
                     return std::unexpected(added.error());
                 index = right - 1;
                 continue;

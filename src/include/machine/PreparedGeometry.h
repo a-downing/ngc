@@ -162,6 +162,14 @@ namespace ngc {
         double fullGeometricJerkCoefficient = 0.0;
     };
 
+    struct PreparedClusterKnotInterval {
+        double curveFrom = 0.0;
+        double curveTo = 0.0;
+        double programmedFeed = 0.0;
+        std::size_t firstGeometricSample = 0;
+        std::size_t geometricSampleCount = 0;
+    };
+
     struct PreparedPathPiece {
         PreparedPieceId id = 0;
         PreparedPieceKind kind = PreparedPieceKind::RetainedLineSection;
@@ -173,6 +181,10 @@ namespace ngc {
         PreparedCommandId primaryCommand = 0;
         std::vector<PreparedCommandId> activationCommands;
         std::vector<PreparedGeometricSample> geometricSamples;
+        // Preparation-only metadata for cluster splines. The cluster-wide
+        // programmedFeed remains authoritative until timing deliberately
+        // adopts these knot-interval feeds and boundaries.
+        std::vector<PreparedClusterKnotInterval> clusterKnotIntervals;
 
         double length() const { return std::max(0.0, curveTo - curveFrom); }
     };

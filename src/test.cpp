@@ -2168,6 +2168,80 @@ namespace {
                 "prepared samples must retain the tangential curvature-squared jerk component");
     }
 
+    void testClusterSplinePreparesKnotIntervalSamplesAndFeeds() {
+        const auto lineRecord=[](const ngc::PreparedCommandId id,
+                                 const ngc::position_t &from,
+                                 const ngc::position_t &to,const double feed) {
+            ngc::PreparedCommandRecord record;
+            record.id=id;
+            record.command=ngc::MoveLine{from,to,feed};
+            return record;
+        };
+        const std::array points{
+            ngc::position_t{0,0,0,0,0,0},
+            ngc::position_t{1,0,0,0,0,0},
+            ngc::position_t{1.04,0.03,0,0,0,0},
+            ngc::position_t{1.08,0,0,0,0,0},
+            ngc::position_t{1.12,0.03,0,0,0,0},
+            ngc::position_t{1.16,0,0,0,0,0},
+            ngc::position_t{1.20,0.03,0,0,0,0},
+            ngc::position_t{1.24,0,0,0,0,0},
+            ngc::position_t{1.28,0.03,0,0,0,0},
+            ngc::position_t{2.28,0.03,0,0,0,0},
+        };
+        constexpr std::array feeds{60.0,120.0,120.0,30.0,120.0,
+                                   120.0,120.0,120.0,180.0};
+        std::vector<ngc::PreparedCommandRecord> records;
+        records.reserve(feeds.size());
+        for(std::size_t index=0;index<feeds.size();++index)
+            records.push_back(lineRecord(index+1,points[index],points[index+1],feeds[index]));
+        const ngc::GeometryPreparationEffort effort{
+            .certifySourceTube=false,
+            .generateSamples=true,
+            .lengthTableIntervalsPerKnotSpan=32,
+        };
+        const auto prepared=ngc::prepareContinuousGeometry(records,0.05,points.front(),effort);
+        require(prepared.has_value(),prepared?"":prepared.error());
+        const auto found=std::ranges::find_if(prepared->pieces,[](const auto &piece) {
+            return piece.kind==ngc::PreparedPieceKind::ClusterSpline;
+        });
+        require(found!=prepared->pieces.end(),
+                "mixed-feed short source entities should produce a cluster spline");
+        const auto *spline=std::get_if<ngc::PreparedSplineCurve>(&found->curve->value);
+        require(spline&&spline->degree==5,
+                "the focused cluster sampling case should use quintic reconstruction");
+        const auto intervalCount=spline->controls.size()-spline->degree;
+        require(found->clusterKnotIntervals.size()==intervalCount,
+                "cluster preparation should retain one metadata record per knot interval");
+        require(found->geometricSamples.size()==16*intervalCount+1,
+                "cluster preparation should retain 17 shared-boundary samples per knot interval");
+        requireNear(found->programmedFeed,2.0,
+                    "cluster-wide programmed feed must remain unchanged");
+        auto minimumIntervalFeed=std::numeric_limits<double>::infinity();
+        for(std::size_t interval=0;interval<intervalCount;++interval) {
+            const auto &metadata=found->clusterKnotIntervals[interval];
+            require(metadata.firstGeometricSample==16*interval
+                    &&metadata.geometricSampleCount==17,
+                    "cluster knot interval should address its 17 samples without a search");
+            require(metadata.curveTo>metadata.curveFrom,
+                    "cluster knot interval distances should be strictly ordered");
+            if(interval>0)
+                requireNear(metadata.curveFrom,
+                    found->clusterKnotIntervals[interval-1].curveTo,
+                    "adjacent cluster knot intervals should share one curve boundary");
+            requireNear(found->geometricSamples[metadata.firstGeometricSample].distance,
+                        metadata.curveFrom-found->curveFrom,
+                        "cluster knot interval first sample distance is incorrect");
+            requireNear(found->geometricSamples[
+                            metadata.firstGeometricSample+metadata.geometricSampleCount-1].distance,
+                        metadata.curveTo-found->curveFrom,
+                        "cluster knot interval last sample distance is incorrect");
+            minimumIntervalFeed=std::min(minimumIntervalFeed,metadata.programmedFeed);
+        }
+        requireNear(minimumIntervalFeed,0.5,
+                    "a knot interval overlapping the slow source entity should retain its minimum feed");
+    }
+
     void testCollinearJunctionBlendUsesLinearTiming() {
         const ngc::position_t first{-0.8375,4.0929,-1.3,0,0,0};
         const ngc::position_t junction{-0.8375,4.0929,-1.4795,0,0,0};
@@ -2971,6 +3045,7 @@ int main() {
         testInfiniteJerkTrajectoryTimeMatchesAnalyticLine();
         testExactStopPlannerEnforcesIndependentAxisLimits();
         testPreparedArcJunctionMatchesSourceCurvature();
+        testClusterSplinePreparesKnotIntervalSamplesAndFeeds();
         testCollinearJunctionBlendUsesLinearTiming();
         testShortLineMidpointCurvatureInference();
         testVerifiedCubicArcSpanCounts();
