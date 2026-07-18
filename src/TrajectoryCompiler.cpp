@@ -1564,7 +1564,8 @@ namespace ngc {
                 if constexpr(std::same_as<T,MoveLine>) {
                     if(command.speed()<=0.0||command.machineCoordinates())
                         return std::unexpected("continuous line must be a positive-feed non-G53 move");
-                    if(const auto mismatch=subtract(command.from(),expectedStart).length();mismatch>1e-8)
+                    if(const auto mismatch=subtract(command.from(),expectedStart).length();
+                       !m_preparedGeometry&&mismatch>1e-8)
                         return std::unexpected(std::format(
                             "continuous line input {} does not begin at the planned position: "
                             "command start [X={} Y={} Z={} A={} B={} C={}], planned [X={} Y={} Z={} A={} B={} C={}], "
@@ -1591,7 +1592,8 @@ namespace ngc {
                 } else if constexpr(std::same_as<T,MoveArc>) {
                     if(command.speed()<=0.0)
                         return std::unexpected("continuous arc must have a positive feed");
-                    if(const auto mismatch=subtract(command.from(),expectedStart).length();mismatch>1e-8)
+                    if(const auto mismatch=subtract(command.from(),expectedStart).length();
+                       !m_preparedGeometry&&mismatch>1e-8)
                         return std::unexpected(std::format(
                             "continuous arc input {} does not begin at the planned position: "
                             "command start [X={} Y={} Z={} A={} B={} C={}], planned [X={} Y={} Z={} A={} B={} C={}], "
@@ -2258,6 +2260,12 @@ namespace ngc {
             pieces.size()>1024?LARGE_TIME_LAW_CACHE_SIZE:SMALL_TIME_LAW_CACHE_SIZE,
             m_continuousPlanningEffort.shareTimeLawCacheAcrossCompilations);
 
+        if(m_preparedGeometry&&!m_preparedGeometry->pieces.empty()) {
+            CurveEvaluationWorkspace workspace;
+            const auto &last=m_preparedGeometry->pieces.back();
+            expectedStart=positionAtDistance(
+                *last.curve,last.curveTo,workspace);
+        }
         const auto expectedEnd=expectedStart;
         const auto startState=requestedStartState.value_or(MotionState{m_position,{},{}});
         const auto endState=requestedEndState.value_or(MotionState{expectedEnd,{},{}});
@@ -3514,6 +3522,7 @@ namespace ngc {
             return std::unexpected(std::format(
                 "continuous local constraint correction did not converge after {} passes: {}",
                 maximumLocalCorrectionPasses,correctionHistory));
+        result->correctionHistory=correctionHistory;
 
         const MotionState emittedStart{
             normalSpans.front().d,

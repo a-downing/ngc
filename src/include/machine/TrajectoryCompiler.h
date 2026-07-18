@@ -256,6 +256,7 @@ namespace ngc {
         std::vector<ContinuousPieceTimingDiagnostic> pieceTiming;
         double velocityOnlySeedDuration = 0.0;
         double accelerationAwareDuration = 0.0;
+        std::string correctionHistory;
         std::size_t ruckigBrakePhases = 0;
         std::size_t reachabilityCandidateEvaluations = 0;
         std::size_t geometryVerificationAttempts = 0;

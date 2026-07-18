@@ -54,8 +54,20 @@ class SimulationWorker {
     ngc::SimulationSnapshot m_snapshot;
     using ChunkKey = std::pair<ngc::EpochId, ngc::ChunkId>;
     using SpanKey = std::pair<ngc::EpochId, ngc::SpanId>;
+    struct ExecutionSpanDiagnostic {
+        ngc::ChunkId chunk = 0;
+        std::uint32_t ordinal = 0;
+        bool stopTail = false;
+        double duration = 0.0;
+        double distance = 0.0;
+        double startVelocity = 0.0;
+        double endVelocity = 0.0;
+        double startAcceleration = 0.0;
+        double endAcceleration = 0.0;
+    };
     std::map<ChunkKey, ChunkPresentation> m_chunks;
     std::map<SpanKey, ChunkPresentation> m_spanPresentations;
+    std::map<SpanKey, ExecutionSpanDiagnostic> m_executionSpans;
     std::map<ChunkKey, ngc::SpanId> m_chunkFirstSpan;
     std::map<std::uint64_t, ChunkKey> m_blockChunks;
     std::map<std::uint64_t, ngc::BlockExecution> m_deferredCompletedBlocks;
@@ -262,6 +274,7 @@ private:
     void clearPresentation() {
         m_chunks.clear();
         m_spanPresentations.clear();
+        m_executionSpans.clear();
         m_chunkFirstSpan.clear();
         m_blockChunks.clear();
         m_deferredCompletedBlocks.clear();
@@ -301,6 +314,33 @@ private:
         presentation.activeBlocks = captured.activeBlocks;
         presentation.command = command;
         const auto key = std::visit([](const auto &value) { return ChunkKey { value.epoch, value.id }; }, item);
+        if(const auto *chunk=std::get_if<ngc::PlanChunk>(&item)) {
+            const auto retainSpan=[&](const ngc::AxisPolynomialSpan &span,
+                                      const std::uint32_t ordinal,const bool stopTail) {
+                const auto scaled=[](const ngc::position_t &value,const double factor) {
+                    return ngc::position_t{value.x*factor,value.y*factor,value.z*factor,
+                        value.a*factor,value.b*factor,value.c*factor};
+                };
+                const ngc::MotionState start{
+                    span.d,scaled(span.c,span.inverseDuration),
+                    scaled(span.b,2.0*span.inverseDurationSquared),
+                };
+                m_executionSpans.try_emplace(SpanKey{chunk->epoch,span.id},
+                    ExecutionSpanDiagnostic{
+                        .chunk=chunk->id,.ordinal=ordinal,.stopTail=stopTail,
+                        .duration=span.duration,
+                        .distance=(span.end.position-start.position).length(),
+                        .startVelocity=start.velocity.length(),
+                        .endVelocity=span.end.velocity.length(),
+                        .startAcceleration=start.acceleration.length(),
+                        .endAcceleration=span.end.acceleration.length(),
+                    });
+            };
+            for(std::uint32_t index=0;index<chunk->normalMotion.size;++index)
+                retainSpan(chunk->normalMotion[index],index,false);
+            for(std::uint32_t index=0;index<chunk->stopTail.size;++index)
+                retainSpan(chunk->stopTail[index],index,true);
+        }
         for(const auto &block:captured.activeBlocks) {
             m_blockChunks.insert_or_assign(block.id,key);
             if(const auto completed=m_deferredCompletedBlocks.find(block.id);
@@ -362,6 +402,27 @@ private:
     }
 
     void applyBackendSnapshot(const ngc::ExecutionSnapshot &backend) {
+        m_snapshot.trajectoryBackendState = backend.state;
+        m_snapshot.trajectoryBackendEpoch = backend.epoch;
+        m_snapshot.trajectoryBackendChunk = backend.activeChunk;
+        m_snapshot.trajectoryBackendSpan = backend.activeSpan;
+        m_snapshot.trajectoryBackendSpanProgress = backend.spanProgress;
+        m_snapshot.trajectoryBackendLastBranch = backend.lastBranch;
+        m_snapshot.trajectoryBackendFaultCode = backend.faultCode;
+        m_snapshot.trajectoryBackendVelocity = backend.commanded.velocity.length();
+        m_snapshot.trajectoryBackendAcceleration = backend.commanded.acceleration.length();
+        if(const auto span=m_executionSpans.find({backend.epoch,backend.activeSpan});
+           span!=m_executionSpans.end()) {
+            const auto &detail=span->second;
+            m_snapshot.trajectoryBackendSpanDetail=std::format(
+                "{} ordinal={} duration={:.9g}s distance={:.9g} "
+                "velocity={:.9g}->{:.9g} acceleration={:.9g}->{:.9g}",
+                detail.stopTail?"stop-tail":"normal",detail.ordinal,
+                detail.duration,detail.distance,detail.startVelocity,
+                detail.endVelocity,detail.startAcceleration,detail.endAcceleration);
+        } else {
+            m_snapshot.trajectoryBackendSpanDetail.clear();
+        }
         if(backend.state == ngc::BackendState::Faulted) {
             m_snapshot.status = ngc::SimulationStatus::Error;
             m_snapshot.error = "mock motion backend fault " + std::to_string(backend.faultCode);
@@ -954,6 +1015,14 @@ private:
                 m_snapshot.lastWakeLatenessSeconds = lastWakeLateness.load(std::memory_order_relaxed);
                 m_snapshot.maximumWakeLatenessSeconds = maximumWakeLateness.load(std::memory_order_relaxed);
                 m_snapshot.maximumTickExecutionSeconds = maximumTickExecution.load(std::memory_order_relaxed);
+                m_snapshot.trajectoryPlanningActivity=m_driver.planningActivity();
+                m_snapshot.trajectoryPlanningActivitySeconds=
+                    m_driver.planningActivitySeconds();
+                m_snapshot.trajectoryDriverActivity=m_driver.activity();
+                m_snapshot.trajectoryContinuousPlanSummary=
+                    m_driver.lastContinuousPlanSummary();
+                m_snapshot.trajectoryContinuousCorrectionHistory=
+                    m_driver.lastContinuousCorrectionHistory();
             };
             auto nextPlanningRefresh=clock::now();
             m_driver.setPlanningProgressCallback([&] {
@@ -1079,6 +1148,7 @@ private:
                     if(m_join||m_stop||m_paused) break;
                 }
                 m_snapshot.trajectoryPlanning = m_driver.planningDiagnostics();
+                copyTimingSnapshot();
                 executorRefillRequested.store(false,std::memory_order_release);
                 state = m_driver.state();
                 if(state == ngc::PreparedDriverState::Error) {

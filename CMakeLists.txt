@@ -151,6 +151,11 @@ target_include_directories(ngc_g64_oracle_export PRIVATE src)
 target_link_libraries(ngc_g64_oracle_export PRIVATE ngc_core)
 ngc_target_defaults(ngc_g64_oracle_export)
 
+add_executable(ngc_simulation_diagnostic tools/ngc_simulation_diagnostic.cpp)
+target_include_directories(ngc_simulation_diagnostic PRIVATE src)
+target_link_libraries(ngc_simulation_diagnostic PRIVATE ngc_core)
+ngc_target_defaults(ngc_simulation_diagnostic)
+
 add_executable(ngc_spline_geometry_analyzer tools/ngc_spline_geometry_analyzer.cpp)
 target_link_libraries(ngc_spline_geometry_analyzer PRIVATE ngc_core)
 ngc_target_defaults(ngc_spline_geometry_analyzer)

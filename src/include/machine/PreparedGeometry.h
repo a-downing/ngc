@@ -100,6 +100,7 @@ namespace ngc {
     struct PreparedCurve {
         PreparedCurveValue value;
         double length = 0.0;
+        bool geometricallyLinear = false;
     };
 
     struct CurveEvaluationWorkspace {

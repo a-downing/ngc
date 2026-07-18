@@ -333,10 +333,10 @@ namespace {
         std::string source="G64 P0.0001\n";
         constexpr int COMMANDS=800;
         for(int command=1;command<=COMMANDS;++command)
-            source+=std::format("G1 F60 X{:.6f}\n",static_cast<double>(command)*0.001);
+            source+=std::format("G1 F60 X{:.6f}\n",static_cast<double>(command)*0.01);
 
         SimulationWorker worker;
-        worker.setTickMultiplier(1000);
+        worker.setTickMultiplier(10);
         ngc::ToolTable tools;
         require(worker.start({{source,"multi-packet-refill.ngc"}},tools),
                 "multi-packet refill simulation should start");
@@ -350,13 +350,15 @@ namespace {
             "timed simulation should refill a continuous batch larger than its eight-slot queue: {}",
             snapshot.error));
         require(snapshot.trajectoryPlanning.planChunks>8
-                    &&snapshot.trajectoryPlanning.maximumWindowCommands==COMMANDS
-                    &&snapshot.trajectoryPlanning.maximumNormalSpans==ngc::MAX_NORMAL_SPANS_PER_CHUNK,
-                std::format("multi-packet refill regression should exceed both old command and RT packet boundaries: "
-                            "chunks={} commands={} maximum spans={}",
+                    &&snapshot.trajectoryPlanning.maximumWindowCommands<COMMANDS
+                    &&snapshot.trajectoryPlanning.continuousHorizons>=2
+                    &&snapshot.trajectoryPlanning.rollingBoundaryCandidates>0,
+                std::format("prepared G64 streaming should publish bounded proved horizons: "
+                            "chunks={} maximum commands={} horizons={} rolling candidates={}",
                             snapshot.trajectoryPlanning.planChunks,
                             snapshot.trajectoryPlanning.maximumWindowCommands,
-                            snapshot.trajectoryPlanning.maximumNormalSpans));
+                            snapshot.trajectoryPlanning.continuousHorizons,
+                            snapshot.trajectoryPlanning.rollingBoundaryCandidates));
         require(std::ranges::none_of(snapshot.statusMessages,[](const auto &entry) {
             return entry.kind==ngc::InterpreterStatusKind::Error;
         }),"successful multi-packet refill should not publish a GUI error");
@@ -564,6 +566,66 @@ namespace {
         worker.join();
     }
 
+    void testModalG64RapidsRemainExactPreparedMotion() {
+        constexpr auto source="G64 P0.005\nG0 X1\nZ1.7\nG1 F60 X2\n";
+        ngc::ToolTable tools;
+
+        Worker preview(UNIT);
+        require(preview.compile({{source,"g64-rapid.ngc"}}),
+                "G64 rapid preview should compile");
+        for(int attempt=0;attempt<3000&&!preview.compiled();++attempt)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        require(preview.compiled(),"G64 rapid preview compilation should finish");
+        const auto initialRevision=preview.lock([&] {
+            return preview.preparedPreview().revision;
+        });
+        require(preview.execute(),"G64 rapid preview should execute");
+        auto previewFinished=false;
+        for(int attempt=0;attempt<3000;++attempt) {
+            if(preview.lock([&] {
+                    return preview.preparedPreview().revision>initialRevision;
+                })&&!preview.busy()) {
+                previewFinished=true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(previewFinished,"G64 rapid preview should finish");
+        preview.lock([&] {
+            auto exactCommands=std::size_t{};
+            auto continuousCommands=std::size_t{};
+            for(const auto &slice:preview.preparedPreview().continuousSlices)
+                for(const auto &record:slice.commands) {
+                    if(record.metadata.pathMode==ngc::ExecutablePathMode::ExactStop)
+                        ++exactCommands;
+                    else ++continuousCommands;
+                }
+            require(exactCommands==2&&continuousCommands==1,std::format(
+                "modal G64 should stream its two rapid moves as exact prepared geometry "
+                "and its feed move as continuous geometry: exact={} continuous={}",
+                exactCommands,continuousCommands));
+        });
+        preview.join();
+
+        SimulationWorker simulation;
+        simulation.setTickMultiplier(1000);
+        require(simulation.start({{source,"g64-rapid.ngc"}},tools),
+                "G64 rapid simulation should start");
+        auto snapshot=simulation.snapshot();
+        for(int attempt=0;attempt<5000
+            &&snapshot.status!=ngc::SimulationStatus::Completed
+            &&snapshot.status!=ngc::SimulationStatus::Error;++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot=simulation.snapshot();
+        }
+        require(snapshot.status==ngc::SimulationStatus::Completed,std::format(
+            "modal G64 rapid simulation should complete without entering continuous timing: {}",
+            snapshot.error));
+        requireNear(snapshot.machinePosition.x,2.0,
+                    "modal G64 rapid regression should reach the feed endpoint");
+        simulation.join();
+    }
+
     void testGeometryPreviewResolvesProbeAtCanonicalTarget() {
         ngc::ToolTable tools;
         const ngc::ToolTable::tool_entry_t tool{
@@ -617,9 +679,13 @@ namespace {
         const auto hello=ngc::readFile("autoload/hello.ngc");
         const auto world=ngc::readFile("autoload/world.ngc");
         const auto toolChange=ngc::readFile("autoload/tool_change.ngc");
-        const auto main=ngc::readFile("adaptive_pockets.ngc");
+        auto main=ngc::readFile("adaptive_pockets.ngc");
         require(hello&&world&&toolChange&&main,
                 "adaptive-pockets geometry preview inputs should load");
+        if(const auto g61=main->find("N40 G61");g61!=std::string::npos)
+            main->replace(g61,7,"N40 G64 P0.005");
+        require(main->contains("N40 G64 P0.005"),
+                "adaptive-pockets geometry preview should exercise G64");
         ngc::ToolTable tools;
         const auto loadedTools=tools.load();
         require(loadedTools.has_value(),loadedTools?"":loadedTools.error());
@@ -662,6 +728,16 @@ namespace {
                 return !slice.commands.empty();
             });
         }),"adaptive-pockets preview should retain prepared G64 motion");
+        require(worker.lock([&] {
+            auto exact=false;
+            auto continuous=false;
+            for(const auto &slice:worker.preparedPreview().continuousSlices)
+                for(const auto &record:slice.commands) {
+                    exact|=record.metadata.pathMode==ngc::ExecutablePathMode::ExactStop;
+                    continuous|=record.metadata.pathMode==ngc::ExecutablePathMode::Continuous;
+                }
+            return exact&&continuous;
+        }),"adaptive-pockets G64 preview should classify startup rapids as exact and cutting feeds as continuous");
         require(worker.lock([&] {
             return worker.preparedPreview().continuousSlices.size()>1;
         }),"adaptive-pockets geometry should reach Preview through multiple SPSC slices");
@@ -2326,6 +2402,51 @@ namespace {
         require(std::abs(incoming.geometricSamples.back().fullGeometricJerkCoefficient
                          -1.0/(RADIUS*RADIUS))<1e-6,
                 "prepared samples must retain the tangential curvature-squared jerk component");
+    }
+
+    void testCollinearJunctionBlendUsesLinearTiming() {
+        const ngc::position_t first{-0.8375,4.0929,-1.3,0,0,0};
+        const ngc::position_t junction{-0.8375,4.0929,-1.4795,0,0,0};
+        const ngc::position_t last{-0.8375,4.0929,-2.1881,0,0,0};
+        const auto lineRecord=[](const ngc::PreparedCommandId id,
+                                 const ngc::position_t &from,
+                                 const ngc::position_t &to,const double feed) {
+            ngc::PreparedCommandRecord record;
+            record.id=id;
+            record.command=ngc::MoveLine{from,to,feed};
+            return record;
+        };
+        const std::array records{
+            lineRecord(1,first,junction,80.0),
+            lineRecord(2,junction,last,40.0),
+        };
+        const auto prepared=ngc::prepareContinuousGeometry(records,0.005,first);
+        require(prepared.has_value(),prepared?"":prepared.error());
+        const auto blend=std::ranges::find_if(prepared->pieces,[](const auto &piece) {
+            return piece.kind==ngc::PreparedPieceKind::JunctionBlend;
+        });
+        require(blend!=prepared->pieces.end()&&blend->geometricallyLinear
+                    &&blend->curve->geometricallyLinear,
+                "a monotone collinear junction blend must retain its spline identity but use "
+                "the exact linear timing emitter");
+
+        ngc::TrajectoryCompiler compiler({
+            .pathAcceleration=20.0,.rapidSpeed=199.8,.arcChordTolerance=0.0001,
+            .pathJerk=501.0,
+            .axisVelocity={3.333333333,3.333333333,3.333333333,
+                           3.333333333,3.333333333,3.333333333},
+            .axisAcceleration={20,20,20,20,20,20},
+            .axisJerk={501,501,501,501,501,501},
+        });
+        compiler.reset(93,first);
+        const auto planned=compiler.compileContinuous(*prepared,0.005);
+        require(planned&&*planned,planned?"":planned.error());
+        const auto duration=std::accumulate((*planned)->pieceTiming.begin(),
+            (*planned)->pieceTiming.end(),0.0,[](const double total,const auto &piece) {
+                return total+piece.duration;
+            });
+        require(duration<5.0,std::format(
+            "collinear feed-transition timing must remain bounded, got {:.6f} seconds",duration));
     }
 
     void testBoundedPlannerExecutesPiecewiseG64Geometry() {
@@ -4090,12 +4211,14 @@ int main() {
         testSimulationWorkerStartsPlayback();
         std::cerr << "checkpoint adaptive start\n";
         testAdaptivePocketsStartsSimulation();
-        std::cerr << "checkpoint refill (temporarily skipped)\n";
+        std::cerr << "checkpoint prepared G64 refill\n";
+        testTimedSimulationRefillsMultiPacketContinuousBatch();
         std::cerr << "checkpoint snapshots (temporarily skipped)\n";
         std::cerr << "checkpoint preview\n";
         testImmediatePreviewBuildsGeometryWithoutTrajectoryExecution();
         testGeometryProducerBlendsAcrossMotionModeChanges();
         testGeometryProducerPreparesExactStopPreviewSlices();
+        testModalG64RapidsRemainExactPreparedMotion();
         testGeometryPreviewResolvesProbeAtCanonicalTarget();
         testAdaptivePocketsGeometryPreviewAvoidsTrajectoryExecution();
         testIncrementalGeometryDefersAndDoesNotRebuildAnchorSection();
@@ -4136,6 +4259,7 @@ int main() {
         testExactStopPlannerEnforcesIndependentAxisLimits();
         testBoundedLookaheadCarriesG64MetadataAndSingleCommandExactStops();
         testPreparedArcJunctionMatchesSourceCurvature();
+        testCollinearJunctionBlendUsesLinearTiming();
         testShortLineMidpointCurvatureInference();
         testCubicSplineInteriorControlConditioning();
         testMicroEntityClusterCollapsesToOneSpline();

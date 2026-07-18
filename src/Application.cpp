@@ -1963,30 +1963,6 @@ public:
             }
             return "Unknown";
         }();
-        ImGui::Text("Simulation: %s    MCS XYZ: %.4f, %.4f, %.4f",
-                    statusText, simulation.machinePosition.x, simulation.machinePosition.y,
-                    simulation.machinePosition.z);
-        if(simulation.toolPose.geometry.number != 0) {
-            ImGui::SameLine();
-            ImGui::Text("    Tool XYZ: %.4f, %.4f, %.4f",
-                        simulation.toolPosition.x, simulation.toolPosition.y, simulation.toolPosition.z);
-        }
-        if(simulation.status != ngc::SimulationStatus::Stopped) {
-            const auto elapsed = std::max(simulation.programElapsedSeconds, 0.0);
-            const auto totalWholeSeconds = static_cast<std::uint64_t>(elapsed);
-            const auto hours = totalWholeSeconds / 3600;
-            const auto minutes = totalWholeSeconds / 60 % 60;
-            const auto seconds = elapsed - static_cast<double>(hours * 3600 + minutes * 60);
-            ImGui::TextDisabled("G-code elapsed %.3f s (%02llu:%02llu:%06.3f)    Servo %.3f ms    Scheduler %.3f ms (%u ticks) x%u    Ticks %llu    Missed deadlines %llu    Max wake %.1f us    Max tick %.1f us",
-                elapsed, static_cast<unsigned long long>(hours),
-                static_cast<unsigned long long>(minutes), seconds,
-                simulation.servoPeriodSeconds * 1000.0, simulation.schedulerPeriodSeconds * 1000.0,
-                simulation.servoTicksPerSchedulerPeriod, simulation.tickMultiplier,
-                static_cast<unsigned long long>(simulation.servoTicks),
-                static_cast<unsigned long long>(simulation.deadlineMisses),
-                simulation.maximumWakeLatenessSeconds * 1.0e6,
-                simulation.maximumTickExecutionSeconds * 1.0e6);
-        }
         auto modalGCodes = m_worker.lock([&] { return m_worker.machine().activeModalGCodes(); });
         const auto simulationHasModalState = simulation.status != ngc::SimulationStatus::Stopped
             && !simulation.activeModalGCodes.empty();
@@ -1996,12 +1972,65 @@ public:
             if(!modalText.empty()) modalText += ' ';
             modalText += code;
         }
-        if(!modalText.empty()) {
-            const auto textWidth = ImGui::CalcTextSize(modalText.c_str()).x;
-            const auto rightAlignedX = ImGui::GetWindowContentRegionMax().x - textWidth;
-            ImGui::SameLine(std::max(ImGui::GetCursorPosX(), rightAlignedX));
-            ImGui::TextDisabled("%s", modalText.c_str());
+
+        auto diagnosticText=std::format("Simulation: {}    MCS XYZ: {:.4f}, {:.4f}, {:.4f}",
+            statusText,simulation.machinePosition.x,simulation.machinePosition.y,
+            simulation.machinePosition.z);
+        if(simulation.toolPose.geometry.number!=0)
+            diagnosticText+=std::format("    Tool XYZ: {:.4f}, {:.4f}, {:.4f}",
+                simulation.toolPosition.x,simulation.toolPosition.y,simulation.toolPosition.z);
+        if(simulation.status != ngc::SimulationStatus::Stopped) {
+            const auto elapsed = std::max(simulation.programElapsedSeconds, 0.0);
+            const auto totalWholeSeconds = static_cast<std::uint64_t>(elapsed);
+            const auto hours = totalWholeSeconds / 3600;
+            const auto minutes = totalWholeSeconds / 60 % 60;
+            const auto seconds = elapsed - static_cast<double>(hours * 3600 + minutes * 60);
+            diagnosticText+=std::format(
+                "\nG-code elapsed {:.3f} s ({:02}:{:02}:{:06.3f})    Servo {:.3f} ms    "
+                "Scheduler {:.3f} ms ({} ticks) x{}    Ticks {}    Missed deadlines {}    "
+                "Max wake {:.1f} us    Max tick {:.1f} us",
+                elapsed,hours,minutes,seconds,simulation.servoPeriodSeconds*1000.0,
+                simulation.schedulerPeriodSeconds*1000.0,
+                simulation.servoTicksPerSchedulerPeriod, simulation.tickMultiplier,
+                simulation.servoTicks,simulation.deadlineMisses,
+                simulation.maximumWakeLatenessSeconds*1.0e6,
+                simulation.maximumTickExecutionSeconds * 1.0e6);
+            if(!simulation.trajectoryPlanningActivity.empty())
+                diagnosticText+=std::format("\nPlanning {:.3f} s: {}",
+                    simulation.trajectoryPlanningActivitySeconds,
+                    simulation.trajectoryPlanningActivity);
+            if(!simulation.trajectoryDriverActivity.empty())
+                diagnosticText+="\nTrajectory driver: "+simulation.trajectoryDriverActivity;
+            if(!simulation.trajectoryContinuousPlanSummary.empty())
+                diagnosticText+="\nContinuous plan: "+simulation.trajectoryContinuousPlanSummary;
+            const auto backendState=[](const ngc::BackendState state) {
+                switch(state) {
+                    case ngc::BackendState::Disabled: return "Disabled";
+                    case ngc::BackendState::Held: return "Held";
+                    case ngc::BackendState::Running: return "Running";
+                    case ngc::BackendState::Faulted: return "Faulted";
+                }
+                return "Unknown";
+            };
+            diagnosticText+=std::format(
+                "\nTrajectory backend: {} epoch={} chunk={} span={} progress={:.6f} "
+                "velocity={:.6g} acceleration={:.6g} branch={} fault={}",
+                backendState(simulation.trajectoryBackendState),
+                simulation.trajectoryBackendEpoch,simulation.trajectoryBackendChunk,
+                simulation.trajectoryBackendSpan,simulation.trajectoryBackendSpanProgress,
+                simulation.trajectoryBackendVelocity,
+                simulation.trajectoryBackendAcceleration,
+                simulation.trajectoryBackendLastBranch,simulation.trajectoryBackendFaultCode);
+            if(!simulation.trajectoryBackendSpanDetail.empty())
+                diagnosticText+="\nActive execution span: "+simulation.trajectoryBackendSpanDetail;
         }
+        if(!modalText.empty()) diagnosticText+="\nModal: "+modalText;
+        const auto diagnosticLines=1+std::ranges::count(diagnosticText,'\n');
+        const auto diagnosticHeight=ImGui::GetTextLineHeightWithSpacing()
+            *static_cast<float>(diagnosticLines)+2.0f*ImGui::GetStyle().FramePadding.y;
+        ImGui::InputTextMultiline("##simulation_diagnostics",diagnosticText.data(),
+            diagnosticText.size()+1,ImVec2(-1.0f,diagnosticHeight),
+            ImGuiInputTextFlags_ReadOnly);
         ImGui::Separator();
         if(!m_errorMessage.empty()) ImGui::TextColored(ImVec4_Redish, "ERROR: %s", m_errorMessage.c_str());
         for(const auto &error : m_worker.parserErrors()) {

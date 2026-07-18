@@ -357,6 +357,10 @@ namespace ngc {
             if(preparedMotion(record)) {
                 const auto pathMode = continuousMotion(record)
                     ? ExecutablePathMode::Continuous : ExecutablePathMode::ExactStop;
+                // The modal G64 state is not sufficient to classify executable
+                // motion. Rapids, explicit G53 moves, and other protected
+                // motion remain exact stops even while G64 is modal.
+                record.metadata.pathMode = pathMode;
                 if(m_geometryPathMode && *m_geometryPathMode != pathMode
                    && !flushContinuous(PreparedBoundaryReason::IncompatibleCommand, true))
                     return false;

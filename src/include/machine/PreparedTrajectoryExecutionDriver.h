@@ -144,6 +144,10 @@ namespace ngc {
                     }
                     return planWindow();
                 } else if constexpr(std::same_as<T, PreparedContinuousEnd>) {
+                    if(!m_planner.endPreparedChain(value.chain)) {
+                        fail("prepared trajectory planner received an end for the wrong geometry chain");
+                        return false;
+                    }
                     return planWindow();
                 } else if constexpr(std::same_as<T, PreparedBlockLifecycleMessage>) {
                     if constexpr(!std::same_as<std::remove_cvref_t<decltype(observeLifecycle)>,
@@ -352,5 +356,41 @@ namespace ngc {
         bool backendReady() const { return m_backendReady; }
         bool forwardComplete() const { return m_forwardComplete; }
         const TrajectoryPlanningDiagnostics &planningDiagnostics() const { return m_planner.diagnostics(); }
+        const std::string &planningActivity() const { return m_planner.planningActivity(); }
+        double planningActivitySeconds() const { return m_planner.planningActivitySeconds(); }
+        const std::string &lastContinuousPlanSummary() const {
+            return m_planner.lastContinuousPlanSummary();
+        }
+        const std::string &lastContinuousCorrectionHistory() const {
+            return m_planner.lastContinuousCorrectionHistory();
+        }
+        std::string activity() const {
+            if(m_error) return "error: "+*m_error;
+            if(!m_backendReady) return "waiting for backend start acknowledgement";
+            if(m_waitingForHeld) return std::format(
+                "waiting for backend held event: outstanding={} retained_commands={} "
+                "retained_pieces={} retained_nominal={:.3f}s rolling_continuation={}",
+                m_outstandingChunks,m_planner.windowSize(),m_planner.preparedPieceCount(),
+                m_planner.preparedNominalDuration(),m_planner.hasRollingContinuation());
+            if(m_pending) return std::format(
+                "publishing planned packet batch: packet={}/{} outstanding={} forward_queue={}",
+                m_pendingItem+1,m_pending->items.size(),m_outstandingChunks,m_forward.size());
+            if(m_planner.windowSize()!=0) return std::format(
+                "retaining prepared work: commands={} pieces={} nominal={:.3f}s "
+                "chain_ended={} rolling_ready={} rolling_continuation={} outstanding={} "
+                "forward_queue={}",
+                m_planner.windowSize(),m_planner.preparedPieceCount(),
+                m_planner.preparedNominalDuration(),m_planner.preparedChainEnded(),
+                m_planner.shouldPlanRollingPrefix(),m_planner.hasRollingContinuation(),
+                m_outstandingChunks,m_forward.size());
+            if(m_forwardComplete) return std::format(
+                "forward stream complete; outstanding={} probe_pending={} synchronization={}",
+                m_outstandingChunks,m_probePending,m_synchronizationFence.has_value());
+            return std::format(
+                "waiting for prepared stream: forward_queue={} outstanding={} deferred={} "
+                "probe_pending={} synchronization={}",
+                m_forward.size(),m_outstandingChunks,m_deferredMessage.has_value(),
+                m_probePending,m_synchronizationFence.has_value());
+        }
     };
 }

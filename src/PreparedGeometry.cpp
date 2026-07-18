@@ -244,14 +244,14 @@ namespace ngc {
         std::shared_ptr<const PreparedCurve> lineCurve(const position_t &from,
                                                         const position_t &to) {
             return std::make_shared<const PreparedCurve>(PreparedCurve{
-                PreparedLineCurve{from, to}, (to - from).length()});
+                PreparedLineCurve{from, to}, (to - from).length(), true});
         }
 
         std::shared_ptr<const PreparedCurve> arcCurve(const MoveArc &arc) {
             simulation_detail::ArcReference reference(arc);
             if(!reference.valid() || reference.length() <= 1e-12) return {};
             return std::make_shared<const PreparedCurve>(PreparedCurve{
-                PreparedArcCurve{arc}, reference.length()});
+                PreparedArcCurve{arc}, reference.length(), false});
         }
 
         std::shared_ptr<const PreparedCurve> splineCurve(std::vector<position_t> controls,
@@ -273,14 +273,17 @@ namespace ngc {
             const auto displacement = spline.controls.back() - spline.controls.front();
             const auto displacementSquared = dot(displacement, displacement);
             auto collinear = displacementSquared > 1e-24;
+            auto previousFraction = 0.0;
             for(const auto &control : spline.controls) {
                 const auto fraction = displacementSquared > 0.0
                     ? dot(control - spline.controls.front(), displacement) / displacementSquared : 0.0;
                 if((control - (spline.controls.front() + scaled(displacement, fraction))).length()
-                        > 1e-10 * std::max(1.0, displacement.length())) {
+                        > 1e-10 * std::max(1.0, displacement.length())
+                   ||fraction + 1e-12 < previousFraction) {
                     collinear = false;
                     break;
                 }
+                previousFraction = fraction;
             }
             if(collinear) {
                 // Collinear junctions are geometrically exact lines. Retain
@@ -290,7 +293,7 @@ namespace ngc {
                 spline.parameters = { 0.0, static_cast<double>(spans) };
                 spline.distances = { 0.0, displacement.length() };
                 return std::make_shared<const PreparedCurve>(PreparedCurve{
-                    std::move(spline), displacement.length()});
+                    std::move(spline), displacement.length(), true});
             }
             const auto intervals = spans * std::max<std::size_t>(1, intervalsPerSpan);
             spline.parameters.reserve(intervals + 1);
@@ -312,7 +315,7 @@ namespace ngc {
                 spline.maximumSecondDerivative = std::max(
                     spline.maximumSecondDerivative, control.length());
             return std::make_shared<const PreparedCurve>(PreparedCurve{
-                std::move(spline), distance});
+                std::move(spline), distance, false});
         }
 
         const simulation_detail::ArcReference *arcReference(const PreparedCurve &curve,
@@ -776,7 +779,7 @@ namespace ngc {
             piece.curveFrom = from;
             piece.curveTo = to;
             piece.programmedFeed = feed;
-            piece.geometricallyLinear = linear;
+            piece.geometricallyLinear = linear || curve->geometricallyLinear;
             piece.primaryCommand = primary;
             piece.activationCommands = std::move(activations);
             if(effort.generateSamples) samplePiece(piece, workspace);
