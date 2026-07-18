@@ -2153,6 +2153,17 @@ namespace {
         require(prepared->pieces[1].sourceCommands
                     ==std::vector<ngc::PreparedCommandId>{1,2},
                 "a junction blend should retain both adjacent source entities for preview selection");
+        const auto &replaced = prepared->pieces[1].replacedSourceIntervals;
+        require(replaced.size() == 2 && replaced[0].command == 1
+                    && replaced[1].command == 2 && replaced[0].curve && replaced[1].curve,
+                "a junction blend should retain both replaced source-curve intervals");
+        requireNear(replaced[0].curveTo, replaced[0].curve->length,
+                    "junction source preview should end at the incoming source endpoint");
+        requireNear(replaced[1].curveFrom, 0.0,
+                    "junction source preview should begin at the outgoing source endpoint");
+        require(replaced[0].curveFrom > 0.0
+                    && replaced[1].curveTo < replaced[1].curve->length,
+                "junction source preview should retain only the replaced portions");
 
         ngc::CurveEvaluationWorkspace workspace;
         const auto &incoming=prepared->pieces[0];
@@ -2222,6 +2233,29 @@ namespace {
         std::iota(expectedSourceCommands.begin(),expectedSourceCommands.end(),1);
         require(found->sourceCommands==expectedSourceCommands,
                 "a cluster spline should retain every reconstructed source entity for preview selection");
+        require(found->replacedSourceIntervals.size()==records.size(),
+                "a cluster spline should retain one replaced interval per contributing source entity");
+        for(std::size_t source=0;source<records.size();++source) {
+            const auto &interval=found->replacedSourceIntervals[source];
+            require(interval.command==source+1&&interval.curve,
+                    "cluster replaced intervals should preserve source-command order");
+            if(source==0) {
+                requireNear(interval.curveFrom,interval.curve->length-0.15,
+                            "cluster source preview should show only the incoming long-entity trim");
+                requireNear(interval.curveTo,interval.curve->length,
+                            "cluster incoming source preview should reach its endpoint");
+            } else if(source+1==records.size()) {
+                requireNear(interval.curveFrom,0.0,
+                            "cluster outgoing source preview should begin at its endpoint");
+                requireNear(interval.curveTo,0.15,
+                            "cluster source preview should show only the outgoing long-entity trim");
+            } else {
+                requireNear(interval.curveFrom,0.0,
+                            "cluster source preview should show each complete short source entity");
+                requireNear(interval.curveTo,interval.curve->length,
+                            "cluster source preview should show each complete short source entity");
+            }
+        }
         const auto *spline=std::get_if<ngc::PreparedSplineCurve>(&found->curve->value);
         require(spline&&spline->degree==5,
                 "the focused cluster sampling case should use quintic reconstruction");

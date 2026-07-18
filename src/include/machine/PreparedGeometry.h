@@ -170,6 +170,13 @@ namespace ngc {
         std::size_t geometricSampleCount = 0;
     };
 
+    struct PreparedSourceInterval {
+        PreparedCommandId command = 0;
+        std::shared_ptr<const PreparedCurve> curve;
+        double curveFrom = 0.0;
+        double curveTo = 0.0;
+    };
+
     struct PreparedPathPiece {
         PreparedPieceId id = 0;
         PreparedPieceKind kind = PreparedPieceKind::RetainedLineSection;
@@ -185,6 +192,10 @@ namespace ngc {
         // involves both adjacent source entities while presentation activates
         // only at the owning command boundary.
         std::vector<PreparedCommandId> sourceCommands;
+        // Exact portions of source entities replaced by a junction blend or
+        // cluster spline. Preview uses these immutable prepared curves to show
+        // the replaced geometry without reconstructing it independently.
+        std::vector<PreparedSourceInterval> replacedSourceIntervals;
         std::vector<PreparedGeometricSample> geometricSamples;
         // Continuous timing treats each cluster-spline knot interval as one
         // timing interval and requires its prepared samples and feed. The

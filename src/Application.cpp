@@ -173,7 +173,8 @@ class ApplicationImpl final {
 
     enum class PreviewBatch : std::size_t {
         Feed, Rapid, G53Feed, G53Rapid, Arc, Probe, G64Spline, G64Cluster,
-        G64ControlPolygon, G64ControlPoints, DarkPoints, LightPoints, Count,
+        G64SourceLine, G64SourceArc, G64ControlPolygon, G64ControlPoints,
+        DarkPoints, LightPoints, Count,
     };
 
     struct BufferedRange {
@@ -218,6 +219,8 @@ class ApplicationImpl final {
         std::vector<glm::dvec3> probeLines;
         std::vector<glm::dvec3> g64SplineLines;
         std::vector<glm::dvec3> g64ClusterSplineLines;
+        std::vector<glm::dvec3> g64SourceLineLines;
+        std::vector<glm::dvec3> g64SourceArcLines;
         std::vector<glm::dvec3> g64ControlPolygon;
         std::vector<glm::dvec3> g64ControlPoints;
         std::vector<GeometricJerkCombSample> clusterGeometricJerkComb;
@@ -234,6 +237,7 @@ class ApplicationImpl final {
     } m_previewRenderCache;
     std::vector<PreviewSourceLine> m_previewSelectedSourceLines;
     std::optional<PreviewSourceLine> m_previewSelectionScrollLine;
+    std::optional<PreviewSourceLine> m_compiledSelectedSourceLine;
     struct PreviewViewSnapshot {
         glm::dquat orientation { 1.0, 0.0, 0.0, 0.0 };
         glm::dvec3 pivot{};
@@ -619,6 +623,7 @@ public:
         }
 
         clearPreviewSelection();
+        m_compiledSelectedSourceLine.reset();
         if(!bestTarget) return;
         m_previewSelectedSourceLines =
             m_previewRenderCache.selectionTargets[*bestTarget].sourceLines;
@@ -686,6 +691,14 @@ public:
                 };
                 if(piece.sourceCommands.empty()) appendCommand(piece.primaryCommand);
                 else for(const auto id : piece.sourceCommands) appendCommand(id);
+                return storeSelectionTarget(std::move(lines));
+            };
+            const auto sourceIntervalSelectionTarget = [&](const ngc::PreparedGeometrySlice &slice,
+                                                           const ngc::PreparedCommandId id) {
+                std::vector<PreviewSourceLine> lines;
+                const auto found = std::ranges::find_if(slice.commands,
+                    [id](const auto &command) { return command.id == id; });
+                if(found != slice.commands.end()) appendSourceLine(lines, *found);
                 return storeSelectionTarget(std::move(lines));
             };
             ngc::CurveEvaluationWorkspace curveWorkspace;
@@ -797,6 +810,25 @@ public:
                     cache.darkPoints.push_back(beginning);
                     cache.lightPoints.push_back(ending);
 
+                    for(const auto &sourceInterval : piece.replacedSourceIntervals) {
+                        if(!sourceInterval.curve) continue;
+                        const auto sourceRecord = std::ranges::find_if(slice.commands,
+                            [&](const auto &record) {
+                                return record.id == sourceInterval.command;
+                            });
+                        if(sourceRecord == slice.commands.end()) continue;
+                        const auto sourceOffset = sourceRecord->presentation.activeToolOffset;
+                        const auto sourceIsLine = std::holds_alternative<ngc::PreparedLineCurve>(
+                            sourceInterval.curve->value);
+                        auto &sourceVertices = sourceIsLine
+                            ? cache.g64SourceLineLines : cache.g64SourceArcLines;
+                        const auto sourceAppended = appendCurve(*sourceInterval.curve,
+                            sourceInterval.curveFrom, sourceInterval.curveTo, sourceOffset,
+                            sourceVertices, !sourceIsLine,
+                            sourceIntervalSelectionTarget(slice, sourceInterval.command));
+                        if(!sourceAppended) return std::unexpected(sourceAppended.error());
+                    }
+
                     if(const auto *spline = std::get_if<ngc::PreparedSplineCurve>(
                             &piece.curve->value)) {
                         for(const auto &control : spline->controls)
@@ -870,6 +902,7 @@ public:
                 &cache.feedLines, &cache.rapidLines, &cache.g53FeedLines,
                 &cache.g53RapidLines, &cache.arcLines, &cache.probeLines,
                 &cache.g64SplineLines, &cache.g64ClusterSplineLines,
+                &cache.g64SourceLineLines, &cache.g64SourceArcLines,
             };
             for(const auto *vertices : geometry) {
                 for(const auto &vertex : *vertices) {
@@ -982,6 +1015,8 @@ public:
            ||!cullLines(source.probeLines, visible.probeLines, true)
            ||!cullLines(source.g64SplineLines, visible.g64SplineLines, true)
            ||!cullLines(source.g64ClusterSplineLines, visible.g64ClusterSplineLines, true)
+           ||!cullLines(source.g64SourceLineLines, visible.g64SourceLineLines, false)
+           ||!cullLines(source.g64SourceArcLines, visible.g64SourceArcLines, false)
            ||!cullLines(source.g64ControlPolygon, visible.g64ControlPolygon, false)
            ||!cullPoints(source.g64ControlPoints, visible.g64ControlPoints)
            ||!cullPoints(source.darkPoints, visible.darkPoints)
@@ -1135,6 +1170,8 @@ public:
             std::pair {PreviewBatch::Probe, &m_previewRenderCache.probeLines},
             std::pair {PreviewBatch::G64Spline, &m_previewRenderCache.g64SplineLines},
             std::pair {PreviewBatch::G64Cluster, &m_previewRenderCache.g64ClusterSplineLines},
+            std::pair {PreviewBatch::G64SourceLine, &m_previewRenderCache.g64SourceLineLines},
+            std::pair {PreviewBatch::G64SourceArc, &m_previewRenderCache.g64SourceArcLines},
             std::pair {PreviewBatch::G64ControlPolygon, &m_previewRenderCache.g64ControlPolygon},
             std::pair {PreviewBatch::G64ControlPoints, &m_previewRenderCache.g64ControlPoints},
             std::pair {PreviewBatch::DarkPoints, &m_previewRenderCache.darkPoints},
@@ -1429,13 +1466,15 @@ public:
 
         const auto drawVertices = [](const std::vector<glm::dvec3> &vertices, const GLenum primitive,
                                      const double red, const double green, const double blue,
-                                     const int stippleFactor = 0, const GLushort stipplePattern = 0xFFFF) {
+                                     const int stippleFactor = 0,
+                                     const GLushort stipplePattern = 0xFFFF,
+                                     const double opacity = 1.0) {
             if(vertices.empty()) return;
             if(stippleFactor > 0) {
                 glEnable(GL_LINE_STIPPLE);
                 glLineStipple(stippleFactor, stipplePattern);
             }
-            glColor3d(red, green, blue);
+            glColor4d(red, green, blue, opacity);
             glEnableClientState(GL_VERTEX_ARRAY);
             glVertexPointer(3, GL_DOUBLE, sizeof(glm::dvec3), &vertices.front().x);
             glDrawArrays(primitive, 0, static_cast<GLsizei>(vertices.size()));
@@ -1447,13 +1486,14 @@ public:
                                               const GLenum primitive, const double red,
                                               const double green, const double blue,
                                               const int stippleFactor = 0,
-                                              const GLushort stipplePattern = 0xFFFF) {
+                                              const GLushort stipplePattern = 0xFFFF,
+                                              const double opacity = 1.0) {
             if(buffer == 0 || count == 0 || !m_glBindBuffer) return false;
             if(stippleFactor > 0) {
                 glEnable(GL_LINE_STIPPLE);
                 glLineStipple(stippleFactor, stipplePattern);
             }
-            glColor3d(red, green, blue);
+            glColor4d(red, green, blue, opacity);
             m_glBindBuffer(GL_ARRAY_BUFFER_VALUE, buffer);
             glEnableClientState(GL_VERTEX_ARRAY);
             glVertexPointer(3, GL_DOUBLE, sizeof(glm::dvec3),
@@ -1469,14 +1509,22 @@ public:
                                      const GLenum primitive, const double red,
                                      const double green, const double blue,
                                      const int stippleFactor = 0,
-                                     const GLushort stipplePattern = 0xFFFF) {
+                                     const GLushort stipplePattern = 0xFFFF,
+                                     const double opacity = 1.0) {
             const auto &range = m_previewRenderCache.bufferedRanges[static_cast<std::size_t>(batch)];
             if(!drawBufferedVertices(m_previewGeometryBuffer, range.first, range.count,
-                                     primitive, red, green, blue, stippleFactor, stipplePattern))
-                drawVertices(fallback, primitive, red, green, blue, stippleFactor, stipplePattern);
+                                     primitive, red, green, blue, stippleFactor, stipplePattern,
+                                     opacity))
+                drawVertices(fallback, primitive, red, green, blue, stippleFactor,
+                             stipplePattern, opacity);
         };
 
         if(m_glBindBuffer) m_glBindBuffer(GL_ARRAY_BUFFER_VALUE, 0);
+        glLineWidth(1.5f);
+        drawPreview(PreviewBatch::G64SourceLine, m_previewRenderCache.g64SourceLineLines,
+                    GL_LINES, 0.4f, 0.4f, 1.0f, 0, 0xFFFF, 0.5);
+        drawPreview(PreviewBatch::G64SourceArc, m_previewRenderCache.g64SourceArcLines,
+                    GL_LINES, 0.4f, 1.0f, 0.4f, 0, 0xFFFF, 0.5);
         glLineWidth(2.0f);
         drawPreview(PreviewBatch::Feed, m_previewRenderCache.feedLines, GL_LINES, 0.4f, 0.4f, 1.0f);
         drawPreview(PreviewBatch::G53Feed, m_previewRenderCache.g53FeedLines, GL_LINES, 1.0f, 1.0f, 0.4f);
@@ -1588,6 +1636,7 @@ public:
 
     void rebuildMainProgramLines() {
         clearPreviewSelection();
+        m_compiledSelectedSourceLine.reset();
         m_mainProgramLines.clear();
         if(m_programSource.empty()) return;
 
@@ -1597,6 +1646,29 @@ public:
             if(!line.empty() && line.back() == '\r') line.pop_back();
             m_mainProgramLines.emplace_back(std::move(line));
         }
+    }
+
+    void copyCompiledSelectionToClipboard(const std::string_view source) const {
+        std::vector<int> selectedLines;
+        for(const auto &selected : m_previewSelectedSourceLines)
+            if(selected.source == source) selectedLines.push_back(selected.line);
+        if(selectedLines.empty() && m_compiledSelectedSourceLine
+           && m_compiledSelectedSourceLine->source == source)
+            selectedLines.push_back(m_compiledSelectedSourceLine->line);
+        if(selectedLines.empty()) return;
+
+        std::ranges::sort(selectedLines);
+        const auto uniqueEnd = std::ranges::unique(selectedLines).begin();
+        selectedLines.erase(uniqueEnd, selectedLines.end());
+        std::string clipboard;
+        auto appended = false;
+        for(const auto line : selectedLines) {
+            if(line <= 0 || line > static_cast<int>(m_mainProgramLines.size())) continue;
+            if(appended) clipboard.push_back('\n');
+            clipboard += m_mainProgramLines[static_cast<std::size_t>(line - 1)];
+            appended = true;
+        }
+        if(appended) ImGui::SetClipboardText(clipboard.c_str());
     }
 
     void renderToolbar(const ImGuiViewport &viewport, const ngc::SimulationSnapshot &simulation) {
@@ -1743,6 +1815,9 @@ public:
                 return std::ranges::contains(
                     m_previewSelectedSourceLines, PreviewSourceLine{name, line});
             };
+            if(ImGui::Shortcut(ImGuiMod_Ctrl | ImGuiKey_C,
+                               ImGuiInputFlags_RouteGlobal))
+                copyCompiledSelectionToClipboard(name);
 
             ImGuiListClipper clipper;
             clipper.Begin(static_cast<int>(m_mainProgramLines.size()));
@@ -1762,10 +1837,17 @@ public:
                     const auto active = lineState.active(lineNumber);
                     const auto completed = lineState.completed(lineNumber);
                     const auto selectedByPreview = previewSelected(lineNumber);
+                    const auto selectedManually = m_compiledSelectedSourceLine
+                        == PreviewSourceLine{name, lineNumber};
                     ImGui::PushStyleColor(ImGuiCol_Header,
-                                          lineState.highlight(lineNumber, selectedByPreview));
-                    ImGui::Selectable(std::format("{:5}  {}", lineNumber, m_mainProgramLines[index]).c_str(),
-                                      active || completed || selectedByPreview);
+                        lineState.highlight(lineNumber,
+                            selectedByPreview || selectedManually));
+                    if(ImGui::Selectable(
+                            std::format("{:5}  {}", lineNumber, m_mainProgramLines[index]).c_str(),
+                            active || completed || selectedByPreview || selectedManually)) {
+                        clearPreviewSelection();
+                        m_compiledSelectedSourceLine = PreviewSourceLine{name, lineNumber};
+                    }
                     if(lineState.current(lineNumber)) ImGui::SetScrollHereY(0.5f);
                     if(m_previewSelectionScrollLine
                        && *m_previewSelectionScrollLine == PreviewSourceLine{name, lineNumber}) {

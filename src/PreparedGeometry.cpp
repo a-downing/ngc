@@ -899,6 +899,7 @@ namespace ngc {
                             const bool linear, const PreparedCommandId primary,
                             std::vector<PreparedCommandId> activations,
                             std::vector<PreparedCommandId> sources,
+                            std::vector<PreparedSourceInterval> replacedSourceIntervals,
                             const std::span<const ClusterSourceFeedRange> clusterSourceFeeds = {})
                 -> std::expected<void, std::string> {
             if(!curve || to - from <= 1e-12 || !std::isfinite(to - from))
@@ -914,6 +915,7 @@ namespace ngc {
             piece.primaryCommand = primary;
             piece.activationCommands = std::move(activations);
             piece.sourceCommands = std::move(sources);
+            piece.replacedSourceIntervals = std::move(replacedSourceIntervals);
             if(kind == PreparedPieceKind::ClusterSpline) {
                 if(auto prepared = prepareClusterKnotIntervals(
                         piece, clusterSourceFeeds, workspace, effort.generateSamples); !prepared)
@@ -950,7 +952,7 @@ namespace ngc {
                 if(auto added = addPiece(kind, entities[index].curve, from, to,
                                          entities[index].feed, entities[index].linear,
                                          entities[index].id, {entities[index].id},
-                                         {entities[index].id}); !added)
+                                         {entities[index].id}, {}); !added)
                     return std::unexpected(added.error());
             }
             if(index + 1 == entities.size()) continue;
@@ -1055,10 +1057,21 @@ namespace ngc {
                 std::vector<PreparedCommandId> sources;
                 for(std::size_t command = index; command <= right; ++command)
                     sources.push_back(entities[command].id);
+                std::vector<PreparedSourceInterval> replacedSourceIntervals;
+                replacedSourceIntervals.reserve(right - index + 1);
+                replacedSourceIntervals.push_back({entities[index].id,
+                    entities[index].curve, entities[index].length - 3.0 * leftScale,
+                    entities[index].length});
+                for(std::size_t entity = index + 1; entity < right; ++entity)
+                    replacedSourceIntervals.push_back({entities[entity].id,
+                        entities[entity].curve, 0.0, entities[entity].length});
+                replacedSourceIntervals.push_back({entities[right].id,
+                    entities[right].curve, 0.0, 3.0 * rightScale});
                 if(auto added = addPiece(PreparedPieceKind::ClusterSpline, curve, 0.0,
                                          curve->length, (entities[index].feed + entities[right].feed) / 2.0,
                                          false, entities[index].id, std::move(activations),
                                          std::move(sources),
+                                         std::move(replacedSourceIntervals),
                                          sourceFeeds); !added)
                     return std::unexpected(added.error());
                 index = right - 1;
@@ -1074,7 +1087,12 @@ namespace ngc {
             if(auto added = addPiece(PreparedPieceKind::JunctionBlend, curve, 0.0, curve->length,
                                      (incoming.feed + outgoing.feed) / 2.0, false,
                                      outgoing.id, {outgoing.id},
-                                     {incoming.id, outgoing.id}); !added)
+                                     {incoming.id, outgoing.id},
+                                     {{incoming.id, incoming.curve,
+                                       incoming.length - 3.0 * sourceScale(incoming, blendScale),
+                                       incoming.length},
+                                      {outgoing.id, outgoing.curve, 0.0,
+                                       3.0 * sourceScale(outgoing, blendScale)}}); !added)
                 return std::unexpected(added.error());
         }
         if(result.pieces.empty()) return std::unexpected("continuous path produced no geometry");
