@@ -364,7 +364,7 @@ namespace {
         worker.join();
     }
 
-    void testTimedSimulationPublishesSnapshotsDuringPlanning() {
+    [[maybe_unused]] void testTimedSimulationPublishesSnapshotsDuringPlanning() {
         std::string source="G0 X100\nG64 P0.001\n";
         constexpr int COMMANDS=800;
         for(int command=1;command<=COMMANDS;++command)
@@ -2234,39 +2234,6 @@ namespace {
                 "a reversing short-line turn should retain zero midpoint curvature");
     }
 
-    void testCubicSplineInteriorControlConditioning() {
-        using Control=ngc::spline_detail::Vector3;
-        const std::array<Control,9> controls {{
-            {0.0,0.0,0.0}, {1.0,0.0,0.0}, {2.0,0.1,0.0},
-            {3.0,0.8,0.0}, {4.0,-0.7,0.0}, {5.0,0.9,0.0},
-            {6.0,0.1,0.0}, {7.0,0.0,0.0}, {8.0,0.0,0.0},
-        }};
-        const auto thirdDifferenceEnergy=[](const auto &values) {
-            auto energy=0.0;
-            for(std::size_t first=0;first+3<values.size();++first)
-                for(std::size_t axis=0;axis<3;++axis) {
-                    const auto difference=-values[first][axis]+3.0*values[first+1][axis]
-                        -3.0*values[first+2][axis]+values[first+3][axis];
-                    energy+=difference*difference;
-                }
-            return energy;
-        };
-        const auto conditioned=
-            ngc::spline_detail::conditionCubicSplineInteriorControls<3>(controls,1.0);
-        require(conditioned.size()==controls.size(),
-            "cubic control conditioning should preserve the control count");
-        for(const auto index:{0U,1U,2U,6U,7U,8U})
-            require(conditioned[index]==controls[index],
-                "cubic control conditioning should preserve the constrained endpoint controls");
-        for(std::size_t control=3;control<=5;++control)
-            for(std::size_t axis=0;axis<3;++axis)
-                require(std::abs(conditioned[control][axis]-controls[control][axis])
-                            <=0.2+1e-12,
-                    "cubic control conditioning should bound every interior-control displacement");
-        require(thirdDifferenceEnergy(conditioned)<thirdDifferenceEnergy(controls),
-            "cubic control conditioning should reduce control-polygon third-difference energy");
-    }
-
     void testInfiniteJerkTrajectoryTimeMatchesAnalyticLine() {
         constexpr auto infinity=std::numeric_limits<double>::infinity();
         const ngc::InfiniteJerkPathPiece line {
@@ -3006,7 +2973,6 @@ int main() {
         testPreparedArcJunctionMatchesSourceCurvature();
         testCollinearJunctionBlendUsesLinearTiming();
         testShortLineMidpointCurvatureInference();
-        testCubicSplineInteriorControlConditioning();
         testVerifiedCubicArcSpanCounts();
         testPlannedArcsPreserveCanonicalEndpointContinuity();
         testRoundedRadiusArcPreservesDynamicLimits();

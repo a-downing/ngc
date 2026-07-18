@@ -1,7 +1,6 @@
 #pragma once
 
 #include <print>
-#include <source_location>
 #include <stdexcept>
 #include <vector>
 #include <memory>
@@ -34,16 +33,14 @@ namespace ngc
         explicit Parser(Lexer &lexer): m_lexer(lexer), m_skipNewlines({true}) { }
 
         class Error final : public std::logic_error {
-            std::source_location m_location;
             std::optional<Token> m_token;
             std::optional<Lexer::Error> m_lexerError;
 
         public:
-            Error(const std::string &message, const std::source_location location): std::logic_error(message), m_location(location) { }
-            Error(const std::string &message, const std::source_location location, const Token &token): std::logic_error(message), m_location(location), m_token(token) { }
-            Error(const std::string &message, const std::source_location location, const Lexer::Error &lexerError): std::logic_error(message), m_location(location), m_lexerError(lexerError) { }
+            explicit Error(const std::string &message): std::logic_error(message) { }
+            Error(const std::string &message, const Token &token): std::logic_error(message), m_token(token) { }
+            Error(const std::string &message, const Lexer::Error &lexerError): std::logic_error(message), m_lexerError(lexerError) { }
 
-            [[nodiscard]] const std::source_location &sourceLocation() const { return m_location; }
             [[nodiscard]] const std::optional<Token> &token() const { return m_token; }
             [[nodiscard]] const std::optional<Lexer::Error> &lexerError() const { return m_lexerError; }
 
@@ -410,20 +407,6 @@ namespace ngc
             return token;
         }
 
-        [[nodiscard]] Token expectInteger() {
-            const auto token = nextToken();
-
-            if(!token.integer()) {
-                error(std::format("expected integer, but found: '{}'", token.text()), token);
-            }
-
-            if(match(Token::Kind::A, Token::Kind::B)) {
-
-            }
-
-            return token;
-        }
-
         template<typename ...Args>
         [[nodiscard]] bool match(Args... args) requires (std::same_as<Args, Token::Kind> && ...) {
             if((check(args) || ...)) {
@@ -446,11 +429,7 @@ namespace ngc
 
         template<typename ...Args>
         [[nodiscard]] bool check(Args... args) requires (std::same_as<Args, Token::Kind> && ...) {
-            if((peekToken().is(args) || ...)) {
-                return true;
-            }
-
-            return false;
+            return (peekToken().is(args) || ...);
         }
 
         [[nodiscard]] Token peekToken() {
@@ -488,16 +467,16 @@ namespace ngc
             }
         }
 
-        [[noreturn]] static void error(const std::string &message, const std::source_location location = std::source_location::current()) {
-            throw Error(message, location);
+        [[noreturn]] static void error(const std::string &message) {
+            throw Error(message);
         }
 
-        [[noreturn]] static void error(const std::string &message, const Token &token, const std::source_location location = std::source_location::current()) {
-            throw Error(message, location, token);
+        [[noreturn]] static void error(const std::string &message, const Token &token) {
+            throw Error(message, token);
         }
 
-        [[noreturn]] static void error(const std::string &message, const Lexer::Error &lexerError, const std::source_location location = std::source_location::current()) {
-            throw Error(message, location, lexerError);
+        [[noreturn]] static void error(const std::string &message, const Lexer::Error &lexerError) {
+            throw Error(message, lexerError);
         }
     };
 }

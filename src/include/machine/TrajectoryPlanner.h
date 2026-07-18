@@ -73,7 +73,6 @@ namespace ngc {
               activationSpans(std::move(activationSpanValues)),
               activationItems(std::move(activationItemValues)) { }
 
-        const ExecutionItem &primaryItem() const { return items.front(); }
     };
 
     struct TrajectoryPlanningDiagnostics {
@@ -118,7 +117,6 @@ namespace ngc {
         bool m_preparedChainEnded = false;
         TrajectoryPlanningDiagnostics m_diagnostics;
         MotionState m_continuousBoundary{};
-        std::string m_lastRollingCandidateError;
         std::optional<double> m_lastRollingVelocityFraction;
         std::string m_planningActivity;
         std::string m_lastContinuousPlanSummary;
@@ -587,7 +585,6 @@ namespace ngc {
             m_preparedChainEnded=false;
             m_compiler.reset(epoch, position);
             m_continuousBoundary={position,{},{}};
-            m_lastRollingCandidateError.clear();
             m_lastRollingVelocityFraction.reset();
             m_planningActivity.clear();
             m_lastContinuousPlanSummary.clear();
@@ -617,7 +614,6 @@ namespace ngc {
         }
         const TrajectoryLimits &limits() const { return m_compiler.limits(); }
         const TrajectoryPlanningDiagnostics &diagnostics() const { return m_diagnostics; }
-        const std::string &lastRollingCandidateError() const { return m_lastRollingCandidateError; }
         const std::string &planningActivity() const { return m_planningActivity; }
         const std::string &lastContinuousPlanSummary() const {
             return m_lastContinuousPlanSummary;
@@ -961,7 +957,6 @@ namespace ngc {
                             suffixProbe.lastTimeLawDiagnostics();
                         if(!suffix) {
                             ++m_diagnostics.rollingSuffixProbeFailures;
-                            m_lastRollingCandidateError="prepared suffix: "+suffix.error();
                             continue;
                         }
                         auto prefixPlanner=m_compiler;
@@ -979,7 +974,6 @@ namespace ngc {
                             prefixPlanner.lastTimeLawDiagnostics();
                         if(!prefix) {
                             ++m_diagnostics.rollingPrefixProbeFailures;
-                            m_lastRollingCandidateError="prepared prefix: "+prefix.error();
                             continue;
                         }
 
@@ -987,7 +981,6 @@ namespace ngc {
                         m_compiler=std::move(prefixPlanner);
                         m_continuousBoundary=boundary;
                         m_lastRollingVelocityFraction=velocityFraction;
-                        m_lastRollingCandidateError.clear();
                         m_preparedWindow=std::move(split->suffix);
                         retainPreparedInputs(*m_preparedWindow);
                         auto finalized=finalize(std::move(*prefix),std::move(inputs));

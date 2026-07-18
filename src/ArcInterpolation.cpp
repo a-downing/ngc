@@ -305,9 +305,6 @@ namespace ngc::simulation_detail {
         return { std::lerp(from.x,to.x,t), std::lerp(from.y,to.y,t), std::lerp(from.z,to.z,t),
                  std::lerp(from.a,to.a,t), std::lerp(from.b,to.b,t), std::lerp(from.c,to.c,t) };
     }
-    double linearDistance(const position_t &from, const position_t &to) {
-        return vec3_t { to.x-from.x, to.y-from.y, to.z-from.z }.length();
-    }
     std::optional<ArcGeometry> arcGeometry(const MoveArc &arc) {
         const vec3_t start { arc.from().x, arc.from().y, arc.from().z };
         const vec3_t end { arc.to().x, arc.to().y, arc.to().z };
@@ -322,18 +319,6 @@ namespace ngc::simulation_detail {
         if(sweep < 0.0) sweep += 2.0*std::numbers::pi;
         if((startArm-endArm).length() < 1e-9) sweep = 2.0*std::numbers::pi;
         return ArcGeometry { arc.center(), axis, startArm, endArm, scale(axis,dot(end-start,axis)), sweep };
-    }
-    position_t interpolate(const MoveArc &arc, const double t) {
-        const auto geometry = arcGeometry(arc);
-        if(!geometry) return mix(arc.from(),arc.to(),t);
-        if(t <= 0.0) return arc.from();
-        if(t >= 1.0) return arc.to();
-        const auto radial = scale(rotate(geometry->startArm,geometry->sweep*t,geometry->axisUnit),1.0-t)
-            + scale(rotate(geometry->endArm,-geometry->sweep*(1.0-t),geometry->axisUnit),t);
-        const auto xyz = geometry->center+radial+scale(geometry->axial,t);
-        auto result = mix(arc.from(),arc.to(),t);
-        result.x=xyz.x; result.y=xyz.y; result.z=xyz.z;
-        return result;
     }
     double pathLength(const MoveArc &arc) {
         return ArcReference(arc).length();

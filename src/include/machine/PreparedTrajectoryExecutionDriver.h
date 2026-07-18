@@ -351,10 +351,6 @@ namespace ngc {
         }
 
         const std::optional<std::string> &error() const { return m_error; }
-        std::size_t outstandingChunks() const { return m_outstandingChunks; }
-        bool canPublish() const { return !m_pending; }
-        bool backendReady() const { return m_backendReady; }
-        bool forwardComplete() const { return m_forwardComplete; }
         const TrajectoryPlanningDiagnostics &planningDiagnostics() const { return m_planner.diagnostics(); }
         const std::string &planningActivity() const { return m_planner.planningActivity(); }
         double planningActivitySeconds() const { return m_planner.planningActivitySeconds(); }

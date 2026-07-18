@@ -24,12 +24,6 @@ namespace ngc {
         position_t acceleration{};
     };
 
-    struct ProgramCursor {
-        std::uint64_t block = 0;
-        double pathParameter = 0.0;
-        std::uint32_t event = 0;
-    };
-
     // q(u) = ((a*u + b)*u + c)*u + d, u in [0, 1]. Timing and
     // all axis-limit validation are completed by NRT before publication.
     struct AxisPolynomialSpan {
@@ -92,8 +86,6 @@ namespace ngc {
         FixedArray<ScheduledEvent, MAX_EVENTS_PER_CHUNK> events;
         MotionState branchState{};
         MotionState stopState{};
-        ProgramCursor branchCursor{};
-        ProgramCursor stopCursor{};
     };
 
     static_assert(std::is_trivially_copyable_v<PlanChunk>);
@@ -154,7 +146,6 @@ namespace ngc {
         DigitalInputId input = 0;
         InputCondition condition = InputCondition::Active;
         bool triggerRequired = false;
-        ProgramCursor cursor{};
     };
 
     // Joint-space counterpart used for gantry squaring and other service
@@ -172,7 +163,6 @@ namespace ngc {
         JointMotionLimits limits{};
         FixedArray<JointTrigger, MAX_JOINTS> triggers;
         bool triggerRequired = false;
-        ProgramCursor cursor{};
     };
 
     using ExecutionItem = std::variant<PlanChunk, TriggeredMove, TriggeredJointMove>;
@@ -294,7 +284,7 @@ namespace ngc {
         JointMotionState jointState;
     };
     struct RequestCompleted { RequestId request; bool succeeded; };
-    struct BackendHeld { EpochId epoch; MotionState state; ProgramCursor cursor; };
+    struct BackendHeld { EpochId epoch; MotionState state; };
     struct BackendFault { std::uint32_t code; };
     using ExecutionEvent = std::variant<ChunkAccepted, ChunkRejected, ChunkRetired, BranchSelected,
                                         TriggeredMoveCompleted, TriggeredJointMoveCompleted,

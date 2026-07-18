@@ -77,11 +77,6 @@ public:
         return m_session.parserErrors();
     }
 
-    std::vector<std::string> blockMessages() const {
-        std::scoped_lock lock(m_mutex);
-        return m_session.blockMessages();
-    }
-
     bool compile(const std::vector<std::tuple<std::string, std::string>> &programs) {
         std::scoped_lock lock(m_mutex);
 
@@ -251,8 +246,4 @@ private:
         }
     }
 
-    bool joinRequested() const {
-        std::scoped_lock lock(m_mutex);
-        return m_doJoin;
-    }
 };

@@ -48,7 +48,7 @@ namespace ngc {
             if(parameter <= first) return controls.front();
             if(parameter >= last) return controls.back();
 
-            auto span = controls.size() - 1;
+            std::size_t span;
             if(parameterSpan) {
                 span = std::min(degree + *parameterSpan, controls.size() - 1);
             } else {

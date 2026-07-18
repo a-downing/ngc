@@ -108,10 +108,8 @@ class ApplicationImpl final {
 
     // windows
     bool m_enableOpenDialog = false;
-    bool m_enableProgramWindow = false; // Legacy window is no longer opened; retained until its renderer is removed.
     bool m_enableMemoryWindow = false;
     bool m_enableToolWindow = false;
-    bool m_enableErrorWindow = false;
     bool m_showClusterGeometricJerkComb = false;
     bool m_showExecutedJerkComb = true;
 
@@ -129,7 +127,6 @@ class ApplicationImpl final {
     double m_pathJerk;
 
     double m_time = 0.0;
-    double m_dt = 0.0;
     double m_mouseX = 0.0;
     double m_mouseY = 0.0;
     double m_mouseDX = 0.0;
@@ -366,20 +363,17 @@ public:
 
         if(!result) {
             m_errorMessage = "failed to load tool table";
-            m_enableErrorWindow = true;
         }
 
         auto autoload = readAutoloadSources();
         if(!autoload) {
             m_errorMessage = autoload.error();
-            m_enableErrorWindow = true;
         } else {
             m_autoloadSource = std::move(*autoload);
         }
     }
 
     void preRender() {
-        m_dt = ImGui::GetTime() - m_time;
         m_time = ImGui::GetTime();
         auto pos = ImGui::GetMousePos();
         m_mouseDX = pos.x - m_mouseX;
@@ -428,13 +422,11 @@ public:
 
             if(!tool) {
                 m_errorMessage = std::format("tool #{}: {}", toolStrings.number, tool.error());
-                m_enableErrorWindow = true;
                 return;
             }
 
             if(tools.get(tool->number)) {
                 m_errorMessage = std::format("duplicate tool number {}", tool->number);
-                m_enableErrorWindow = true;
                 return;
             }
 
@@ -445,13 +437,11 @@ public:
 
         if(!result) {
             m_errorMessage = result.error();
-            m_enableErrorWindow = true;
             return;
         }
 
         if(!m_worker.setToolTable(tools)) {
             m_errorMessage = "tool table was saved, but cannot be applied while the worker is busy";
-            m_enableErrorWindow = true;
             return;
         }
 
@@ -464,22 +454,15 @@ public:
 
         if(!result) {
             m_errorMessage = result.error();
-            m_enableErrorWindow = true;
             return;
         }
 
         if(!m_worker.setToolTable(m_tools)) {
             m_errorMessage = "tool table cannot be reloaded while the worker is busy";
-            m_enableErrorWindow = true;
             return;
         }
 
         initToolTableStrings();
-    }
-
-    bool noWindowHasFocus() {
-        auto ctx = ImGui::GetCurrentContext();
-        return ctx->NavWindow == nullptr && ctx->MovingWindow == nullptr && ctx->WheelingWindow == nullptr;
     }
 
     void fitToolpathToView(const int width, const int height) {
@@ -1422,18 +1405,6 @@ public:
             drawToolWireframe(simulation.toolPose);
     }
 
-    void renderErrorWindow() {
-        ImGui::OpenPopup("Error");
-
-        if(ImGui::BeginPopupModal("Error", &m_enableErrorWindow, ImGuiWindowFlags_AlwaysAutoResize)) {
-            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4_Redish);
-            ImGui::TextUnformatted(m_errorMessage.c_str());
-            ImGui::PopStyleColor();
-        }
-
-        ImGui::EndPopup();
-    }
-
     void saveMainProgram() {
         if(m_programSource.empty()) return;
         const auto &[source, name] = m_programSource.back();
@@ -2270,110 +2241,6 @@ public:
         ImGui::End();
     }
 
-    void renderProgramWindow() {
-        if(ImGui::Begin("Program", &m_enableProgramWindow)) {
-            if(ImGui::BeginChild("top", { 0, 0 }, ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeY)) {
-                if(ImGui::Button("Compile Programs", {0,0}, m_worker.busy())) {
-                    m_worker.compile(m_programSource);
-                }
-
-                if(m_worker.compiled()) {
-                    if(ImGui::Button("Build Preview")) {
-                        m_worker.execute();
-                    }
-                }
-
-                const auto simulation = m_simulation.snapshot();
-                const auto simulationActive = simulation.status == ngc::SimulationStatus::Running
-                    || simulation.status == ngc::SimulationStatus::Paused;
-
-                ImGui::SameLine();
-                ImGui::BeginDisabled(m_programSource.empty() || simulationActive);
-                if(ImGui::Button("Run Simulation")) {
-                    m_simulation.setTickMultiplier(m_simulationTickMultiplier);
-                    m_simulation.setRapidSpeed(m_simulatedRapidSpeed);
-                    m_simulation.start(m_programSource, m_tools, true);
-                }
-                ImGui::EndDisabled();
-
-                ImGui::SameLine();
-                ImGui::BeginDisabled(!simulationActive);
-                if(simulation.status == ngc::SimulationStatus::Paused) {
-                    if(ImGui::Button("Resume")) m_simulation.resume();
-                } else {
-                    if(ImGui::Button("Pause")) m_simulation.pause();
-                }
-                ImGui::SameLine();
-                if(ImGui::Button("Stop")) m_simulation.stop();
-                ImGui::EndDisabled();
-
-                ImGui::SetNextItemWidth(120.0f);
-                if(ImGui::InputInt("Speed multiplier", &m_simulationTickMultiplier, 1, 10)) {
-                    m_simulationTickMultiplier = std::clamp(m_simulationTickMultiplier, 1, 1000);
-                    m_simulation.setTickMultiplier(m_simulationTickMultiplier);
-                }
-                ImGui::SameLine();
-                ImGui::SetNextItemWidth(120.0f);
-                if(ImGui::InputDouble("Rapid speed", &m_simulatedRapidSpeed, 10.0, 100.0, "%.2f")) {
-                    m_simulatedRapidSpeed = std::max(m_simulatedRapidSpeed, 1e-6);
-                    m_simulation.setRapidSpeed(m_simulatedRapidSpeed);
-                }
-
-                const auto statusText = [&] {
-                    switch(simulation.status) {
-                        case ngc::SimulationStatus::Stopped: return "Stopped";
-                        case ngc::SimulationStatus::Running: return "Running";
-                        case ngc::SimulationStatus::Paused: return "Paused";
-                        case ngc::SimulationStatus::Completed: return "Completed";
-                        case ngc::SimulationStatus::Error: return "Error";
-                    }
-                    return "Unknown";
-                }();
-                ImGui::Text("Simulation: %s  MCS XYZ: %.4f, %.4f, %.4f",
-                            statusText, simulation.machinePosition.x, simulation.machinePosition.y,
-                            simulation.machinePosition.z);
-                if(!simulation.error.empty()) {
-                    ImGui::TextColored(ImVec4_Redish, "%s", simulation.error.c_str());
-                }
-
-                if(ImGui::BeginTabBar("programs")) {
-                    for(auto &[source, name] : m_programSource) {
-                        if(ImGui::BeginTabItem(name.c_str())) {
-                            ImGui::InputTextMultiline("##source", &source, { -1, -1 });
-                            ImGui::EndTabItem();
-                        }
-                    }
-                }
-
-                ImGui::EndTabBar();
-            }
-
-            ImGui::EndChild();
-
-            if(ImGui::BeginChild("middle", {0, 0 }, ImGuiChildFlags_Borders | ImGuiChildFlags_ResizeY)) {
-                for(const auto &error : m_worker.parserErrors()) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4_Redish);
-                    ImGui::Selectable(error.text().c_str());
-                    ImGui::PopStyleColor();
-                }
-            }
-
-            ImGui::EndChild();
-
-            if(ImGui::BeginChild("bottom", {0, 0 }, ImGuiChildFlags_Borders)) {
-                for(const auto &block : m_worker.blockMessages()) {
-                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4_Greenish);
-                    ImGui::Selectable(block.c_str());
-                    ImGui::PopStyleColor();
-                }
-            }
-
-            ImGui::EndChild();
-        }
-
-        ImGui::End();
-    }
-
     void renderOpenDialog() {
         ImGui::OpenPopup("Open File");
 
@@ -2401,14 +2268,12 @@ public:
 
                         if(!result) {
                             m_errorMessage = result.error().what();
-                            m_enableErrorWindow = true;
                             break;
                         }
 
                         auto autoload = readAutoloadSources();
                         if(!autoload) {
                             m_errorMessage = autoload.error();
-                            m_enableErrorWindow = true;
                             break;
                         }
 
@@ -2425,7 +2290,6 @@ public:
 
                     if(typeError) {
                         m_errorMessage = std::format("failed to inspect '{}': {}", entry.path().string(), typeError.message());
-                        m_enableErrorWindow = true;
                         break;
                     }
                 }
@@ -2433,7 +2297,6 @@ public:
 
             if(directoryError) {
                 m_errorMessage = std::format("failed to read '{}': {}", m_path.string(), directoryError.message());
-                m_enableErrorWindow = true;
             }
 
             ImGui::EndPopup();

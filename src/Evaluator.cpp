@@ -18,52 +18,6 @@
 #include "gcode/GCode.h"
 
 namespace ngc {
-#if 0 // Message interfaces live in Evaluator.h.
-    class EvaluatorMessageVisitor {
-    public:
-        virtual void visit(const class BlockMessage &) = 0;
-        virtual void visit(const class PrintMessage &) = 0;
-    };
-
-    class EvaluatorMessage {
-    public:
-        virtual ~EvaluatorMessage() = default;
-        virtual bool isImpl(const BlockMessage *) const { return false; }
-        virtual bool isImpl(const PrintMessage *) const { return false; }
-        virtual void accept(EvaluatorMessageVisitor &) const = 0;
-
-        template<typename T>
-        [[nodiscard]] bool is() const {
-            return this->isImpl(static_cast<const T *>(nullptr));
-        }
-
-        template<typename T>
-        const T *as() const {
-            return this->isImpl(static_cast<const T *>(nullptr)) ? static_cast<const T *>(this) : nullptr;
-        }
-    };
-
-    class BlockMessage final : public EvaluatorMessage {
-        Block m_block;
-    public:
-        virtual ~BlockMessage() override = default;
-        explicit BlockMessage(Block block) : m_block(std::move(block)) { }
-        const Block &block() const { return m_block; }
-        virtual bool isImpl(const BlockMessage *) const override { return true; }
-        void accept(EvaluatorMessageVisitor &visitor) const override { visitor.visit(*this); }
-    };
-
-    class PrintMessage final : public EvaluatorMessage {
-        std::string m_text;
-    public:
-        virtual ~PrintMessage() override = default;
-        explicit PrintMessage(std::string text) : m_text(std::move(text)) { }
-        const std::string &text() const { return m_text; }
-        virtual bool isImpl(const PrintMessage *) const override { return true; }
-        void accept(EvaluatorMessageVisitor &visitor) const override { visitor.visit(*this); }
-    };
-
-#endif
     class Evaluator::Impl final : public Visitor {
         std::vector<std::unordered_map<std::string_view, uint32_t>> m_scope;
         std::vector<std::unordered_map<SubSignature, const SubStatement *>> m_subScope;

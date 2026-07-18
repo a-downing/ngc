@@ -195,8 +195,7 @@ namespace ngc {
                            || !std::isfinite(trigger.debounce) || trigger.debounce < 0.0) return false;
                         boundJoints |= JointMask{1} << trigger.joint;
                     }
-                    if(value.triggerRequired && boundJoints != value.joints) return false;
-                    return true;
+                    return !value.triggerRequired || boundJoints == value.joints;
                 }
             }, item);
             if(!valid) return PublishResult::Invalid;
@@ -351,10 +350,6 @@ namespace ngc {
         static BranchSequence itemPredecessor(const ExecutionItem &item) {
             return std::visit([](const auto &value) { return value.predecessorBranch; }, item);
         }
-        static BranchSequence itemBranch(const ExecutionItem &item) {
-            return std::visit([](const auto &value) { return value.branch; }, item);
-        }
-
         const AxisPolynomialSpan &currentSpan() const {
             const auto &chunk = activeChunk();
             return m_stopping ? chunk.stopTail[m_span] : chunk.normalMotion[m_span];
@@ -671,8 +666,7 @@ namespace ngc {
             input.max_acceleration = {accelerationLimit};
             input.max_jerk = {jerkLimit};
             ruckig::Ruckig<1> generator;
-            if(generator.calculate(input, m_triggered.trajectory) != ruckig::Result::Working) return false;
-            return true;
+            return generator.calculate(input, m_triggered.trajectory) == ruckig::Result::Working;
         }
 
         std::optional<double> syntheticTransitionDistance(const TriggeredMoveId move) const {
@@ -726,7 +720,7 @@ namespace ngc {
             emit(ChunkRetired { move.epoch, move.id });
             m_snapshot.state = BackendState::Held;
             m_snapshot.lastBranch = move.branch;
-            emit(BackendHeld { move.epoch, stopped, move.cursor });
+            emit(BackendHeld { move.epoch, stopped });
             removeSyntheticInput(move.moveId);
             release(*m_active);
             m_active.reset();
@@ -904,7 +898,7 @@ namespace ngc {
             m_snapshot.state = BackendState::Held;
             m_snapshot.lastBranch = move.branch;
             m_snapshot.activeJoints = 0;
-            emit(BackendHeld { move.epoch, m_snapshot.commanded, move.cursor });
+            emit(BackendHeld { move.epoch, m_snapshot.commanded });
             removeSyntheticJointInputs(move.moveId);
             release(*m_active);
             m_active.reset();
@@ -1077,7 +1071,7 @@ namespace ngc {
                 emit(ChunkRetired { chunk.epoch, chunk.id });
                 m_snapshot.state = BackendState::Held;
                 m_snapshot.lastBranch = chunk.branch;
-                emit(BackendHeld { chunk.epoch, chunk.stopState, chunk.stopCursor });
+                emit(BackendHeld { chunk.epoch, chunk.stopState });
                 release(*m_active);
                 m_active.reset();
                 return;

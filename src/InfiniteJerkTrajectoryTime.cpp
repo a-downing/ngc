@@ -316,7 +316,7 @@ namespace ngc {
                         .refinements=refinement,
                     };
             }
-            previous=std::move(*current);
+            previous=*current;
         }
         if(!previous) return std::unexpected(std::format(
             "infinite-jerk timing produced no feasible refined envelope: {}",

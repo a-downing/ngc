@@ -223,15 +223,6 @@ namespace ngc {
         GeometryPreparationDiagnostics diagnostics;
     };
 
-    enum class PreparedBoundaryReason {
-        NaturalEnd,
-        ProtectedBoundary,
-        Synchronization,
-        Probe,
-        ProgramEnd,
-        IncompatibleCommand,
-    };
-
     struct PreparedGeometrySlice {
         GeometryEpoch epoch = 0;
         GeometrySequence sequence = 0;
@@ -253,7 +244,6 @@ namespace ngc {
         GeometryEpoch epoch = 0;
         GeometrySequence sequence = 0;
         ContinuousChainId chain = 0;
-        PreparedBoundaryReason reason = PreparedBoundaryReason::NaturalEnd;
     };
 
     struct PreparedBlockLifecycleMessage {

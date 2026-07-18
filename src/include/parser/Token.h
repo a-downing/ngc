@@ -1,7 +1,6 @@
 #pragma once
 
 #include <memory>
-#include <cmath>
 #include <cassert>
 #include <utility>
 #include <stdexcept>
@@ -32,7 +31,7 @@ namespace ngc {
             PLUS, MINUS,
             MUL, SLASH, MOD, POW,
             AND, OR, XOR,
-            SUB, RETURN, IF, THEN, ELSE, WHILE, CONTINUE, BREAK,
+            SUB, RETURN, IF, ELSE, WHILE, CONTINUE, BREAK,
             ALIAS, LET
         };
 
@@ -86,15 +85,6 @@ namespace ngc {
             }
         }
 
-        [[nodiscard]] bool integer() const {
-            if(!number()) {
-                return false;
-            }
-
-            auto d = as_double();
-            return std::abs(std::round(d) - d) <= 0.0001;
-        }
-
         [[nodiscard]] double as_double() const {
             if(m_kind != Kind::NUMBER) {
                 throw std::logic_error(std::format("Token::as_double() called on Token {} '{}'", name(), text()));
@@ -107,14 +97,6 @@ namespace ngc {
             }
 
             return *result;
-        }
-
-        [[nodiscard]] int as_integer() const {
-            if(!integer()) {
-                throw std::logic_error(std::format("Token::as_integer() called on Token {} '{}'", name(), text()));
-            }
-
-            return static_cast<int>(as_double());
         }
 
         [[nodiscard]] const char *name() const;

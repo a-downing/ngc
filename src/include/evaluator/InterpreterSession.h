@@ -239,7 +239,7 @@ namespace ngc {
                 }
 
                 if(!m_pendingCommands.empty()) {
-                    auto command = std::move(m_pendingCommands.front());
+                    auto command = m_pendingCommands.front();
                     m_pendingCommands.pop_front();
 
                     if(const auto probe = std::get_if<ProbeMove>(&command)) {
@@ -458,7 +458,7 @@ namespace ngc {
                 auto commands = m_machine.executeBlock(blockMessage->block());
 
                 for(auto &command : commands) {
-                    m_pendingCommands.emplace_back(std::move(command));
+                    m_pendingCommands.emplace_back(command);
                 }
             }
 

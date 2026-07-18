@@ -751,7 +751,7 @@ namespace ngc {
             const auto duration=result->back().time;
             instrumentation.store(key,true,duration);
             timer.succeeded=true;
-            return {.timing=std::move(*result),.duration=duration,.successful=true};
+            return {.timing=*result,.duration=duration,.successful=true};
         }
 
         std::optional<TimeLaw> materializeCandidateTimeLaw(TimeLawWorkspace &workspace,
@@ -768,7 +768,7 @@ namespace ngc {
             diagnostics.seconds+=std::chrono::duration<double>(
                 std::chrono::steady_clock::now()-started).count();
             if(!result) return std::nullopt;
-            return std::move(*result);
+            return *result;
         }
 
         std::expected<TimeLaw, std::string> timeLaw(TimeLawWorkspace &workspace,
@@ -1676,7 +1676,7 @@ namespace ngc {
                 if(!timing) return std::unexpected(std::format(
                     "continuous reachability seed timing failed at piece {} input {}: {}",
                     pieceIndex,pieces[pieceIndex].input,timing.error()));
-                pieceTiming[pieceIndex]=std::move(*timing);
+                pieceTiming[pieceIndex]=*timing;
             }
             result->velocityOnlySeedDuration=std::accumulate(
                 pieceTiming.begin(),pieceTiming.end(),0.0,
@@ -1958,8 +1958,8 @@ namespace ngc {
                         bestDuration=duration;
                         bestVelocity=velocity;
                         bestAcceleration=acceleration;
-                        bestLeft=std::move(*left.timing);
-                        bestRight=std::move(*right.timing);
+                        bestLeft=*left.timing;
+                        bestRight=*right.timing;
                         improved=true;
                     }
                     return true;
@@ -2045,8 +2045,8 @@ namespace ngc {
                 }
                 stationVelocity[station]=bestVelocity;
                 stationAcceleration[station]=bestAcceleration;
-                pieceTiming[leftPiece]=std::move(bestLeft);
-                pieceTiming[rightPiece]=std::move(bestRight);
+                pieceTiming[leftPiece]=bestLeft;
+                pieceTiming[rightPiece]=bestRight;
                 if(improved) ++improvedStationVisits;
                 if(measureStationVisitReplay) {
                     const auto visitSeconds=std::chrono::duration<double>(

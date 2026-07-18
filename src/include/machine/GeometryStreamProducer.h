@@ -43,8 +43,6 @@ namespace ngc {
         std::uint64_t slicesPublished = 0;
         std::uint64_t standaloneCommandsPublished = 0;
         std::uint64_t continuousEndsPublished = 0;
-        std::uint64_t producerBackpressureCount = 0;
-        std::uint64_t consumerEmptyWaitCount = 0;
         std::size_t forwardQueueHighWater = 0;
         std::size_t maximumPreparedPieces = 0;
         double maximumSliceNominalDuration = 0.0;
@@ -272,7 +270,7 @@ namespace ngc {
             return true;
         }
 
-        bool flushContinuous(const PreparedBoundaryReason reason, const bool publishEnd) {
+        bool flushContinuous() {
             if(!m_continuous.empty()) {
                 auto prepared = prepareWindow();
                 if(!prepared) {
@@ -292,13 +290,10 @@ namespace ngc {
                 m_unpreparedExactStopDuration = 0.0;
             }
             if(m_chain == 0) return true;
-            if(publishEnd) {
-                m_continuousScale.reset();
-                m_continuousPresentation.reset();
-                m_geometryPathMode.reset();
-            }
-            if(!publishEnd) return true;
-            if(!publish(PreparedContinuousEnd{m_epoch, m_sequence++, m_chain, reason})) return false;
+            m_continuousScale.reset();
+            m_continuousPresentation.reset();
+            m_geometryPathMode.reset();
+            if(!publish(PreparedContinuousEnd{m_epoch, m_sequence++, m_chain})) return false;
             ++m_diagnostics.continuousEndsPublished;
             m_chain = 0;
             m_commandRecords.clear();
@@ -365,7 +360,7 @@ namespace ngc {
                 // motion remain exact stops even while G64 is modal.
                 record.metadata.pathMode = pathMode;
                 if(m_geometryPathMode && *m_geometryPathMode != pathMode
-                   && !flushContinuous(PreparedBoundaryReason::IncompatibleCommand, true))
+                   && !flushContinuous())
                     return false;
                 if(!m_geometryPathMode) m_geometryPathMode = pathMode;
                 if(pathMode == ExecutablePathMode::ExactStop) {
@@ -412,7 +407,7 @@ namespace ngc {
                     &&samePosition(*commandEnd(m_continuous.back().command),
                                    *commandStart(record.command));
                 if(!compatible && !m_continuous.empty()
-                   &&!flushContinuous(PreparedBoundaryReason::IncompatibleCommand, true)) return false;
+                   &&!flushContinuous()) return false;
                 if(m_continuous.empty() && m_chain == 0) {
                     m_chain = m_nextChain++;
                     m_continuousScale = scale;
@@ -433,7 +428,7 @@ namespace ngc {
                 }
                 return true;
             }
-            if(!flushContinuous(PreparedBoundaryReason::IncompatibleCommand, true)) return false;
+            if(!flushContinuous()) return false;
             if(!publishStandalone(std::move(record))) return false;
             return true;
         }
@@ -466,7 +461,7 @@ namespace ngc {
                         if(!publish(PreparedBlockLifecycleMessage{m_epoch, m_sequence++, *lifecycle})) return false;
                     } else if(const auto *command = std::get_if<MachineCommand>(&event)) {
                         if(const auto *probe = std::get_if<ProbeMove>(command)) {
-                            if(!flushContinuous(PreparedBoundaryReason::Probe, true)) return false;
+                            if(!flushContinuous()) return false;
                             if(!publishStandalone(makeRecord(*command))) return false;
                             if(!publish(PreparedProbeFence{m_epoch, m_sequence++, probe->id()})) return false;
                             m_pendingProbe = *probe;
@@ -479,7 +474,7 @@ namespace ngc {
                             })) return false;
                         } else if(!processCommand(*command)) return false;
                     } else if(std::holds_alternative<InterpreterWaitingForSynchronization>(event)) {
-                        if(!flushContinuous(PreparedBoundaryReason::Synchronization, true)) return false;
+                        if(!flushContinuous()) return false;
                         const auto fence = m_nextFence++;
                         if(!publish(PreparedSynchronizationFence{m_epoch, m_sequence++, fence})) return false;
                         m_pendingSynchronization = fence;
@@ -494,7 +489,7 @@ namespace ngc {
                         publish(PreparedFailure{m_epoch, m_sequence++, error->message});
                         return false;
                     } else if(std::holds_alternative<InterpreterCompleted>(event)) {
-                        if(!flushContinuous(PreparedBoundaryReason::ProgramEnd, true)) return false;
+                        if(!flushContinuous()) return false;
                         if(!publish(PreparedProgramEnd{m_epoch, m_sequence++})) return false;
                         return true;
                     } else if(const auto *waiting = std::get_if<InterpreterWaitingForProbe>(&event)) {
@@ -513,6 +508,5 @@ namespace ngc {
 
         void stop() { m_cancelled.store(true, std::memory_order_release); m_forward.notifyAll(); m_feedback.notifyAll(); }
         const GeometryStreamDiagnostics &diagnostics() const { return m_diagnostics; }
-        GeometryStreamDiagnostics takeDiagnostics() { return std::move(m_diagnostics); }
     };
 }
