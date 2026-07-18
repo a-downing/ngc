@@ -17,8 +17,8 @@
 
 #include "evaluator/Evaluator.h"
 #include "evaluator/Preamble.h"
-#include "machine/ExactStopTrajectoryPlanner.h"
-#include "machine/BoundedLookaheadTrajectoryPlanner.h"
+#include "machine/TrajectoryCompiler.h"
+#include "machine/TrajectoryPlanner.h"
 #include "machine/Machine.h"
 #include "machine/MachineConfiguration.h"
 #include "parser/Program.h"
@@ -713,7 +713,7 @@ int main(const int argc,char **argv) {
             if(std::isfinite(trajectoryLimits.axisJerk.*component))
                 trajectoryLimits.axisJerk.*component*=jerkMultiplier;
         const auto runRolling=[&](const std::optional<double> baselineDuration) {
-            ngc::BoundedLookaheadTrajectoryPlanner rollingPlanner(trajectoryLimits);
+            ngc::TrajectoryPlanner rollingPlanner(trajectoryLimits);
             rollingPlanner.setContinuousPlanningEffort(effort);
             rollingPlanner.reset(2,startPosition(window.commands.front()));
             std::size_t horizons=0;
@@ -877,7 +877,7 @@ int main(const int argc,char **argv) {
             runRolling(std::nullopt);
             return 0;
         }
-        ngc::ExactStopTrajectoryPlanner planner(trajectoryLimits);
+        ngc::TrajectoryCompiler planner(trajectoryLimits);
         planner.setContinuousPlanningEffort(effort);
         planner.reset(1,startPosition(window.commands.front()));
         ngc::InfiniteJerkTrajectoryTimeResult infiniteJerkTime;

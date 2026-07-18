@@ -286,7 +286,7 @@ namespace ngc {
         double lookaheadDuration = 2.0;
     };
 
-    class ExactStopTrajectoryPlanner {
+    class TrajectoryCompiler {
         TrajectoryLimits m_limits;
         ContinuousPlanningEffort m_continuousPlanningEffort;
         EpochId m_epoch = 1;
@@ -302,7 +302,7 @@ namespace ngc {
         const PreparedContinuousGeometry *m_preparedGeometry = nullptr;
 
     public:
-        explicit ExactStopTrajectoryPlanner(TrajectoryLimits limits = {});
+        explicit TrajectoryCompiler(TrajectoryLimits limits = {});
 
         void reset(EpochId epoch, const position_t &position = {});
         const TrajectoryLimits &limits() const { return m_limits; }
@@ -325,7 +325,9 @@ namespace ngc {
         }
         const position_t &plannedPosition() const { return m_position; }
 
-        std::expected<PlanChunk, std::string> compile(const MachineCommand &command);
+        std::expected<PlanChunk, std::string> compile(
+            const MachineCommand &command,
+            const PreparedPathPiece *preparedPiece = nullptr);
         std::expected<std::unique_ptr<ContinuousTrajectoryPlan>, std::string> compileContinuous(
             std::span<const MachineCommand> commands, double blendScale,
             std::optional<MotionState> startState = std::nullopt,

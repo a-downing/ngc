@@ -10,7 +10,7 @@
 #include <utility>
 
 #include "evaluator/InterpreterSession.h"
-#include "machine/BoundedLookaheadTrajectoryPlanner.h"
+#include "machine/TrajectoryPlanner.h"
 #include "machine/MotionBackend.h"
 
 namespace ngc {
@@ -22,7 +22,7 @@ namespace ngc {
     class TrajectoryExecutionDriver {
         InterpreterSession &m_session;
         MotionBackend &m_backend;
-        BoundedLookaheadTrajectoryPlanner m_planner;
+        TrajectoryPlanner m_planner;
         std::unique_ptr<PlannedExecution> m_pending;
         std::size_t m_pendingItem = 0;
         std::optional<std::string> m_error;
@@ -166,7 +166,7 @@ namespace ngc {
                     (void)planWindow();
                     return true;
                 }
-                const auto retain=BoundedLookaheadTrajectoryPlanner::eligibleForLookahead(input);
+                const auto retain=TrajectoryPlanner::eligibleForLookahead(input);
                 if(!m_planner.enqueue(std::move(input))) {
                     fail("bounded trajectory lookahead window is full");
                     return true;
@@ -206,7 +206,7 @@ namespace ngc {
                     m_deferredInput=std::move(input);
                     (void)planWindow();
                 } else {
-                    const auto retain=BoundedLookaheadTrajectoryPlanner::eligibleForLookahead(input);
+                    const auto retain=TrajectoryPlanner::eligibleForLookahead(input);
                     if(!m_planner.enqueue(std::move(input))) {
                         fail("bounded trajectory lookahead window is full");
                         return true;

@@ -1,4 +1,4 @@
-#include "machine/ExactStopTrajectoryPlanner.h"
+#include "machine/TrajectoryCompiler.h"
 #include "machine/ArcInterpolation.h"
 #include "machine/SplineHandleOptimization.h"
 #include "machine/SplineReconstruction.h"
@@ -892,433 +892,7 @@ namespace ngc {
             return knots;
         }
 
-        std::vector<double> endpointDerivativeCoefficients(
-                const FittingSpline &spline,const std::size_t order,const bool end) {
-            const auto count=spline.controls.size();
-            std::vector<std::vector<double>> values(count,std::vector<double>(count));
-            for(std::size_t index=0;index<count;++index) values[index][index]=1.0;
-            auto knots=spline.knots;
-            auto degree=spline.degree;
-            for(std::size_t derivative=0;derivative<order;++derivative) {
-                std::vector<std::vector<double>> next(
-                    values.size()-1,std::vector<double>(count));
-                for(std::size_t index=0;index<next.size();++index) {
-                    const auto factor=static_cast<double>(degree)
-                        /(knots[index+degree+1]-knots[index+1]);
-                    for(std::size_t source=0;source<count;++source)
-                        next[index][source]=factor
-                            *(values[index+1][source]-values[index][source]);
-                }
-                values=std::move(next);
-                knots={knots.begin()+1,knots.end()-1};
-                --degree;
-            }
-            return end?values.back():values.front();
-        }
-
-        void imposeEndpointDerivative(FittingSpline &spline,const std::size_t order,
-                                      const position_t &desired,const bool end) {
-            const auto coefficients=endpointDerivativeCoefficients(spline,order,end);
-            const auto unknown=end?spline.controls.size()-1-order:order;
-            for(const auto component:AXIS_COMPONENTS) {
-                auto residual=desired.*component;
-                for(std::size_t index=0;index<spline.controls.size();++index)
-                    if(index!=unknown)
-                        residual-=coefficients[index]*(spline.controls[index].*component);
-                spline.controls[unknown].*component=residual/coefficients[unknown];
-            }
-        }
-
         using SplineFitSource=spline_detail::SplineReconstructionSource;
-
-        FittingSpline initialQuinticSpline(const std::size_t spans,
-                                           const SplineFitSource &source) {
-            FittingSpline result;
-            result.degree=5;
-            result.controls.resize(spans+result.degree);
-            result.knots=openSplineKnots(result.controls.size(),result.degree);
-            for(std::size_t index=0;index<result.controls.size();++index) {
-                auto greville=0.0;
-                for(std::size_t offset=1;offset<=result.degree;++offset)
-                    greville+=result.knots[index+offset];
-                greville/=static_cast<double>(result.degree);
-                result.controls[index]=source.positionAt(
-                    source.length*greville/static_cast<double>(spans));
-            }
-            const auto parameterDistance=source.length/static_cast<double>(spans);
-            result.controls.front()=source.positionAt(0.0);
-            result.controls.back()=source.positionAt(source.length);
-            imposeEndpointDerivative(result,1,
-                scaled(source.startTangent,parameterDistance),false);
-            imposeEndpointDerivative(result,2,
-                scaled(source.startCurvature,parameterDistance*parameterDistance),false);
-            imposeEndpointDerivative(result,3,scaled(source.startCurvatureDerivative,
-                parameterDistance*parameterDistance*parameterDistance),false);
-            imposeEndpointDerivative(result,1,
-                scaled(source.endTangent,parameterDistance),true);
-            imposeEndpointDerivative(result,2,
-                scaled(source.endCurvature,parameterDistance*parameterDistance),true);
-            imposeEndpointDerivative(result,3,scaled(source.endCurvatureDerivative,
-                parameterDistance*parameterDistance*parameterDistance),true);
-            return result;
-        }
-
-        struct SplineFitMeasurement {
-            double maximumNormalCurvatureDerivative=0.0;
-            double integratedNormalCurvatureDerivative=0.0;
-            double maximumCurvature=0.0;
-            double maximumDeviation=0.0;
-        };
-
-        SplineFitMeasurement measureSplineFit(const FittingSpline &spline,
-                                              const SplineFitSource &source,
-                                              const unsigned samplesPerSpan) {
-            const auto first=spline.derivative();
-            const auto second=first.derivative();
-            const auto third=second.derivative();
-            const auto spans=spline.controls.size()-spline.degree;
-            SplineFitMeasurement result;
-            auto previous=spline.at(0.0);
-            auto previousNormal=0.0;
-            for(std::size_t sample=0;sample<=spans*samplesPerSpan;++sample) {
-                const auto parameter=static_cast<double>(sample)/samplesPerSpan;
-                const auto position=spline.at(parameter);
-                const auto r1=first.at(parameter);
-                const auto r2=second.at(parameter);
-                const auto r3=third.at(parameter);
-                const auto speed=r1.length();
-                if(!std::isfinite(speed)||speed<=1e-15) {
-                    result.maximumCurvature=std::numeric_limits<double>::infinity();
-                    result.maximumNormalCurvatureDerivative=
-                        std::numeric_limits<double>::infinity();
-                    result.maximumDeviation=std::numeric_limits<double>::infinity();
-                    return result;
-                }
-                const auto tangent=scaled(r1,1.0/speed);
-                const auto firstSecond=positionDot(r1,r2);
-                const auto inverseSpeed2=1.0/(speed*speed);
-                const auto inverseSpeed4=inverseSpeed2*inverseSpeed2;
-                const auto inverseSpeed6=inverseSpeed4*inverseSpeed2;
-                const auto curvature=scaled(subtract(r2,
-                    scaled(tangent,positionDot(r2,tangent))),inverseSpeed2);
-                const auto parameterDerivative=add(scaled(r3,inverseSpeed2),
-                    add(scaled(r2,-3.0*firstSecond*inverseSpeed4),
-                        add(scaled(r1,-(positionDot(r2,r2)+positionDot(r1,r3))
-                            *inverseSpeed4),
-                            scaled(r1,4.0*firstSecond*firstSecond*inverseSpeed6))));
-                const auto derivative=scaled(parameterDerivative,1.0/speed);
-                const auto normal=subtract(derivative,
-                    scaled(tangent,positionDot(tangent,derivative))).length();
-                result.maximumNormalCurvatureDerivative=std::max(
-                    result.maximumNormalCurvatureDerivative,normal);
-                result.maximumCurvature=std::max(result.maximumCurvature,curvature.length());
-                result.maximumDeviation=std::max(result.maximumDeviation,
-                    subtract(position,source.positionAt(source.length*parameter/spans)).length());
-                if(sample!=0) {
-                    const auto distance=subtract(position,previous).length();
-                    result.integratedNormalCurvatureDerivative+=
-                        0.5*(previousNormal+normal)*distance;
-                }
-                previous=position;
-                previousNormal=normal;
-            }
-            return result;
-        }
-
-        std::expected<void,std::string> certifySplineFitTube(
-                const FittingSpline &spline,const SplineFitSource &source,
-                const double deviationLimit) {
-            if(source.boundaries.size()<2||source.boundaries.front()!=0.0
-               ||source.boundaries.back()!=source.length)
-                return std::unexpected("quintic source has invalid ordered boundaries");
-            const auto second=spline.derivative().derivative();
-            auto maximumSecond=0.0;
-            for(const auto &control:second.controls)
-                maximumSecond=std::max(maximumSecond,control.length());
-            const auto spans=static_cast<double>(spline.controls.size()-spline.degree);
-            const auto parameterAtSourceDistance=[&](const double distance) {
-                return spans*distance/source.length;
-            };
-            struct Interval { double from=0.0; double to=0.0; unsigned depth=0; };
-            std::vector<Interval> pending;
-            pending.reserve(source.boundaries.size()*2);
-            for(std::size_t index=0;index+1<source.boundaries.size();++index)
-                pending.push_back({source.boundaries[index],source.boundaries[index+1],0});
-            const auto attemptBudget=std::max<std::size_t>(8192,4*spline.controls.size());
-            auto attempts=std::size_t {0};
-            while(!pending.empty()) {
-                if(++attempts>attemptBudget)
-                    return std::unexpected(std::format(
-                        "quintic source-tube proof exceeded {} ordered intervals",attemptBudget));
-                const auto interval=pending.back();
-                pending.pop_back();
-                const auto fromParameter=parameterAtSourceDistance(interval.from);
-                const auto toParameter=parameterAtSourceDistance(interval.to);
-                const auto fromDeviation=subtract(spline.at(fromParameter),
-                    source.positionAt(interval.from)).length();
-                const auto toDeviation=subtract(spline.at(toParameter),
-                    source.positionAt(interval.to)).length();
-                const auto sourceError=source.chordErrorBound(interval.from,interval.to);
-                const auto parameterWidth=toParameter-fromParameter;
-                const auto splineError=maximumSecond*parameterWidth*parameterWidth/8.0;
-                const auto bound=std::max(fromDeviation,toDeviation)+sourceError+splineError;
-                if(std::isfinite(bound)&&bound<=deviationLimit) continue;
-                if(interval.depth>=20)
-                    return std::unexpected(std::format(
-                        "quintic source-tube proof did not converge: bound={} limit={} "
-                        "source=[{},{}]",bound,deviationLimit,interval.from,interval.to));
-                const auto middle=std::midpoint(interval.from,interval.to);
-                pending.push_back({middle,interval.to,interval.depth+1});
-                pending.push_back({interval.from,middle,interval.depth+1});
-            }
-            return {};
-        }
-
-        struct SplineFitResult {
-            FittingSpline spline;
-            std::size_t candidateCount=0;
-        };
-
-        std::expected<SplineFitResult,std::string> fitQuinticSpline(
-                FittingSpline initial,const SplineFitSource &source,
-                const double programmedScale,const SplineFitSolver solver) {
-            constexpr std::size_t FIXED_CONTROLS_PER_END=4;
-            constexpr std::size_t HALF_BANDWIDTH=3;
-            constexpr std::array<double,4> THIRD_DIFFERENCE{-1.0,3.0,-3.0,1.0};
-            const auto firstFree=FIXED_CONTROLS_PER_END;
-            const auto lastFree=initial.controls.size()-FIXED_CONTROLS_PER_END;
-            if(lastFree<=firstFree) return SplineFitResult{std::move(initial),0};
-            const auto limit=programmedScale;
-            const auto original=measureSplineFit(initial,source,32);
-            if(original.maximumDeviation>limit*(1.0+1e-9))
-                return std::unexpected("initial quintic exceeds the programmed G64 scale");
-            const auto score=[&](const SplineFitMeasurement &measurement) {
-                const auto peak=measurement.maximumNormalCurvatureDerivative
-                    /std::max(original.maximumNormalCurvatureDerivative,1e-30);
-                const auto integral=measurement.integratedNormalCurvatureDerivative
-                    /std::max(original.integratedNormalCurvatureDerivative,1e-30);
-                return 0.65*peak+0.35*integral;
-            };
-            const auto acceptable=[&](const SplineFitMeasurement &measurement) {
-                return measurement.maximumDeviation<=0.98*limit
-                    &&measurement.maximumCurvature<=original.maximumCurvature*1.02;
-            };
-            SplineFitResult result{initial,0};
-            auto bestScore=score(original);
-
-            if(solver==SplineFitSolver::CoordinateSearch) {
-                const auto coordinateScore=[&](const SplineFitMeasurement &measurement) {
-                    const auto excess=std::max(
-                        0.0,measurement.maximumDeviation/(0.98*limit)-1.0);
-                    return score(measurement)+100.0*excess*excess;
-                };
-                bestScore=coordinateScore(original);
-                for(const auto fraction:{0.25,0.0625,0.015625}) {
-                    const auto step=programmedScale*fraction;
-                    for(std::size_t control=firstFree;control<lastFree;++control) {
-                        for(const auto component:AXIS_COMPONENTS) {
-                            for(const auto direction:{-1.0,1.0}) {
-                                auto candidate=result.spline;
-                                candidate.controls[control].*component+=direction*step;
-                                const auto measurement=measureSplineFit(candidate,source,4);
-                                ++result.candidateCount;
-                                if(measurement.maximumCurvature
-                                        >original.maximumCurvature*1.02) continue;
-                                const auto candidateScore=coordinateScore(measurement);
-                                if(candidateScore<bestScore*(1.0-1e-10)) {
-                                    result.spline=std::move(candidate);
-                                    bestScore=candidateScore;
-                                }
-                            }
-                        }
-                    }
-                }
-                const auto verified=measureSplineFit(result.spline,source,256);
-                if(verified.maximumDeviation>limit*(1.0+1e-9))
-                    return std::unexpected(
-                        "coordinate-search quintic exceeds the programmed G64 scale");
-                return result;
-            }
-
-            const auto freeCount=lastFree-firstFree;
-            const auto rowCount=initial.controls.size()-3;
-            const std::vector<double> uniformRowWeights(rowCount,1.0);
-            const auto solve=[&](const double fairnessWeight,
-                                 const std::span<const double> rowWeights)
-                    ->std::optional<FittingSpline> {
-                std::vector<std::array<double,2*HALF_BANDWIDTH+1>> matrix(freeCount);
-                std::vector<position_t> rightHandSide(freeCount);
-                for(std::size_t free=0;free<freeCount;++free) {
-                    matrix[free][HALF_BANDWIDTH]=1.0;
-                    rightHandSide[free]=initial.controls[firstFree+free];
-                }
-                for(std::size_t row=0;row+3<initial.controls.size();++row) {
-                    for(std::size_t a=0;a<THIRD_DIFFERENCE.size();++a) {
-                        const auto controlA=row+a;
-                        if(controlA<firstFree||controlA>=lastFree) continue;
-                        const auto freeA=controlA-firstFree;
-                        for(std::size_t b=0;b<THIRD_DIFFERENCE.size();++b) {
-                            const auto controlB=row+b;
-                            const auto value=fairnessWeight*rowWeights[row]
-                                *THIRD_DIFFERENCE[a]*THIRD_DIFFERENCE[b];
-                            if(controlB>=firstFree&&controlB<lastFree) {
-                                const auto freeB=controlB-firstFree;
-                                if(freeB<=freeA)
-                                    matrix[freeA][HALF_BANDWIDTH+freeB-freeA]+=value;
-                            } else {
-                                for(const auto component:AXIS_COMPONENTS)
-                                    rightHandSide[freeA].*component-=
-                                        value*(initial.controls[controlB].*component);
-                            }
-                        }
-                    }
-                }
-                std::vector<std::array<double,HALF_BANDWIDTH+1>> lower(freeCount);
-                for(std::size_t i=0;i<freeCount;++i) {
-                    const auto firstJ=i>HALF_BANDWIDTH?i-HALF_BANDWIDTH:0;
-                    for(auto j=firstJ;j<=i;++j) {
-                        auto value=matrix[i][HALF_BANDWIDTH+j-i];
-                        const auto firstK=std::max(
-                            i>HALF_BANDWIDTH?i-HALF_BANDWIDTH:0,
-                            j>HALF_BANDWIDTH?j-HALF_BANDWIDTH:0);
-                        for(auto k=firstK;k<j;++k)
-                            value-=lower[i][i-k]*lower[j][j-k];
-                        if(i==j) {
-                            if(!std::isfinite(value)||value<=1e-18) return std::nullopt;
-                            lower[i][0]=std::sqrt(value);
-                        } else lower[i][i-j]=value/lower[j][0];
-                    }
-                }
-                auto candidate=initial;
-                for(const auto component:AXIS_COMPONENTS) {
-                    std::vector<double> intermediate(freeCount),solution(freeCount);
-                    for(std::size_t i=0;i<freeCount;++i) {
-                        auto value=rightHandSide[i].*component;
-                        const auto maximum=std::min(HALF_BANDWIDTH,i);
-                        for(std::size_t distance=1;distance<=maximum;++distance)
-                            value-=lower[i][distance]*intermediate[i-distance];
-                        intermediate[i]=value/lower[i][0];
-                    }
-                    for(auto reverse=freeCount;reverse-->0;) {
-                        auto value=intermediate[reverse];
-                        const auto maximum=std::min(
-                            HALF_BANDWIDTH,freeCount-1-reverse);
-                        for(std::size_t distance=1;distance<=maximum;++distance)
-                            value-=lower[reverse+distance][distance]
-                                *solution[reverse+distance];
-                        solution[reverse]=value/lower[reverse][0];
-                        candidate.controls[firstFree+reverse].*component=solution[reverse];
-                    }
-                }
-                return candidate;
-            };
-
-            constexpr std::array<double,13> FAIRNESS_WEIGHTS{
-                3e-2,1e-1,3e-1,1.0,3.0,10.0,30.0,100.0,300.0,500.0,700.0,
-                1000.0,3000.0};
-            struct ActiveSeed {
-                FittingSpline spline;
-                double fairnessWeight=0.0;
-                double score=std::numeric_limits<double>::infinity();
-            };
-            std::array<std::optional<ActiveSeed>,3> activeSeeds;
-            for(const auto fairnessWeight:FAIRNESS_WEIGHTS) {
-                auto candidate=solve(fairnessWeight,uniformRowWeights);
-                ++result.candidateCount;
-                if(!candidate) continue;
-                const auto measurement=measureSplineFit(*candidate,source,8);
-                if(!acceptable(measurement)) continue;
-                const auto candidateScore=score(measurement);
-                const auto utilization=measurement.maximumDeviation/limit;
-                const auto seedIndex=utilization<0.35?0U:utilization<0.7?1U:2U;
-                if(!activeSeeds[seedIndex]||candidateScore<activeSeeds[seedIndex]->score)
-                    activeSeeds[seedIndex]=ActiveSeed{
-                        *candidate,fairnessWeight,candidateScore};
-                if(candidateScore<bestScore*(1.0-1e-10)) {
-                    result.spline=std::move(*candidate);
-                    bestScore=candidateScore;
-                }
-            }
-            if(solver==SplineFitSolver::PeakTargetedBandedFairness) {
-                constexpr unsigned ACTIVE_PASSES=4;
-                constexpr unsigned PROFILE_SAMPLES_PER_SPAN=24;
-                for(const auto &seed:activeSeeds) {
-                    if(!seed) continue;
-                    auto current=seed->spline;
-                    auto currentScore=score(measureSplineFit(current,source,12));
-                    auto rowWeights=uniformRowWeights;
-                    const auto spans=current.controls.size()-current.degree;
-                    for(unsigned pass=0;pass<ACTIVE_PASSES;++pass) {
-                        const auto first=current.derivative();
-                        const auto second=first.derivative();
-                        const auto third=second.derivative();
-                        std::vector<double> spanPeaks(spans);
-                        auto globalPeak=0.0;
-                        for(std::size_t sample=0;
-                                sample<=spans*PROFILE_SAMPLES_PER_SPAN;++sample) {
-                            const auto parameter=static_cast<double>(sample)
-                                /PROFILE_SAMPLES_PER_SPAN;
-                            const auto r1=first.at(parameter);
-                            const auto r2=second.at(parameter);
-                            const auto r3=third.at(parameter);
-                            const auto speed=r1.length();
-                            if(!std::isfinite(speed)||speed<=1e-15) {
-                                globalPeak=std::numeric_limits<double>::infinity();
-                                break;
-                            }
-                            const auto tangent=scaled(r1,1.0/speed);
-                            const auto firstSecond=positionDot(r1,r2);
-                            const auto inverseSpeed2=1.0/(speed*speed);
-                            const auto inverseSpeed4=inverseSpeed2*inverseSpeed2;
-                            const auto inverseSpeed6=inverseSpeed4*inverseSpeed2;
-                            const auto parameterDerivative=add(scaled(r3,inverseSpeed2),
-                                add(scaled(r2,-3.0*firstSecond*inverseSpeed4),
-                                    add(scaled(r1,-(positionDot(r2,r2)+positionDot(r1,r3))
-                                        *inverseSpeed4),scaled(r1,4.0*firstSecond*firstSecond
-                                        *inverseSpeed6))));
-                            const auto derivative=scaled(parameterDerivative,1.0/speed);
-                            const auto normal=subtract(derivative,
-                                scaled(tangent,positionDot(tangent,derivative))).length();
-                            const auto span=std::min(spans-1,
-                                static_cast<std::size_t>(std::floor(parameter)));
-                            spanPeaks[span]=std::max(spanPeaks[span],normal);
-                            globalPeak=std::max(globalPeak,normal);
-                        }
-                        if(!std::isfinite(globalPeak)||globalPeak<=1e-30) break;
-                        auto changed=false;
-                        for(std::size_t span=0;span<spans;++span) {
-                            const auto ratio=spanPeaks[span]/globalPeak;
-                            if(ratio<0.35) continue;
-                            const auto increase=1.0+12.0*ratio*ratio*ratio*ratio;
-                            for(std::size_t local=0;local<3;++local) {
-                                const auto row=std::min(rowCount-1,span+local);
-                                const auto updated=std::min(1e6,rowWeights[row]*increase);
-                                changed=changed||updated>rowWeights[row]*(1.0+1e-12);
-                                rowWeights[row]=updated;
-                            }
-                        }
-                        if(!changed) break;
-                        auto candidate=solve(seed->fairnessWeight,rowWeights);
-                        ++result.candidateCount;
-                        if(!candidate) break;
-                        const auto measurement=measureSplineFit(*candidate,source,16);
-                        if(!acceptable(measurement)) break;
-                        const auto candidateScore=score(measurement);
-                        if(candidateScore>=currentScore*(1.0-1e-10)) break;
-                        current=std::move(*candidate);
-                        currentScore=candidateScore;
-                        if(candidateScore<bestScore*(1.0-1e-10)) {
-                            result.spline=current;
-                            bestScore=candidateScore;
-                        }
-                    }
-                }
-            }
-            const auto verified=measureSplineFit(result.spline,source,256);
-            if(verified.maximumDeviation>limit*(1.0+1e-9))
-                return std::unexpected("banded quintic exceeds the programmed G64 scale");
-            return result;
-        }
 
         template<typename Function>
         double integrateAdaptive(const Function &function, const double from, const double to,
@@ -1610,34 +1184,9 @@ namespace ngc {
         };
     }
 
-    std::expected<spline_detail::ReconstructedSpline,std::string>
-    spline_detail::reconstructSpline(const std::span<const position_t> cubicControls,
-            const SplineReconstructionSource &source,const double programmedScale,
-            const bool certifyTube) {
-        if(cubicControls.size()<=6
-           ||continuousSplineFitSolver()==SplineFitSolver::CubicBaseline)
-            return ReconstructedSpline{
-                .degree=3,
-                .controls={cubicControls.begin(),cubicControls.end()},
-            };
-        auto fitted=fitQuinticSpline(
-            initialQuinticSpline(cubicControls.size()-3,source),source,programmedScale,
-            continuousSplineFitSolver());
-        if(!fitted) return std::unexpected(fitted.error());
-        if(certifyTube) {
-            if(auto certified=certifySplineFitTube(
-                    fitted->spline,source,programmedScale);!certified)
-                return std::unexpected(certified.error());
-        }
-        return ReconstructedSpline{
-            .degree=fitted->spline.degree,
-            .controls=std::move(fitted->spline.controls),
-        };
-    }
+    TrajectoryCompiler::TrajectoryCompiler(TrajectoryLimits limits) : m_limits(limits) { }
 
-    ExactStopTrajectoryPlanner::ExactStopTrajectoryPlanner(TrajectoryLimits limits) : m_limits(limits) { }
-
-    void ExactStopTrajectoryPlanner::reset(const EpochId epoch, const position_t &position) {
+    void TrajectoryCompiler::reset(const EpochId epoch, const position_t &position) {
         m_epoch = epoch;
         m_nextChunk = 1;
         m_nextSpan = 1;
@@ -1645,7 +1194,8 @@ namespace ngc {
         m_position = position;
     }
 
-    std::expected<PlanChunk, std::string> ExactStopTrajectoryPlanner::compile(const MachineCommand &command) {
+    std::expected<PlanChunk, std::string> TrajectoryCompiler::compile(
+            const MachineCommand &command, const PreparedPathPiece *preparedPiece) {
         m_lastTimeLawDiagnostics={};
         if(m_limits.pathAcceleration <= 0.0 || m_limits.pathJerk <= 0.0
            || m_limits.rapidSpeed <= 0.0 || m_limits.arcChordTolerance <= 0.0
@@ -1663,10 +1213,44 @@ namespace ngc {
         chunk.branch = chunk.id;
         TimeLawWorkspace timeLawWorkspace;
         TimeLawCompilationRecorder timeLawRecorder {m_lastTimeLawDiagnostics};
+        CurveEvaluationWorkspace preparedWorkspace;
+        if(preparedPiece && (!preparedPiece->curve
+           ||(!preparedPiece->geometricallyLinear && preparedPiece->length() <= 1e-12)))
+            return std::unexpected("exact-stop prepared piece is invalid");
+
+        const auto preparedSample = [&](const double distance) {
+            const auto source = preparedPiece->curveFrom
+                + std::clamp(distance, 0.0, preparedPiece->length());
+            return PathSample{
+                positionAtDistance(*preparedPiece->curve, source, preparedWorkspace),
+                tangentAtDistance(*preparedPiece->curve, source, preparedWorkspace)};
+        };
+        const auto preparedMaximumTangent = [&] {
+            position_t maximum{};
+            if(!preparedPiece) return maximum;
+            if(!preparedPiece->geometricSamples.empty()) {
+                for(const auto &sample : preparedPiece->geometricSamples)
+                    for(const auto component : AXIS_COMPONENTS)
+                        maximum.*component = std::max(
+                            maximum.*component, std::abs(sample.tangent.*component));
+            } else {
+                constexpr unsigned samples = 64;
+                for(unsigned index = 0; index <= samples; ++index) {
+                    const auto tangent = preparedSample(
+                        preparedPiece->length() * index / static_cast<double>(samples)).tangent;
+                    for(const auto component : AXIS_COMPONENTS)
+                        maximum.*component = std::max(
+                            maximum.*component, std::abs(tangent.*component));
+                }
+            }
+            return maximum;
+        };
 
         auto appendMotion = [&](const double length, const double speedPerMinute,
                                 const position_t &maximumTangent,
-                                const auto &sample, const auto &verify) -> std::optional<std::string> {
+                                const auto &sample, const auto &curvatureAt,
+                                const bool curved,
+                                const auto &verify) -> std::optional<std::string> {
             if(length <= 1e-12) {
                 auto hold = hermite(m_nextSpan++, sample(0.0), sample(length), 0.0, 0.0, 1e-6);
                 if(!chunk.normalMotion.push(hold)) return "trajectory chunk span capacity exceeded";
@@ -1693,16 +1277,49 @@ namespace ngc {
                     const auto from = scalar.at(u0);
                     const auto to = scalar.at(u1);
                     const auto duration = scalar.duration * (u1 - u0);
-                    auto span = hermite(m_nextSpan++, sample(from.distance), sample(to.distance),
-                                        from.velocity, to.velocity, duration);
-                    if(!verify(span, from.distance, to.distance, from.velocity, to.velocity)) {
-                        --m_nextSpan;
+                    std::vector<AxisPolynomialSpan> spans;
+                    if(curved) {
+                        const auto state = [&](const TimeBoundary &boundary) {
+                            const auto geometry = sample(boundary.distance);
+                            const auto curvature = curvatureAt(boundary.distance);
+                            return KinematicPathState{
+                                .position = geometry.position,
+                                .velocity = scaled(geometry.tangent, boundary.velocity),
+                                .acceleration = add(
+                                    scaled(geometry.tangent, boundary.acceleration),
+                                    scaled(curvature, boundary.velocity * boundary.velocity)),
+                            };
+                        };
+                        const auto chain = c2CubicChain(
+                            m_nextSpan, state(from), state(to), duration);
+                        spans.assign(chain.begin(), chain.end());
+                    } else {
+                        spans.push_back(hermite(m_nextSpan, sample(from.distance),
+                            sample(to.distance), from.velocity, to.velocity, duration));
+                    }
+                    auto accepted = true;
+                    for(std::size_t index = 0; index < spans.size(); ++index) {
+                        const auto fraction0 = static_cast<double>(index) / spans.size();
+                        const auto fraction1 = static_cast<double>(index + 1) / spans.size();
+                        const auto proofFrom = scalar.at(std::lerp(u0, u1, fraction0));
+                        const auto proofTo = scalar.at(std::lerp(u0, u1, fraction1));
+                        if(!verify(spans[index], proofFrom.distance, proofTo.distance,
+                                   proofFrom.velocity, proofTo.velocity)) {
+                            accepted = false;
+                            break;
+                        }
+                    }
+                    if(!accepted) {
                         if(depth == 20) return "arc cubic tolerance verification did not converge";
                         const auto middle = std::midpoint(u0, u1);
                         if(auto result = self(self, u0, middle, depth + 1)) return result;
                         return self(self, middle, u1, depth + 1);
                     }
-                    if(!chunk.normalMotion.push(span)) return "trajectory chunk span capacity exceeded";
+                    for(auto &span : spans) {
+                        if(!chunk.normalMotion.push(span))
+                            return "trajectory chunk span capacity exceeded";
+                        ++m_nextSpan;
+                    }
                     return std::nullopt;
                 };
                 if(auto result = emit(emit, 0.0, 1.0, 0)) return result;
@@ -1742,6 +1359,38 @@ namespace ngc {
         auto error = std::visit([&](const auto &value) -> std::optional<std::string> {
             using T = std::decay_t<decltype(value)>;
             if constexpr(std::same_as<T, MoveLine>) {
+                if(preparedPiece) {
+                    const auto start = preparedSample(0.0).position;
+                    const auto end = preparedSample(preparedPiece->length()).position;
+                    if(subtract(start, value.from()).length() > 1e-8
+                       || subtract(end, value.to()).length() > 1e-8)
+                        return "exact-stop prepared line endpoints do not match its source entity";
+                    const auto speed = value.speed() < 0.0 ? m_limits.rapidSpeed : value.speed();
+                    const auto accept = [&](const AxisPolynomialSpan &span,
+                                            const double from, const double to,
+                                            double, double) {
+                        if(preparedPiece->geometricallyLinear) return true;
+                        return verifiesOrderedCurveTolerance(span, from, to,
+                            m_limits.arcChordTolerance,
+                            [&](const double distance) {
+                                return preparedSample(distance).position;
+                            },
+                            [&](const double a, const double b) {
+                                return chordErrorBound(*preparedPiece->curve,
+                                    preparedPiece->curveFrom + a,
+                                    preparedPiece->curveFrom + b, preparedWorkspace);
+                            });
+                    };
+                    const auto curvature = [&](const double distance) {
+                        return curvatureAtDistance(*preparedPiece->curve,
+                            preparedPiece->curveFrom + distance, preparedWorkspace);
+                    };
+                    if(auto result = appendMotion(preparedPiece->length(), speed,
+                            preparedMaximumTangent(), preparedSample, curvature,
+                            !preparedPiece->geometricallyLinear, accept)) return result;
+                    m_position = value.to();
+                    return std::nullopt;
+                }
                 const auto source = value.from();
                 const auto target = value.to();
                 const auto delta = subtract(target, source);
@@ -1751,11 +1400,60 @@ namespace ngc {
                 const auto sample = [&](const double distance) { return PathSample { add(source, scaled(tangent, distance)), tangent }; };
                 const auto speed = value.speed() < 0.0 ? m_limits.rapidSpeed : value.speed();
                 const auto accept = [](const AxisPolynomialSpan &, double, double, double, double) { return true; };
-                if(auto result = appendMotion(length, speed, tangent, sample, accept)) return result;
+                const auto curvature = [](double) { return position_t{}; };
+                if(auto result = appendMotion(length, speed, tangent, sample,
+                        curvature, false, accept)) return result;
                 m_position = target;
             } else if constexpr(std::same_as<T, ProbeMove>) {
                 return "unreachable probe compilation path";
             } else if constexpr(std::same_as<T, MoveArc>) {
+                if(preparedPiece) {
+                    const auto start = preparedSample(0.0).position;
+                    const auto end = preparedSample(preparedPiece->length()).position;
+                    if(subtract(start, value.from()).length() > 1e-8
+                       || subtract(end, value.to()).length() > 1e-8)
+                        return "exact-stop prepared arc endpoints do not match its source entity";
+                    auto arcSpeed = value.speed();
+                    if(!std::isinf(m_limits.pathAcceleration)) {
+                        auto maximumCurvature = 0.0;
+                        if(!preparedPiece->geometricSamples.empty())
+                            for(const auto &sample : preparedPiece->geometricSamples)
+                                maximumCurvature = std::max(
+                                    maximumCurvature, sample.curvature.length());
+                        else for(unsigned index = 0; index <= 64; ++index)
+                            maximumCurvature = std::max(maximumCurvature,
+                                curvatureAtDistance(*preparedPiece->curve,
+                                    preparedPiece->curveFrom + preparedPiece->length()
+                                        * index / 64.0,
+                                    preparedWorkspace).length());
+                        if(maximumCurvature > 1e-15)
+                            arcSpeed = std::min(arcSpeed, 60.0 * std::sqrt(
+                                m_limits.pathAcceleration / maximumCurvature));
+                    }
+                    const auto accept = [&](const AxisPolynomialSpan &span,
+                                            const double from, const double to,
+                                            double, double) {
+                        return verifiesOrderedCurveTolerance(span, from, to,
+                            m_limits.arcChordTolerance,
+                            [&](const double distance) {
+                                return preparedSample(distance).position;
+                            },
+                            [&](const double a, const double b) {
+                                return chordErrorBound(*preparedPiece->curve,
+                                    preparedPiece->curveFrom + a,
+                                    preparedPiece->curveFrom + b, preparedWorkspace);
+                            });
+                    };
+                    const auto curvature = [&](const double distance) {
+                        return curvatureAtDistance(*preparedPiece->curve,
+                            preparedPiece->curveFrom + distance, preparedWorkspace);
+                    };
+                    if(auto result = appendMotion(preparedPiece->length(), arcSpeed,
+                            preparedMaximumTangent(), preparedSample, curvature,
+                            true, accept)) return result;
+                    m_position = value.to();
+                    return std::nullopt;
+                }
                 const simulation_detail::ArcReference reference(value);
                 if(!reference.valid()) return value.axis().length() <= 1e-12
                     ? "arc axis must be nonzero" : "arc radius must be nonzero";
@@ -1787,7 +1485,11 @@ namespace ngc {
                         m_limits.arcChordTolerance, positionAt,
                         [&](const double from, const double to) { return reference.chordErrorBound(from, to); });
                 };
-                if(auto result = appendMotion(length, arcSpeed, maximumTangent, sample, accept)) return result;
+                const auto curvature = [&](const double distance) {
+                    return reference.curvatureAtDistance(distance);
+                };
+                if(auto result = appendMotion(length, arcSpeed, maximumTangent, sample,
+                        curvature, true, accept)) return result;
                 m_position = value.to();
             } else if constexpr(std::same_as<T, SpindleStart> || std::same_as<T, SpindleStop>) {
                 const PathSample held { m_position, {} };
@@ -1817,7 +1519,7 @@ namespace ngc {
     }
 
     std::expected<std::unique_ptr<ContinuousTrajectoryPlan>, std::string>
-    ExactStopTrajectoryPlanner::compileContinuous(
+    TrajectoryCompiler::compileContinuous(
             const std::span<const MachineCommand> commands, const double blendScale,
             std::optional<MotionState> requestedStartState,
             std::optional<MotionState> requestedEndState,
@@ -3891,7 +3593,7 @@ namespace ngc {
     }
 
     std::expected<std::unique_ptr<ContinuousTrajectoryPlan>, std::string>
-    ExactStopTrajectoryPlanner::compileContinuous(
+    TrajectoryCompiler::compileContinuous(
             const PreparedContinuousGeometry &geometry, const double blendScale,
             std::optional<MotionState> startState,
             std::optional<MotionState> endState,
@@ -3916,7 +3618,7 @@ namespace ngc {
         return result;
     }
 
-    std::expected<TriggeredMove, std::string> ExactStopTrajectoryPlanner::compileTriggeredMove(
+    std::expected<TriggeredMove, std::string> TrajectoryCompiler::compileTriggeredMove(
             const ProbeMove &command, const DigitalInputId input, const InputCondition condition) {
         if(m_limits.pathAcceleration <= 0.0 || m_limits.pathJerk <= 0.0 || command.feed() <= 0.0
            || !positiveAxisLimits(m_limits.axisVelocity)

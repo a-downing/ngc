@@ -77,8 +77,8 @@ segments are not submitted for drawing.
 GeometryStreamProducer
     -> PreparedGeometryForwardChannel
     -> PreparedTrajectoryExecutionDriver
-    -> BoundedLookaheadTrajectoryPlanner
-    -> ExactStopTrajectoryPlanner
+    -> TrajectoryPlanner
+    -> TrajectoryCompiler
     -> MotionBackend execution SPSC
     -> MockMotionBackend or future RT backend
 ```
@@ -226,7 +226,7 @@ bounded allocation-free SPSC contract used by `MotionBackend`.
 
 ## Trajectory timing
 
-`ExactStopTrajectoryPlanner` consumes path geometry and produces timed
+`TrajectoryCompiler` consumes path geometry and produces timed
 axis-space cubic execution spans. Dynamic work remains on the planning side:
 
 - programmed-feed and per-axis velocity limits;
@@ -255,7 +255,7 @@ proof. Exact extrema of emitted axis polynomials remain authoritative.
 
 ## Rolling trajectory planning
 
-`BoundedLookaheadTrajectoryPlanner` collects compatible G64 commands and may
+`TrajectoryPlanner` collects compatible G64 commands and may
 publish an immutable timed prefix while retaining a mutable suffix. A valid
 rolling boundary must provide:
 

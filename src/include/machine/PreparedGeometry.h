@@ -296,6 +296,7 @@ namespace ngc {
     struct PreparedPreviewScene {
         std::vector<PreparedGeometrySlice> continuousSlices;
         std::vector<PreparedStandaloneCommand> standaloneCommands;
+        std::vector<PreparedContinuousEnd> geometryEnds;
         std::vector<TrajectoryCommandPresentation> presentations;
         std::uint64_t revision = 0;
     };
@@ -309,6 +310,7 @@ namespace ngc {
         void clear() {
             m_scene.continuousSlices.clear();
             m_scene.standaloneCommands.clear();
+            m_scene.geometryEnds.clear();
             m_scene.presentations.clear();
         }
 
@@ -325,6 +327,8 @@ namespace ngc {
                     const auto &stored = m_scene.standaloneCommands.back();
                     if(stored.command.presentationActivation)
                         m_scene.presentations.push_back(stored.command.presentation);
+                } else if constexpr(std::same_as<T, PreparedContinuousEnd>) {
+                    m_scene.geometryEnds.push_back(std::move(value));
                 }
             }, std::move(message));
         }
@@ -360,4 +364,9 @@ namespace ngc {
         position_t expectedStart = {},
         const GeometryPreparationEffort &effort = {},
         const ContinuousGeometryBoundaries &boundaries = {});
+
+    std::expected<PreparedContinuousGeometry, std::string> prepareExactStopGeometry(
+        std::span<const PreparedCommandRecord> commands,
+        position_t expectedStart = {},
+        const GeometryPreparationEffort &effort = {});
 }

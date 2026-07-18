@@ -202,6 +202,8 @@ private:
                     if(const auto *probe = std::get_if<ngc::ProbeMove>(&value.command.command))
                         pendingProbe = *probe;
                     retainForPreview = true;
+                } else if constexpr(std::same_as<T, ngc::PreparedContinuousEnd>) {
+                    retainForPreview = true;
                 } else if constexpr(std::same_as<T, ngc::PreparedSynchronizationFence>) {
                     if(!sendFeedback(ngc::ReleaseSynchronization{value.epoch, value.fence}))
                         failure = "preview could not release an interpreter synchronization fence";

@@ -626,6 +626,80 @@ namespace ngc {
         }, curve.value);
     }
 
+    std::expected<PreparedContinuousGeometry, std::string> prepareExactStopGeometry(
+            const std::span<const PreparedCommandRecord> records,
+            const position_t expectedStart, const GeometryPreparationEffort &effort) {
+        if(records.empty()) return std::unexpected("exact-stop geometry window is empty");
+
+        PreparedContinuousGeometry result;
+        result.commands.assign(records.begin(), records.end());
+        result.diagnostics.sourceCommands = records.size();
+        CurveEvaluationWorkspace workspace;
+        auto expected = expectedStart;
+        for(const auto &record : records) {
+            auto piece = std::visit([&](const auto &command)
+                    -> std::expected<PreparedPathPiece, std::string> {
+                using T = std::decay_t<decltype(command)>;
+                std::shared_ptr<const PreparedCurve> curve;
+                PreparedPieceKind kind = PreparedPieceKind::RetainedLineSection;
+                auto feed = 0.0;
+                auto linear = false;
+                position_t start{};
+                position_t end{};
+                if constexpr(std::same_as<T, MoveLine>) {
+                    start = command.from();
+                    end = command.to();
+                    curve = lineCurve(start, end);
+                    kind = PreparedPieceKind::RetainedLineSection;
+                    feed = command.speed() > 0.0 ? command.speed() / 60.0 : 0.0;
+                    linear = true;
+                } else if constexpr(std::same_as<T, MoveArc>) {
+                    start = command.from();
+                    end = command.to();
+                    curve = arcCurve(command);
+                    kind = PreparedPieceKind::RetainedArcSection;
+                    feed = command.speed() > 0.0 ? command.speed() / 60.0 : 0.0;
+                } else {
+                    return std::unexpected(
+                        "exact-stop prepared geometry accepts only lines and arcs");
+                }
+                if((start - expected).length() > 1e-8)
+                    return std::unexpected(
+                        "exact-stop geometry source endpoints are discontinuous");
+                if(!curve || (!linear && curve->length <= 1e-12))
+                    return std::unexpected("exact-stop path contains an invalid source entity");
+                PreparedPathPiece prepared;
+                prepared.id = static_cast<PreparedPieceId>(result.pieces.size() + 1);
+                prepared.kind = kind;
+                prepared.curve = std::move(curve);
+                prepared.curveFrom = 0.0;
+                prepared.curveTo = prepared.curve->length;
+                prepared.programmedFeed = feed;
+                prepared.geometricallyLinear = linear;
+                prepared.primaryCommand = record.id;
+                prepared.activationCommands = {record.id};
+                if(effort.generateSamples) samplePiece(prepared, workspace);
+                expected = end;
+                return prepared;
+            }, record.command);
+            if(!piece) return std::unexpected(piece.error());
+            result.diagnostics.pathLength += piece->length();
+            if(piece->programmedFeed > 0.0)
+                result.diagnostics.nominalDuration +=
+                    piece->length() / piece->programmedFeed;
+            ++result.diagnostics.preparedPieces;
+            if(piece->geometricallyLinear)
+                ++result.diagnostics.retainedLineSections;
+            else
+                ++result.diagnostics.retainedArcSections;
+            result.pieces.push_back(std::move(*piece));
+        }
+        result.beginning = boundaryAt(result.pieces.front(), workspace, 0.0);
+        result.ending = boundaryAt(
+            result.pieces.back(), workspace, result.pieces.back().length());
+        return result;
+    }
+
     std::expected<PreparedContinuousGeometry, std::string> prepareContinuousGeometry(
             const std::span<const PreparedCommandRecord> records, const double blendScale,
             const position_t expectedStart, const GeometryPreparationEffort &effort,

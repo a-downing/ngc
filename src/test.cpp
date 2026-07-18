@@ -21,7 +21,7 @@
 #include "machine/Machine.h"
 #include "machine/MachineConfiguration.h"
 #include "machine/ArcInterpolation.h"
-#include "machine/ExactStopTrajectoryPlanner.h"
+#include "machine/TrajectoryCompiler.h"
 #include "machine/MockMotionBackend.h"
 #include "machine/OwningSpscChannel.h"
 #include "machine/PreparedGeometry.h"
@@ -294,27 +294,36 @@ namespace {
         auto main = ngc::readFile("adaptive_pockets.ngc");
         require(hello && world && toolChange && main, "adaptive-pockets simulation inputs should load");
         const auto g64=main->find("N40 G64 P");
-        require(g64!=std::string::npos,"adaptive-pockets startup fixture should contain its G64 block");
-        const auto g64End=main->find('\n',g64);
-        main->replace(g64,g64End==std::string::npos?main->size()-g64:g64End-g64,"N40 G61");
+        if(g64!=std::string::npos) {
+            const auto g64End=main->find('\n',g64);
+            main->replace(g64,g64End==std::string::npos?main->size()-g64:g64End-g64,"N40 G61");
+        }
+        require(main->contains("N40 G61"),
+                "adaptive-pockets exact-stop fixture should select G61");
         ngc::ToolTable tools;
         const auto loadedTools = tools.load();
         require(loadedTools.has_value(), loadedTools ? "" : loadedTools.error());
 
         SimulationWorker worker;
+        worker.setTickMultiplier(1000);
         require(worker.start({ { *hello, "autoload/hello.ngc" }, { *world, "autoload/world.ngc" },
                                { *toolChange, "autoload/tool_change.ngc" }, { *main, "adaptive_pockets.ngc" } }, tools),
                 "adaptive-pockets simulation should start");
 
         auto snapshot = worker.snapshot();
-        for(int attempt = 0; attempt < 2000 && snapshot.activeBlocks.empty()
-            && snapshot.completedLineFlags.empty() && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+        for(int attempt=0;attempt<30000
+            &&snapshot.status!=ngc::SimulationStatus::Completed
+            &&snapshot.status!=ngc::SimulationStatus::Error;++attempt) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             snapshot = worker.snapshot();
         }
-        const auto message = std::format("adaptive-pockets simulation did not publish block lifecycle: status {} error '{}'",
+        const auto message = std::format("adaptive-pockets G61 simulation did not complete: status {} error '{}'",
                                          static_cast<int>(snapshot.status), snapshot.error);
-        require(!snapshot.activeBlocks.empty() || !snapshot.completedLineFlags.empty(), message);
+        require(snapshot.status==ngc::SimulationStatus::Completed,message);
+        require(snapshot.toolPose.geometry.number==2,
+                "completed adaptive-pockets G61 simulation should activate tool 2");
+        require(snapshot.programElapsedSeconds>0.0,
+                "completed adaptive-pockets G61 simulation should advance program time");
         worker.join();
     }
 
@@ -487,7 +496,7 @@ namespace {
         worker.join();
     }
 
-    void testGeometryProducerPreparesStandalonePreviewMotion() {
+    void testGeometryProducerPreparesExactStopPreviewSlices() {
         Worker worker(UNIT);
         require(worker.compile({{
             "G0 X1\nG61\nG1 F60 X2\nG2 X3 I0.5\nG61.1\nG1 X4\n",
@@ -508,19 +517,48 @@ namespace {
         }
         require(!worker.busy(),"standalone-motion preview should finish");
         worker.lock([&] {
-            const auto &commands=worker.preparedPreview().standaloneCommands;
-            require(commands.size()==4,
-                    "rapid and exact-stop source entities should remain standalone preview work");
-            require(std::ranges::all_of(commands,[](const auto &command) {
-                return command.displayGeometry!=nullptr;
-            }),"geometry producer should prepare every standalone preview motion");
-            require(std::holds_alternative<ngc::PreparedLineCurve>(commands[0].displayGeometry->value),
+            const auto &scene=worker.preparedPreview();
+            require(scene.standaloneCommands.empty(),
+                    "rapid and exact-stop source entities must not use standalone command messages");
+            require(!scene.continuousSlices.empty(),
+                    "the exact-stop source sequence should publish prepared geometry slices");
+            const auto &slice=scene.continuousSlices.front();
+            require(scene.geometryEnds.size()==1
+                    &&scene.geometryEnds.front().chain==slice.chain
+                    &&scene.geometryEnds.front().sequence
+                        >scene.continuousSlices.back().sequence,
+                    std::format("the exact-stop slice sequence should finish with its ordered end "
+                        "message: slices={} ends={} first_chain={} end_chain={} last_slice_sequence={} "
+                        "end_sequence={}",scene.continuousSlices.size(),scene.geometryEnds.size(),
+                        slice.chain,scene.geometryEnds.empty()?0:scene.geometryEnds.front().chain,
+                        scene.continuousSlices.back().sequence,
+                        scene.geometryEnds.empty()?0:scene.geometryEnds.front().sequence));
+            std::vector<const ngc::PreparedPathPiece *> pieces;
+            auto commandCount=std::size_t{};
+            for(const auto &preparedSlice:scene.continuousSlices) {
+                commandCount+=preparedSlice.commands.size();
+                require(std::ranges::all_of(preparedSlice.commands,[](const auto &record) {
+                    return record.metadata.pathMode==ngc::ExecutablePathMode::ExactStop;
+                }),"G61/G61.1 slice commands should retain exact-stop timing metadata");
+                for(const auto &piece:preparedSlice.pieces) pieces.push_back(&piece);
+            }
+            require(commandCount==4&&pieces.size()==4,
+                    "the exact-stop slice should retain one prepared piece per source entity");
+            require(std::ranges::none_of(pieces,[](const auto *piece) {
+                return piece->kind==ngc::PreparedPieceKind::JunctionBlend
+                    ||piece->kind==ngc::PreparedPieceKind::ClusterSpline;
+            }),"exact-stop preparation must preserve complete source entities without blends");
+            require(std::holds_alternative<ngc::PreparedLineCurve>(
+                        pieces[0]->curve->value),
                     "rapid preview should use a producer-prepared line");
-            require(std::holds_alternative<ngc::PreparedLineCurve>(commands[1].displayGeometry->value),
+            require(std::holds_alternative<ngc::PreparedLineCurve>(
+                        pieces[1]->curve->value),
                     "G61 line preview should use a producer-prepared line");
-            require(std::holds_alternative<ngc::PreparedArcCurve>(commands[2].displayGeometry->value),
+            require(std::holds_alternative<ngc::PreparedArcCurve>(
+                        pieces[2]->curve->value),
                     "G61 arc preview should use the shared producer-prepared arc");
-            require(std::holds_alternative<ngc::PreparedLineCurve>(commands[3].displayGeometry->value),
+            require(std::holds_alternative<ngc::PreparedLineCurve>(
+                        pieces[3]->curve->value),
                     "G61.1 line preview should use a producer-prepared line");
         });
         worker.join();
@@ -557,7 +595,7 @@ namespace {
         }),"canonical-target probe preview should not report an execution error");
         worker.lock([&] {
             const auto &commands=worker.preparedPreview().standaloneCommands;
-            require(commands.size()==2,"probe preview should retain the probe and following line");
+            require(commands.size()==1,"probe preview should retain the probe as standalone work");
             const auto *probe=std::get_if<ngc::ProbeMove>(&commands[0].command.command);
             require(probe!=nullptr,"probe preview should retain canonical probe geometry");
             require(commands[0].displayGeometry!=nullptr,
@@ -568,6 +606,9 @@ namespace {
                 -commands[0].command.presentation.activeToolOffset;
             requireNear(endpoint.z,-1.0,
                         "prepared probe preview endpoint should be the commanded tool-tip target");
+            require(worker.preparedPreview().continuousSlices.size()==1
+                    &&worker.preparedPreview().continuousSlices.front().pieces.size()==1,
+                    "motion following a probe should use an exact-stop prepared geometry slice");
         });
         worker.join();
     }
@@ -1970,7 +2011,7 @@ namespace {
     void testExactStopPlannerCompilesLinesAndArcs() {
         constexpr double ACCELERATION = 4.0;
         constexpr double JERK = 8.0;
-        ngc::ExactStopTrajectoryPlanner planner({
+        ngc::TrajectoryCompiler planner({
             .pathAcceleration = ACCELERATION,
             .rapidSpeed = 120.0,
             .arcChordTolerance = 0.0001,
@@ -2036,7 +2077,7 @@ namespace {
                     "compiled arc should respect the configured jerk limit");
         }
 
-        ngc::ExactStopTrajectoryPlanner instantaneous({
+        ngc::TrajectoryCompiler instantaneous({
             .pathAcceleration = std::numeric_limits<double>::infinity(),
             .rapidSpeed = 120.0,
             .arcChordTolerance = 0.0001,
@@ -2057,7 +2098,7 @@ namespace {
 
     void testExactStopPlannerEnforcesIndependentAxisLimits() {
         constexpr auto infinity = std::numeric_limits<double>::infinity();
-        ngc::ExactStopTrajectoryPlanner planner({
+        ngc::TrajectoryCompiler planner({
             .pathAcceleration = infinity,
             .rapidSpeed = 600.0,
             .arcChordTolerance = 0.0001,
@@ -2081,7 +2122,7 @@ namespace {
         require(rapid.has_value(), rapid ? "" : rapid.error());
         requireAxisLimits(*rapid, &ngc::position_t::x, 0.25, 0.5, 2.0, "rapid X");
 
-        ngc::ExactStopTrajectoryPlanner arcPlanner({
+        ngc::TrajectoryCompiler arcPlanner({
             .pathAcceleration = infinity,
             .rapidSpeed = 600.0,
             .arcChordTolerance = 0.0001,
@@ -2100,7 +2141,7 @@ namespace {
     }
 
     void testBoundedLookaheadCarriesG64MetadataAndSingleCommandExactStops() {
-        ngc::BoundedLookaheadTrajectoryPlanner planner({
+        ngc::TrajectoryPlanner planner({
             .pathAcceleration = 4.0,
             .rapidSpeed = 120.0,
             .arcChordTolerance = 0.0001,
@@ -2140,7 +2181,7 @@ namespace {
                     && diagnostics.maximumNormalSpans > 0 && diagnostics.plannedDuration > 0.0,
                 "lookahead diagnostics should retain window, span, and duration high-water marks");
 
-        ngc::BoundedLookaheadTrajectoryPlanner commandCountIndependent;
+        ngc::TrajectoryPlanner commandCountIndependent;
         commandCountIndependent.reset(22);
         for(std::size_t index=0;index<64;++index)
             require(commandCountIndependent.enqueue({ngc::SpindleStop{},{},{}}),
@@ -2148,7 +2189,7 @@ namespace {
         require(commandCountIndependent.windowSize()==64,
                 "RT PlanChunk capacity should be independent of buffered G-code command count");
 
-        ngc::BoundedLookaheadTrajectoryPlanner protectedPlanner;
+        ngc::TrajectoryPlanner protectedPlanner;
         protectedPlanner.reset(23);
         ngc::TrajectoryPlannerInput g54 {
             ngc::MoveLine{{},{1,0,0,0,0,0},60.0},
@@ -2166,7 +2207,7 @@ namespace {
             ngc::MoveLine{{1,0,0,0,0,0},{2,0,0,0,0,0},-1.0},
             {ngc::ExecutablePathMode::Continuous,0.1}, {},
         };
-        require(!ngc::BoundedLookaheadTrajectoryPlanner::eligibleForLookahead(rapid),
+        require(!ngc::TrajectoryPlanner::eligibleForLookahead(rapid),
                 "rapid moves should remain protected from G64 preview blending");
     }
 
@@ -2288,7 +2329,7 @@ namespace {
     }
 
     void testBoundedPlannerExecutesPiecewiseG64Geometry() {
-        ngc::BoundedLookaheadTrajectoryPlanner planner({
+        ngc::TrajectoryPlanner planner({
             .pathAcceleration=5.0, .rapidSpeed=120.0, .arcChordTolerance=0.001, .pathJerk=20.0,
             .axisVelocity={10,10,10,10,10,10},
             .axisAcceleration={10,10,10,10,10,10},
@@ -2453,7 +2494,7 @@ namespace {
             ngc::MoveLine{p0,p1,60.0},ngc::MoveLine{p1,p2,60.0},
             ngc::MoveLine{p2,p3,60.0},
         };
-        ngc::ExactStopTrajectoryPlanner planner({
+        ngc::TrajectoryCompiler planner({
             .pathAcceleration=20.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,
             .pathJerk=200.0,
             .axisVelocity={20,20,20,20,20,20},
@@ -2498,7 +2539,7 @@ namespace {
     }
 
     void testRollingContinuousHorizonsPreserveMovingPvaBoundary() {
-        ngc::BoundedLookaheadTrajectoryPlanner planner({
+        ngc::TrajectoryPlanner planner({
             .pathAcceleration=10.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,.pathJerk=100.0,
             .axisVelocity={10,10,10,10,10,10},
             .axisAcceleration={20,20,20,20,20,20},
@@ -2576,7 +2617,7 @@ namespace {
     }
 
     void testRollingPrefixRejectsShortEntityAnchors() {
-        ngc::BoundedLookaheadTrajectoryPlanner planner({
+        ngc::TrajectoryPlanner planner({
             .pathAcceleration=10.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,.pathJerk=100.0,
             .axisVelocity={10,10,10,10,10,10},
             .axisAcceleration={20,20,20,20,20,20},
@@ -2657,7 +2698,7 @@ namespace {
     }
 
     void testExactStopLeadInAdvancesRollingBoundary() {
-        ngc::BoundedLookaheadTrajectoryPlanner planner({
+        ngc::TrajectoryPlanner planner({
             .pathAcceleration=10.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,.pathJerk=100.0,
             .axisVelocity={10,10,10,10,10,10},
             .axisAcceleration={20,20,20,20,20,20},
@@ -2696,7 +2737,7 @@ namespace {
     }
 
     void testG64C2PrecisionUsesLocalCoordinates() {
-        ngc::BoundedLookaheadTrajectoryPlanner planner({
+        ngc::TrajectoryPlanner planner({
             .pathAcceleration=5.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,.pathJerk=20.0,
             .axisVelocity={10,10,10,10,10,10},
             .axisAcceleration={10,10,10,10,10,10},
@@ -2738,7 +2779,7 @@ namespace {
     }
 
     void testContinuousTrajectoryPacketizesBeyondNormalSpanCapacity() {
-        ngc::ExactStopTrajectoryPlanner planner({
+        ngc::TrajectoryCompiler planner({
             .pathAcceleration=5.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,.pathJerk=20.0,
             .axisVelocity={10,10,10,10,10,10},
             .axisAcceleration={10,10,10,10,10,10},
@@ -2823,7 +2864,7 @@ namespace {
         ngc::Machine machine(UNIT);
         const auto commands=execute(machine,*source);
         require(commands.size()==22,"dense timing fixture should emit 22 motion commands");
-        ngc::ExactStopTrajectoryPlanner planner({
+        ngc::TrajectoryCompiler planner({
             .pathAcceleration=20.0,.rapidSpeed=199.8,.arcChordTolerance=0.0001,.pathJerk=100.0,
             .axisVelocity={3.333333333333333,3.333333333333333,3.333333333333333,
                            3.333333333333333,3.333333333333333,3.333333333333333},
@@ -2984,7 +3025,7 @@ namespace {
                 return value.from();
             else return {};
         },commands.front());
-        ngc::ExactStopTrajectoryPlanner planner(configuration->trajectory);
+        ngc::TrajectoryCompiler planner(configuration->trajectory);
         planner.reset(80,start);
         const auto planned=planner.compileContinuous(commands,0.005);
         require(planned&&*planned,planned
@@ -3017,7 +3058,7 @@ namespace {
     }
 
     void testContinuousTimingUsesLocalEntityAndAverageBlendFeeds() {
-        ngc::ExactStopTrajectoryPlanner planner({
+        ngc::TrajectoryCompiler planner({
             .pathAcceleration=100.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,.pathJerk=1000.0,
             .axisVelocity={100,100,100,100,100,100},
             .axisAcceleration={100,100,100,100,100,100},
@@ -3042,7 +3083,7 @@ namespace {
     }
 
     void testCollapsedClusterRetainsLocalFeedChanges() {
-        ngc::ExactStopTrajectoryPlanner planner({
+        ngc::TrajectoryCompiler planner({
             .pathAcceleration=100.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,
             .pathJerk=1000.0,
             .axisVelocity={100,100,100,100,100,100},
@@ -3079,7 +3120,7 @@ namespace {
     }
 
     void testDistantSlowEntityDoesNotThrottleFastContinuousPrefix() {
-        ngc::ExactStopTrajectoryPlanner planner({
+        ngc::TrajectoryCompiler planner({
             .pathAcceleration=10.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,.pathJerk=100.0,
             .axisVelocity={10,10,10,10,10,10},
             .axisAcceleration={10,10,10,10,10,10},
@@ -3136,7 +3177,7 @@ namespace {
         const ngc::TrajectoryPlanningMetadata g64 {
             .pathMode=ngc::ExecutablePathMode::Continuous,.pathTolerance=0.1,
         };
-        ngc::BoundedLookaheadTrajectoryPlanner arcPlanner({
+        ngc::TrajectoryPlanner arcPlanner({
             .pathAcceleration=5.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,.pathJerk=20.0,
             .lookaheadDuration=1000.0,
         });
@@ -3162,7 +3203,7 @@ namespace {
     }
 
     void testExecutableG64RetainsExactPrimitiveMiddles() {
-        ngc::BoundedLookaheadTrajectoryPlanner planner({
+        ngc::TrajectoryPlanner planner({
             .pathAcceleration=5.0,.rapidSpeed=120.0,.arcChordTolerance=0.0001,.pathJerk=20.0,
             .lookaheadDuration=1000.0,
         });
@@ -3208,12 +3249,12 @@ namespace {
             std::uint32_t expectedSpans;
         };
         constexpr std::array cases {
-            ArcCase { "quarter circle", 1.0, std::numbers::pi / 2.0, 0.0, 4 },
-            ArcCase { "half circle", 1.0, std::numbers::pi, 0.0, 8 },
-            ArcCase { "major three-quarter circle", 1.0, 3.0 * std::numbers::pi / 2.0, 0.0, 16 },
-            ArcCase { "full circle", 1.0, 2.0 * std::numbers::pi, 0.0, 16 },
-            ArcCase { "full helical turn", 1.0, 2.0 * std::numbers::pi, 1.0, 16 },
-            ArcCase { "large-radius quarter circle", 10.0, std::numbers::pi / 2.0, 0.0, 8 },
+            ArcCase { "quarter circle", 1.0, std::numbers::pi / 2.0, 0.0, 12 },
+            ArcCase { "half circle", 1.0, std::numbers::pi, 0.0, 24 },
+            ArcCase { "major three-quarter circle", 1.0, 3.0 * std::numbers::pi / 2.0, 0.0, 24 },
+            ArcCase { "full circle", 1.0, 2.0 * std::numbers::pi, 0.0, 48 },
+            ArcCase { "full helical turn", 1.0, 2.0 * std::numbers::pi, 1.0, 48 },
+            ArcCase { "large-radius quarter circle", 10.0, std::numbers::pi / 2.0, 0.0, 12 },
         };
 
         for(const auto &test : cases) {
@@ -3221,7 +3262,7 @@ namespace {
             const ngc::position_t to {
                 test.radius * std::cos(test.sweep), test.radius * std::sin(test.sweep), test.rise, 0, 0, 0,
             };
-            ngc::ExactStopTrajectoryPlanner planner({
+            ngc::TrajectoryCompiler planner({
                 .pathAcceleration = std::numeric_limits<double>::infinity(),
                 .rapidSpeed = 120.0,
                 .arcChordTolerance = TOLERANCE,
@@ -3265,7 +3306,7 @@ namespace {
         const ngc::MoveArc firstArc { start, junction, {}, { 0, 0, 1 }, 60.0 };
         const ngc::MoveArc secondArc { junction, secondEnd, {}, { 0, 0, 1 }, 60.0 };
 
-        ngc::ExactStopTrajectoryPlanner planner({
+        ngc::TrajectoryCompiler planner({
             .pathAcceleration = std::numeric_limits<double>::infinity(),
             .rapidSpeed = 120.0,
             .arcChordTolerance = TOLERANCE,
@@ -3295,7 +3336,7 @@ namespace {
         requireNear(secondFinal.x, followingLineStart.x, "arc-to-line junction should have continuous X");
         requireNear(secondFinal.y, followingLineStart.y, "arc-to-line junction should have continuous Y");
 
-        ngc::ExactStopTrajectoryPlanner lineThenArc({
+        ngc::TrajectoryCompiler lineThenArc({
             .pathAcceleration = std::numeric_limits<double>::infinity(),
             .rapidSpeed = 120.0,
             .arcChordTolerance = TOLERANCE,
@@ -3334,7 +3375,7 @@ namespace {
     void testRoundedRadiusArcPreservesDynamicLimits() {
         constexpr double ACCELERATION = 4.0;
         constexpr double JERK = 8.0;
-        ngc::ExactStopTrajectoryPlanner planner({
+        ngc::TrajectoryCompiler planner({
             .pathAcceleration = ACCELERATION,
             .rapidSpeed = 120.0,
             .arcChordTolerance = 0.0001,
@@ -3612,7 +3653,7 @@ namespace {
     void testProbeCompilesAsBackendOwnedTriggeredMove() {
         constexpr double ACCELERATION = 2.0;
         constexpr double JERK = 10.0;
-        ngc::ExactStopTrajectoryPlanner planner({
+        ngc::TrajectoryCompiler planner({
             .pathAcceleration = ACCELERATION,
             .rapidSpeed = 100.0,
             .arcChordTolerance = 0.0001,
@@ -4054,7 +4095,7 @@ int main() {
         std::cerr << "checkpoint preview\n";
         testImmediatePreviewBuildsGeometryWithoutTrajectoryExecution();
         testGeometryProducerBlendsAcrossMotionModeChanges();
-        testGeometryProducerPreparesStandalonePreviewMotion();
+        testGeometryProducerPreparesExactStopPreviewSlices();
         testGeometryPreviewResolvesProbeAtCanonicalTarget();
         testAdaptivePocketsGeometryPreviewAvoidsTrajectoryExecution();
         testIncrementalGeometryDefersAndDoesNotRebuildAnchorSection();

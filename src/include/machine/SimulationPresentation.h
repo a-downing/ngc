@@ -7,7 +7,7 @@
 #include <vector>
 
 #include "evaluator/InterpreterStatus.h"
-#include "machine/BoundedLookaheadTrajectoryPlanner.h"
+#include "machine/TrajectoryPlanner.h"
 #include "machine/GeometryStreamProducer.h"
 #include "machine/MachineCommand.h"
 #include "machine/MotionBackend.h"

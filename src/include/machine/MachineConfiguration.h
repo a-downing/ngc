@@ -6,7 +6,7 @@
 #include <string>
 #include <vector>
 
-#include "machine/ExactStopTrajectoryPlanner.h"
+#include "machine/TrajectoryCompiler.h"
 #include "machine/Machine.h"
 
 namespace ngc {

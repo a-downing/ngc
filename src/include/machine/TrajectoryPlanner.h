@@ -16,7 +16,7 @@
 #include <utility>
 #include <vector>
 
-#include "machine/ExactStopTrajectoryPlanner.h"
+#include "machine/TrajectoryCompiler.h"
 #include "machine/ArcInterpolation.h"
 #include "machine/PreparedGeometry.h"
 #include "evaluator/InterpreterSession.h"
@@ -31,6 +31,19 @@ namespace ngc {
         TrajectoryCommandPresentation presentation;
         bool presentationActivation = true;
         double continuousScaleOverride = 0.0;
+        std::optional<PreparedPathPiece> preparedPiece;
+
+        TrajectoryPlannerInput(MachineCommand commandValue,
+                               TrajectoryPlanningMetadata metadataValue = {},
+                               TrajectoryCommandPresentation presentationValue = {},
+                               const bool presentationActivationValue = true,
+                               const double continuousScaleOverrideValue = 0.0,
+                               std::optional<PreparedPathPiece> preparedPieceValue = std::nullopt)
+            : command(std::move(commandValue)), metadata(std::move(metadataValue)),
+              presentation(std::move(presentationValue)),
+              presentationActivation(presentationActivationValue),
+              continuousScaleOverride(continuousScaleOverrideValue),
+              preparedPiece(std::move(preparedPieceValue)) { }
     };
 
     struct PlannedExecution {
@@ -97,9 +110,9 @@ namespace ngc {
     // NRT-only compatible command horizon. RT capacity is imposed later while
     // the verified polynomial stream is packetized into PlanChunk values; it is
     // deliberately not expressed as an arbitrary G-code command count.
-    class BoundedLookaheadTrajectoryPlanner {
+    class TrajectoryPlanner {
     private:
-        ExactStopTrajectoryPlanner m_exactStop;
+        TrajectoryCompiler m_compiler;
         std::deque<TrajectoryPlannerInput> m_window;
         std::optional<PreparedContinuousGeometry> m_preparedWindow;
         TrajectoryPlanningDiagnostics m_diagnostics;
@@ -286,7 +299,7 @@ namespace ngc {
                 } else return std::nullopt;
 
                 auto velocityLimit=continuousFeed(command);
-                const auto &limits=m_exactStop.limits();
+                const auto &limits=m_compiler.limits();
                 for(const auto component:AXIS_COMPONENTS) {
                     const auto tangentComponent=std::abs(tangent.*component);
                     if(tangentComponent>1e-15)
@@ -360,9 +373,14 @@ namespace ngc {
             if(discontinuity(normalEnd.position,chunk.branchState.position)
                ||discontinuity(normalEnd.velocity,chunk.branchState.velocity)
                ||discontinuity(normalEnd.acceleration,chunk.branchState.acceleration))
-                return std::unexpected("planned chunk branch state does not match normal-motion terminal state");
+                return std::unexpected(std::format(
+                    "planned chunk branch state does not match normal-motion terminal state: "
+                    "position={} velocity={} acceleration={}",
+                    (normalEnd.position-chunk.branchState.position).length(),
+                    (normalEnd.velocity-chunk.branchState.velocity).length(),
+                    (normalEnd.acceleration-chunk.branchState.acceleration).length()));
             auto previous = chunk.branchState;
-            const auto &limits = m_exactStop.limits();
+            const auto &limits = m_compiler.limits();
             for(const auto &span : chunk.stopTail) {
                 if(!std::isfinite(span.duration) || span.duration <= 0.0)
                     return std::unexpected("planned stop branch contains an invalid span duration");
@@ -401,7 +419,7 @@ namespace ngc {
         std::expected<void,std::string> verifyContinuousNormalMotion(const PlanChunk &chunk) const {
             if(chunk.normalMotion.size==0)
                 return std::unexpected("continuous plan has no normal motion");
-            const auto &limits=m_exactStop.limits();
+            const auto &limits=m_compiler.limits();
             std::optional<MotionState> previous;
             SpanId previousSpan=0;
             std::size_t spanIndex=0;
@@ -516,13 +534,13 @@ namespace ngc {
         }
 
     public:
-        explicit BoundedLookaheadTrajectoryPlanner(const TrajectoryLimits limits = {})
-            : m_exactStop(limits) { }
+        explicit TrajectoryPlanner(const TrajectoryLimits limits = {})
+            : m_compiler(limits) { }
 
         void reset(const EpochId epoch, const position_t &position = {}) {
             m_window.clear();
             m_preparedWindow.reset();
-            m_exactStop.reset(epoch, position);
+            m_compiler.reset(epoch, position);
             m_continuousBoundary={position,{},{}};
             m_lastRollingCandidateError.clear();
             m_nextRollingAttemptWindowSize=2;
@@ -530,17 +548,17 @@ namespace ngc {
         }
 
         void rebase(const EpochId epoch, const position_t &position) {
-            m_exactStop.reset(epoch,position);
+            m_compiler.reset(epoch,position);
             m_continuousBoundary={position,{},{}};
         }
 
         void clearDiagnostics() { m_diagnostics = {}; }
         void setLimits(const TrajectoryLimits &limits) {
-            m_exactStop.setLimits(limits);
+            m_compiler.setLimits(limits);
             m_lastRollingVelocityFraction.reset();
         }
         void setContinuousPlanningEffort(const ContinuousPlanningEffort &effort) {
-            m_exactStop.setContinuousPlanningEffort(effort);
+            m_compiler.setContinuousPlanningEffort(effort);
         }
         void setContinuousDiagnosticCallback(std::function<void(
                 const ContinuousTrajectoryPlan &,
@@ -548,9 +566,9 @@ namespace ngc {
             m_continuousDiagnosticCallback=std::move(callback);
         }
         void setProgressCallback(std::function<void()> callback) {
-            m_exactStop.setProgressCallback(std::move(callback));
+            m_compiler.setProgressCallback(std::move(callback));
         }
-        const TrajectoryLimits &limits() const { return m_exactStop.limits(); }
+        const TrajectoryLimits &limits() const { return m_compiler.limits(); }
         const TrajectoryPlanningDiagnostics &diagnostics() const { return m_diagnostics; }
         const std::string &lastRollingCandidateError() const { return m_lastRollingCandidateError; }
         std::size_t windowSize() const { return m_window.size(); }
@@ -569,7 +587,7 @@ namespace ngc {
                 if(!length||feed<=0.0) return false;
                 nominalDuration+=*length/feed;
             }
-            return nominalDuration>=2.0*m_exactStop.limits().lookaheadDuration;
+            return nominalDuration>=2.0*m_compiler.limits().lookaheadDuration;
         }
         static bool eligibleForLookahead(const TrajectoryPlannerInput &input) {
             return continuousMotion(input);
@@ -597,6 +615,27 @@ namespace ngc {
 
         bool enqueuePrepared(const PreparedGeometrySlice &slice) {
             if(m_preparedWindow || !m_window.empty()) return false;
+            if(slice.commands.empty() || slice.pieces.empty()) return false;
+            const auto exactStop = std::ranges::all_of(slice.commands, [](const auto &record) {
+                return record.metadata.pathMode == ExecutablePathMode::ExactStop;
+            });
+            const auto continuous = std::ranges::all_of(slice.commands, [](const auto &record) {
+                return record.metadata.pathMode == ExecutablePathMode::Continuous;
+            });
+            if(!exactStop && !continuous) return false;
+            if(exactStop) {
+                if(slice.pieces.size() != slice.commands.size()) return false;
+                for(const auto &record : slice.commands) {
+                    const auto piece = std::ranges::find_if(slice.pieces, [&](const auto &candidate) {
+                        return candidate.primaryCommand == record.id;
+                    });
+                    if(piece == slice.pieces.end()) return false;
+                    if(!enqueue(TrajectoryPlannerInput{record.command, record.metadata,
+                            record.presentation, record.presentationActivation,
+                            record.continuousScaleOverride, *piece})) return false;
+                }
+                return true;
+            }
             PreparedContinuousGeometry geometry;
             geometry.commands=slice.commands;
             geometry.pieces=slice.pieces;
@@ -619,24 +658,26 @@ namespace ngc {
             auto item = std::visit([&](const auto &command) -> std::expected<ExecutionItem, std::string> {
                 using T = std::decay_t<decltype(command)>;
                 if constexpr(std::same_as<T, ProbeMove>) {
-                    auto move = m_exactStop.compileTriggeredMove(command);
+                    auto move = m_compiler.compileTriggeredMove(command);
                     if(!move) return std::unexpected(move.error());
                     return ExecutionItem { *move };
                 } else {
-                    auto chunk = m_exactStop.compile(input.command);
-                    m_diagnostics.timeLaw+=m_exactStop.lastTimeLawDiagnostics();
+                    auto chunk = m_compiler.compile(input.command,
+                        input.preparedPiece ? &*input.preparedPiece : nullptr);
+                    m_diagnostics.timeLaw+=m_compiler.lastTimeLawDiagnostics();
                     if(!chunk) return std::unexpected(chunk.error());
                     if(auto verified = verifyStopBranch(*chunk); !verified)
-                        return std::unexpected(verified.error());
+                        return std::unexpected(std::format("{}; command {}",
+                            verified.error(), input.command.index()));
                     return ExecutionItem { *chunk };
                 }
             }, input.command);
             if(!item) return std::unexpected(item.error());
-            // Exact-stop commands advance ExactStopTrajectoryPlanner's internal
+            // Exact-stop commands advance TrajectoryCompiler's internal
             // position. Keep the independently retained rolling PVA boundary at
             // that same held endpoint so a later G64 window does not inherit a
             // stale probe/rebase position.
-            m_continuousBoundary={m_exactStop.plannedPosition(),{}, {}};
+            m_continuousBoundary={m_compiler.plannedPosition(),{}, {}};
             const auto planningSeconds = std::chrono::duration<double>(
                 std::chrono::steady_clock::now() - started).count();
             record(*item);
@@ -742,9 +783,9 @@ namespace ngc {
                 if(auto candidate=std::holds_alternative<MoveLine>(m_window[index].command)
                         ?rollingSplit(m_window[index].command,blendScale):std::nullopt;
                    candidate&&nominalDuration+candidate->prefixLength/feed
-                        >=m_exactStop.limits().lookaheadDuration
+                        >=m_compiler.limits().lookaheadDuration
                    &&(allowTerminalStop||totalNominalDuration-nominalDuration
-                        -candidate->prefixLength/feed>=m_exactStop.limits().lookaheadDuration)) {
+                        -candidate->prefixLength/feed>=m_compiler.limits().lookaheadDuration)) {
                     splitCandidates.emplace_back(index,std::move(*candidate),entityScale);
                     if(splitCandidates.size()>=8) break;
                 }
@@ -769,7 +810,7 @@ namespace ngc {
                     /continuousFeed(split.suffix);
                 for(std::size_t index=splitIndex+1;
                     index<m_window.size()
-                        &&suffixProbeDuration<m_exactStop.limits().lookaheadDuration;++index) {
+                        &&suffixProbeDuration<m_compiler.limits().lookaheadDuration;++index) {
                     suffixProbeCommands.push_back(m_window[index].command);
                     suffixProbeScales.push_back(m_window[index].continuousScaleOverride);
                     const auto length=continuousMotionLength(m_window[index].command);
@@ -778,7 +819,7 @@ namespace ngc {
                 }
 
                 std::unique_ptr<ContinuousTrajectoryPlan> selected;
-                std::optional<ExactStopTrajectoryPlanner> selectedPlanner;
+                std::optional<TrajectoryCompiler> selectedPlanner;
                 MotionState selectedBoundary;
                 auto selectedVelocityFraction=0.0;
                 const auto initialVelocityFraction=m_lastRollingVelocityFraction
@@ -789,10 +830,10 @@ namespace ngc {
                     if(velocity<split.velocityLimit*0.01) break;
                     ++m_diagnostics.rollingBoundaryCandidates;
                     const auto boundary=splitBoundaryState(split,velocity);
-                    ExactStopTrajectoryPlanner suffixProbe(m_exactStop.limits());
+                    TrajectoryCompiler suffixProbe(m_compiler.limits());
                     suffixProbe.setContinuousPlanningEffort(
-                        m_exactStop.continuousPlanningEffort());
-                    suffixProbe.setProgressCallback(m_exactStop.progressCallback());
+                        m_compiler.continuousPlanningEffort());
+                    suffixProbe.setProgressCallback(m_compiler.progressCallback());
                     suffixProbe.reset(1,split.position);
                     auto suffix=suffixProbe.compileContinuous(
                         suffixProbeCommands,blendScale,boundary,std::nullopt,
@@ -805,7 +846,7 @@ namespace ngc {
                         m_lastRollingCandidateError="suffix: "+suffix.error();
                         continue;
                     }
-                    auto prefixPlanner=m_exactStop;
+                    auto prefixPlanner=m_compiler;
                     auto prefix=prefixPlanner.compileContinuous(
                         prefixCommands,blendScale,m_continuousBoundary,boundary,
                         prefixScales,ROLLING_VELOCITY_SEARCH_ITERATIONS);
@@ -831,7 +872,7 @@ namespace ngc {
                     m_window.front().command=split.suffix;
                     m_window.front().presentationActivation=false;
                     m_window.front().continuousScaleOverride=splitScale;
-                    m_exactStop=std::move(*selectedPlanner);
+                    m_compiler=std::move(*selectedPlanner);
                     m_continuousBoundary=selectedBoundary;
                     m_lastRollingVelocityFraction=selectedVelocityFraction;
                     m_lastRollingCandidateError.clear();
@@ -858,13 +899,13 @@ namespace ngc {
                 scales.push_back(input.continuousScaleOverride);
             }
             auto continuous=m_preparedWindow
-                ?m_exactStop.compileContinuous(*m_preparedWindow,blendScale,
+                ?m_compiler.compileContinuous(*m_preparedWindow,blendScale,
                     m_continuousBoundary,std::nullopt,
                     movingBoundary?ROLLING_VELOCITY_SEARCH_ITERATIONS:12U)
-                :m_exactStop.compileContinuous(commands,blendScale,
+                :m_compiler.compileContinuous(commands,blendScale,
                     m_continuousBoundary,std::nullopt,scales,
                     movingBoundary?ROLLING_VELOCITY_SEARCH_ITERATIONS:12U);
-            m_diagnostics.timeLaw+=m_exactStop.lastTimeLawDiagnostics();
+            m_diagnostics.timeLaw+=m_compiler.lastTimeLawDiagnostics();
             if(!continuous) return std::unexpected(std::format(
                 "fatal continuous-motion compilation failure: {}; cause: {}",context,continuous.error()));
             std::vector<TrajectoryPlannerInput> inputs;
@@ -877,6 +918,10 @@ namespace ngc {
             const auto &terminal=(*continuous)->chunks.back().branchState;
             m_continuousBoundary=terminal;
             return finalize(std::move(*continuous),std::move(inputs));
+        }
+
+        bool shouldPlanImmediately() const {
+            return !m_window.empty() && !continuousMotion(m_window.front());
         }
     };
 }

@@ -85,7 +85,7 @@ A much denser coordinate search reached peak normal curvature derivative 59,158.
 
 The generated comparison artifacts are `build/polyline_quintic_fast_release.csv` and `build/polyline_quintic_fast_release.svg`.
 
-This is evidence, not a production proof. The analyzer currently compares dense equal-progress samples to the ordered source composite; it does not compute a certified Hausdorff/Frechet bound, its arc geometry uses numerical estimates, and it does not prove extrema between samples. The experiment also mixes a line-dominated strip with six terminal arcs. The result justifies implementing the banded quintic and recursive tube verifier in the standalone tool before changing `ExactStopTrajectoryPlanner`.
+This is evidence, not a production proof. The analyzer currently compares dense equal-progress samples to the ordered source composite; it does not compute a certified Hausdorff/Frechet bound, its arc geometry uses numerical estimates, and it does not prove extrema between samples. The experiment also mixes a line-dominated strip with six terminal arcs. The result justifies implementing the banded quintic and recursive tube verifier in the standalone tool before changing `TrajectoryCompiler`.
 
 #### `adaptive_pockets.ngc` follow-up
 
@@ -167,7 +167,7 @@ This is encouraging but not production-ready. Deviation and physical derivatives
 
 #### Planner integration
 
-The three experimental quintic fitters are now integrated into `ExactStopTrajectoryPlanner` behind the single `continuousSplineFitSolver()` selection point. The available selections are `CoordinateSearch`, `UniformBandedFairness`, and `PeakTargetedBandedFairness`; `CubicBaseline` is retained for controlled A/B measurement. Only variable-control short-entity clusters are reconstructed. Ordinary six-control junction splines remain cubic because fixing four quintic controls at each end leaves them no optimization freedom and converting them imposed needless proof and runtime cost.
+The three experimental quintic fitters are now integrated into `TrajectoryCompiler` behind the single `continuousSplineFitSolver()` selection point. The available selections are `CoordinateSearch`, `UniformBandedFairness`, and `PeakTargetedBandedFairness`; `CubicBaseline` is retained for controlled A/B measurement. Only variable-control short-entity clusters are reconstructed. Ordinary six-control junction splines remain cubic because fixing four quintic controls at each end leaves them no optimization freedom and converting them imposed needless proof and runtime cost.
 
 Unlike the standalone experiment, planner acceptance does not make sampled deviation authoritative. The selected quintic is checked by an ordered recursive source-tube proof. Each interval combines the maximum endpoint association error with a conservative source chord-error bound and a quintic second-derivative control-hull chord bound. Source entity boundaries are explicit initial proof boundaries, the work count is finite, and a failure is fatal rather than permission to publish the candidate. The ordinary emitted-polynomial geometry and XYZABC constraint proofs remain downstream authority.
 
@@ -186,7 +186,7 @@ All four selections completed the rolling planner. Uniform banding is therefore 
 
 The full-horizon export reached the optional infinite-jerk oracle after planning but that diagnostic did not converge within its existing nine refinements on the new geometry. Rolling production-shaped planning and all final trajectory proofs completed. The oracle refinement policy needs a separate investigation before using its duration as the quintic comparison baseline.
 
-Geometry-only ImGui Preview now calls the same `spline_detail::reconstructSpline()` function and reads the same `continuousSplineFitSolver()` selection as timed planning. Preview supplies its retained canonical XYZ source geometry, receives the same cubic or quintic degree and controls, and tessellates that degree directly. It does not invoke `ExactStopTrajectoryPlanner`, Ruckig, trajectory timing, polynomial emission, packetization, or a backend. Planner calls request the recursive source-tube certificate; Preview calls remain display-only. A focused regression reconstructs one long line strip through both paths and requires every XYZ control to agree within `1e-12`.
+Geometry-only ImGui Preview now calls the same `spline_detail::reconstructSpline()` function and reads the same `continuousSplineFitSolver()` selection as timed planning. Preview supplies its retained canonical XYZ source geometry, receives the same cubic or quintic degree and controls, and tessellates that degree directly. It does not invoke `TrajectoryCompiler`, Ruckig, trajectory timing, polynomial emission, packetization, or a backend. Planner calls request the recursive source-tube certificate; Preview calls remain display-only. A focused regression reconstructs one long line strip through both paths and requires every XYZ control to agree within `1e-12`.
 
 #### Execution visualization and remaining timing question
 

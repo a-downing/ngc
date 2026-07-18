@@ -82,6 +82,8 @@ namespace ngc {
         bool m_processedLongAnchor = false;
         std::optional<double> m_continuousScale;
         std::optional<TrajectoryCommandPresentation> m_continuousPresentation;
+        std::optional<ExecutablePathMode> m_geometryPathMode;
+        double m_unpreparedExactStopDuration = 0.0;
         ContinuousChainId m_chain = 0;
 
         static bool samePosition(const position_t &left, const position_t &right) {
@@ -96,6 +98,13 @@ namespace ngc {
                     return command.speed() > 0.0 && !command.machineCoordinates();
                 else if constexpr(std::same_as<T, MoveArc>) return command.speed() > 0.0;
                 else return false;
+            }, record.command);
+        }
+
+        static bool preparedMotion(const PreparedCommandRecord &record) {
+            return std::visit([](const auto &command) {
+                using T = std::decay_t<decltype(command)>;
+                return std::same_as<T, MoveLine> || std::same_as<T, MoveArc>;
             }, record.command);
         }
 
@@ -208,14 +217,17 @@ namespace ngc {
             const auto started = std::chrono::steady_clock::now();
             position_t start{};
             if(const auto value = commandStart(m_continuous.front().command)) start = *value;
-            auto prepared = prepareContinuousGeometry(m_continuous,
-                m_continuousScale.value_or(0.001), start,
-                GeometryPreparationEffort{ .certifySourceTube = false,
-                    .generateSamples = true,
-                    .lengthTableIntervalsPerKnotSpan = 32 },
-                ContinuousGeometryBoundaries{
-                    .incomingReplacement = m_processedLongAnchor,
-                    .deferFinalRetainedSection = deferFinalRetainedSection });
+            const GeometryPreparationEffort effort{
+                .certifySourceTube = false,
+                .generateSamples = true,
+                .lengthTableIntervalsPerKnotSpan = 32 };
+            auto prepared = m_geometryPathMode == ExecutablePathMode::ExactStop
+                ? prepareExactStopGeometry(m_continuous, start, effort)
+                : prepareContinuousGeometry(m_continuous,
+                    m_continuousScale.value_or(0.001), start, effort,
+                    ContinuousGeometryBoundaries{
+                        .incomingReplacement = m_processedLongAnchor,
+                        .deferFinalRetainedSection = deferFinalRetainedSection });
             m_diagnostics.retainedSourceHighWater = std::max(
                 m_diagnostics.retainedSourceHighWater, m_continuous.size());
             m_diagnostics.preparationSeconds += std::chrono::duration<double>(
@@ -258,30 +270,37 @@ namespace ngc {
         }
 
         bool flushContinuous(const PreparedBoundaryReason reason, const bool publishEnd) {
-            if(m_continuous.empty()) return true;
-            auto prepared = prepareWindow();
-            if(!prepared) {
-                m_diagnostics.lastFailure = prepared.error();
-                publish(PreparedFailure{m_epoch, m_sequence++, prepared.error()});
-                m_cancelled.store(true, std::memory_order_release);
-                return false;
+            if(!m_continuous.empty()) {
+                auto prepared = prepareWindow();
+                if(!prepared) {
+                    m_diagnostics.lastFailure = prepared.error();
+                    publish(PreparedFailure{m_epoch, m_sequence++, prepared.error()});
+                    m_cancelled.store(true, std::memory_order_release);
+                    return false;
+                }
+                for(auto &piece : prepared->pieces)
+                    appendPending(std::move(piece));
+                if(!publishPending()) return false;
+                m_continuous.clear();
+                m_commandRecords.clear();
+                m_activatedCommands.clear();
+                m_haveLongAnchor = false;
+                m_processedLongAnchor = false;
+                m_unpreparedExactStopDuration = 0.0;
             }
-            for(auto &piece : prepared->pieces)
-                appendPending(std::move(piece));
-            if(!publishPending()) return false;
-            m_continuous.clear();
-            m_commandRecords.clear();
-            m_activatedCommands.clear();
-            m_haveLongAnchor = false;
-            m_processedLongAnchor = false;
+            if(m_chain == 0) return true;
             if(publishEnd) {
                 m_continuousScale.reset();
                 m_continuousPresentation.reset();
+                m_geometryPathMode.reset();
             }
             if(!publishEnd) return true;
             if(!publish(PreparedContinuousEnd{m_epoch, m_sequence++, m_chain, reason})) return false;
             ++m_diagnostics.continuousEndsPublished;
             m_chain = 0;
+            m_commandRecords.clear();
+            m_activatedCommands.clear();
+            m_unpreparedExactStopDuration = 0.0;
             return true;
         }
 
@@ -335,7 +354,47 @@ namespace ngc {
 
         bool processCommand(MachineCommand command) {
             auto record = makeRecord(std::move(command));
-            if(continuousMotion(record)) {
+            if(preparedMotion(record)) {
+                const auto pathMode = continuousMotion(record)
+                    ? ExecutablePathMode::Continuous : ExecutablePathMode::ExactStop;
+                if(m_geometryPathMode && *m_geometryPathMode != pathMode
+                   && !flushContinuous(PreparedBoundaryReason::IncompatibleCommand, true))
+                    return false;
+                if(!m_geometryPathMode) m_geometryPathMode = pathMode;
+                if(pathMode == ExecutablePathMode::ExactStop) {
+                    if(m_chain == 0) m_chain = m_nextChain++;
+                    m_commandRecords.insert_or_assign(record.id, record);
+                    const auto duration = std::visit([&](const auto &value) {
+                        using T = std::decay_t<decltype(value)>;
+                        if constexpr(std::same_as<T, MoveLine>)
+                            return value.speed() > 0.0
+                                ? sourceLength(record) / (value.speed() / 60.0) : 0.0;
+                        else if constexpr(std::same_as<T, MoveArc>)
+                            return value.speed() > 0.0
+                                ? sourceLength(record) / (value.speed() / 60.0) : 0.0;
+                        else return 0.0;
+                    }, record.command);
+                    m_unpreparedExactStopDuration += duration;
+                    m_continuous.push_back(std::move(record));
+                    m_diagnostics.retainedSourceHighWater = std::max(
+                        m_diagnostics.retainedSourceHighWater, m_continuous.size());
+                    if(m_unpreparedExactStopDuration >= m_policy.publishNominalDuration) {
+                        auto prepared = prepareWindow();
+                        if(!prepared) {
+                            m_diagnostics.lastFailure = prepared.error();
+                            publish(PreparedFailure{m_epoch, m_sequence++, prepared.error()});
+                            m_cancelled.store(true, std::memory_order_release);
+                            return false;
+                        }
+                        for(auto &piece : prepared->pieces)
+                            appendPending(std::move(piece));
+                        if(!publishPending()) return false;
+                        m_continuous.clear();
+                        m_unpreparedExactStopDuration = 0.0;
+                        pruneCommandRecords();
+                    }
+                    return true;
+                }
                 const auto scale = record.metadata.pathTolerance.value_or(0.001);
                 const auto compatible = !m_continuous.empty()
                     &&m_continuousScale && std::abs(*m_continuousScale - scale) <= 0.0

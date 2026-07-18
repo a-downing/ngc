@@ -47,7 +47,8 @@ add_library(ngc_core STATIC
         src/InfiniteJerkTrajectoryTime.cpp
         src/MachineConfiguration.cpp
         src/PreparedGeometry.cpp
-        src/ExactStopTrajectoryPlanner.cpp
+        src/SplineReconstruction.cpp
+        src/TrajectoryCompiler.cpp
         src/Evaluator.cpp
         src/Machine.cpp
         src/MockMotionBackend.cpp

@@ -9,7 +9,7 @@
 #include <string>
 #include <utility>
 
-#include "machine/BoundedLookaheadTrajectoryPlanner.h"
+#include "machine/TrajectoryPlanner.h"
 #include "machine/GeometryStreamProducer.h"
 #include "machine/MotionBackend.h"
 
@@ -23,7 +23,7 @@ namespace ngc {
         PreparedGeometryForwardChannel &m_forward;
         GeometryFeedbackChannel &m_feedback;
         std::atomic<bool> &m_cancelled;
-        BoundedLookaheadTrajectoryPlanner m_planner;
+        TrajectoryPlanner m_planner;
         std::unique_ptr<PlannedExecution> m_pending;
         std::size_t m_pendingItem = 0;
         std::optional<PreparedStreamMessage> m_deferredMessage;
@@ -267,6 +267,8 @@ namespace ngc {
                 return true;
             }
 
+            if(m_planner.shouldPlanImmediately()) return planWindow();
+
             PreparedForwardMessage message;
             if(!m_forward.tryPop(message)) return false;
             if(!message) {
@@ -317,8 +319,14 @@ namespace ngc {
                     if(held->epoch == m_epoch) {
                         m_waitingForHeld = false;
                         (void)releaseSynchronizationIfHeld();
-                        if(m_planner.hasRollingContinuation())
+                        if(m_planner.hasRollingContinuation()) {
                             fail("motion stopped on a rolling-horizon packet branch with retained prepared geometry");
+                        } else {
+                            const auto request = m_nextRequest++;
+                            if(m_backend.trySubmit(ResumeRequest{request, m_epoch})
+                                    != SubmitResult::Submitted)
+                                fail("motion backend control channel is full while resuming after an exact stop");
+                        }
                     }
                 } else if(const auto *completed = std::get_if<RequestCompleted>(&event)) {
                     if(completed->request == m_startRequest) {
