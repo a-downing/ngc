@@ -1,5 +1,7 @@
 #pragma once
 
+#include <algorithm>
+#include <cmath>
 #include <expected>
 #include <functional>
 #include <limits>
@@ -15,6 +17,37 @@
 #include "machine/PreparedGeometry.h"
 
 namespace ngc {
+    namespace trajectory_detail {
+        inline double maximumAxisVelocity(const AxisPolynomialSpan &span,
+                                          const double position_t::*component) {
+            const auto at = [&](const double u) {
+                return std::abs((3.0*span.a.*component*u*u + 2.0*span.b.*component*u
+                    + span.c.*component) * span.inverseDuration);
+            };
+            auto result = std::max(at(0.0), at(1.0));
+            if(std::abs(span.a.*component) > 1e-15) {
+                const auto stationary = -(span.b.*component) / (3.0*(span.a.*component));
+                if(stationary > 0.0 && stationary < 1.0)
+                    result = std::max(result, at(stationary));
+            }
+            return result;
+        }
+
+        inline double maximumAxisAcceleration(const AxisPolynomialSpan &span,
+                                              const double position_t::*component) {
+            const auto at = [&](const double u) {
+                return std::abs((6.0*span.a.*component*u + 2.0*span.b.*component)
+                    * span.inverseDurationSquared);
+            };
+            return std::max(at(0.0), at(1.0));
+        }
+
+        inline double maximumAxisJerk(const AxisPolynomialSpan &span,
+                                      const double position_t::*component) {
+            return std::abs(6.0*span.a.*component * span.inverseDurationCubed);
+        }
+    }
+
     enum class ContinuousVelocityLimitCause {
         ProgrammedFeed,
         AxisVelocity,

@@ -85,6 +85,38 @@ class ApplicationImpl final {
     std::string m_mdiInput;
     static constexpr std::string_view MDI_SOURCE_NAME = "<MDI>";
 
+    struct SourceLineExecutionState {
+        std::unordered_set<int> activeLines;
+        std::optional<int> currentLine;
+        const std::vector<std::uint8_t> *completedLines = nullptr;
+
+        bool active(const int line) const { return activeLines.contains(line); }
+        bool completed(const int line) const {
+            return completedLines && line < static_cast<int>(completedLines->size())
+                && (*completedLines)[line] != 0;
+        }
+        bool current(const int line) const { return currentLine == line; }
+        ImVec4 highlight(const int line) const {
+            if(current(line)) return {0.75f, 0.55f, 0.08f, 0.75f};
+            if(active(line)) return {0.65f, 0.38f, 0.08f, 0.55f};
+            if(completed(line)) return {0.15f, 0.45f, 0.22f, 0.55f};
+            return {0, 0, 0, 0};
+        }
+    };
+
+    static SourceLineExecutionState sourceLineExecutionState(
+            const ngc::SimulationSnapshot &simulation, const std::string_view source) {
+        SourceLineExecutionState result;
+        for(const auto &block : simulation.activeBlocks)
+            if(block.source == source) result.activeLines.insert(block.line);
+        if(!simulation.activeBlocks.empty() && simulation.activeBlocks.back().source == source)
+            result.currentLine = simulation.activeBlocks.back().line;
+        if(const auto completed = simulation.completedLineFlags.find(std::string(source));
+           completed != simulation.completedLineFlags.end())
+            result.completedLines = &completed->second;
+        return result;
+    }
+
     enum class ProgramPaneMode { Edit, Compiled };
     ProgramPaneMode m_programPaneMode = ProgramPaneMode::Edit;
     bool m_programDirty = false;
@@ -1564,37 +1596,23 @@ public:
                 rebuildMainProgramLines();
             }
         } else {
-            std::unordered_set<int> activeLines;
-            std::optional<int> currentLine;
-            for(const auto &block : simulation.activeBlocks) {
-                if(block.source == name) activeLines.insert(block.line);
-            }
-            if(!simulation.activeBlocks.empty() && simulation.activeBlocks.back().source == name) {
-                currentLine = simulation.activeBlocks.back().line;
-            }
-            const auto completedSource = simulation.completedLineFlags.find(name);
+            const auto lineState = sourceLineExecutionState(simulation, name);
 
             ImGuiListClipper clipper;
             clipper.Begin(static_cast<int>(m_mainProgramLines.size()));
-            if(currentLine && *currentLine > 0 && *currentLine <= static_cast<int>(m_mainProgramLines.size())) {
-                clipper.IncludeItemByIndex(*currentLine - 1);
+            if(lineState.currentLine && *lineState.currentLine > 0
+               && *lineState.currentLine <= static_cast<int>(m_mainProgramLines.size())) {
+                clipper.IncludeItemByIndex(*lineState.currentLine - 1);
             }
             while(clipper.Step()) {
                 for(int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
                     const auto lineNumber = index + 1;
-                    const auto active = activeLines.contains(lineNumber);
-                    const auto completed = completedSource != simulation.completedLineFlags.end()
-                        && lineNumber < static_cast<int>(completedSource->second.size())
-                        && completedSource->second[lineNumber] != 0;
-                    const auto current = currentLine == lineNumber;
-                    const auto highlight = current
-                        ? ImVec4(0.75f, 0.55f, 0.08f, 0.75f)
-                        : active ? ImVec4(0.65f, 0.38f, 0.08f, 0.55f)
-                        : completed ? ImVec4(0.15f, 0.45f, 0.22f, 0.55f) : ImVec4(0, 0, 0, 0);
-                    ImGui::PushStyleColor(ImGuiCol_Header, highlight);
+                    const auto active = lineState.active(lineNumber);
+                    const auto completed = lineState.completed(lineNumber);
+                    ImGui::PushStyleColor(ImGuiCol_Header, lineState.highlight(lineNumber));
                     ImGui::Selectable(std::format("{:5}  {}", lineNumber, m_mainProgramLines[index]).c_str(),
                                       active || completed);
-                    if(current) ImGui::SetScrollHereY(0.5f);
+                    if(lineState.current(lineNumber)) ImGui::SetScrollHereY(0.5f);
                     ImGui::PopStyleColor();
                 }
             }
@@ -1627,15 +1645,7 @@ public:
     }
 
     void renderMdiTab(const ngc::SimulationSnapshot &simulation) {
-        std::unordered_set<int> activeLines;
-        std::optional<int> currentLine;
-        for(const auto &block : simulation.activeBlocks) {
-            if(block.source == MDI_SOURCE_NAME) activeLines.insert(block.line);
-        }
-        if(!simulation.activeBlocks.empty() && simulation.activeBlocks.back().source == MDI_SOURCE_NAME) {
-            currentLine = simulation.activeBlocks.back().line;
-        }
-        const auto completedSource = simulation.completedLineFlags.find(std::string(MDI_SOURCE_NAME));
+        const auto lineState = sourceLineExecutionState(simulation, MDI_SOURCE_NAME);
 
         const auto inputHeight = ImGui::GetFrameHeightWithSpacing();
         if(ImGui::BeginChild("##mdi_history", { 0.0f, -inputHeight }, ImGuiChildFlags_Borders)) {
@@ -1644,19 +1654,10 @@ public:
             while(clipper.Step()) {
                 for(int index = clipper.DisplayStart; index < clipper.DisplayEnd; ++index) {
                     const auto lineNumber = index + 1;
-                    const auto active = activeLines.contains(lineNumber);
-                    const auto completed = completedSource != simulation.completedLineFlags.end()
-                        && lineNumber < static_cast<int>(completedSource->second.size())
-                        && completedSource->second[lineNumber] != 0;
-                    const auto current = currentLine == lineNumber;
-                    const auto highlight = current
-                        ? ImVec4(0.75f, 0.55f, 0.08f, 0.75f)
-                        : active ? ImVec4(0.65f, 0.38f, 0.08f, 0.55f)
-                        : completed ? ImVec4(0.15f, 0.45f, 0.22f, 0.55f) : ImVec4(0, 0, 0, 0);
                     const auto label = std::format("{:5}  {}", index + 1, m_mdiHistory[index]);
-                    ImGui::PushStyleColor(ImGuiCol_Header, highlight);
+                    ImGui::PushStyleColor(ImGuiCol_Header, lineState.highlight(lineNumber));
                     if(ImGui::Selectable(label.c_str())) m_mdiInput = m_mdiHistory[index];
-                    if(current) ImGui::SetScrollHereY(0.5f);
+                    if(lineState.current(lineNumber)) ImGui::SetScrollHereY(0.5f);
                     ImGui::PopStyleColor();
                 }
             }

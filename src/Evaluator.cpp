@@ -468,6 +468,20 @@ namespace ngc {
             if(m_interrupt) m_interrupt();
         }
 
+        [[noreturn]] static void throwMemoryError(const Memory::Error error) {
+            switch(error) {
+                case Memory::Error::INVALID_DATA_ADDRESS:
+                    throw std::logic_error("INVALID_DATA_ADDRESS");
+                case Memory::Error::INVALID_STACK_ADDRESS:
+                    throw std::logic_error("INVALID_STACK_ADDRESS");
+                case Memory::Error::READ:
+                    throw std::logic_error("READ");
+                case Memory::Error::WRITE:
+                    throw std::logic_error("WRITE");
+            }
+            throw std::logic_error("unknown memory error");
+        }
+
         double eval(const RealExpression *expr, VisitorContext *ctx, const bool dereference = true) {
             if(dereference && expr->is<VariableExpression>()) synchronize();
             expr->accept(*this, ctx);
@@ -482,42 +496,19 @@ namespace ngc {
 
         bool isVolatile(const uint32_t addr) {
             const auto result = m_mem.isVolatile(addr);
-
-            if(!result) {
-                switch (result.error()) {
-                    case Memory::Error::INVALID_DATA_ADDRESS: throw std::logic_error("INVALID_DATA_ADDRESS");
-                    case Memory::Error::INVALID_STACK_ADDRESS: throw std::logic_error("INVALID_STACK_ADDRESS");
-                    case Memory::Error::READ: throw std::logic_error("READ");
-                    case Memory::Error::WRITE: throw std::logic_error("WRITE");
-                }
-            }
+            if(!result) throwMemoryError(result.error());
             return *result;
         }
 
         [[nodiscard]] double read(const uint32_t addr) {
             auto result = m_mem.read(addr);
-
-            if(!result) {
-                switch (result.error()) {
-                    case Memory::Error::INVALID_DATA_ADDRESS: throw std::logic_error("INVALID_DATA_ADDRESS");
-                    case Memory::Error::INVALID_STACK_ADDRESS: throw std::logic_error("INVALID_STACK_ADDRESS");
-                    case Memory::Error::READ: throw std::logic_error("READ");
-                    case Memory::Error::WRITE: throw std::logic_error("WRITE");
-                }
-            }
-
+            if(!result) throwMemoryError(result.error());
             return *result;
         }
 
         void write(const uint32_t addr, const double value) {
-            if(auto result = m_mem.write(addr, value); !result) {
-                switch (result.error()) {
-                case Memory::Error::INVALID_DATA_ADDRESS: throw std::logic_error("INVALID_DATA_ADDRESS");
-                case Memory::Error::INVALID_STACK_ADDRESS: throw std::logic_error("INVALID_STACK_ADDRESS");
-                case Memory::Error::READ: throw std::logic_error("READ");
-                case Memory::Error::WRITE: throw std::logic_error("WRITE");
-                }
-            }
+            if(auto result = m_mem.write(addr, value); !result)
+                throwMemoryError(result.error());
         }
 
         template<typename T>

@@ -342,6 +342,22 @@ namespace ngc {
                             derivative.knots, parameter, parameterSpan);
         }
 
+        position_t curvatureDerivativeFromParameterDerivatives(
+                const position_t &first, const position_t &second,
+                const position_t &third, const double speed) {
+            const auto firstSecond = dot(first, second);
+            const auto secondSquared = dot(second, second);
+            const auto firstThird = dot(first, third);
+            const auto inverseSpeed2 = 1.0 / (speed * speed);
+            const auto inverseSpeed4 = inverseSpeed2 * inverseSpeed2;
+            const auto inverseSpeed6 = inverseSpeed4 * inverseSpeed2;
+            const auto parameterDerivative = scaled(third, inverseSpeed2)
+                + scaled(second, -3.0 * firstSecond * inverseSpeed4)
+                + scaled(first, -(secondSquared + firstThird) * inverseSpeed4)
+                + scaled(first, 4.0 * firstSecond * firstSecond * inverseSpeed6);
+            return scaled(parameterDerivative, 1.0 / speed);
+        }
+
         PreparedGeometryBoundary splineBoundaryAtParameter(
                 const PreparedSplineCurve &spline, const double parameter,
                 const std::size_t parameterSpan) {
@@ -358,17 +374,8 @@ namespace ngc {
                 second - scaled(result.tangent, dot(second, result.tangent)),
                 1.0 / (speed * speed));
 
-            const auto firstSecond = dot(first, second);
-            const auto secondSquared = dot(second, second);
-            const auto firstThird = dot(first, third);
-            const auto inverseSpeed2 = 1.0 / (speed * speed);
-            const auto inverseSpeed4 = inverseSpeed2 * inverseSpeed2;
-            const auto inverseSpeed6 = inverseSpeed4 * inverseSpeed2;
-            const auto parameterDerivative = scaled(third, inverseSpeed2)
-                + scaled(second, -3.0 * firstSecond * inverseSpeed4)
-                + scaled(first, -(secondSquared + firstThird) * inverseSpeed4)
-                + scaled(first, 4.0 * firstSecond * firstSecond * inverseSpeed6);
-            result.curvatureDerivative = scaled(parameterDerivative, 1.0 / speed);
+            result.curvatureDerivative = curvatureDerivativeFromParameterDerivatives(
+                first, second, third, speed);
             return result;
         }
 
@@ -595,17 +602,8 @@ namespace ngc {
                 const auto third = derivativeAt(value, parameter, 3);
                 const auto speed = first.length();
                 if(speed <= 1e-15) return {};
-                const auto firstSecond = dot(first, second);
-                const auto secondSquared = dot(second, second);
-                const auto firstThird = dot(first, third);
-                const auto inverseSpeed2 = 1.0 / (speed * speed);
-                const auto inverseSpeed4 = inverseSpeed2 * inverseSpeed2;
-                const auto inverseSpeed6 = inverseSpeed4 * inverseSpeed2;
-                const auto parameterDerivative = scaled(third, inverseSpeed2)
-                    + scaled(second, -3.0 * firstSecond * inverseSpeed4)
-                    + scaled(first, -(secondSquared + firstThird) * inverseSpeed4)
-                    + scaled(first, 4.0 * firstSecond * firstSecond * inverseSpeed6);
-                return scaled(parameterDerivative, 1.0 / speed);
+                return curvatureDerivativeFromParameterDerivatives(
+                    first, second, third, speed);
             }
         }, curve.value);
     }

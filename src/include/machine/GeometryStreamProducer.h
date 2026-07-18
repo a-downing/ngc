@@ -134,6 +134,13 @@ namespace ngc {
             return true;
         }
 
+        bool failPreparation(std::string error) {
+            m_diagnostics.lastFailure = std::move(error);
+            publish(PreparedFailure{m_epoch, m_sequence++, m_diagnostics.lastFailure});
+            m_cancelled.store(true, std::memory_order_release);
+            return false;
+        }
+
         void tag(PreparedPathPiece &piece) {
             piece.id = m_nextPiece++;
         }
@@ -238,12 +245,7 @@ namespace ngc {
 
         bool prepareThroughLongAnchor(const PreparedCommandId nextAnchor) {
             auto prepared = prepareWindow(true);
-            if(!prepared) {
-                m_diagnostics.lastFailure = prepared.error();
-                publish(PreparedFailure{m_epoch, m_sequence++, prepared.error()});
-                m_cancelled.store(true, std::memory_order_release);
-                return false;
-            }
+            if(!prepared) return failPreparation(prepared.error());
 
             if(prepared->pieces.empty())
                 throw std::runtime_error("incremental geometry window produced no finalized pieces");
@@ -273,12 +275,7 @@ namespace ngc {
         bool flushContinuous() {
             if(!m_continuous.empty()) {
                 auto prepared = prepareWindow();
-                if(!prepared) {
-                    m_diagnostics.lastFailure = prepared.error();
-                    publish(PreparedFailure{m_epoch, m_sequence++, prepared.error()});
-                    m_cancelled.store(true, std::memory_order_release);
-                    return false;
-                }
+                if(!prepared) return failPreparation(prepared.error());
                 for(auto &piece : prepared->pieces)
                     appendPending(std::move(piece));
                 if(!publishPending()) return false;
@@ -382,12 +379,7 @@ namespace ngc {
                         m_diagnostics.retainedSourceHighWater, m_continuous.size());
                     if(m_unpreparedExactStopDuration >= m_policy.publishNominalDuration) {
                         auto prepared = prepareWindow();
-                        if(!prepared) {
-                            m_diagnostics.lastFailure = prepared.error();
-                            publish(PreparedFailure{m_epoch, m_sequence++, prepared.error()});
-                            m_cancelled.store(true, std::memory_order_release);
-                            return false;
-                        }
+                        if(!prepared) return failPreparation(prepared.error());
                         for(auto &piece : prepared->pieces)
                             appendPending(std::move(piece));
                         if(!publishPending()) return false;

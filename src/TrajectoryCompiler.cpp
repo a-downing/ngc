@@ -566,31 +566,6 @@ namespace ngc {
             return result;
         }
 
-        double maximumAxisVelocity(const AxisPolynomialSpan &span, const double position_t::*component) {
-            const auto at = [&](const double u) {
-                return std::abs((3.0*span.a.*component*u*u + 2.0*span.b.*component*u
-                    + span.c.*component) * span.inverseDuration);
-            };
-            auto result = std::max(at(0.0), at(1.0));
-            if(std::abs(span.a.*component) > 1e-15) {
-                const auto stationary = -(span.b.*component) / (3.0*(span.a.*component));
-                if(stationary > 0.0 && stationary < 1.0) result = std::max(result, at(stationary));
-            }
-            return result;
-        }
-
-        double maximumAxisAcceleration(const AxisPolynomialSpan &span, const double position_t::*component) {
-            const auto at = [&](const double u) {
-                return std::abs((6.0*span.a.*component*u + 2.0*span.b.*component)
-                    * span.inverseDurationSquared);
-            };
-            return std::max(at(0.0), at(1.0));
-        }
-
-        double maximumAxisJerk(const AxisPolynomialSpan &span, const double position_t::*component) {
-            return std::abs(6.0*span.a.*component * span.inverseDurationCubed);
-        }
-
         std::expected<TimeLaw, std::string> solveTimeLawBetween(TimeLawWorkspace &workspace,
                 const double length,const double fromVelocity,const double fromAcceleration,
                 const double toVelocity,const double toAcceleration,
@@ -990,11 +965,14 @@ namespace ngc {
                 maximumJerk = std::max(maximumJerk, maximumLinearJerk(span));
                 for(const auto component : AXIS_COMPONENTS) {
                     axisScaleFactor = std::max(axisScaleFactor,
-                        maximumAxisVelocity(span, component) / (m_limits.axisVelocity.*component));
+                        trajectory_detail::maximumAxisVelocity(span, component)
+                            / (m_limits.axisVelocity.*component));
                     axisScaleFactor = std::max(axisScaleFactor, std::sqrt(
-                        maximumAxisAcceleration(span, component) / (m_limits.axisAcceleration.*component)));
+                        trajectory_detail::maximumAxisAcceleration(span, component)
+                            / (m_limits.axisAcceleration.*component)));
                     axisScaleFactor = std::max(axisScaleFactor, std::cbrt(
-                        maximumAxisJerk(span, component) / (m_limits.axisJerk.*component)));
+                        trajectory_detail::maximumAxisJerk(span, component)
+                            / (m_limits.axisJerk.*component)));
                 }
             }
             const auto scaleFactor = std::max({1.0, axisScaleFactor,
@@ -2479,14 +2457,14 @@ namespace ngc {
                     "path_jerk","path",pathJerk,m_limits.pathJerk);
                 for(std::size_t axis=0;axis<AXIS_COMPONENTS.size();++axis) {
                     const auto component=AXIS_COMPONENTS[axis];
-                    const auto velocity=maximumAxisVelocity(span,component);
+                    const auto velocity=trajectory_detail::maximumAxisVelocity(span,component);
                     consider(velocity/(m_limits.axisVelocity.*component),"axis_velocity",
                         AXIS_NAMES[axis],velocity,m_limits.axisVelocity.*component);
-                    const auto acceleration=maximumAxisAcceleration(span,component);
+                    const auto acceleration=trajectory_detail::maximumAxisAcceleration(span,component);
                     consider(std::sqrt(acceleration/(m_limits.axisAcceleration.*component)),
                         "axis_acceleration",AXIS_NAMES[axis],acceleration,
                         m_limits.axisAcceleration.*component);
-                    const auto jerk=maximumAxisJerk(span,component);
+                    const auto jerk=trajectory_detail::maximumAxisJerk(span,component);
                     consider(std::cbrt(jerk/(m_limits.axisJerk.*component)),"axis_jerk",
                         AXIS_NAMES[axis],jerk,m_limits.axisJerk.*component);
                 }

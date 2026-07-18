@@ -367,34 +367,6 @@ namespace ngc {
                 m_diagnostics.maximumWindowCommands,m_window.size());
         }
 
-        static double maximumAxisVelocity(const AxisPolynomialSpan &span,
-                                          const double position_t::*component) {
-            const auto at = [&](const double u) {
-                return std::abs((3.0*span.a.*component*u*u + 2.0*span.b.*component*u
-                    + span.c.*component) * span.inverseDuration);
-            };
-            auto result = std::max(at(0.0), at(1.0));
-            if(std::abs(span.a.*component) > 1e-15) {
-                const auto stationary = -(span.b.*component) / (3.0*(span.a.*component));
-                if(stationary > 0.0 && stationary < 1.0) result = std::max(result, at(stationary));
-            }
-            return result;
-        }
-
-        static double maximumAxisAcceleration(const AxisPolynomialSpan &span,
-                                              const double position_t::*component) {
-            const auto at = [&](const double u) {
-                return std::abs((6.0*span.a.*component*u + 2.0*span.b.*component)
-                    * span.inverseDurationSquared);
-            };
-            return std::max(at(0.0), at(1.0));
-        }
-
-        static double maximumAxisJerk(const AxisPolynomialSpan &span,
-                                      const double position_t::*component) {
-            return std::abs(6.0*span.a.*component * span.inverseDurationCubed);
-        }
-
         static bool exceeds(const double value, const double limit) {
             return value > limit*(1.0 + 1e-9) + 1e-9;
         }
@@ -430,9 +402,12 @@ namespace ngc {
                    || discontinuity(start.acceleration, previous.acceleration))
                     return std::unexpected("planned stop branch is discontinuous at a span boundary");
                 for(const auto component : AXIS_COMPONENTS) {
-                    if(exceeds(maximumAxisVelocity(span, component), limits.axisVelocity.*component)
-                       || exceeds(maximumAxisAcceleration(span, component), limits.axisAcceleration.*component)
-                       || exceeds(maximumAxisJerk(span, component), limits.axisJerk.*component))
+                    if(exceeds(trajectory_detail::maximumAxisVelocity(span, component),
+                               limits.axisVelocity.*component)
+                       || exceeds(trajectory_detail::maximumAxisAcceleration(span, component),
+                                  limits.axisAcceleration.*component)
+                       || exceeds(trajectory_detail::maximumAxisJerk(span, component),
+                                  limits.axisJerk.*component))
                         return std::unexpected("planned stop branch exceeds a configured axis limit");
                 }
                 const auto acceleration0 = start.acceleration.length();
@@ -487,9 +462,12 @@ namespace ngc {
                     }
                 }
                 for(const auto component:AXIS_COMPONENTS) {
-                    if(exceeds(maximumAxisVelocity(span,component),limits.axisVelocity.*component)
-                       ||exceeds(maximumAxisAcceleration(span,component),limits.axisAcceleration.*component)
-                       ||exceeds(maximumAxisJerk(span,component),limits.axisJerk.*component))
+                    if(exceeds(trajectory_detail::maximumAxisVelocity(span,component),
+                               limits.axisVelocity.*component)
+                       ||exceeds(trajectory_detail::maximumAxisAcceleration(span,component),
+                                 limits.axisAcceleration.*component)
+                       ||exceeds(trajectory_detail::maximumAxisJerk(span,component),
+                                 limits.axisJerk.*component))
                         return std::unexpected("continuous plan exceeds a configured axis limit");
                 }
                 const auto acceleration0=start.acceleration.length();

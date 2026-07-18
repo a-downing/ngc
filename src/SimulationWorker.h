@@ -534,6 +534,21 @@ private:
         return true;
     }
 
+    void advanceServiceMotionPeriod() {
+        const auto multiplier = m_executorTickMultiplier.load(std::memory_order_relaxed);
+        const auto ticks = static_cast<std::uint64_t>(m_servoTicksPerSchedulerPeriod) * multiplier;
+        for(std::uint64_t tick = 0; tick < ticks; ++tick)
+            m_backend.advanceTick(m_servoPeriod, tick + 1 == ticks);
+
+        ngc::ExecutionSnapshot backendSnapshot;
+        while(m_backend.tryTakeSnapshot(backendSnapshot)) {
+            std::scoped_lock lock(m_mutex);
+            applyHomingBackendSnapshot(backendSnapshot);
+        }
+        std::scoped_lock lock(m_mutex);
+        m_snapshot.servoTicks += ticks;
+    }
+
     std::optional<ngc::TriggeredJointMoveCompleted> executeHomingMove(
         const ngc::TriggeredJointMove &move,
         const std::vector<std::pair<ngc::JointId, double>> &transitions,
@@ -548,20 +563,7 @@ private:
 
         for(std::size_t guard = 0; guard < 10000000; ++guard) {
             if(!homingMayContinue()) return std::nullopt;
-            const auto multiplier = m_executorTickMultiplier.load(std::memory_order_relaxed);
-            const auto ticks = static_cast<std::uint64_t>(m_servoTicksPerSchedulerPeriod) * multiplier;
-            for(std::uint64_t tick = 0; tick < ticks; ++tick)
-                m_backend.advanceTick(m_servoPeriod, tick + 1 == ticks);
-
-            ngc::ExecutionSnapshot backendSnapshot;
-            while(m_backend.tryTakeSnapshot(backendSnapshot)) {
-                std::scoped_lock lock(m_mutex);
-                applyHomingBackendSnapshot(backendSnapshot);
-            }
-            {
-                std::scoped_lock lock(m_mutex);
-                m_snapshot.servoTicks += ticks;
-            }
+            advanceServiceMotionPeriod();
             ngc::ExecutionEvent event;
             while(m_backend.tryTakeEvent(event)) {
                 if(const auto *completed = std::get_if<ngc::TriggeredJointMoveCompleted>(&event))
@@ -816,20 +818,7 @@ private:
                 }
             }
 
-            const auto multiplier = m_executorTickMultiplier.load(std::memory_order_relaxed);
-            const auto ticks = static_cast<std::uint64_t>(m_servoTicksPerSchedulerPeriod) * multiplier;
-            for(std::uint64_t tick = 0; tick < ticks; ++tick)
-                m_backend.advanceTick(m_servoPeriod, tick + 1 == ticks);
-
-            ngc::ExecutionSnapshot backendSnapshot;
-            while(m_backend.tryTakeSnapshot(backendSnapshot)) {
-                std::scoped_lock lock(m_mutex);
-                applyHomingBackendSnapshot(backendSnapshot);
-            }
-            {
-                std::scoped_lock lock(m_mutex);
-                m_snapshot.servoTicks += ticks;
-            }
+            advanceServiceMotionPeriod();
 
             ngc::ExecutionEvent event;
             while(m_backend.tryTakeEvent(event)) {
