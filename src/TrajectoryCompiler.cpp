@@ -2237,13 +2237,38 @@ namespace ngc {
                 if(solveInfo.simplex_iteration_count>0)
                     result->scpSimplexIterations+=
                         static_cast<std::size_t>(solveInfo.simplex_iteration_count);
-                if(solveStatus!=HighsStatus::kOk
-                   ||highs.getModelStatus()!=HighsModelStatus::kOptimal) {
+                const auto modelStatus=highs.getModelStatus();
+                auto solveClassification=trajectory_detail::ScpSolveClassification::Failure;
+                if(solveStatus!=HighsStatus::kError) {
+                    if(modelStatus==HighsModelStatus::kOptimal
+                       &&solveStatus==HighsStatus::kOk)
+                        solveClassification=trajectory_detail::ScpSolveClassification::Optimal;
+                    else if(modelStatus==HighsModelStatus::kTimeLimit)
+                        solveClassification=trajectory_detail::ScpSolveClassification::TimeLimit;
+                    else if(modelStatus==HighsModelStatus::kIterationLimit)
+                        solveClassification=
+                            trajectory_detail::ScpSolveClassification::IterationLimit;
+                }
+                const auto solveAction=trajectory_detail::scpSolveAction(solveClassification);
+                if(solveAction==trajectory_detail::ScpSolveAction::RetainReference) {
+                    auto &fallback=result->scpResourceFallback;
+                    if(fallback.occurrences==0) {
+                        fallback.reason=solveClassification
+                                ==trajectory_detail::ScpSolveClassification::TimeLimit
+                            ?ScpResourceFallbackReason::TimeLimit
+                            :ScpResourceFallbackReason::IterationLimit;
+                        fallback.correctionPass=correctionPass;
+                        fallback.scpIteration=scpIteration;
+                    }
+                    ++fallback.occurrences;
+                    break;
+                }
+                if(solveAction==trajectory_detail::ScpSolveAction::Fail) {
                     return std::unexpected(std::format(
                         "continuous SCP HiGHS solve failed on correction pass {} iteration {}: {} "
                         "pieces={} start=[v={} a={}] end=[v={} a={}]",
                         correctionPass,scpIteration,
-                        highs.modelStatusToString(highs.getModelStatus()),pieces.size(),
+                        highs.modelStatusToString(modelStatus),pieces.size(),
                         scalarStart->first,scalarStart->second,
                         scalarEnd->first,scalarEnd->second));
                 }

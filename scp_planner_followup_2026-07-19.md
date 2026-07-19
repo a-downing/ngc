@@ -105,7 +105,7 @@ Ruckig solver calls from 445 to 417, and winning-candidate materializations from
 
 ### 2. Make expected HiGHS resource exhaustion nonfatal
 
-Status: pending
+Status: completed
 
 When an SCP solve reaches its time or simplex-iteration limit, stop the SCP
 improvement loop and retain the current feasible, exactly materialized station
@@ -115,6 +115,14 @@ Do not use a partial HiGHS primal solution.
 Keep configuration errors, model-passing errors, reference-containment failures,
 infeasible or unbounded models, missing primal values after an allegedly optimal
 solve, and other solver failures fatal.
+
+Implementation: HiGHS `kTimeLimit` and `kIterationLimit` model statuses now stop
+the current SCP improvement loop before `getSolution()` and retain the feasible,
+exactly materialized reference. Every other non-optimal or failed solve still
+uses the fatal error path. `ContinuousTrajectoryPlan::scpResourceFallback` is a
+fixed-size NRT diagnostic containing the first fallback reason, correction pass,
+SCP iteration, and the total number of fallback occurrences. The continuous-plan
+summary exposes those fields.
 
 Required regression evidence:
 
@@ -130,6 +138,16 @@ Testing qualification: a tiny wall-clock limit is not deterministic, and
 iterations rather than one iteration. Use a proven fixture that reliably reaches
 the selected resource status, or add a narrow test seam for the status-policy
 branch; do not accept a timing-dependent regression.
+
+Regression evidence: the existing cluster-spline timing fixture, with a
+`1e-12`-second solve limit, reliably returns HiGHS `kTimeLimit` on correction pass
+0, SCP iteration 0. Compilation succeeds with a time-limit diagnostic, zero
+accepted SCP steps, nonzero geometry-verification work, populated normal
+execution spans, and populated stop tails. This proves that no partial HiGHS
+primal is consumed and that the retained reference still passes the ordinary
+exact gates. Compile-time policy assertions cover optimal acceptance, time- and
+iteration-limit fallback, and fatal handling of every other classification. A
+zero solve-time configuration remains a fatal bounded-effort error.
 
 ### 3. Reduce SCP trial materialization cost
 

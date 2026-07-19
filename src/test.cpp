@@ -2322,6 +2322,16 @@ namespace {
     void testClusterSplinePreparesKnotIntervalSamplesAndFeeds() {
         static_assert(ngc::spline_detail::continuousSplineFitSolver()
             ==ngc::spline_detail::SplineFitSolver::VelocityTargetedBandedFairness);
+        using ngc::trajectory_detail::ScpSolveAction;
+        using ngc::trajectory_detail::ScpSolveClassification;
+        static_assert(ngc::trajectory_detail::scpSolveAction(ScpSolveClassification::Optimal)
+            ==ScpSolveAction::AcceptOptimal);
+        static_assert(ngc::trajectory_detail::scpSolveAction(ScpSolveClassification::TimeLimit)
+            ==ScpSolveAction::RetainReference);
+        static_assert(ngc::trajectory_detail::scpSolveAction(
+            ScpSolveClassification::IterationLimit)==ScpSolveAction::RetainReference);
+        static_assert(ngc::trajectory_detail::scpSolveAction(ScpSolveClassification::Failure)
+            ==ScpSolveAction::Fail);
         const auto lineRecord=[](const ngc::PreparedCommandId id,
                                  const ngc::position_t &from,
                                  const ngc::position_t &to,const double feed) {
@@ -2592,6 +2602,40 @@ namespace {
                         expectedTimingIntervals[interval].second,
                         "continuous timing interval should use its prepared programmed feed");
         }
+
+        ngc::TrajectoryCompiler limitedCompiler(trajectoryLimits);
+        auto limitedEffort=replayEffort;
+        // This fixture performs enough model setup before HiGHS checks its clock
+        // that the minimum practical positive limit reliably selects kTimeLimit.
+        limitedEffort.scpSolveTimeLimit=1e-12;
+        limitedCompiler.setContinuousPlanningEffort(limitedEffort);
+        limitedCompiler.reset(96,points.front());
+        const auto limitedPlan=limitedCompiler.compileContinuous(*prepared,0.05);
+        require(limitedPlan&&*limitedPlan,limitedPlan?"":limitedPlan.error());
+        const auto &fallback=(*limitedPlan)->scpResourceFallback;
+        require(fallback.reason==ngc::ScpResourceFallbackReason::TimeLimit
+                    &&fallback.occurrences>0&&fallback.correctionPass==0
+                    &&fallback.scpIteration==0,
+                "a bounded HiGHS time limit should retain the feasible SCP reference");
+        require((*limitedPlan)->scpAcceptedSteps==0,
+                "resource fallback must not consume a partial HiGHS primal solution");
+        require((*limitedPlan)->geometryVerificationAttempts>0
+                    &&!(*limitedPlan)->chunks.empty()
+                    &&std::ranges::all_of((*limitedPlan)->chunks,[](const auto &chunk) {
+                        return chunk.normalMotion.size>0&&chunk.stopTail.size>0;
+                    }),
+                "the retained SCP reference must pass normal verification and stop-tail gates");
+
+        ngc::TrajectoryCompiler invalidEffortCompiler(trajectoryLimits);
+        auto invalidEffort=limitedEffort;
+        invalidEffort.scpSolveTimeLimit=0.0;
+        invalidEffortCompiler.setContinuousPlanningEffort(invalidEffort);
+        invalidEffortCompiler.reset(97,points.front());
+        const auto invalidEffortPlan=invalidEffortCompiler.compileContinuous(*prepared,0.05);
+        require(!invalidEffortPlan
+                    &&invalidEffortPlan.error().contains(
+                        "continuous planning effort is outside its bounded range"),
+                "SCP configuration errors must remain fatal rather than selecting fallback");
 
         auto missingSamples=*prepared;
         const auto missingCluster=std::ranges::find_if(

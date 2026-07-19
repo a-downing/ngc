@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdint>
 #include <expected>
 #include <functional>
 #include <limits>
@@ -9,6 +10,7 @@
 #include <optional>
 #include <span>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "machine/MotionBackend.h"
@@ -17,7 +19,46 @@
 #include "machine/PreparedGeometry.h"
 
 namespace ngc {
+    enum class ScpResourceFallbackReason : std::uint8_t {
+        None,
+        TimeLimit,
+        IterationLimit,
+    };
+
+    inline std::string_view name(const ScpResourceFallbackReason reason) {
+        switch(reason) {
+            case ScpResourceFallbackReason::None: return "none";
+            case ScpResourceFallbackReason::TimeLimit: return "time-limit";
+            case ScpResourceFallbackReason::IterationLimit: return "iteration-limit";
+        }
+        return "unknown";
+    }
+
     namespace trajectory_detail {
+        enum class ScpSolveClassification : std::uint8_t {
+            Optimal,
+            TimeLimit,
+            IterationLimit,
+            Failure,
+        };
+
+        enum class ScpSolveAction : std::uint8_t {
+            AcceptOptimal,
+            RetainReference,
+            Fail,
+        };
+
+        constexpr ScpSolveAction scpSolveAction(const ScpSolveClassification classification) {
+            switch(classification) {
+                case ScpSolveClassification::Optimal: return ScpSolveAction::AcceptOptimal;
+                case ScpSolveClassification::TimeLimit:
+                case ScpSolveClassification::IterationLimit:
+                    return ScpSolveAction::RetainReference;
+                case ScpSolveClassification::Failure: return ScpSolveAction::Fail;
+            }
+            return ScpSolveAction::Fail;
+        }
+
         inline double maximumAxisVelocity(const AxisPolynomialSpan &span,
                                           const double position_t::*component) {
             const auto at = [&](const double u) {
@@ -285,6 +326,14 @@ namespace ngc {
         std::size_t scpAcceptedSteps = 0;
         std::size_t scpMaterializationAttempts = 0;
         double scpSeconds = 0.0;
+        // Bounded NRT evidence for the first expected solver-resource fallback
+        // in this plan. occurrences includes later correction-pass fallbacks.
+        struct ResourceFallbackDiagnostic {
+            ScpResourceFallbackReason reason = ScpResourceFallbackReason::None;
+            unsigned correctionPass = 0;
+            unsigned scpIteration = 0;
+            std::size_t occurrences = 0;
+        } scpResourceFallback;
         bool accelerationAwareRescue = false;
         TimeLawDiagnostics timeLaw;
     };
