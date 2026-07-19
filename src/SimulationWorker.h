@@ -1118,8 +1118,6 @@ private:
                         completeBlock(block);
                     }
                     m_deferredCompletedBlocks.clear();
-                    m_snapshot.status = ngc::SimulationStatus::Completed;
-                    m_running = false;
                 }
                 if(state != ngc::PreparedDriverState::Running || !m_running) {
                     stopExecutor.store(true, std::memory_order_release);
@@ -1138,6 +1136,10 @@ private:
                         const auto tool = m_session.machine().toolGeometry();
                         m_snapshot.toolPosition = m_snapshot.machinePosition - tool.offset;
                         m_snapshot.toolPose = { tool, m_snapshot.machinePosition, m_snapshot.toolPosition };
+                        if(state == ngc::PreparedDriverState::Completed) {
+                            m_running = false;
+                            m_snapshot.status = ngc::SimulationStatus::Completed;
+                        }
                     }
                     break;
                 }
