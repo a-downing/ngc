@@ -976,7 +976,8 @@ namespace ngc {
                     }
                 }
                 std::size_t splineDegree = 3;
-                if(controls.size() > 6) {
+                if(controls.size() > 6
+                   && effort.splineFitSolver != spline_detail::SplineFitSolver::None) {
                     // The shared solver is intentionally selected here, just as
                     // it is for timed cluster preparation. Velocity-targeted
                     // fitting receives the same typed machine limits in Preview

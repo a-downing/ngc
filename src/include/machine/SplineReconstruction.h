@@ -12,7 +12,7 @@
 
 namespace ngc::spline_detail {
     enum class SplineFitSolver {
-        CubicBaseline,
+        None,
         CoordinateSearch,
         UniformBandedFairness,
         PeakTargetedBandedFairness,

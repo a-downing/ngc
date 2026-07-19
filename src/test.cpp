@@ -2333,6 +2333,28 @@ namespace {
                 "prepared samples must retain the tangential curvature-squared jerk component");
     }
 
+    void testNoneSplineSmoothingPreservesCubicControls() {
+        const std::vector<ngc::position_t> controls{
+            {0.0,0.0,0.0,0.0,0.0,0.0},
+            {0.1,0.2,0.0,0.0,0.0,0.0},
+            {0.2,0.3,0.0,0.0,0.0,0.0},
+            {0.3,0.4,0.0,0.0,0.0,0.0},
+            {0.4,0.3,0.0,0.0,0.0,0.0},
+            {0.5,0.2,0.0,0.0,0.0,0.0},
+            {0.6,0.0,0.0,0.0,0.0,0.0},
+        };
+        const auto reconstructed=ngc::spline_detail::reconstructSpline(controls,
+            ngc::spline_detail::SplineReconstructionSource{},0.01,true,
+            ngc::spline_detail::SplineFitSolver::None);
+        require(reconstructed.has_value(),
+            reconstructed?"":reconstructed.error());
+        require(reconstructed->degree==3&&reconstructed->controls.size()==controls.size(),
+            "none spline smoothing must retain the input cubic representation");
+        for(std::size_t index=0;index<controls.size();++index)
+            require((reconstructed->controls[index]-controls[index]).length()==0.0,
+                "none spline smoothing must preserve every cubic control exactly");
+    }
+
     void testClusterSplinePreparesKnotIntervalSamplesAndFeeds() {
         static_assert(ngc::spline_detail::continuousSplineFitSolver()
             ==ngc::spline_detail::SplineFitSolver::VelocityTargetedBandedFairness);
@@ -2431,6 +2453,19 @@ namespace {
         const auto *spline=std::get_if<ngc::PreparedSplineCurve>(&found->curve->value);
         require(spline&&spline->degree==5,
                 "the focused cluster sampling case should use quintic reconstruction");
+        auto noneEffort=effort;
+        noneEffort.splineFitSolver=ngc::spline_detail::SplineFitSolver::None;
+        const auto unsmoothed=ngc::prepareContinuousGeometry(
+            records,0.05,points.front(),noneEffort);
+        require(unsmoothed.has_value(),unsmoothed?"":unsmoothed.error());
+        const auto unsmoothedCluster=std::ranges::find_if(
+            unsmoothed->pieces,[](const auto &piece) {
+                return piece.kind==ngc::PreparedPieceKind::ClusterSpline;
+            });
+        const auto *unsmoothedSpline=unsmoothedCluster==unsmoothed->pieces.end()
+            ?nullptr:std::get_if<ngc::PreparedSplineCurve>(&unsmoothedCluster->curve->value);
+        require(unsmoothedSpline&&unsmoothedSpline->degree==3,
+            "none smoothing must preserve the cluster's unsmoothed cubic construction");
         const auto intervalCount=spline->controls.size()-spline->degree;
         require(found->clusterKnotIntervals.size()==intervalCount,
                 "cluster preparation should retain one metadata record per knot interval");
@@ -3558,6 +3593,7 @@ int main() {
         testInfiniteJerkTrajectoryTimeMatchesAnalyticLine();
         testExactStopPlannerEnforcesIndependentAxisLimits();
         testPreparedArcJunctionMatchesSourceCurvature();
+        testNoneSplineSmoothingPreservesCubicControls();
         testClusterSplinePreparesKnotIntervalSamplesAndFeeds();
         testCollinearJunctionBlendUsesLinearTiming();
         testShortLineMidpointCurvatureInference();

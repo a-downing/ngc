@@ -45,7 +45,7 @@ namespace {
     const char *smootherName(const ngc::spline_detail::SplineFitSolver solver) {
         using ngc::spline_detail::SplineFitSolver;
         switch(solver) {
-            case SplineFitSolver::CubicBaseline: return "cubic";
+            case SplineFitSolver::None: return "none";
             case SplineFitSolver::CoordinateSearch: return "coordinate";
             case SplineFitSolver::UniformBandedFairness: return "uniform";
             case SplineFitSolver::PeakTargetedBandedFairness: return "peak-targeted";
@@ -61,13 +61,15 @@ namespace {
             return std::unexpected("smoother option must use --smoother=<name>");
         argument.remove_prefix(prefix.size());
         using ngc::spline_detail::SplineFitSolver;
+        if(argument=="none") return SplineFitSolver::None;
         if(argument=="coordinate") return SplineFitSolver::CoordinateSearch;
         if(argument=="uniform") return SplineFitSolver::UniformBandedFairness;
         if(argument=="peak-targeted") return SplineFitSolver::PeakTargetedBandedFairness;
         if(argument=="velocity-targeted")
             return SplineFitSolver::VelocityTargetedBandedFairness;
         return std::unexpected(
-            "unknown smoother; expected coordinate, uniform, peak-targeted, or velocity-targeted");
+            "unknown smoother; expected none, coordinate, uniform, peak-targeted, or "
+            "velocity-targeted");
     }
 }
 
@@ -75,7 +77,7 @@ int main(const int argc,char **argv) {
     if(argc>7) {
         std::println(stderr,"usage: ngc_simulation_diagnostic [program.ngc] "
             "[maximum-program-seconds] [tick-multiplier] "
-            "[--smoother=coordinate|uniform|peak-targeted|velocity-targeted] "
+            "[--smoother=none|coordinate|uniform|peak-targeted|velocity-targeted] "
             "[--scp-reachability-rows=on|off] [--scp-basis-reuse=on|off]");
         return 2;
     }

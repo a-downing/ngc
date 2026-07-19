@@ -630,7 +630,7 @@ namespace ngc {
             const SplineReconstructionSource &source,const double programmedScale,
             const bool certifyTube,const SplineFitSolver solver) {
         if(cubicControls.size()<=6
-           ||solver==SplineFitSolver::CubicBaseline)
+           ||solver==SplineFitSolver::None)
             return ReconstructedSpline{
                 .degree=3,
                 .controls={cubicControls.begin(),cubicControls.end()},
