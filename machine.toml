@@ -5,9 +5,9 @@ coordinates = ["x", "y", "z"]
 
 [trajectory]
 # machine-units / second^2
-path_acceleration = 20.0
+path_acceleration = 25.1
 # machine-units / second^3
-path_jerk = 501
+path_jerk = 101
 # machine-units / second
 rapid_velocity = 3.33
 # machine-units
@@ -36,24 +36,24 @@ joints = [0]
 minimum = -14.0
 maximum = 13.75
 max_velocity = 3.33333333333
-max_acceleration = 20
-max_jerk = 501
+max_acceleration = 5.1
+max_jerk = 101
 
 [axes.y]
 joints = [1, 2]
 minimum = 0
 maximum = 33.25
 max_velocity = 3.33333333333
-max_acceleration = 20
-max_jerk = 501
+max_acceleration = 5.1
+max_jerk = 101
 
 [axes.z]
 joints = [3]
 minimum = -8.5
 maximum = 0.001
 max_velocity = 3.33333333333
-max_acceleration = 20
-max_jerk = 501
+max_acceleration = 5.1
+max_jerk = 101
 
 # Stable logical input IDs. A future physical backend will map these names and
 # IDs to hardware; simulation supplies mock transitions without hardware data.
@@ -75,8 +75,8 @@ coordinate_scale = 1.0
 minimum = -14.0
 maximum = 13.75
 max_velocity = 3.33333333333
-max_acceleration = 20
-max_jerk = 501
+max_acceleration = 5.1
+max_jerk = 101
 
 [joints.homing]
 input = "shared_home"
@@ -98,8 +98,8 @@ coordinate_scale = 1.0
 minimum = -0.1
 maximum = 33.25
 max_velocity = 3.33333333333
-max_acceleration = 20.0
-max_jerk = 501
+max_acceleration = 25.1
+max_jerk = 101
 
 [joints.homing]
 input = "shared_home"
@@ -121,8 +121,8 @@ coordinate_scale = 1.0
 minimum = -0.1
 maximum = 33.25
 max_velocity = 3.33333333333
-max_acceleration = 20.0
-max_jerk = 501
+max_acceleration = 25.1
+max_jerk = 101
 
 [joints.homing]
 input = "y2_home"
@@ -144,8 +144,8 @@ coordinate_scale = 1.0
 minimum = -8.5
 maximum = 0.001
 max_velocity = 3.33333333333
-max_acceleration = 20.0
-max_jerk = 501
+max_acceleration = 25.1
+max_jerk = 101
 
 [joints.homing]
 input = "shared_home"
