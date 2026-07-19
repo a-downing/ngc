@@ -197,15 +197,16 @@ namespace ngc {
         double maximumDurationChange = 0.0;
     };
 
-    // NRT-only shadow evidence for replaying an acceleration-aware station
-    // visit on the following correction pass. Shadow matches still execute the
-    // visit and compare its complete output, so these counters do not affect
-    // trajectory selection or resource-budget authority.
+    // NRT-only evidence for replaying an acceleration-aware station visit on
+    // the following correction pass. With replay disabled, matching visits
+    // still execute and compare their complete output to measure potential
+    // savings without affecting trajectory selection or resource authority.
     struct StationVisitReplayDiagnostics {
         std::size_t activeVisits = 0;
         std::size_t comparableVisits = 0;
         std::size_t exactInputMatches = 0;
         std::size_t exactOutputMatches = 0;
+        std::size_t replayedVisits = 0;
         std::size_t outputMismatches = 0;
         std::size_t potentialCandidateEvaluations = 0;
         std::size_t potentialEndpointChecks = 0;
@@ -221,6 +222,7 @@ namespace ngc {
             comparableVisits+=other.comparableVisits;
             exactInputMatches+=other.exactInputMatches;
             exactOutputMatches+=other.exactOutputMatches;
+            replayedVisits+=other.replayedVisits;
             outputMismatches+=other.outputMismatches;
             potentialCandidateEvaluations+=other.potentialCandidateEvaluations;
             potentialEndpointChecks+=other.potentialEndpointChecks;

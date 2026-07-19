@@ -1,4 +1,5 @@
 #include <array>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <exception>
@@ -2422,17 +2423,152 @@ namespace {
                 expectedTimingIntervals.emplace_back(piece.length(),piece.programmedFeed);
             }
         }
-        ngc::TrajectoryCompiler compiler({
+        const ngc::TrajectoryLimits trajectoryLimits{
             .pathAcceleration=20.0,.rapidSpeed=199.8,.arcChordTolerance=0.0001,
             .pathJerk=501.0,
             .axisVelocity={3.333333333,3.333333333,3.333333333,
                            3.333333333,3.333333333,3.333333333},
             .axisAcceleration={20,20,20,20,20,20},
             .axisJerk={501,501,501,501,501,501},
-        });
+        };
+        ngc::TrajectoryCompiler compiler(trajectoryLimits);
+        auto replayEffort=compiler.continuousPlanningEffort();
+        replayEffort.shareTimeLawCacheAcrossCompilations=false;
+        compiler.setContinuousPlanningEffort(replayEffort);
         compiler.reset(94,points.front());
         const auto planned=compiler.compileContinuous(*prepared,0.05);
         require(planned&&*planned,planned?"":planned.error());
+        ngc::TrajectoryCompiler shadowCompiler(trajectoryLimits);
+        auto shadowEffort=replayEffort;
+        shadowEffort.enableStationVisitReplay=false;
+        shadowEffort.measureStationVisitReplay=true;
+        shadowCompiler.setContinuousPlanningEffort(shadowEffort);
+        shadowCompiler.reset(94,points.front());
+        const auto shadowPlanned=shadowCompiler.compileContinuous(*prepared,0.05);
+        require(shadowPlanned&&*shadowPlanned,
+            shadowPlanned?"":shadowPlanned.error());
+        const auto replayCalls=ngc::totalTimeLawCalls((*planned)->timeLaw);
+        const auto shadowCalls=ngc::totalTimeLawCalls((*shadowPlanned)->timeLaw);
+        const auto &replayDiagnostics=(*planned)->timeLaw.stationVisitReplay;
+        const auto &shadowDiagnostics=(*shadowPlanned)->timeLaw.stationVisitReplay;
+        require((*planned)->accelerationAwareRescue
+                    &&(*planned)->correctionHistory.contains("pass 2:"),
+                "station-visit replay regression should exercise at least two rescue passes");
+        require(replayDiagnostics.comparableVisits>0
+                    &&replayDiagnostics.exactInputMatches>0
+                    &&replayDiagnostics.replayedVisits>0
+                    &&replayDiagnostics.replayedVisits
+                        ==replayDiagnostics.exactOutputMatches,
+                "a later rescue pass should find and replay an exact station visit");
+        require(shadowDiagnostics.replayedVisits==0
+                    &&shadowDiagnostics.exactInputMatches>0
+                    &&shadowDiagnostics.exactOutputMatches>0
+                    &&shadowDiagnostics.outputMismatches==0,
+                "replay-disabled shadow execution should confirm the cached visit output");
+        require(replayCalls.calls<shadowCalls.calls
+                    &&replayCalls.solverCalls<shadowCalls.solverCalls
+                    &&replayCalls.cacheMaterializations<shadowCalls.cacheMaterializations,
+                "an exact station replay should reduce scalar time-law work");
+        require(shadowCalls.calls-replayCalls.calls
+                        ==shadowDiagnostics.potentialTimeLawCalls
+                    &&shadowCalls.solverCalls-replayCalls.solverCalls
+                        ==shadowDiagnostics.potentialSolverCalls
+                    &&shadowCalls.cacheMaterializations-replayCalls.cacheMaterializations
+                        ==shadowDiagnostics.potentialMaterializations,
+                "measured replay savings should match replay-disabled shadow evidence");
+
+        const auto planFingerprint=[](const ngc::ContinuousTrajectoryPlan &plan) {
+            std::vector<std::uint64_t> result;
+            const auto appendInteger=[&](const auto value) {
+                result.push_back(static_cast<std::uint64_t>(value));
+            };
+            const auto appendDouble=[&](const double value) {
+                result.push_back(std::bit_cast<std::uint64_t>(value));
+            };
+            const auto appendPosition=[&](const ngc::position_t &position) {
+                appendDouble(position.x);
+                appendDouble(position.y);
+                appendDouble(position.z);
+                appendDouble(position.a);
+                appendDouble(position.b);
+                appendDouble(position.c);
+            };
+            const auto appendState=[&](const ngc::MotionState &state) {
+                appendPosition(state.position);
+                appendPosition(state.velocity);
+                appendPosition(state.acceleration);
+            };
+            const auto appendSpan=[&](const ngc::AxisPolynomialSpan &span) {
+                appendInteger(span.id);
+                appendDouble(span.duration);
+                appendDouble(span.inverseDuration);
+                appendDouble(span.inverseDurationSquared);
+                appendDouble(span.inverseDurationCubed);
+                appendPosition(span.a);
+                appendPosition(span.b);
+                appendPosition(span.c);
+                appendPosition(span.d);
+                appendState(span.end);
+            };
+
+            appendInteger(plan.pieceTiming.size());
+            for(const auto &piece:plan.pieceTiming) {
+                appendInteger(piece.input);
+                appendDouble(piece.length);
+                appendInteger(piece.linear);
+                appendPosition(piece.startPosition);
+                appendPosition(piece.endPosition);
+                appendDouble(piece.programmedVelocityLimit);
+                appendDouble(piece.initialVelocityLimit);
+                appendInteger(piece.initialVelocityLimitCause);
+                appendDouble(piece.initialAccelerationLimit);
+                appendDouble(piece.initialJerkLimit);
+                appendDouble(piece.velocityLimit);
+                appendDouble(piece.accelerationLimit);
+                appendDouble(piece.jerkLimit);
+                appendDouble(piece.entryVelocity);
+                appendDouble(piece.entryAcceleration);
+                appendDouble(piece.exitVelocity);
+                appendDouble(piece.exitAcceleration);
+                appendDouble(piece.duration);
+                appendDouble(piece.curvatureDerivativeSampleDistance);
+                appendDouble(piece.curvatureDerivativeMagnitude);
+                appendDouble(piece.curvatureMagnitudeAtDerivativeSample);
+                appendDouble(piece.curvatureDerivativeTangentialMagnitude);
+                appendDouble(piece.curvatureDerivativeNormalMagnitude);
+                appendDouble(piece.curvatureDerivativeFiniteDifferenceCoarse);
+                appendDouble(piece.curvatureDerivativeFiniteDifferenceFine);
+                appendDouble(piece.curvatureDerivativeFiniteDifferenceCoarseStep);
+                appendDouble(piece.curvatureDerivativeFiniteDifferenceFineStep);
+            }
+            appendInteger(plan.activationSpans.size());
+            for(const auto span:plan.activationSpans) appendInteger(span);
+            appendInteger(plan.chunks.size());
+            for(const auto &chunk:plan.chunks) {
+                appendInteger(chunk.epoch);
+                appendInteger(chunk.id);
+                appendInteger(chunk.predecessorBranch);
+                appendInteger(chunk.branch);
+                appendInteger(chunk.normalMotion.size);
+                for(const auto &span:chunk.normalMotion) appendSpan(span);
+                appendInteger(chunk.stopTail.size);
+                for(const auto &span:chunk.stopTail) appendSpan(span);
+                appendInteger(chunk.events.size);
+                require(chunk.events.size==0,
+                    "focused replay plan should not contain scheduled events");
+                appendState(chunk.branchState);
+                appendState(chunk.stopState);
+            }
+            return result;
+        };
+        require(planFingerprint(**planned)==planFingerprint(**shadowPlanned),
+                "station replay must preserve accepted station states, timing, and emitted spans");
+        require((*planned)->geometryVerificationAttempts
+                        ==(*shadowPlanned)->geometryVerificationAttempts
+                    &&(*planned)->geometryVerificationHighWater
+                        ==(*shadowPlanned)->geometryVerificationHighWater
+                    &&(*planned)->correctionHistory==(*shadowPlanned)->correctionHistory,
+                "station replay must preserve exact verification and correction outcomes");
         require((*planned)->scpSolves>0,
                 "continuous timing should solve at least one HiGHS SCP subproblem");
         require((*planned)->scpAcceptedSteps>0,

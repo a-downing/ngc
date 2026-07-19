@@ -2450,6 +2450,7 @@ namespace ngc {
                 }
 
                 if(enableStationVisitReplay&&matchingVisit) {
+                    ++replayDiagnostics.replayedVisits;
                     reachabilityCandidateEvaluations+=matchingVisit->candidateEvaluations;
                     totalReachabilityCandidateEvaluations+=matchingVisit->candidateEvaluations;
                     auto &passEvaluations=curvedCandidate
@@ -2740,9 +2741,10 @@ namespace ngc {
                     capVelocitySearches,binaryVelocitySearchSteps));
             previousStationVisits=std::move(currentStationVisits);
             previousStationVisitSlots=std::move(currentStationVisitSlots);
+            } else {
+                previousStationVisits.clear();
+                previousStationVisitSlots.clear();
             }
-            previousStationVisits.clear();
-            previousStationVisitSlots.clear();
             result->reachabilityCandidateEvaluations=totalReachabilityCandidateEvaluations;
             const auto reachabilityDuration=std::accumulate(pieceTiming.begin(),pieceTiming.end(),0.0,
                 [](const double total,const auto &timing) { return total+timing.back().time; });
