@@ -258,6 +258,8 @@ namespace ngc {
                 auto &entry=entries()[TimeLawInputHash{}(key)&(cacheSize-1)];
                 if(entry.valid&&entry.key==key) {
                     ++diagnosticsForPurpose.cacheHits;
+                    if(entry.successful) ++diagnosticsForPurpose.cacheSuccessfulHits;
+                    else ++diagnosticsForPurpose.cacheFailureHits;
                     return &entry;
                 }
                 ++diagnosticsForPurpose.cacheMisses;
@@ -731,12 +733,15 @@ namespace ngc {
 
         struct CandidateTimeLaw {
             std::optional<TimeLaw> timing;
+            TimeLawInputKey key {};
             double duration=0.0;
             bool successful=false;
+            bool cacheHit=false;
         };
 
         CandidateTimeLaw candidateTimeLawBetween(TimeLawWorkspace &workspace,
-                TimeLawInstrumentation &instrumentation,const TimeLawPurpose purpose,
+                TimeLawInstrumentation &instrumentation,const bool useCache,
+                const TimeLawPurpose purpose,
                 const bool correctionPass,
                 const double length,const double fromVelocity,const double fromAcceleration,
                 const double toVelocity,const double toAcceleration,
@@ -745,29 +750,41 @@ namespace ngc {
             TimeLawCallTimer timer {diagnostics};
             const auto key=timeLawInputKey(length,fromVelocity,fromAcceleration,toVelocity,
                 toAcceleration,requestedVelocity,acceleration,jerk);
-            if(const auto *cached=instrumentation.find(key,diagnostics)) {
-                timer.succeeded=cached->successful;
-                return {.timing=std::nullopt,.duration=cached->duration,
-                    .successful=cached->successful};
+            if(useCache) {
+                if(const auto *cached=instrumentation.find(key,diagnostics)) {
+                    timer.succeeded=cached->successful;
+                    return {.timing=std::nullopt,.key=key,.duration=cached->duration,
+                        .successful=cached->successful,.cacheHit=true};
+                }
             }
             ++diagnostics.solverCalls;
             auto result=solveTimeLawBetween(workspace,length,fromVelocity,fromAcceleration,
                 toVelocity,toAcceleration,requestedVelocity,acceleration,jerk);
             if(!result) {
-                instrumentation.store(key,false,0.0);
-                return {};
+                if(useCache) instrumentation.store(key,false,0.0);
+                return {.timing=std::nullopt,.key=key,.duration=0.0,
+                    .successful=false,.cacheHit=false};
             }
             const auto duration=result->back().time;
-            instrumentation.store(key,true,duration);
+            if(useCache) instrumentation.store(key,true,duration);
             timer.succeeded=true;
-            return {.timing=*result,.duration=duration,.successful=true};
+            return {.timing=*result,.key=key,.duration=duration,
+                .successful=true,.cacheHit=false};
         }
 
-        std::optional<TimeLaw> materializeCandidateTimeLaw(TimeLawWorkspace &workspace,
+        std::expected<TimeLaw,std::string> materializeCandidateTimeLaw(
+                TimeLawWorkspace &workspace,
                 TimeLawInstrumentation &instrumentation,const TimeLawPurpose purpose,
+                const CandidateTimeLaw &candidate,
                 const double length,const double fromVelocity,const double fromAcceleration,
                 const double toVelocity,const double toAcceleration,
                 const double requestedVelocity,const double acceleration,const double jerk) {
+            const auto key=timeLawInputKey(length,fromVelocity,fromAcceleration,toVelocity,
+                toAcceleration,requestedVelocity,acceleration,jerk);
+            if(!candidate.successful)
+                return std::unexpected("cannot materialize an unsuccessful cached time law");
+            if(candidate.key!=key)
+                return std::unexpected("cached time-law winner does not match its materialization key");
             auto &diagnostics=instrumentation.forPurpose(purpose);
             ++diagnostics.cacheMaterializations;
             ++diagnostics.solverCalls;
@@ -776,7 +793,13 @@ namespace ngc {
                 toVelocity,toAcceleration,requestedVelocity,acceleration,jerk);
             diagnostics.seconds+=std::chrono::duration<double>(
                 std::chrono::steady_clock::now()-started).count();
-            if(!result) return std::nullopt;
+            if(!result)
+                return std::unexpected(
+                    "cached successful time-law winner failed exact materialization");
+            if(std::bit_cast<std::uint64_t>(result->back().time)
+                    !=std::bit_cast<std::uint64_t>(candidate.duration))
+                return std::unexpected(
+                    "cached time-law winner duration changed during exact materialization");
             return *result;
         }
 
@@ -1220,6 +1243,11 @@ namespace ngc {
            ||m_continuousPlanningEffort.scpIterations>32
            ||m_continuousPlanningEffort.scpLineSearchSteps==0
            ||m_continuousPlanningEffort.scpLineSearchSteps>24
+           ||(m_continuousPlanningEffort.timeLawCacheEntries!=0
+                &&((m_continuousPlanningEffort.timeLawCacheEntries
+                        &(m_continuousPlanningEffort.timeLawCacheEntries-1))!=0
+                   ||m_continuousPlanningEffort.timeLawCacheEntries
+                        >LARGE_TIME_LAW_CACHE_SIZE))
            ||m_continuousPlanningEffort.scpSimplexIterationLimitMultiplier==0
            ||m_continuousPlanningEffort.scpSimplexIterationLimitMultiplier>4096
            ||!std::isfinite(m_continuousPlanningEffort.scpVelocityTrustFraction)
@@ -1387,8 +1415,12 @@ namespace ngc {
                     prepared.id));
         }
         if(pieces.empty()) return std::unexpected("continuous path produced no geometry");
+        const auto automaticTimeLawCacheSize=
+            pieces.size()>1024?LARGE_TIME_LAW_CACHE_SIZE:SMALL_TIME_LAW_CACHE_SIZE;
         timeLawRecorder.instrumentation.configureCache(
-            pieces.size()>1024?LARGE_TIME_LAW_CACHE_SIZE:SMALL_TIME_LAW_CACHE_SIZE,
+            m_continuousPlanningEffort.timeLawCacheEntries==0
+                ?automaticTimeLawCacheSize
+                :m_continuousPlanningEffort.timeLawCacheEntries,
             m_continuousPlanningEffort.shareTimeLawCacheAcrossCompilations);
 
         CurveEvaluationWorkspace endpointWorkspace;
@@ -2313,34 +2345,72 @@ namespace ngc {
                                     !=CoupledEndpointResult::Feasible)
                             continue;
 
-                        ++result->scpMaterializationAttempts;
-                        auto leftTiming=timeLawBetween(timeLawWorkspace,
-                            timeLawRecorder.instrumentation,TimeLawPurpose::ContinuousSeed,
+                        auto left=candidateTimeLawBetween(timeLawWorkspace,
+                            timeLawRecorder.instrumentation,
+                            m_continuousPlanningEffort.cacheScpLineSearchTrials,
+                            TimeLawPurpose::ContinuousSeed,
                             correctionPass>0,pieces[leftPiece].length,
                             stationVelocity[leftPiece],stationAcceleration[leftPiece],
                             trialVelocity,trialAcceleration,
                             localLimits[leftPiece].velocity,
                             localLimits[leftPiece].acceleration,
                             localLimits[leftPiece].jerk);
-                        if(!leftTiming) continue;
-                        ++result->scpMaterializationAttempts;
-                        auto rightTiming=timeLawBetween(timeLawWorkspace,
-                            timeLawRecorder.instrumentation,TimeLawPurpose::ContinuousSeed,
+                        if(!left.cacheHit) ++result->scpMaterializationAttempts;
+                        if(!left.successful) continue;
+                        auto right=candidateTimeLawBetween(timeLawWorkspace,
+                            timeLawRecorder.instrumentation,
+                            m_continuousPlanningEffort.cacheScpLineSearchTrials,
+                            TimeLawPurpose::ContinuousSeed,
                             correctionPass>0,pieces[rightPiece].length,
                             trialVelocity,trialAcceleration,
                             stationVelocity[rightPiece+1],stationAcceleration[rightPiece+1],
                             localLimits[rightPiece].velocity,
                             localLimits[rightPiece].acceleration,
                             localLimits[rightPiece].jerk);
-                        if(!rightTiming) continue;
-                        const auto newDuration=leftTiming->back().time
-                            +rightTiming->back().time;
+                        if(!right.cacheHit) ++result->scpMaterializationAttempts;
+                        if(!right.successful) continue;
+                        const auto newDuration=left.duration+right.duration;
                         if(newDuration>oldDuration*(1.0+1e-10)) continue;
+
+                        if(!left.timing) {
+                            ++result->scpMaterializationAttempts;
+                            auto materialized=materializeCandidateTimeLaw(timeLawWorkspace,
+                                timeLawRecorder.instrumentation,
+                                TimeLawPurpose::ContinuousSeed,left,
+                                pieces[leftPiece].length,stationVelocity[leftPiece],
+                                stationAcceleration[leftPiece],trialVelocity,trialAcceleration,
+                                localLimits[leftPiece].velocity,
+                                localLimits[leftPiece].acceleration,
+                                localLimits[leftPiece].jerk);
+                            if(!materialized)
+                                return std::unexpected(std::format(
+                                    "continuous SCP left trial cache materialization failed "
+                                    "on correction pass {} iteration {} station {}: {}",
+                                    correctionPass,scpIteration,station,materialized.error()));
+                            left.timing=std::move(*materialized);
+                        }
+                        if(!right.timing) {
+                            ++result->scpMaterializationAttempts;
+                            auto materialized=materializeCandidateTimeLaw(timeLawWorkspace,
+                                timeLawRecorder.instrumentation,
+                                TimeLawPurpose::ContinuousSeed,right,
+                                pieces[rightPiece].length,trialVelocity,trialAcceleration,
+                                stationVelocity[rightPiece+1],stationAcceleration[rightPiece+1],
+                                localLimits[rightPiece].velocity,
+                                localLimits[rightPiece].acceleration,
+                                localLimits[rightPiece].jerk);
+                            if(!materialized)
+                                return std::unexpected(std::format(
+                                    "continuous SCP right trial cache materialization failed "
+                                    "on correction pass {} iteration {} station {}: {}",
+                                    correctionPass,scpIteration,station,materialized.error()));
+                            right.timing=std::move(*materialized);
+                        }
 
                         stationVelocity[station]=trialVelocity;
                         stationAcceleration[station]=trialAcceleration;
-                        pieceTiming[leftPiece]=std::move(*leftTiming);
-                        pieceTiming[rightPiece]=std::move(*rightTiming);
+                        pieceTiming[leftPiece]=std::move(*left.timing);
+                        pieceTiming[rightPiece]=std::move(*right.timing);
                         scpDuration+=newDuration-oldDuration;
                         ++result->scpAcceptedSteps;
                         acceptedAny=true;
@@ -2385,9 +2455,10 @@ namespace ngc {
                 stationVisitSlotCount,NO_STATION_VISIT);
             currentStationVisits.reserve(measureStationVisitReplay
                 ?std::min(stationVisitSlotCount,2*pieces.size()):0);
+            std::optional<std::string> cachedMaterializationError;
             const auto optimizeStation=[&](const std::size_t station,
                                            const unsigned sweep,const bool reverse) {
-                if(reachabilityCandidateBudgetExceeded) return false;
+                if(reachabilityCandidateBudgetExceeded||cachedMaterializationError) return false;
                 const auto leftPiece=station-1;
                 const auto rightPiece=station;
                 const auto leftSeedSlope=(stationVelocity[station]*stationVelocity[station]
@@ -2555,14 +2626,14 @@ namespace ngc {
                         return false;
                     }
                     auto left=candidateTimeLawBetween(timeLawWorkspace,
-                        timeLawRecorder.instrumentation,
+                        timeLawRecorder.instrumentation,true,
                         purpose,correctionPass>0,pieces[leftPiece].length,
                         stationVelocity[station-1],stationAcceleration[station-1],
                         velocity,acceleration,localLimits[leftPiece].velocity,
                         localLimits[leftPiece].acceleration,localLimits[leftPiece].jerk);
                     if(!left.successful) return false;
                     auto right=candidateTimeLawBetween(timeLawWorkspace,
-                        timeLawRecorder.instrumentation,
+                        timeLawRecorder.instrumentation,true,
                         purpose,correctionPass>0,pieces[rightPiece].length,
                         velocity,acceleration,stationVelocity[station+1],
                         stationAcceleration[station+1],localLimits[rightPiece].velocity,
@@ -2570,24 +2641,36 @@ namespace ngc {
                     if(!right.successful) return false;
                     const auto duration=left.duration+right.duration;
                     if(duration<bestDuration-1e-12) {
-                        if(!left.timing)
-                            left.timing=materializeCandidateTimeLaw(timeLawWorkspace,
+                        if(!left.timing) {
+                            if(auto materialized=materializeCandidateTimeLaw(timeLawWorkspace,
                                 timeLawRecorder.instrumentation,purpose,
+                                left,
                                 pieces[leftPiece].length,stationVelocity[station-1],
                                 stationAcceleration[station-1],velocity,acceleration,
                                 localLimits[leftPiece].velocity,
                                 localLimits[leftPiece].acceleration,
-                                localLimits[leftPiece].jerk);
-                        if(!left.timing) return false;
-                        if(!right.timing)
-                            right.timing=materializeCandidateTimeLaw(timeLawWorkspace,
+                                localLimits[leftPiece].jerk))
+                                left.timing=std::move(*materialized);
+                            else {
+                                cachedMaterializationError=materialized.error();
+                                return false;
+                            }
+                        }
+                        if(!right.timing) {
+                            if(auto materialized=materializeCandidateTimeLaw(timeLawWorkspace,
                                 timeLawRecorder.instrumentation,purpose,
+                                right,
                                 pieces[rightPiece].length,velocity,acceleration,
                                 stationVelocity[station+1],stationAcceleration[station+1],
                                 localLimits[rightPiece].velocity,
                                 localLimits[rightPiece].acceleration,
-                                localLimits[rightPiece].jerk);
-                        if(!right.timing) return false;
+                                localLimits[rightPiece].jerk))
+                                right.timing=std::move(*materialized);
+                            else {
+                                cachedMaterializationError=materialized.error();
+                                return false;
+                            }
+                        }
                         bestDuration=duration;
                         bestVelocity=velocity;
                         bestAcceleration=acceleration;
@@ -2749,6 +2832,10 @@ namespace ngc {
                     sweepImproved=optimizeStation(station,sweep,true)||sweepImproved;
                 if(!sweepImproved||reachabilityCandidateBudgetExceeded) break;
             }
+            if(cachedMaterializationError)
+                return std::unexpected(std::format(
+                    "continuous reachability cache materialization failed on pass {}: {}",
+                    correctionPass,*cachedMaterializationError));
             if(reachabilityCandidateBudgetExceeded)
                 return std::unexpected(std::format(
                     "continuous acceleration-aware reachability resource bound exceeded: "

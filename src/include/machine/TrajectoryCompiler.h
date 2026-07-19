@@ -114,6 +114,12 @@ namespace ngc {
         bool measureStationVisitReplay = false;
         bool enableStationVisitReplay = true;
         bool shareTimeLawCacheAcrossCompilations = true;
+        // Measurement controls for the compile-local scalar time-law cache.
+        // Production uses cached duration-only SCP line-search trials and the
+        // automatic horizon-sized cache. Tests and offline benchmarks may
+        // disable the trial cache or force a smaller power-of-two table.
+        bool cacheScpLineSearchTrials = true;
+        std::size_t timeLawCacheEntries = 0;
         // Experimental HiGHS-backed sequential linearization. These bounds
         // are NRT planning limits, not RT execution data.
         unsigned scpIterations = 1;
@@ -168,6 +174,8 @@ namespace ngc {
         std::size_t failures = 0;
         std::size_t solverCalls = 0;
         std::size_t cacheHits = 0;
+        std::size_t cacheSuccessfulHits = 0;
+        std::size_t cacheFailureHits = 0;
         std::size_t cacheMisses = 0;
         std::size_t cacheCollisions = 0;
         std::size_t cacheMaterializations = 0;
@@ -180,6 +188,8 @@ namespace ngc {
             failures+=other.failures;
             solverCalls+=other.solverCalls;
             cacheHits+=other.cacheHits;
+            cacheSuccessfulHits+=other.cacheSuccessfulHits;
+            cacheFailureHits+=other.cacheFailureHits;
             cacheMisses+=other.cacheMisses;
             cacheCollisions+=other.cacheCollisions;
             cacheMaterializations+=other.cacheMaterializations;

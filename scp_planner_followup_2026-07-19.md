@@ -151,12 +151,23 @@ zero solve-time configuration remains a fatal bounded-effort error.
 
 ### 3. Reduce SCP trial materialization cost
 
-Status: pending
+Status: completed
 
 Route line-search trials through the existing bit-exact candidate time-law cache.
 Use cached success and duration while evaluating trials, then materialize only
 the accepted left and right candidates. Preserve current instrumentation and
 ensure the materialized winner exactly matches the candidate key.
+
+Implementation: sparse-SCP working-set trials now query the compile-local
+bit-exact time-law cache. A cache hit supplies only its recorded success and
+duration during line search. Failed hits remain rejected; a successful hit is
+re-solved only after the adjacent pair is selected for acceptance. Exact
+materialization verifies the complete eight-field input key and bit-exact
+duration before the time law can replace executable timing. A mismatch or a
+previously successful result that cannot be reproduced is a detailed fatal
+planning error. NRT effort controls retain an uncached A/B path and permit a
+power-of-two cache-size override for focused measurement; production defaults
+use cached trials and the automatic horizon-sized table.
 
 Required regression evidence:
 
@@ -165,6 +176,19 @@ Required regression evidence:
   workload.
 - Cached failures remain failures and cannot be selected.
 - Cache collisions cannot return a nonmatching result.
+
+Regression evidence: on the repeat-heavy cluster-spline correction fixture,
+cached and uncached SCP trials produce identical semantic fingerprints covering
+piece timing, accepted station PVA states, activation ownership, normal
+execution spans, stop-tail spans, and packet branch states. Correction history,
+geometry-verification count, and verification high-water mark also match. With
+cross-compilation sharing disabled, caching reduces Ruckig solver calls from 445
+to 408 and full SCP materialization attempts from 228 to 189. The cached run
+observes 96 repeated failure hits, all of which remain rejected. A forced
+one-entry direct-mapped cache records collisions while producing the same exact
+plan and correction history, proving that a colliding nonmatching key is treated
+as a miss. These are deterministic work-count reductions, not a wall-time
+speedup claim.
 
 ### 4. Add adjacent-station reachability relaxations
 
@@ -267,8 +291,9 @@ At the investigation baseline, the existing focused regression asserted only
 that an SCP subproblem was solved and that at least one station update was
 accepted. Item 1 now adds multi-pass rescue, actual replay, replay-disabled
 equivalence, exact emitted-plan, verification-outcome, and scalar-work evidence.
-Resource fallback, warm starts, and adjacent-station LP coupling remain
-uncovered pending their respective items.
+Items 2 and 3 now cover expected solver-resource fallback and cached SCP trials.
+Basis reuse and adjacent-station LP coupling remain uncovered pending their
+respective experiments.
 
 A bounded diagnostic using the locally modified machine configuration observed:
 
@@ -286,12 +311,10 @@ total planner processing:  0.136593 seconds
 This supports investigating trial materialization cost, but it is not a controlled
 benchmark and must not be used as proof of a proposed speedup.
 
-CTest passed all three targets during one run. A later no-op rebuild and rerun
-intermittently failed the unrelated persistent-G43 simulation assertion, then
-passed on retry. Treat current test completion as flaky until that separate issue
-is isolated. Track it as a separate state-leakage investigation rather than SCP
-planner work; it does not invalidate the static SCP findings or item 1's focused
-replay evidence.
+The unrelated persistent-G43 simulation failure was isolated as a terminal
+snapshot-publication race: `Completed` became observable before final modal state
+was copied. Completion now remains internal until final session state is
+published atomically, and the fix is merged from `main` into this branch.
 
 ## Completion criteria
 
