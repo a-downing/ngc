@@ -7,3 +7,6 @@
 [submodule "tomlplusplus"]
 	path = tomlplusplus
 	url = https://github.com/marzer/tomlplusplus.git
+[submodule "highs"]
+	path = highs
+	url = https://github.com/ERGO-Code/HiGHS.git

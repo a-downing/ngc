@@ -41,6 +41,27 @@ add_subdirectory(tomlplusplus EXCLUDE_FROM_ALL)
 unset(BUILD_EXAMPLES)
 unset(BUILD_TESTS)
 
+# HiGHS is used only by NGC's non-real-time trajectory scheduler. Keep its
+# tools, examples, and tests out of the application build, and do not apply
+# NGC's target-scoped warning or optimization flags to the dependency.
+set(_ngc_build_testing ${BUILD_TESTING})
+set(FAST_BUILD ON)
+set(BUILD_CXX ON)
+set(BUILD_CXX_EXE OFF)
+set(BUILD_TESTING OFF)
+set(BUILD_EXAMPLES OFF)
+set(ZLIB OFF)
+set(HIGHS_NO_DEFAULT_THREADS ON)
+add_subdirectory(highs EXCLUDE_FROM_ALL)
+set(BUILD_TESTING ${_ngc_build_testing})
+unset(_ngc_build_testing)
+unset(FAST_BUILD)
+unset(BUILD_CXX)
+unset(BUILD_CXX_EXE)
+unset(BUILD_EXAMPLES)
+unset(ZLIB)
+unset(HIGHS_NO_DEFAULT_THREADS)
+
 add_library(ngc_core STATIC
         src/ArcInterpolation.cpp
         src/InfiniteJerkTrajectoryTime.cpp
@@ -53,7 +74,8 @@ add_library(ngc_core STATIC
         src/MockMotionBackend.cpp
         src/ToolTable.cpp)
 target_include_directories(ngc_core PUBLIC src/include)
-target_link_libraries(ngc_core PRIVATE ngc_ruckig tomlplusplus::tomlplusplus)
+target_include_directories(ngc_core SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/highs)
+target_link_libraries(ngc_core PRIVATE ngc_ruckig tomlplusplus::tomlplusplus highs::highs)
 ngc_target_defaults(ngc_core)
 
 add_library(ngc_imgui STATIC

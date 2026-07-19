@@ -2433,6 +2433,10 @@ namespace {
         compiler.reset(94,points.front());
         const auto planned=compiler.compileContinuous(*prepared,0.05);
         require(planned&&*planned,planned?"":planned.error());
+        require((*planned)->scpSolves>0,
+                "continuous timing should solve at least one HiGHS SCP subproblem");
+        require((*planned)->scpAcceptedSteps>0,
+                "continuous timing should accept at least one locally feasible SCP station update");
         require((*planned)->pieceTiming.size()==expectedTimingIntervals.size(),
                 "continuous timing should create one timing interval per cluster knot interval");
         for(std::size_t interval=0;interval<expectedTimingIntervals.size();++interval) {

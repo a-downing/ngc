@@ -882,14 +882,18 @@ namespace ngc {
                         "pieces={} actual={:.3f}s seed={:.3f}s slowest_input={} "
                         "length={:.6g} nominal={:.6g}s actual={:.6g}s ratio={:.3f} "
                         "programmed_v={:.6g} local_v={:.6g} entry_v={:.6g} exit_v={:.6g} "
-                        "local_a={:.6g} local_j={:.6g}",
+                        "local_a={:.6g} local_j={:.6g} scp_solves={} scp_iterations={} "
+                        "scp_accepted={} scp_materializations={} scp_seconds={:.6f}",
                         continuous->pieceTiming.size(),actualDuration,
                         continuous->velocityOnlySeedDuration,slowest->input,
                         slowest->length,nominal,slowest->duration,
                         nominal>0.0?slowest->duration/nominal:0.0,
                         slowest->programmedVelocityLimit,slowest->velocityLimit,
                         slowest->entryVelocity,slowest->exitVelocity,
-                        slowest->accelerationLimit,slowest->jerkLimit);
+                        slowest->accelerationLimit,slowest->jerkLimit,
+                        continuous->scpSolves,continuous->scpSimplexIterations,
+                        continuous->scpAcceptedSteps,continuous->scpMaterializationAttempts,
+                        continuous->scpSeconds);
                 } else {
                     m_lastContinuousPlanSummary="continuous plan has no piece timing diagnostics";
                 }

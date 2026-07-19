@@ -73,6 +73,14 @@ namespace ngc {
         bool measureStationVisitReplay = false;
         bool enableStationVisitReplay = true;
         bool shareTimeLawCacheAcrossCompilations = true;
+        // Experimental HiGHS-backed sequential linearization. These bounds
+        // are NRT planning limits, not RT execution data.
+        unsigned scpIterations = 1;
+        unsigned scpLineSearchSteps = 8;
+        std::size_t scpSimplexIterationLimitMultiplier = 64;
+        double scpVelocityTrustFraction = 0.35;
+        double scpAccelerationTrustFraction = 0.75;
+        double scpSolveTimeLimit = 0.5;
     };
 
     struct ContinuousPieceTimingDiagnostic {
@@ -270,6 +278,11 @@ namespace ngc {
         std::size_t reachabilityCandidateEvaluations = 0;
         std::size_t geometryVerificationAttempts = 0;
         std::size_t geometryVerificationHighWater = 0;
+        std::size_t scpSolves = 0;
+        std::size_t scpSimplexIterations = 0;
+        std::size_t scpAcceptedSteps = 0;
+        std::size_t scpMaterializationAttempts = 0;
+        double scpSeconds = 0.0;
         TimeLawDiagnostics timeLaw;
     };
 
