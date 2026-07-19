@@ -121,6 +121,7 @@ namespace ngc {
         std::string m_planningActivity;
         std::string m_lastContinuousPlanSummary;
         std::string m_lastContinuousCorrectionHistory;
+        std::string m_lastPreparedEnqueueError;
         std::chrono::steady_clock::time_point m_planningActivityStarted{};
         std::function<void(const ContinuousTrajectoryPlan &,
             std::span<const TrajectoryPlannerInput>)> m_continuousDiagnosticCallback;
@@ -569,6 +570,7 @@ namespace ngc {
             m_planningActivity.clear();
             m_lastContinuousPlanSummary.clear();
             m_lastContinuousCorrectionHistory.clear();
+            m_lastPreparedEnqueueError.clear();
         }
 
         void rebase(const EpochId epoch, const position_t &position) {
@@ -600,6 +602,9 @@ namespace ngc {
         }
         const std::string &lastContinuousCorrectionHistory() const {
             return m_lastContinuousCorrectionHistory;
+        }
+        const std::string &lastPreparedEnqueueError() const {
+            return m_lastPreparedEnqueueError;
         }
         double planningActivitySeconds() const {
             if(m_planningActivity.empty()) return 0.0;
@@ -638,33 +643,55 @@ namespace ngc {
         }
 
         bool enqueuePrepared(const PreparedGeometrySlice &slice) {
-            if(slice.commands.empty() || slice.pieces.empty()) return false;
+            m_lastPreparedEnqueueError.clear();
+            const auto reject = [&](std::string reason) {
+                m_lastPreparedEnqueueError = std::format(
+                    "slice sequence={} chain={} commands={} pieces={}: {}",
+                    slice.sequence, slice.chain, slice.commands.size(), slice.pieces.size(),
+                    std::move(reason));
+                return false;
+            };
+            if(slice.commands.empty() || slice.pieces.empty())
+                return reject("slice is empty");
             const auto exactStop = std::ranges::all_of(slice.commands, [](const auto &record) {
                 return record.metadata.pathMode == ExecutablePathMode::ExactStop;
             });
             const auto continuous = std::ranges::all_of(slice.commands, [](const auto &record) {
                 return record.metadata.pathMode == ExecutablePathMode::Continuous;
             });
-            if(!exactStop && !continuous) return false;
+            if(!exactStop && !continuous)
+                return reject("slice mixes exact-stop and continuous commands");
             if(exactStop) {
-                if(m_preparedWindow||!m_window.empty()) return false;
-                if(slice.pieces.size() != slice.commands.size()) return false;
+                if(m_preparedWindow||!m_window.empty())
+                    return reject(std::format(
+                        "exact-stop slice overlaps retained work: prepared={} retained_commands={}",
+                        m_preparedWindow.has_value(), m_window.size()));
+                if(slice.pieces.size() != slice.commands.size())
+                    return reject("exact-stop piece count does not match its command count");
                 for(const auto &record : slice.commands) {
                     const auto piece = std::ranges::find_if(slice.pieces, [&](const auto &candidate) {
                         return candidate.primaryCommand == record.id;
                     });
-                    if(piece == slice.pieces.end()) return false;
+                    if(piece == slice.pieces.end()) return reject(std::format(
+                        "exact-stop command {} has no owning piece", record.id));
                     if(!enqueue(TrajectoryPlannerInput{record.command, record.metadata,
                             record.presentation, record.presentationActivation,
-                            record.continuousScaleOverride, *piece})) return false;
+                            record.continuousScaleOverride, *piece}))
+                        return reject(std::format(
+                            "exact-stop command {} was rejected by the command window", record.id));
                 }
                 return true;
             }
-            if(m_preparedChainEnded) return false;
+            if(m_preparedChainEnded)
+                return reject("continuous slice arrived after its prepared chain end");
             if(m_preparedWindow) {
-                if(!m_preparedChain||*m_preparedChain!=slice.chain) return false;
+                if(!m_preparedChain||*m_preparedChain!=slice.chain)
+                    return reject(std::format(
+                        "continuous chain does not match retained chain {}",
+                        m_preparedChain.value_or(0)));
             } else {
-                if(!m_window.empty()) return false;
+                if(!m_window.empty()) return reject(std::format(
+                    "continuous slice overlaps {} retained non-prepared commands", m_window.size()));
                 m_preparedWindow.emplace();
                 m_preparedChain=slice.chain;
             }
@@ -675,21 +702,30 @@ namespace ngc {
                     ||std::ranges::any_of(slice.commands,
                            [id](const auto &record) { return record.id==id; });
             };
-            if(std::ranges::any_of(slice.pieces,[&](const auto &piece) {
-                return !piece.curve||piece.length()<=1e-12
-                    ||!knownCommand(piece.primaryCommand)
-                    ||std::ranges::any_of(piece.activationCommands,
-                        [&](const auto id) { return !knownCommand(id); })
-                    ||std::ranges::any_of(piece.sourceCommands,
-                        [&](const auto id) { return !knownCommand(id); })
-                    ||std::ranges::any_of(geometry.pieces,
-                        [&](const auto &retained) { return retained.id==piece.id; });
-            })) return false;
+            for(const auto &piece : slice.pieces) {
+                if(!piece.curve) return reject(std::format("piece {} has no curve", piece.id));
+                if(piece.length()<=1e-12)
+                    return reject(std::format("piece {} has non-positive length", piece.id));
+                if(!knownCommand(piece.primaryCommand)) return reject(std::format(
+                    "piece {} references unknown primary command {}", piece.id,
+                    piece.primaryCommand));
+                for(const auto id : piece.activationCommands)
+                    if(!knownCommand(id)) return reject(std::format(
+                        "piece {} references unknown activation command {}", piece.id, id));
+                for(const auto id : piece.sourceCommands)
+                    if(!knownCommand(id)) return reject(std::format(
+                        "piece {} references unknown source command {}", piece.id, id));
+                if(std::ranges::any_of(geometry.pieces,
+                        [&](const auto &retained) { return retained.id==piece.id; }))
+                    return reject(std::format("piece {} overlaps a retained piece ID", piece.id));
+            }
             if(!geometry.pieces.empty()) {
                 const auto previous=preparedBoundary(
                     geometry.pieces.back(),geometry.pieces.back().length()).position;
                 const auto next=preparedBoundary(slice.pieces.front(),0.0).position;
-                if(!samePosition(previous,next)) return false;
+                if(!samePosition(previous,next)) return reject(std::format(
+                    "geometry boundary distance {:.17g} exceeds continuity tolerance",
+                    (previous-next).length()));
             }
             for(const auto &record:slice.commands) {
                 if(std::ranges::any_of(geometry.commands,
@@ -697,7 +733,8 @@ namespace ngc {
                 geometry.commands.push_back(record);
                 if(!enqueue(TrajectoryPlannerInput{record.command,record.metadata,
                         record.presentation,record.presentationActivation,
-                        record.continuousScaleOverride})) return false;
+                        record.continuousScaleOverride})) return reject(std::format(
+                            "continuous command {} was rejected by the command window", record.id));
             }
             geometry.pieces.insert(geometry.pieces.end(),
                 slice.pieces.begin(),slice.pieces.end());
@@ -884,8 +921,8 @@ namespace ngc {
                 auto totalDuration=m_preparedWindow->diagnostics.nominalDuration;
                 auto precedingDuration=0.0;
                 constexpr std::array FRACTIONS{0.25,0.5,0.75};
-                for(std::size_t index=0;
-                    index<m_preparedWindow->pieces.size()&&candidates.size()<8;++index) {
+                for(std::size_t index=0;index<m_preparedWindow->pieces.size()
+                    &&candidates.size()<8&&!m_preparedChainEnded;++index) {
                     const auto &piece=m_preparedWindow->pieces[index];
                     if(piece.programmedFeed<=0.0) break;
                     const auto duration=piece.length()/piece.programmedFeed;

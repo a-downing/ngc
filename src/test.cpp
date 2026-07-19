@@ -333,6 +333,7 @@ namespace {
         constexpr int COMMANDS=800;
         for(int command=1;command<=COMMANDS;++command)
             source+=std::format("G1 F60 X{:.6f}\n",static_cast<double>(command)*0.01);
+        source+="G0 X9\n";
 
         SimulationWorker worker;
         worker.setTickMultiplier(10);
@@ -346,8 +347,10 @@ namespace {
             snapshot=worker.snapshot();
         }
         require(snapshot.status==ngc::SimulationStatus::Completed,std::format(
-            "timed simulation should refill a continuous batch larger than its eight-slot queue: {}",
+            "timed simulation should refill and terminal-compile a continuous batch before its rapid: {}",
             snapshot.error));
+        requireNear(snapshot.machinePosition.x,9.0,
+                    "motion after the ended rolling G64 chain should execute");
         require(snapshot.trajectoryPlanning.planChunks>8
                     &&snapshot.trajectoryPlanning.maximumWindowCommands<COMMANDS
                     &&snapshot.trajectoryPlanning.continuousHorizons>=2
@@ -633,6 +636,34 @@ namespace {
         simulation.join();
     }
 
+    void testZeroLengthFeedBetweenPreparedMotionChains() {
+        constexpr auto source =
+            "G64 P0.001\n"
+            "G1 F120 X1\n"
+            "G0 X2\n"
+            "G1 F120 X2\n"
+            "G1 X3\n"
+            "M30\n";
+        ngc::ToolTable tools;
+        SimulationWorker simulation;
+        simulation.setTickMultiplier(1000);
+        require(simulation.start({{source, "zero-length-chain-transition.ngc"}}, tools),
+                "zero-length chain transition simulation should start");
+        auto snapshot = simulation.snapshot();
+        for(int attempt = 0; attempt < 10000
+            && snapshot.status != ngc::SimulationStatus::Completed
+            && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = simulation.snapshot();
+        }
+        require(snapshot.status == ngc::SimulationStatus::Completed, std::format(
+            "zero-length feed between prepared chains should simulate completely: {}",
+            snapshot.error));
+        requireNear(snapshot.machinePosition.x, 3.0,
+                    "motion after a zero-length feed should reach its endpoint");
+        simulation.join();
+    }
+
     void testGeometryPreviewResolvesProbeAtCanonicalTarget() {
         ngc::ToolTable tools;
         const ngc::ToolTable::tool_entry_t tool{
@@ -819,6 +850,72 @@ namespace {
             return !scene.continuousSlices.empty()||!scene.standaloneCommands.empty();
         }),
                 "1001 preview should retain displayable canonical geometry");
+        worker.join();
+    }
+
+    void test1002PreparedSliceBoundaries() {
+        const auto hello = ngc::readFile("autoload/hello.ngc");
+        const auto world = ngc::readFile("autoload/world.ngc");
+        const auto toolChange = ngc::readFile("autoload/tool_change.ngc");
+        const auto main = ngc::readFile("1002_3d.ngc");
+        require(hello && world && toolChange && main, "1002_3d preview inputs should load");
+        ngc::ToolTable tools;
+        const auto loadedTools = tools.load();
+        require(loadedTools.has_value(), loadedTools ? "" : loadedTools.error());
+
+        Worker worker(UNIT);
+        require(worker.setToolTable(tools), "1002_3d preview should accept the tool table");
+        require(worker.compile({ { *hello, "autoload/hello.ngc" }, { *world, "autoload/world.ngc" },
+                                 { *toolChange, "autoload/tool_change.ngc" },
+                                 { *main, "1002_3d.ngc" } }),
+                "1002_3d preview should start compilation");
+        for(int attempt = 0; attempt < 3000 && !worker.compiled(); ++attempt)
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        require(worker.compiled(), "1002_3d preview should compile");
+        const auto initialRevision = worker.lock([&] { return worker.preparedPreview().revision; });
+        require(worker.execute(), "1002_3d preview should execute");
+        for(int attempt = 0; attempt < 60000; ++attempt) {
+            if(worker.lock([&] { return worker.preparedPreview().revision > initialRevision; })
+               && !worker.busy()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(!worker.busy(), "1002_3d preview should finish");
+        const auto messages = worker.statusMessages();
+        require(std::ranges::none_of(messages, [](const auto &message) {
+            return message.kind == ngc::InterpreterStatusKind::Error;
+        }), "1002_3d preview should not report an error");
+        require(std::ranges::any_of(messages, [](const auto &message) {
+            return message.kind == ngc::InterpreterStatusKind::Print
+                && message.text == "Hello World!";
+        }), "1002_3d preview should interpret through the print after M30");
+        worker.lock([&] {
+            const auto &slices = worker.preparedPreview().continuousSlices;
+            require(slices.size() > 400,
+                    "1002_3d preview should retain all prepared geometry slices");
+            require(worker.preparedPreview().geometryEnds.size() >= 20,
+                    "1002_3d preview should retain every motion chain");
+            std::set<ngc::PreparedPieceId> pieceIds;
+            const ngc::PreparedPathPiece *previous = nullptr;
+            ngc::ContinuousChainId previousChain = 0;
+            for(const auto &slice : slices) {
+                for(const auto &piece : slice.pieces) {
+                    require(pieceIds.insert(piece.id).second,
+                            std::format("1002 duplicate prepared piece {}", piece.id));
+                }
+                if(previous && previousChain == slice.chain && !slice.pieces.empty()) {
+                    ngc::CurveEvaluationWorkspace workspace;
+                    const auto prior = ngc::positionAtDistance(
+                        *previous->curve, previous->curveTo, workspace);
+                    const auto next = ngc::positionAtDistance(
+                        *slice.pieces.front().curve, slice.pieces.front().curveFrom, workspace);
+                    require((prior - next).length() <= 1e-12, std::format(
+                        "1002 slice boundary mismatch before sequence {}: distance={:.17g}",
+                        slice.sequence, (prior - next).length()));
+                }
+                if(!slice.pieces.empty()) previous = &slice.pieces.back();
+                previousChain = slice.chain;
+            }
+        });
         worker.join();
     }
 
@@ -1575,6 +1672,27 @@ namespace {
             require(item && *item == value,
                     "threaded owning SPSC transfer must remain ordered and lossless");
         }
+
+        ngc::OwningSpscChannel<std::unique_ptr<std::uint64_t>, 1> cancellationChannel;
+        std::atomic<bool> cancelled = false;
+        std::atomic<bool> consumerStarted = false;
+        std::unique_ptr<std::uint64_t> cancellationValue;
+        bool cancellationResult = false;
+        std::thread waitingConsumer([&] {
+            consumerStarted.store(true, std::memory_order_release);
+            cancellationResult = cancellationChannel.waitPop(cancellationValue, [&] {
+                return cancelled.load(std::memory_order_acquire);
+            });
+        });
+        while(!consumerStarted.load(std::memory_order_acquire)) std::this_thread::yield();
+        std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        require(cancellationChannel.tryPush(std::make_unique<std::uint64_t>(42)),
+                "owning SPSC cancellation regression should publish its terminal value");
+        cancelled.store(true, std::memory_order_release);
+        cancellationChannel.notifyAll();
+        waitingConsumer.join();
+        require(cancellationResult && cancellationValue && *cancellationValue == 42,
+                "owning SPSC cancellation must not discard an already-published terminal value");
     }
 
     void testIncrementalGeometryDefersAndDoesNotRebuildAnchorSection() {
@@ -3114,11 +3232,13 @@ int main() {
         testGeometryProducerBlendsAcrossMotionModeChanges();
         testGeometryProducerPreparesExactStopPreviewSlices();
         testModalG64RapidsRemainExactPreparedMotion();
+        testZeroLengthFeedBetweenPreparedMotionChains();
         testGeometryPreviewResolvesProbeAtCanonicalTarget();
         testAdaptivePocketsGeometryPreviewAvoidsTrajectoryExecution();
         testIncrementalGeometryDefersAndDoesNotRebuildAnchorSection();
         testSimulationDriverFailureAppearsInGuiStatusStream();
         test1001PreviewCompletesBoundedly();
+        test1002PreparedSliceBoundaries();
         testMdiToolChangeUsesAutoloadPrograms();
         testSimulationWorkerPersistsUntilReset();
         testSimulationProgramElapsedTimeIsPlaybackSpeedIndependent();

@@ -113,7 +113,8 @@ namespace ngc {
 
         bool appendSlice(const PreparedGeometrySlice &slice) {
             if(!m_planner.enqueuePrepared(slice)) {
-                fail("prepared trajectory planner rejected a nonempty or overlapping geometry slice");
+                fail("prepared trajectory planner rejected a geometry slice: "
+                    +m_planner.lastPreparedEnqueueError());
                 return false;
             }
             if(m_planner.shouldPlanRollingPrefix()) return planWindow(false);

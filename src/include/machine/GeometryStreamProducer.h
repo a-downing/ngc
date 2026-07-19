@@ -352,6 +352,13 @@ namespace ngc {
         }
 
         bool processCommand(MachineCommand command) {
+            if(const auto *line = std::get_if<MoveLine>(&command);
+               line && (line->to() - line->from()).length() == 0.0) {
+                // A modal coordinate block may resolve to the current
+                // canonical position. It is valid interpreter input but does
+                // not define a source entity for prepared geometry or timing.
+                return true;
+            }
             auto record = makeRecord(std::move(command));
             if(preparedMotion(record)) {
                 const auto pathMode = continuousMotion(record)

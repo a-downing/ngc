@@ -107,7 +107,11 @@ namespace ngc {
                 m_consumerWaiting.store(true, std::memory_order_release);
                 m_notEmpty.wait(lock, [&] { return !empty() || cancelled(); });
                 m_consumerWaiting.store(false, std::memory_order_release);
-                if(cancelled()) return false;
+                // Cancellation must not discard a value that the producer
+                // published before cancelling the run. In particular,
+                // PreparedFailure is published immediately before geometry
+                // cancellation so the consumer can report the fatal error.
+                if(cancelled() && empty()) return false;
             }
             return true;
         }
