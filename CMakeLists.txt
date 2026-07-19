@@ -125,6 +125,12 @@ target_include_directories(ngc_simulation_diagnostic PRIVATE src)
 target_link_libraries(ngc_simulation_diagnostic PRIVATE ngc_core)
 ngc_target_defaults(ngc_simulation_diagnostic)
 
+add_executable(pendant_probe tools/pendant_probe.cpp)
+ngc_target_defaults(pendant_probe)
+if(WIN32)
+    target_link_libraries(pendant_probe PRIVATE hid setupapi)
+endif()
+
 add_executable(ngc_spline_geometry_analyzer tools/ngc_spline_geometry_analyzer.cpp)
 target_link_libraries(ngc_spline_geometry_analyzer PRIVATE ngc_core)
 ngc_target_defaults(ngc_spline_geometry_analyzer)
