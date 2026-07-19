@@ -12,7 +12,7 @@ Use these names consistently in code, diagnostics, research notes, and discussio
 
 - **Source entity**: one canonical CAM line or arc.
 - **Retained primitive section**: the untrimmed middle of a sufficiently long source line or arc.
-- **Junction blend spline** (short form: **junction blend**): a local spline joining two retained primitive sections. It replaces only the trimmed ends near their junction. The current construction uses six-control cubic splines.
+- **Junction blend spline** (short form: **junction blend**): a local spline joining two retained primitive sections. It replaces only the trimmed ends near their junction. The current construction uses twelve-control quintic splines.
 - **Short-entity cluster**: consecutive short source entities selected for replacement as one group.
 - **Short-entity cluster spline** (short form: **cluster spline**): one variable-control spline that reconstructs and replaces an entire short-entity cluster. It does not merely connect the entities.
 - **Execution span**: one timed axis-space cubic polynomial emitted by the trajectory planner. Reserve the word "span" for this meaning; do not use it for a group of source entities or a spline knot interval.
@@ -109,12 +109,12 @@ The endpoint-exact arc reference is authoritative for Preview and planning. It s
 An executable G64 chain contains only:
 
 - exact retained line or arc sections;
-- local six-control cubic junction blends; and
+- local twelve-control quintic junction blends; and
 - variable-control cluster splines replacing bounded short-entity clusters.
 
-For each source entity, `p_entity = min(P, entity_arc_length / 6)`. An ordinary junction replaces the final `3*p_incoming` and first `3*p_outgoing`; line controls remain on the source lines, while arc-side controls preserve endpoint tangent and curvature. The junction itself is not a control point. Retained primitive sections keep their own feed; a junction blend uses the arithmetic mean of its adjacent entity feeds.
+For each source entity, `p_entity = min(P, entity_arc_length / 8)`. An ordinary junction replaces the final `4*p_incoming` and first `4*p_outgoing`. Its twelve-control quintic is initialized by exact degree elevation of the fair six-control cubic reference and retains exact source position, tangent, and curvature at both trim boundaries. All six curvature-preserving interior controls are adjusted by one bounded timing-aware objective that treats source normal sharpness as a soft target; curvature-derivative matching is not a hard constraint and there is no cubic fallback selection. The fixed endpoint control triples for line sides remain on their source lines. The junction itself is not a control point. Retained primitive sections keep their own feed; a junction blend uses the arithmetic mean of its adjacent entity feeds.
 
-A maximal run of entities with length at most `6P`, bounded by entities longer than `6P`, is reconstructed as one cluster spline. Cluster knot intervals retain local programmed-feed boundaries for timing. `spline_detail::continuousSplineFitSolver()` is the one production selection point; the current default is `VelocityTargetedBandedFairness`. Only cluster reconstruction uses the variable-control quintic path. Junction blends remain six-control cubics. Preview and timed planning must consume the exact same prepared controls, degree, knots, samples, feeds, and source-interval metadata; neither may independently reconstruct geometry. Replaced source geometry may be displayed for inspection but is not executable motion.
+A maximal run of entities with length at most `8P`, bounded by entities longer than `8P`, is reconstructed as one cluster spline. Cluster knot intervals retain local programmed-feed boundaries for timing. `spline_detail::continuousSplineFitSolver()` is the one production selection point; the current default is `VelocityTargetedBandedFairness`. Only cluster reconstruction uses the variable-control quintic path. Junction blends remain twelve-control quintics. Preview and timed planning must consume the exact same prepared controls, degree, knots, samples, feeds, and source-interval metadata; neither may independently reconstruct geometry. Replaced source geometry may be displayed for inspection but is not executable motion.
 
 Rapids, explicit G53 motion, probes, non-G64 motion, P changes, discontinuous endpoints, protected presentation changes, and non-motion commands are protected boundaries. Do not blend across them or solve planning/capacity problems with synthetic connectors or a whole-path spline fit.
 

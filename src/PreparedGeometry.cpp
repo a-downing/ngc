@@ -50,7 +50,13 @@ namespace ngc {
 
             std::size_t span;
             if(parameterSpan) {
-                span = std::min(degree + *parameterSpan, controls.size() - 1);
+                span = degree;
+                auto interval = std::size_t{0};
+                for(auto candidate = degree; candidate < controls.size(); ++candidate) {
+                    if(knots[candidate + 1] <= knots[candidate]) continue;
+                    span = candidate;
+                    if(interval++ == *parameterSpan) break;
+                }
             } else {
                 const auto upper = std::upper_bound(
                     knots.begin() + static_cast<std::ptrdiff_t>(degree),
@@ -104,10 +110,24 @@ namespace ngc {
 
         std::size_t splineParameterSpan(const PreparedSplineCurve &spline,
                                         const double parameter) {
-            const auto spans = spline.controls.size() - spline.degree;
-            if(spans <= 1) return 0;
-            return std::min(spans - 1, static_cast<std::size_t>(
-                std::floor(std::clamp(parameter, 0.0, static_cast<double>(spans)))));
+            auto interval = std::size_t{0};
+            auto previous = std::size_t{0};
+            for(auto span = spline.degree; span < spline.controls.size(); ++span) {
+                if(spline.knots[span + 1] <= spline.knots[span]) continue;
+                if(parameter < spline.knots[span + 1]) return interval;
+                previous = interval++;
+            }
+            return previous;
+        }
+
+        std::vector<std::pair<double,double>> splineParameterIntervals(
+                const std::size_t degree,const std::span<const position_t> controls,
+                const std::span<const double> knots) {
+            std::vector<std::pair<double,double>> result;
+            for(auto span=degree;span<controls.size();++span)
+                if(knots[span+1]>knots[span])
+                    result.emplace_back(knots[span],knots[span+1]);
+            return result;
         }
 
         double derivativeSpeed(const PreparedSplineCurve &spline, const double parameter,
@@ -184,7 +204,8 @@ namespace ngc {
             if(distance == length) {
                 if(ordered) {
                     ordered->tableIndex = spline.distances.size() - 2;
-                    ordered->parameterSpan = spline.controls.size() - spline.degree - 1;
+                    ordered->parameterSpan = splineParameterSpan(
+                        spline,spline.parameters.back());
                     ordered->previousDistance = distance;
                 }
                 return spline.parameters.back();
@@ -256,12 +277,15 @@ namespace ngc {
 
         std::shared_ptr<const PreparedCurve> splineCurve(std::vector<position_t> controls,
                                                          std::size_t degree,
+                                                         std::vector<double> knots,
                                                          const std::size_t intervalsPerSpan) {
             if(degree == 0 || controls.size() <= degree) return {};
+            if(knots.size()!=controls.size()+degree+1
+               ||!std::ranges::is_sorted(knots)) return {};
             PreparedSplineCurve spline;
             spline.degree = degree;
             spline.controls = std::move(controls);
-            spline.knots = openKnots(spline.controls.size(), degree);
+            spline.knots = std::move(knots);
             spline.derivatives[0] = derivativeSpline(
                 spline.degree, spline.controls, spline.knots);
             for(std::size_t order = 1; order < spline.derivatives.size(); ++order) {
@@ -269,7 +293,9 @@ namespace ngc {
                 spline.derivatives[order] = derivativeSpline(
                     previous.degree, previous.controls, previous.knots);
             }
-            const auto spans = spline.controls.size() - degree;
+            const auto parameterIntervals=splineParameterIntervals(
+                spline.degree,spline.controls,spline.knots);
+            if(parameterIntervals.empty()) return {};
             const auto displacement = spline.controls.back() - spline.controls.front();
             const auto displacementSquared = dot(displacement, displacement);
             auto collinear = displacementSquared > 1e-24;
@@ -288,23 +314,34 @@ namespace ngc {
             if(collinear) {
                 // Collinear junctions are geometrically exact lines. Retain
                 // the spline controls/knots for presentation identity, but
-                // use an exact chord-length bracket and avoid rebuilding a
-                // costly numerical table for every straight G64 junction.
-                spline.parameters = { 0.0, static_cast<double>(spans) };
-                spline.distances = { 0.0, displacement.length() };
+                // use exact chord-length brackets at the nonempty knot
+                // boundaries and avoid rebuilding a numerical table.
+                spline.parameters.reserve(parameterIntervals.size()+1);
+                spline.distances.reserve(parameterIntervals.size()+1);
+                spline.parameters.push_back(parameterIntervals.front().first);
+                spline.distances.push_back(0.0);
+                for(const auto &[from,to]:parameterIntervals) {
+                    (void)from;
+                    spline.parameters.push_back(to);
+                    spline.distances.push_back((splineAt(spline,to)
+                        -spline.controls.front()).length());
+                }
                 return std::make_shared<const PreparedCurve>(PreparedCurve{
                     std::move(spline), displacement.length(), true});
             }
-            const auto intervals = spans * std::max<std::size_t>(1, intervalsPerSpan);
+            const auto subdivisions=std::max<std::size_t>(1,intervalsPerSpan);
+            const auto intervals = parameterIntervals.size()*subdivisions;
             spline.parameters.reserve(intervals + 1);
             spline.distances.reserve(intervals + 1);
-            spline.parameters.push_back(0.0);
+            spline.parameters.push_back(parameterIntervals.front().first);
             spline.distances.push_back(0.0);
             auto distance = 0.0;
             for(std::size_t index = 1; index <= intervals; ++index) {
-                const auto parameter = static_cast<double>(spans) * index / intervals;
-                const auto parameterSpan = std::min(
-                    spans - 1, (index - 1) / std::max<std::size_t>(1, intervalsPerSpan));
+                const auto parameterSpan=(index-1)/subdivisions;
+                const auto subdivision=(index-1)%subdivisions+1;
+                const auto &[from,to]=parameterIntervals[parameterSpan];
+                const auto parameter=std::lerp(from,to,
+                    static_cast<double>(subdivision)/static_cast<double>(subdivisions));
                 distance += integrateSpeed(spline, spline.parameters.back(), parameter,
                                            nullptr, parameterSpan);
                 spline.parameters.push_back(parameter);
@@ -316,6 +353,13 @@ namespace ngc {
                     spline.maximumSecondDerivative, control.length());
             return std::make_shared<const PreparedCurve>(PreparedCurve{
                 std::move(spline), distance, false});
+        }
+
+        std::shared_ptr<const PreparedCurve> splineCurve(std::vector<position_t> controls,
+                                                         const std::size_t degree,
+                                                         const std::size_t intervalsPerSpan) {
+            auto knots=openKnots(controls.size(),degree);
+            return splineCurve(std::move(controls),degree,std::move(knots),intervalsPerSpan);
         }
 
         const simulation_detail::ArcReference *arcReference(const PreparedCurve &curve,
@@ -546,8 +590,12 @@ namespace ngc {
             double length = 0.0;
         };
 
+        constexpr double JUNCTION_REPLACEMENT_SCALE=4.0;
+        constexpr double SHORT_ENTITY_SCALE_DENOMINATOR=8.0;
+
         double sourceScale(const SourceEntity &entity, const double blendScale) {
-            return std::min(blendScale, entity.length / 6.0);
+            return std::min(blendScale,
+                entity.length/SHORT_ENTITY_SCALE_DENOMINATOR);
         }
 
         position_t sourcePosition(const SourceEntity &entity, double distance,
@@ -560,14 +608,15 @@ namespace ngc {
             return tangentAtDistance(*entity.curve, distance, workspace);
         }
 
-        std::vector<position_t> curvatureMatchedSixControlBlend(
+        std::vector<position_t> curvatureMatchedSixControlClusterSeed(
                                                 const SourceEntity &incoming,
                                                 const SourceEntity &outgoing,
                                                 const double incomingScale,
                                                 const double outgoingScale,
                                                 CurveEvaluationWorkspace &workspace) {
-            const auto startDistance = incoming.length - 3.0 * incomingScale;
-            const auto endDistance = 3.0 * outgoingScale;
+            const auto startDistance = incoming.length
+                -JUNCTION_REPLACEMENT_SCALE*incomingScale;
+            const auto endDistance = JUNCTION_REPLACEMENT_SCALE*outgoingScale;
             const auto start = sourcePosition(incoming, startDistance, workspace);
             const auto end = sourcePosition(outgoing, endDistance, workspace);
             const auto startTangent = sourceTangent(incoming, startDistance, workspace);
@@ -635,6 +684,243 @@ namespace ngc {
                 end - scaled(endTangent, outgoingHandle),
                 end,
             };
+        }
+
+        std::vector<double> elevatedJunctionKnots() {
+            return {0,0,0,0,0,0, 1,1,1, 2,2,2, 3,3,3,3,3,3};
+        }
+
+        std::vector<position_t> elevateCubicJunctionToQuintic(
+                const std::span<const position_t> cubicControls) {
+            constexpr std::size_t CONTROL_COUNT=12;
+            const auto cubicKnots=openKnots(cubicControls.size(),3);
+            const auto quinticKnots=elevatedJunctionKnots();
+            const auto greville=[&] {
+                std::array<double,CONTROL_COUNT> result{};
+                for(std::size_t control=0;control<result.size();++control)
+                    for(std::size_t knot=1;knot<=5;++knot)
+                        result[control]+=quinticKnots[control+knot]/5.0;
+                return result;
+            }();
+            static const auto inverse=[] {
+                const auto knots=elevatedJunctionKnots();
+                std::array<double,CONTROL_COUNT> parameters{};
+                for(std::size_t control=0;control<CONTROL_COUNT;++control)
+                    for(std::size_t knot=1;knot<=5;++knot)
+                        parameters[control]+=knots[control+knot]/5.0;
+                std::array<std::array<double,2*CONTROL_COUNT>,CONTROL_COUNT> matrix{};
+                for(std::size_t row=0;row<CONTROL_COUNT;++row) {
+                    for(std::size_t column=0;column<CONTROL_COUNT;++column) {
+                        std::array<position_t,CONTROL_COUNT> basis{};
+                        basis[column].x=1.0;
+                        matrix[row][column]=splineAt(5,basis,knots,parameters[row]).x;
+                    }
+                    matrix[row][CONTROL_COUNT+row]=1.0;
+                }
+                for(std::size_t column=0;column<CONTROL_COUNT;++column) {
+                    auto pivot=column;
+                    for(std::size_t row=column+1;row<CONTROL_COUNT;++row)
+                        if(std::abs(matrix[row][column])>std::abs(matrix[pivot][column]))
+                            pivot=row;
+                    if(std::abs(matrix[pivot][column])<=1e-14)
+                        throw std::runtime_error("quintic degree-elevation matrix is singular");
+                    std::swap(matrix[pivot],matrix[column]);
+                    const auto divisor=matrix[column][column];
+                    for(auto &value:matrix[column]) value/=divisor;
+                    for(std::size_t row=0;row<CONTROL_COUNT;++row) {
+                        if(row==column) continue;
+                        const auto factor=matrix[row][column];
+                        for(std::size_t entry=0;entry<2*CONTROL_COUNT;++entry)
+                            matrix[row][entry]-=factor*matrix[column][entry];
+                    }
+                }
+                std::array<std::array<double,CONTROL_COUNT>,CONTROL_COUNT> result{};
+                for(std::size_t row=0;row<CONTROL_COUNT;++row)
+                    for(std::size_t column=0;column<CONTROL_COUNT;++column)
+                        result[row][column]=matrix[row][CONTROL_COUNT+column];
+                return result;
+            }();
+            std::array<position_t,CONTROL_COUNT> samples{};
+            for(std::size_t sample=0;sample<CONTROL_COUNT;++sample)
+                samples[sample]=splineAt(3,cubicControls,cubicKnots,greville[sample]);
+            std::vector<position_t> result(CONTROL_COUNT);
+            for(std::size_t control=0;control<CONTROL_COUNT;++control)
+                for(std::size_t sample=0;sample<CONTROL_COUNT;++sample)
+                    result[control]=result[control]+scaled(
+                        samples[sample],inverse[control][sample]);
+            return result;
+        }
+
+        std::vector<position_t> softOptimizedTwelveControlBlend(
+                const SourceEntity &incoming,const SourceEntity &outgoing,
+                const double incomingScale,const double outgoingScale,
+                const spline_detail::SplineVelocityLimits &limits,
+                const double programmedFeed,CurveEvaluationWorkspace &workspace) {
+            constexpr std::size_t DEGREE=5;
+            constexpr std::array components{
+                &position_t::x,&position_t::y,&position_t::z,
+                &position_t::a,&position_t::b,&position_t::c,
+            };
+            const auto startDistance=incoming.length
+                -JUNCTION_REPLACEMENT_SCALE*incomingScale;
+            const auto endDistance=JUNCTION_REPLACEMENT_SCALE*outgoingScale;
+            const PreparedGeometryBoundary start{
+                sourcePosition(incoming,startDistance,workspace),
+                sourceTangent(incoming,startDistance,workspace),
+                curvatureAtDistance(*incoming.curve,startDistance,workspace),
+                curvatureDerivativeAtDistance(*incoming.curve,startDistance,workspace),
+            };
+            const PreparedGeometryBoundary end{
+                sourcePosition(outgoing,endDistance,workspace),
+                sourceTangent(outgoing,endDistance,workspace),
+                curvatureAtDistance(*outgoing.curve,endDistance,workspace),
+                curvatureDerivativeAtDistance(*outgoing.curve,endDistance,workspace),
+            };
+            const auto cubicControls=curvatureMatchedSixControlClusterSeed(
+                incoming,outgoing,incomingScale,outgoingScale,workspace);
+            const auto knots=elevatedJunctionKnots();
+            auto controls=elevateCubicJunctionToQuintic(cubicControls);
+
+            const auto baseline=controls;
+            const auto scale=std::max(std::min(incomingScale,outgoingScale),1e-12);
+            const auto normalPart=[](const position_t &value,const position_t &tangent) {
+                return value-scaled(tangent,dot(value,tangent));
+            };
+            const auto startNormalSharpness=normalPart(
+                start.curvatureDerivative,start.tangent);
+            const auto endNormalSharpness=normalPart(
+                end.curvatureDerivative,end.tangent);
+            std::array<bool,components.size()> activeComponents{};
+            for(std::size_t componentIndex=0;
+                componentIndex<components.size();++componentIndex) {
+                const auto component=components[componentIndex];
+                auto minimum=baseline.front().*component;
+                auto maximum=minimum;
+                for(const auto &control:baseline) {
+                    minimum=std::min(minimum,control.*component);
+                    maximum=std::max(maximum,control.*component);
+                }
+                activeComponents[componentIndex]=maximum-minimum>1e-12*scale;
+            }
+            const auto score=[&](const std::vector<position_t> &candidate) {
+                const auto first=derivativeSpline(DEGREE,candidate,knots);
+                const auto second=derivativeSpline(first.degree,first.controls,first.knots);
+                const auto third=derivativeSpline(second.degree,second.controls,second.knots);
+                auto duration=0.0;
+                auto maximumDisplacement=0.0;
+                auto spacingPenalty=0.0;
+                auto normalSharpnessError=0.0;
+                auto maximumNormalSharpnessError=0.0;
+                for(std::size_t control=3;control<=8;++control)
+                    maximumDisplacement=std::max(maximumDisplacement,
+                        (candidate[control]-baseline[control]).length());
+                for(std::size_t control=1;control<candidate.size();++control) {
+                    const auto normalized=(candidate[control]-candidate[control-1]).length()/scale;
+                    spacingPenalty+=std::pow(std::max(0.0,0.15-normalized),2);
+                }
+                constexpr std::size_t SAMPLES_PER_INTERVAL=32;
+                for(std::size_t interval=0;interval<3;++interval) {
+                    auto previousSpeed=0.0;
+                    auto previousCap=programmedFeed;
+                    for(std::size_t sample=0;sample<=SAMPLES_PER_INTERVAL;++sample) {
+                        const auto parameter=static_cast<double>(interval)
+                            +static_cast<double>(sample)/SAMPLES_PER_INTERVAL;
+                        const auto firstValue=splineAt(
+                            first.degree,first.controls,first.knots,parameter,interval);
+                        const auto speed=firstValue.length();
+                        if(!std::isfinite(speed)||speed<=1e-12)
+                            return std::array{std::numeric_limits<double>::infinity(),
+                                std::numeric_limits<double>::infinity(),maximumDisplacement};
+                        const auto secondValue=splineAt(
+                            second.degree,second.controls,second.knots,parameter,interval);
+                        const auto thirdValue=splineAt(
+                            third.degree,third.controls,third.knots,parameter,interval);
+                        const auto tangent=scaled(firstValue,1.0/speed);
+                        const auto curvature=scaled(secondValue
+                            -scaled(tangent,dot(secondValue,tangent)),1.0/(speed*speed));
+                        const auto geometricThird=curvatureDerivativeFromParameterDerivatives(
+                            firstValue,secondValue,thirdValue,speed);
+                        const auto fraction=parameter/3.0;
+                        const auto targetNormal=startNormalSharpness
+                            +scaled(endNormalSharpness-startNormalSharpness,fraction);
+                        const auto dimensionlessNormalError=normalPart(
+                            geometricThird,tangent)-targetNormal;
+                        const auto normalizedNormalError=
+                            dimensionlessNormalError.length()*scale*scale;
+                        normalSharpnessError+=normalizedNormalError*normalizedNormalError;
+                        maximumNormalSharpnessError=std::max(
+                            maximumNormalSharpnessError,normalizedNormalError);
+                        auto cap=programmedFeed;
+                        if(std::isfinite(limits.pathAcceleration)
+                           &&curvature.length()>1e-15)
+                            cap=std::min(cap,
+                                std::sqrt(limits.pathAcceleration/curvature.length()));
+                        if(std::isfinite(limits.pathJerk)&&geometricThird.length()>1e-15)
+                            cap=std::min(cap,
+                                std::cbrt(limits.pathJerk/geometricThird.length()));
+                        for(const auto component:components) {
+                            const auto tangentMagnitude=std::abs(tangent.*component);
+                            const auto curvatureMagnitude=std::abs(curvature.*component);
+                            const auto jerkMagnitude=std::abs(geometricThird.*component);
+                            if(std::isfinite(limits.axisVelocity.*component)
+                               &&tangentMagnitude>1e-15)
+                                cap=std::min(cap,
+                                    (limits.axisVelocity.*component)/tangentMagnitude);
+                            if(std::isfinite(limits.axisAcceleration.*component)
+                               &&curvatureMagnitude>1e-15)
+                                cap=std::min(cap,std::sqrt(
+                                    (limits.axisAcceleration.*component)/curvatureMagnitude));
+                            if(std::isfinite(limits.axisJerk.*component)
+                               &&jerkMagnitude>1e-15)
+                                cap=std::min(cap,std::cbrt(
+                                    (limits.axisJerk.*component)/jerkMagnitude));
+                        }
+                        if(!std::isfinite(cap)||cap<=0.0) cap=programmedFeed;
+                        if(sample>0) {
+                            constexpr auto step=
+                                1.0/static_cast<double>(SAMPLES_PER_INTERVAL);
+                            duration+=0.5*(previousSpeed+speed)*step
+                                /std::min(previousCap,cap);
+                        }
+                        previousSpeed=speed;
+                        previousCap=cap;
+                    }
+                }
+                const auto regularization=0.02*std::pow(maximumDisplacement/scale,2)
+                    +0.001*spacingPenalty
+                    +0.002*normalSharpnessError/99.0
+                    +0.0005*maximumNormalSharpnessError*maximumNormalSharpnessError;
+                return std::array{duration*(1.0+regularization),duration,
+                    maximumDisplacement};
+            };
+            auto bestScore=score(controls);
+            for(const auto stepFactor:{0.2,0.1,0.05}) {
+                for(std::size_t control=3;control<=8;++control) {
+                    for(std::size_t componentIndex=0;
+                        componentIndex<components.size();++componentIndex) {
+                        if(!activeComponents[componentIndex]) continue;
+                        const auto component=components[componentIndex];
+                        auto selected=controls;
+                        auto selectedScore=bestScore;
+                        for(const auto direction:{-1.0,1.0}) {
+                            auto candidate=controls;
+                            candidate[control].*component+=direction*stepFactor*scale;
+                            if((candidate[control]-baseline[control]).length()>0.35*scale)
+                                continue;
+                            const auto candidateScore=score(candidate);
+                            if(candidateScore<selectedScore) {
+                                selectedScore=candidateScore;
+                                selected=std::move(candidate);
+                            }
+                        }
+                        if(selectedScore<bestScore) {
+                            controls=std::move(selected);
+                            bestScore=selectedScore;
+                        }
+                    }
+                }
+            }
+            return controls;
         }
     }
 
@@ -910,9 +1196,9 @@ namespace ngc {
         for(std::size_t index = 0; index < entities.size(); ++index) {
             const auto incomingScale = sourceScale(entities[index], blendScale);
             const auto from = index == 0 && !boundaries.incomingReplacement
-                ? 0.0 : 3.0 * incomingScale;
+                ? 0.0 : JUNCTION_REPLACEMENT_SCALE*incomingScale;
             const auto to = index + 1 == entities.size() ? entities[index].length
-                : entities[index].length - 3.0 * incomingScale;
+                : entities[index].length-JUNCTION_REPLACEMENT_SCALE*incomingScale;
             const auto cluster = clusterRight[index];
             const auto collapsed = std::ranges::any_of(clusters, [&](const auto &candidate) {
                 return index > candidate.left && index < candidate.right;
@@ -940,11 +1226,13 @@ namespace ngc {
                     sourceFeeds.push_back({sourceLength, sourceLength + length, feed});
                     sourceLength += length;
                 };
-                appendSourceFeed(3.0 * leftScale, entities[index].feed);
+                appendSourceFeed(JUNCTION_REPLACEMENT_SCALE*leftScale,
+                    entities[index].feed);
                 for(std::size_t entity = index + 1; entity < right; ++entity)
                     appendSourceFeed(entities[entity].length, entities[entity].feed);
-                appendSourceFeed(3.0 * rightScale, entities[right].feed);
-                auto controls = curvatureMatchedSixControlBlend(
+                appendSourceFeed(JUNCTION_REPLACEMENT_SCALE*rightScale,
+                    entities[right].feed);
+                auto controls = curvatureMatchedSixControlClusterSeed(
                     entities[index], entities[right], leftScale, rightScale, workspace);
                 if(right > index + 1) {
                     std::vector<double> interiorLengths;
@@ -985,7 +1273,7 @@ namespace ngc {
                     spline_detail::SplineReconstructionSource source;
                     source.length = sourceLength;
                     source.positionAt = [&](double distance) {
-                        const auto leftLength = 3.0 * leftScale;
+                        const auto leftLength=JUNCTION_REPLACEMENT_SCALE*leftScale;
                         if(distance <= leftLength)
                             return sourcePosition(entities[index], entities[index].length - leftLength + distance,
                                 workspace);
@@ -995,7 +1283,8 @@ namespace ngc {
                                 return sourcePosition(entities[entity], distance, workspace);
                             distance -= entities[entity].length;
                         }
-                        return sourcePosition(entities[right], std::min(distance, 3.0 * rightScale), workspace);
+                        return sourcePosition(entities[right],std::min(distance,
+                            JUNCTION_REPLACEMENT_SCALE*rightScale),workspace);
                     };
                     source.chordErrorBound = [](double, double) { return 0.0; };
                     source.boundaries.reserve(sourceFeeds.size() + 1);
@@ -1006,8 +1295,9 @@ namespace ngc {
                         source.programmedFeeds.push_back(range.programmedFeed);
                     }
                     source.velocityLimits=effort.splineVelocityLimits;
-                    const auto startDistance = entities[index].length - 3.0 * leftScale;
-                    const auto endDistance = 3.0 * rightScale;
+                    const auto startDistance=entities[index].length
+                        -JUNCTION_REPLACEMENT_SCALE*leftScale;
+                    const auto endDistance=JUNCTION_REPLACEMENT_SCALE*rightScale;
                     source.startTangent = tangentAtDistance(
                         *entities[index].curve, startDistance, workspace);
                     source.startCurvature = curvatureAtDistance(
@@ -1039,13 +1329,14 @@ namespace ngc {
                 std::vector<PreparedSourceInterval> replacedSourceIntervals;
                 replacedSourceIntervals.reserve(right - index + 1);
                 replacedSourceIntervals.push_back({entities[index].id,
-                    entities[index].curve, entities[index].length - 3.0 * leftScale,
+                    entities[index].curve,entities[index].length
+                        -JUNCTION_REPLACEMENT_SCALE*leftScale,
                     entities[index].length});
                 for(std::size_t entity = index + 1; entity < right; ++entity)
                     replacedSourceIntervals.push_back({entities[entity].id,
                         entities[entity].curve, 0.0, entities[entity].length});
                 replacedSourceIntervals.push_back({entities[right].id,
-                    entities[right].curve, 0.0, 3.0 * rightScale});
+                    entities[right].curve,0.0,JUNCTION_REPLACEMENT_SCALE*rightScale});
                 if(auto added = addPiece(PreparedPieceKind::ClusterSpline, curve, 0.0,
                                          curve->length, (entities[index].feed + entities[right].feed) / 2.0,
                                          entities[index].id, std::move(activations),
@@ -1058,9 +1349,11 @@ namespace ngc {
             }
             const auto &incoming = entities[index];
             const auto &outgoing = entities[index + 1];
-            const auto controls = curvatureMatchedSixControlBlend(incoming, outgoing,
-                sourceScale(incoming, blendScale), sourceScale(outgoing, blendScale), workspace);
-            auto curve = splineCurve(controls, 3,
+            const auto controls=softOptimizedTwelveControlBlend(
+                incoming,outgoing,sourceScale(incoming,blendScale),
+                sourceScale(outgoing,blendScale),effort.splineVelocityLimits,
+                std::midpoint(incoming.feed,outgoing.feed),workspace);
+            auto curve = splineCurve(controls,5,elevatedJunctionKnots(),
                 effort.lengthTableIntervalsPerKnotSpan);
             if(!curve) return std::unexpected("junction blend spline construction failed");
             if(auto added = addPiece(PreparedPieceKind::JunctionBlend, curve, 0.0, curve->length,
@@ -1068,10 +1361,12 @@ namespace ngc {
                                      {outgoing.id},
                                      {incoming.id, outgoing.id},
                                      {{incoming.id, incoming.curve,
-                                       incoming.length - 3.0 * sourceScale(incoming, blendScale),
+                                       incoming.length-JUNCTION_REPLACEMENT_SCALE
+                                            *sourceScale(incoming,blendScale),
                                        incoming.length},
                                       {outgoing.id, outgoing.curve, 0.0,
-                                       3.0 * sourceScale(outgoing, blendScale)}}); !added)
+                                       JUNCTION_REPLACEMENT_SCALE
+                                            *sourceScale(outgoing,blendScale)}}); !added)
                 return std::unexpected(added.error());
         }
         if(result.pieces.empty()) return std::unexpected("continuous path produced no geometry");

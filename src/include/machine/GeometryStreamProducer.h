@@ -156,7 +156,7 @@ namespace ngc {
         }
 
         bool isLongSource(const PreparedCommandRecord &record) const {
-            return sourceLength(record) > 6.0 * m_continuousScale.value_or(0.001);
+            return sourceLength(record)>8.0*m_continuousScale.value_or(0.001);
         }
 
         void appendPending(PreparedPathPiece piece) {

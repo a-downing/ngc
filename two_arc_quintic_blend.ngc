@@ -1,0 +1,15 @@
+(Two equal-radius quarter arcs meeting at a cusp.)
+(Use this to inspect the ordinary quintic junction blend.)
+G20
+G90
+G17
+G94
+G91.1
+G64 P0.005
+F600
+
+G0 X0 Y-1 Z0
+G3 X1 Y0 I0 J1
+G3 X2 Y-1 I1 J0
+
+M30

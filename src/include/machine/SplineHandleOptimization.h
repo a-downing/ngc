@@ -35,7 +35,7 @@ namespace ngc::spline_detail {
         std::vector<ShortEntitySplineCluster> result;
         if(!std::isfinite(programmedScale)||programmedScale<=0.0||lengths.size()<3)
             return result;
-        const auto threshold=6.0*programmedScale;
+        const auto threshold=8.0*programmedScale;
         for(std::size_t left=0;left+2<lengths.size();) {
             if(lengths[left]<=threshold) {
                 ++left;

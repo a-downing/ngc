@@ -221,7 +221,7 @@ namespace ngc {
 
     // Selects the open boundaries of an incremental continuous-geometry
     // preparation. An incoming replacement means the first source entity's
-    // first 3P has already been replaced. Deferring the final retained
+    // first 4P has already been replaced. Deferring the final retained
     // primitive section permits construction of the replacement entering that
     // source without constructing or sampling that not-yet-final section.
     struct ContinuousGeometryBoundaries {
