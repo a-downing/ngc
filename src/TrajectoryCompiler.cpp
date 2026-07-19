@@ -1647,6 +1647,7 @@ namespace ngc {
         std::vector<double> previousStationAcceleration;
         std::vector<TimeLaw> previousPieceTiming;
         std::vector<std::size_t> previouslyCorrectedPieces;
+        bool useAccelerationAwareRescue=false;
         const auto bitExactDouble=[](const double left,const double right) {
             return std::bit_cast<std::uint64_t>(left)
                 ==std::bit_cast<std::uint64_t>(right);
@@ -2326,10 +2327,13 @@ namespace ngc {
             result->scpSeconds+=std::chrono::duration<double>(
                 std::chrono::steady_clock::now()-scpStarted).count();
 
-            // Retain the old implementation in this experiment branch for
-            // immediate source-level comparison, but do not execute it.
-            if(false) {
-            const auto reachabilitySweeps=m_continuousPlanningEffort.reachabilitySweeps;
+            // The sparse pass is normally sufficient. If exact verification
+            // later predicts a pathological local-limit collapse, retry that
+            // horizon with a tightly bounded acceleration-aware refinement.
+            // This keeps the expensive search off ordinary horizons.
+            if(useAccelerationAwareRescue) {
+            const auto reachabilitySweeps=std::min(
+                2U,m_continuousPlanningEffort.reachabilitySweeps);
             const auto reachabilityAccelerationCandidates=
                 m_continuousPlanningEffort.accelerationCandidates;
             // Production rolling callers may request a coarser bounded refinement.
@@ -2338,11 +2342,8 @@ namespace ngc {
             const auto requestedEffortVelocitySearchIterations=std::max(
                 requestedVelocitySearchIterations,
                 m_continuousPlanningEffort.minimumVelocitySearchIterations);
-            const auto reachabilityVelocitySearchIterations=
-                m_continuousPlanningEffort.capLargeHorizonVelocitySearch
-                    &&curvedReachabilityStations>1024
-                    ?std::min(4U,std::max(1U,requestedEffortVelocitySearchIterations))
-                    :std::max(1U,requestedEffortVelocitySearchIterations);
+            const auto reachabilityVelocitySearchIterations=std::min(
+                4U,std::max(1U,requestedEffortVelocitySearchIterations));
             std::size_t reachabilityCandidateEvaluations=0;
             std::size_t curvedCandidateEvaluations=0;
             std::size_t linearCandidateEvaluations=0;
@@ -2753,7 +2754,7 @@ namespace ngc {
                         return boundary.ruckigBrakePhase;
                     });
                 });
-            if(correctionPass>0) {
+            if(correctionPass>0&&!previouslyCorrectedPieces.empty()) {
                 CorrectionPassLocalityDiagnostic locality {
                     .pass=correctionPass,
                     .pieceCount=pieces.size(),
@@ -3126,6 +3127,37 @@ namespace ngc {
             if(worst<=1.0+1e-9) {
                 constraintsVerified=true;
                 break;
+            }
+            if(!useAccelerationAwareRescue) {
+                auto pathologicalCorrection=false;
+                for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
+                    if(correction[pieceIndex]<=1.0+1e-9) continue;
+                    const auto factor=correction[pieceIndex]*1.01;
+                    const auto projectedVelocity=localLimits[pieceIndex].velocity/factor;
+                    const auto projectedJerk=localLimits[pieceIndex].jerk
+                        /(factor*factor*factor);
+                    if(projectedVelocity<initialLocalLimits[pieceIndex].velocity*0.02
+                       ||projectedJerk<initialLocalLimits[pieceIndex].jerk*0.001) {
+                        pathologicalCorrection=true;
+                        break;
+                    }
+                }
+                if(pathologicalCorrection) {
+                    useAccelerationAwareRescue=true;
+                    result->accelerationAwareRescue=true;
+                    localLimits=initialLocalLimits;
+                    previousStationVelocity.clear();
+                    previousStationAcceleration.clear();
+                    previousPieceTiming.clear();
+                    previouslyCorrectedPieces.clear();
+                    previousStationVisits.clear();
+                    previousStationVisitSlots.clear();
+                    correctionHistory+=std::format(
+                        "{}pass {}: restored initial local limits and enabled bounded "
+                        "acceleration-aware rescue",correctionHistory.empty()?"":"; ",
+                        correctionPass);
+                    continue;
+                }
             }
             previousStationVelocity=stationVelocity;
             previousStationAcceleration=stationAcceleration;

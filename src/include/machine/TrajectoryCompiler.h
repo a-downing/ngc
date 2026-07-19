@@ -283,6 +283,7 @@ namespace ngc {
         std::size_t scpAcceptedSteps = 0;
         std::size_t scpMaterializationAttempts = 0;
         double scpSeconds = 0.0;
+        bool accelerationAwareRescue = false;
         TimeLawDiagnostics timeLaw;
     };
 
