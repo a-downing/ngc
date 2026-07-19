@@ -50,7 +50,6 @@ namespace ngc {
         double preparedSeconds = 0.0;
         double preparationSeconds = 0.0;
         std::size_t retainedSourceHighWater = 0;
-        GeometryPreparationDiagnostics pieces;
         std::string lastFailure;
     };
 
@@ -76,7 +75,6 @@ namespace ngc {
         std::vector<PreparedCommandRecord> m_continuous;
         std::map<PreparedCommandId, PreparedCommandRecord> m_commandRecords;
         std::vector<PreparedPathPiece> m_pendingPieces;
-        double m_pendingLength = 0.0;
         double m_pendingDuration = 0.0;
         std::set<PreparedCommandId> m_activatedCommands;
         bool m_haveLongAnchor = false;
@@ -163,7 +161,6 @@ namespace ngc {
 
         void appendPending(PreparedPathPiece piece) {
             tag(piece);
-            m_pendingLength += piece.length();
             if(piece.programmedFeed > 0.0)
                 m_pendingDuration += piece.length() / piece.programmedFeed;
             m_pendingPieces.push_back(std::move(piece));
@@ -188,7 +185,6 @@ namespace ngc {
             slice.epoch = m_epoch;
             slice.sequence = m_sequence++;
             slice.chain = m_chain;
-            slice.pathLength = m_pendingLength;
             slice.nominalDuration = m_pendingDuration;
             slice.pieces = std::move(m_pendingPieces);
 
@@ -216,7 +212,6 @@ namespace ngc {
             if(!publish(std::move(slice))) return false;
             ++m_diagnostics.slicesPublished;
             m_pendingPieces.clear();
-            m_pendingLength = 0.0;
             m_pendingDuration = 0.0;
             pruneCommandRecords();
             return true;

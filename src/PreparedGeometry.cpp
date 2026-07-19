@@ -392,12 +392,8 @@ namespace ngc {
 
         void appendGeometricSample(PreparedPathPiece &piece, const double distance,
                                    const PreparedGeometryBoundary &boundary) {
-            const auto tangential = dot(boundary.tangent, boundary.curvatureDerivative);
-            const auto normal = boundary.curvatureDerivative
-                - scaled(boundary.tangent, tangential);
-            piece.geometricSamples.push_back({distance, boundary.position, boundary.tangent,
-                boundary.curvature, boundary.curvatureDerivative, normal.length(),
-                boundary.curvatureDerivative.length()});
+            piece.geometricSamples.push_back({distance, boundary.tangent,
+                boundary.curvature, boundary.curvatureDerivative});
         }
 
         void samplePiece(PreparedPathPiece &piece, CurveEvaluationWorkspace &workspace) {
@@ -483,8 +479,8 @@ namespace ngc {
             for(std::size_t interval = 0; interval < intervalCount; ++interval) {
                 // Reconstruction maps composite source distance linearly onto
                 // the spline parameter domain [0, intervalCount]. Retain that
-                // provenance for feed attribution even though timing continues
-                // to use the cluster-wide PreparedPathPiece::programmedFeed.
+                // provenance to assign each knot interval its conservative
+                // local programmed feed.
                 const auto sourceFrom = sourceLength * static_cast<double>(interval)
                     / static_cast<double>(intervalCount);
                 const auto sourceTo = sourceLength * static_cast<double>(interval + 1)
@@ -763,7 +759,6 @@ namespace ngc {
 
         PreparedContinuousGeometry result;
         result.commands.assign(records.begin(), records.end());
-        result.diagnostics.sourceCommands = records.size();
         CurveEvaluationWorkspace workspace;
         auto expected = expectedStart;
         for(const auto &record : records) {
@@ -773,7 +768,6 @@ namespace ngc {
                 std::shared_ptr<const PreparedCurve> curve;
                 PreparedPieceKind kind = PreparedPieceKind::RetainedLineSection;
                 auto feed = 0.0;
-                auto linear = false;
                 position_t start{};
                 position_t end{};
                 if constexpr(std::same_as<T, MoveLine>) {
@@ -782,7 +776,6 @@ namespace ngc {
                     curve = lineCurve(start, end);
                     kind = PreparedPieceKind::RetainedLineSection;
                     feed = command.speed() > 0.0 ? command.speed() / 60.0 : 0.0;
-                    linear = true;
                 } else if constexpr(std::same_as<T, MoveArc>) {
                     start = command.from();
                     end = command.to();
@@ -796,7 +789,7 @@ namespace ngc {
                 if((start - expected).length() > 1e-8)
                     return std::unexpected(
                         "exact-stop geometry source endpoints are discontinuous");
-                if(!curve || (!linear && curve->length <= 1e-12))
+                if(!curve || curve->length <= 1e-12)
                     return std::unexpected("exact-stop path contains an invalid source entity");
                 PreparedPathPiece prepared;
                 prepared.id = static_cast<PreparedPieceId>(result.pieces.size() + 1);
@@ -805,7 +798,6 @@ namespace ngc {
                 prepared.curveFrom = 0.0;
                 prepared.curveTo = prepared.curve->length;
                 prepared.programmedFeed = feed;
-                prepared.geometricallyLinear = linear;
                 prepared.primaryCommand = record.id;
                 prepared.activationCommands = {record.id};
                 prepared.sourceCommands = {record.id};
@@ -814,20 +806,11 @@ namespace ngc {
                 return prepared;
             }, record.command);
             if(!piece) return std::unexpected(piece.error());
-            result.diagnostics.pathLength += piece->length();
             if(piece->programmedFeed > 0.0)
                 result.diagnostics.nominalDuration +=
                     piece->length() / piece->programmedFeed;
-            ++result.diagnostics.preparedPieces;
-            if(piece->geometricallyLinear)
-                ++result.diagnostics.retainedLineSections;
-            else
-                ++result.diagnostics.retainedArcSections;
             result.pieces.push_back(std::move(*piece));
         }
-        result.beginning = boundaryAt(result.pieces.front(), workspace, 0.0);
-        result.ending = boundaryAt(
-            result.pieces.back(), workspace, result.pieces.back().length());
         return result;
     }
 
@@ -841,7 +824,6 @@ namespace ngc {
 
         PreparedContinuousGeometry result;
         result.commands.assign(records.begin(), records.end());
-        result.diagnostics.sourceCommands = records.size();
         std::vector<SourceEntity> entities;
         entities.reserve(records.size());
         CurveEvaluationWorkspace workspace;
@@ -896,7 +878,7 @@ namespace ngc {
 
         auto addPiece = [&](const PreparedPieceKind kind, const std::shared_ptr<const PreparedCurve> &curve,
                             const double from, const double to, const double feed,
-                            const bool linear, const PreparedCommandId primary,
+                            const PreparedCommandId primary,
                             std::vector<PreparedCommandId> activations,
                             std::vector<PreparedCommandId> sources,
                             std::vector<PreparedSourceInterval> replacedSourceIntervals,
@@ -911,7 +893,6 @@ namespace ngc {
             piece.curveFrom = from;
             piece.curveTo = to;
             piece.programmedFeed = feed;
-            piece.geometricallyLinear = linear || curve->geometricallyLinear;
             piece.primaryCommand = primary;
             piece.activationCommands = std::move(activations);
             piece.sourceCommands = std::move(sources);
@@ -921,15 +902,7 @@ namespace ngc {
                         piece, clusterSourceFeeds, workspace, effort.generateSamples); !prepared)
                     return std::unexpected(prepared.error());
             } else if(effort.generateSamples) samplePiece(piece, workspace);
-            result.diagnostics.pathLength += piece.length();
             if(feed > 0.0) result.diagnostics.nominalDuration += piece.length() / feed;
-            ++result.diagnostics.preparedPieces;
-            switch(kind) {
-                case PreparedPieceKind::RetainedLineSection: ++result.diagnostics.retainedLineSections; break;
-                case PreparedPieceKind::RetainedArcSection: ++result.diagnostics.retainedArcSections; break;
-                case PreparedPieceKind::JunctionBlend: ++result.diagnostics.junctionBlends; break;
-                case PreparedPieceKind::ClusterSpline: ++result.diagnostics.clusterSplines; break;
-            }
             result.pieces.push_back(std::move(piece));
             return {};
         };
@@ -950,8 +923,8 @@ namespace ngc {
                 const auto kind = entities[index].linear ? PreparedPieceKind::RetainedLineSection
                                                           : PreparedPieceKind::RetainedArcSection;
                 if(auto added = addPiece(kind, entities[index].curve, from, to,
-                                         entities[index].feed, entities[index].linear,
-                                         entities[index].id, {entities[index].id},
+                                         entities[index].feed, entities[index].id,
+                                         {entities[index].id},
                                          {entities[index].id}, {}); !added)
                     return std::unexpected(added.error());
             }
@@ -1074,7 +1047,7 @@ namespace ngc {
                     entities[right].curve, 0.0, 3.0 * rightScale});
                 if(auto added = addPiece(PreparedPieceKind::ClusterSpline, curve, 0.0,
                                          curve->length, (entities[index].feed + entities[right].feed) / 2.0,
-                                         false, entities[index].id, std::move(activations),
+                                         entities[index].id, std::move(activations),
                                          std::move(sources),
                                          std::move(replacedSourceIntervals),
                                          sourceFeeds); !added)
@@ -1090,8 +1063,8 @@ namespace ngc {
                 effort.lengthTableIntervalsPerKnotSpan);
             if(!curve) return std::unexpected("junction blend spline construction failed");
             if(auto added = addPiece(PreparedPieceKind::JunctionBlend, curve, 0.0, curve->length,
-                                     (incoming.feed + outgoing.feed) / 2.0, false,
-                                     outgoing.id, {outgoing.id},
+                                     (incoming.feed + outgoing.feed) / 2.0, outgoing.id,
+                                     {outgoing.id},
                                      {incoming.id, outgoing.id},
                                      {{incoming.id, incoming.curve,
                                        incoming.length - 3.0 * sourceScale(incoming, blendScale),
@@ -1101,8 +1074,6 @@ namespace ngc {
                 return std::unexpected(added.error());
         }
         if(result.pieces.empty()) return std::unexpected("continuous path produced no geometry");
-        result.beginning = boundaryAt(result.pieces.front(), workspace, 0.0);
-        result.ending = boundaryAt(result.pieces.back(), workspace, result.pieces.back().length());
         return result;
     }
 }

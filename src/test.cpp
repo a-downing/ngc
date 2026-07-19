@@ -2312,9 +2312,23 @@ namespace {
                 "an arc-to-arc junction blend must match outgoing arc curvature");
         require(blendStartCurvature.length()>19.0&&blendEndCurvature.length()>19.0,
                 "arc junction blend endpoint curvature must not collapse to zero");
-        require(std::abs(incoming.geometricSamples.back().normalSharpness)<1e-8,
+        const auto &geometricSample=incoming.geometricSamples.back();
+        const auto tangential=geometricSample.tangent.x*geometricSample.curvatureDerivative.x
+            +geometricSample.tangent.y*geometricSample.curvatureDerivative.y
+            +geometricSample.tangent.z*geometricSample.curvatureDerivative.z
+            +geometricSample.tangent.a*geometricSample.curvatureDerivative.a
+            +geometricSample.tangent.b*geometricSample.curvatureDerivative.b
+            +geometricSample.tangent.c*geometricSample.curvatureDerivative.c;
+        const ngc::position_t normal{
+            geometricSample.curvatureDerivative.x-geometricSample.tangent.x*tangential,
+            geometricSample.curvatureDerivative.y-geometricSample.tangent.y*tangential,
+            geometricSample.curvatureDerivative.z-geometricSample.tangent.z*tangential,
+            geometricSample.curvatureDerivative.a-geometricSample.tangent.a*tangential,
+            geometricSample.curvatureDerivative.b-geometricSample.tangent.b*tangential,
+            geometricSample.curvatureDerivative.c-geometricSample.tangent.c*tangential};
+        require(normal.length()<1e-8,
                 "constant-curvature arc samples should have zero normal sharpness");
-        require(std::abs(incoming.geometricSamples.back().fullGeometricJerkCoefficient
+        require(std::abs(geometricSample.curvatureDerivative.length()
                          -1.0/(RADIUS*RADIUS))<1e-6,
                 "prepared samples must retain the tangential curvature-squared jerk component");
     }
@@ -2755,8 +2769,7 @@ namespace {
         const auto blend=std::ranges::find_if(prepared->pieces,[](const auto &piece) {
             return piece.kind==ngc::PreparedPieceKind::JunctionBlend;
         });
-        require(blend!=prepared->pieces.end()&&blend->geometricallyLinear
-                    &&blend->curve->geometricallyLinear,
+        require(blend!=prepared->pieces.end()&&blend->curve->geometricallyLinear,
                 "a monotone collinear junction blend must retain its spline identity but use "
                 "the exact linear timing emitter");
 

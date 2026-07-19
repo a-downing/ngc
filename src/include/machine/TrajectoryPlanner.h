@@ -161,14 +161,17 @@ namespace ngc {
                     m_preparedWindow->pieces.size());
                 const auto &first=m_preparedWindow->commands.front();
                 const auto &last=m_preparedWindow->commands.back();
+                const auto beginning=preparedBoundary(
+                    m_preparedWindow->pieces.front(),0.0);
+                const auto ending=preparedBoundary(m_preparedWindow->pieces.back(),
+                    m_preparedWindow->pieces.back().length());
                 return std::format(
                     "prepared G64 window commands={} pieces={} P={} first={} last={} start={} end={}",
                     m_preparedWindow->commands.size(),m_preparedWindow->pieces.size(),
                     first.metadata.pathTolerance
                         ?std::format("{}",*first.metadata.pathTolerance):std::string("<default>"),
                     inputLocation(first),inputLocation(last),
-                    formatPosition(m_preparedWindow->beginning.position),
-                    formatPosition(m_preparedWindow->ending.position));
+                    formatPosition(beginning.position),formatPosition(ending.position));
             }
             if(m_window.empty()) return "empty G64 window";
             const auto start=motionStart(m_window.front().command);
@@ -239,15 +242,11 @@ namespace ngc {
             for(unsigned index=0;index<=SAMPLE_INTERVALS;++index) {
                 const auto local=piece.length()*index/static_cast<double>(SAMPLE_INTERVALS);
                 const auto distance=piece.curveFrom+local;
-                const auto position=positionAtDistance(*piece.curve,distance,workspace);
                 const auto tangent=tangentAtDistance(*piece.curve,distance,workspace);
                 const auto curvature=curvatureAtDistance(*piece.curve,distance,workspace);
                 const auto derivative=curvatureDerivativeAtDistance(
                     *piece.curve,distance,workspace);
-                const auto tangential=positionDot(tangent,derivative);
-                const auto normal=derivative-scalePosition(tangent,tangential);
-                piece.geometricSamples.push_back({local,position,tangent,curvature,
-                    derivative,normal.length(),derivative.length()});
+                piece.geometricSamples.push_back({local,tangent,curvature,derivative});
             }
         }
 
@@ -266,24 +265,8 @@ namespace ngc {
                     piece.sourceCommands.end());
                 activated.insert(activated.end(),piece.activationCommands.begin(),
                     piece.activationCommands.end());
-                result.diagnostics.pathLength+=piece.length();
                 if(piece.programmedFeed>0.0)
                     result.diagnostics.nominalDuration+=piece.length()/piece.programmedFeed;
-                ++result.diagnostics.preparedPieces;
-                switch(piece.kind) {
-                    case PreparedPieceKind::RetainedLineSection:
-                        ++result.diagnostics.retainedLineSections;
-                        break;
-                    case PreparedPieceKind::RetainedArcSection:
-                        ++result.diagnostics.retainedArcSections;
-                        break;
-                    case PreparedPieceKind::JunctionBlend:
-                        ++result.diagnostics.junctionBlends;
-                        break;
-                    case PreparedPieceKind::ClusterSpline:
-                        ++result.diagnostics.clusterSplines;
-                        break;
-                }
             }
             for(const auto &record:source.commands) {
                 if(!std::ranges::contains(referenced,record.id)) continue;
@@ -291,12 +274,6 @@ namespace ngc {
                 retained.presentationActivation=retained.presentationActivation
                     &&std::ranges::contains(activated,record.id);
                 result.commands.push_back(std::move(retained));
-            }
-            result.diagnostics.sourceCommands=result.commands.size();
-            if(!result.pieces.empty()) {
-                result.beginning=preparedBoundary(result.pieces.front(),0.0);
-                result.ending=preparedBoundary(
-                    result.pieces.back(),result.pieces.back().length());
             }
             return result;
         }
@@ -315,7 +292,7 @@ namespace ngc {
             const auto &source=*m_preparedWindow;
             const auto &piece=source.pieces[pieceIndex];
             if(piece.kind!=PreparedPieceKind::RetainedLineSection
-               ||!piece.geometricallyLinear||localDistance<=1e-10
+               ||!piece.curve->geometricallyLinear||localDistance<=1e-10
                ||piece.length()-localDistance<=1e-10) return std::nullopt;
             auto prefixPiece=piece;
             auto suffixPiece=piece;
@@ -743,13 +720,7 @@ namespace ngc {
             }
             geometry.pieces.insert(geometry.pieces.end(),
                 slice.pieces.begin(),slice.pieces.end());
-            geometry.beginning=preparedBoundary(geometry.pieces.front(),0.0);
-            geometry.ending=preparedBoundary(
-                geometry.pieces.back(),geometry.pieces.back().length());
-            geometry.diagnostics.pathLength+=slice.pathLength;
             geometry.diagnostics.nominalDuration+=slice.nominalDuration;
-            geometry.diagnostics.sourceCommands=geometry.commands.size();
-            geometry.diagnostics.preparedPieces=geometry.pieces.size();
             return true;
         }
 
@@ -949,7 +920,7 @@ namespace ngc {
                     if(piece.programmedFeed<=0.0) break;
                     const auto duration=piece.length()/piece.programmedFeed;
                     if(piece.kind==PreparedPieceKind::RetainedLineSection
-                       &&piece.geometricallyLinear) {
+                       &&piece.curve->geometricallyLinear) {
                         for(const auto fraction:FRACTIONS) {
                             const auto prefixDuration=precedingDuration+duration*fraction;
                             const auto suffixDuration=totalDuration-prefixDuration;

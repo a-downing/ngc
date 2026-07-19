@@ -672,6 +672,11 @@ public:
                 return glm::dvec3(value.x - offset.x, value.y - offset.y,
                                   value.z - offset.z);
             };
+            const auto positionDot = [](const ngc::position_t &left,
+                                        const ngc::position_t &right) {
+                return left.x * right.x + left.y * right.y + left.z * right.z
+                    + left.a * right.a + left.b * right.b + left.c * right.c;
+            };
             const auto commandOffset = [](const ngc::PreparedGeometrySlice &slice,
                                           const ngc::PreparedCommandId id) {
                 const auto found = std::ranges::find_if(slice.commands,
@@ -855,12 +860,23 @@ public:
                         const auto curvature = glm::dvec3(sample.curvature.x,
                             sample.curvature.y, sample.curvature.z);
                         const auto curvatureLength = glm::length(curvature);
+                        const auto tangential = positionDot(
+                            sample.tangent, sample.curvatureDerivative);
+                        const ngc::position_t normal {
+                            sample.curvatureDerivative.x - sample.tangent.x * tangential,
+                            sample.curvatureDerivative.y - sample.tangent.y * tangential,
+                            sample.curvatureDerivative.z - sample.tangent.z * tangential,
+                            sample.curvatureDerivative.a - sample.tangent.a * tangential,
+                            sample.curvatureDerivative.b - sample.tangent.b * tangential,
+                            sample.curvatureDerivative.c - sample.tangent.c * tangential };
                         GeometricJerkCombSample displaySample;
-                        displaySample.position = offsetPoint(sample.position, offset);
+                        displaySample.position = offsetPoint(ngc::positionAtDistance(
+                            *piece.curve, piece.curveFrom + sample.distance, curveWorkspace),
+                            offset);
                         if(curvatureLength > 1e-15)
                             displaySample.normalDirection = curvature / curvatureLength;
-                        displaySample.magnitude = sample.fullGeometricJerkCoefficient;
-                        displaySample.normalMagnitude = sample.normalSharpness;
+                        displaySample.magnitude = sample.curvatureDerivative.length();
+                        displaySample.normalMagnitude = normal.length();
                         displaySample.tangentialMagnitude = curvatureLength * curvatureLength;
                         displaySample.programmedSpeed = piece.programmedFeed;
                         if(m_pathJerk > 0.0 && displaySample.magnitude > 1e-15)

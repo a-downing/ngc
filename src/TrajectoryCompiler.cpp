@@ -925,8 +925,7 @@ namespace ngc {
         TimeLawWorkspace timeLawWorkspace;
         TimeLawCompilationRecorder timeLawRecorder {m_lastTimeLawDiagnostics};
         CurveEvaluationWorkspace preparedWorkspace;
-        if(preparedPiece && (!preparedPiece->curve
-           ||(!preparedPiece->geometricallyLinear && preparedPiece->length() <= 1e-12)))
+        if(preparedPiece && (!preparedPiece->curve||preparedPiece->length()<=1e-12))
             return std::unexpected("exact-stop prepared piece is invalid");
 
         const auto preparedSample = [&](const double distance) {
@@ -1083,7 +1082,7 @@ namespace ngc {
                     const auto accept = [&](const AxisPolynomialSpan &span,
                                             const double from, const double to,
                                             double, double) {
-                        if(preparedPiece->geometricallyLinear) return true;
+                        if(preparedPiece->curve->geometricallyLinear) return true;
                         return verifiesOrderedCurveTolerance(span, from, to,
                             m_limits.arcChordTolerance,
                             [&](const double distance) {
@@ -1101,7 +1100,7 @@ namespace ngc {
                     };
                     if(auto result = appendMotion(preparedPiece->length(), speed,
                             preparedMaximumTangent(), preparedSample, curvature,
-                            !preparedPiece->geometricallyLinear, accept)) return result;
+                            !preparedPiece->curve->geometricallyLinear, accept)) return result;
                     m_position = value.to();
                     return std::nullopt;
                 }
@@ -1347,7 +1346,7 @@ namespace ngc {
                     .activationInputs=std::move(activationInputs),
                     .length=length,
                     .speed=speed,
-                    .linear=prepared.geometricallyLinear,
+                    .linear=prepared.curve->geometricallyLinear,
                     .geometricSamples=samples,
                     .geometricSampleDistanceOffset=sampleOffset,
                     .sampleAt=[curve,workspace,from,length](const double distance) {
@@ -1538,7 +1537,6 @@ namespace ngc {
             CurvatureDerivativeDiagnostic derivativeDiagnostic;
             for(const auto &geometric:piece.geometricSamples) {
                 const auto distance=geometric.distance-piece.geometricSampleDistanceOffset;
-                const PathSample sample{geometric.position,geometric.tangent};
                 const auto &curvature=geometric.curvature;
                 const auto &curvatureDerivative=geometric.curvatureDerivative;
                 const auto derivativeMagnitude=curvatureDerivative.length();
@@ -1547,7 +1545,7 @@ namespace ngc {
                     derivativeDiagnostic.analyticMagnitude=derivativeMagnitude;
                 }
                 for(const auto component:AXIS_COMPONENTS) {
-                    const auto tangent=std::abs(sample.tangent.*component);
+                    const auto tangent=std::abs(geometric.tangent.*component);
                     if(tangent>1e-15) {
                         limitVelocity(m_limits.axisVelocity.*component/tangent,
                             ContinuousVelocityLimitCause::AxisVelocity);

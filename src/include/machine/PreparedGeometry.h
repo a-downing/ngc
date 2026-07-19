@@ -154,12 +154,9 @@ namespace ngc {
 
     struct PreparedGeometricSample {
         double distance = 0.0;
-        position_t position{};
         position_t tangent{};
         position_t curvature{};
         position_t curvatureDerivative{};
-        double normalSharpness = 0.0;
-        double fullGeometricJerkCoefficient = 0.0;
     };
 
     struct PreparedClusterKnotInterval {
@@ -184,7 +181,6 @@ namespace ngc {
         double curveFrom = 0.0;
         double curveTo = 0.0;
         double programmedFeed = 0.0;
-        bool geometricallyLinear = false;
         PreparedCommandId primaryCommand = 0;
         std::vector<PreparedCommandId> activationCommands;
         // Source entities whose geometry this piece represents. This is
@@ -234,21 +230,12 @@ namespace ngc {
     };
 
     struct GeometryPreparationDiagnostics {
-        std::size_t sourceCommands = 0;
-        std::size_t preparedPieces = 0;
-        std::size_t retainedLineSections = 0;
-        std::size_t retainedArcSections = 0;
-        std::size_t junctionBlends = 0;
-        std::size_t clusterSplines = 0;
-        double pathLength = 0.0;
         double nominalDuration = 0.0;
     };
 
     struct PreparedContinuousGeometry {
         std::vector<PreparedCommandRecord> commands;
         std::vector<PreparedPathPiece> pieces;
-        PreparedGeometryBoundary beginning;
-        PreparedGeometryBoundary ending;
         GeometryPreparationDiagnostics diagnostics;
     };
 
@@ -258,7 +245,6 @@ namespace ngc {
         ContinuousChainId chain = 0;
         std::vector<PreparedCommandRecord> commands;
         std::vector<PreparedPathPiece> pieces;
-        double pathLength = 0.0;
         double nominalDuration = 0.0;
     };
 
