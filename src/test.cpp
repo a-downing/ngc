@@ -2355,6 +2355,60 @@ namespace {
                 "none spline smoothing must preserve every cubic control exactly");
     }
 
+    void testSingleShortEntityClusterRetainsMidpointControl() {
+        const auto lineRecord=[](const ngc::PreparedCommandId id,
+                                 const ngc::position_t &from,
+                                 const ngc::position_t &to) {
+            ngc::PreparedCommandRecord record;
+            record.id=id;
+            record.command=ngc::MoveLine{from,to,60.0};
+            return record;
+        };
+        const std::array points{
+            ngc::position_t{0,0,0,0,0,0},
+            ngc::position_t{1,0,0,0,0,0},
+            ngc::position_t{1.1,0.01,0,0,0,0},
+            ngc::position_t{2.1,0.01,0,0,0,0},
+        };
+        const std::array records{
+            lineRecord(1,points[0],points[1]),
+            lineRecord(2,points[1],points[2]),
+            lineRecord(3,points[2],points[3]),
+        };
+        ngc::GeometryPreparationEffort effort;
+        effort.certifySourceTube=false;
+        effort.generateSamples=false;
+        effort.splineFitSolver=ngc::spline_detail::SplineFitSolver::None;
+        const auto unsmoothed=ngc::prepareContinuousGeometry(
+            records,0.05,points.front(),effort);
+        require(unsmoothed.has_value(),unsmoothed?"":unsmoothed.error());
+        const auto findCluster=[](const ngc::PreparedContinuousGeometry &geometry) {
+            return std::ranges::find_if(geometry.pieces,[](const auto &piece) {
+                return piece.kind==ngc::PreparedPieceKind::ClusterSpline;
+            });
+        };
+        const auto unsmoothedCluster=findCluster(*unsmoothed);
+        require(unsmoothedCluster!=unsmoothed->pieces.end(),
+            "one short source entity between long anchors must form a cluster spline");
+        const auto *cubic=std::get_if<ngc::PreparedSplineCurve>(
+            &unsmoothedCluster->curve->value);
+        require(cubic&&cubic->degree==3&&cubic->controls.size()==7,
+            "a one-entity unsmoothed cluster must retain one interior control");
+        const ngc::position_t midpoint{1.05,0.005,0,0,0,0};
+        require((cubic->controls[3]-midpoint).length()<1e-12,
+            "the cluster seed control must be the short source entity midpoint");
+
+        effort.splineFitSolver=ngc::spline_detail::continuousSplineFitSolver();
+        const auto smoothed=ngc::prepareContinuousGeometry(
+            records,0.05,points.front(),effort);
+        require(smoothed.has_value(),smoothed?"":smoothed.error());
+        const auto smoothedCluster=findCluster(*smoothed);
+        const auto *quintic=smoothedCluster==smoothed->pieces.end()?nullptr
+            :std::get_if<ngc::PreparedSplineCurve>(&smoothedCluster->curve->value);
+        require(quintic&&quintic->degree==5&&quintic->controls.size()==9,
+            "smoothing a one-entity cluster must retain one optimizable interior control");
+    }
+
     void testClusterSplinePreparesKnotIntervalSamplesAndFeeds() {
         static_assert(ngc::spline_detail::continuousSplineFitSolver()
             ==ngc::spline_detail::SplineFitSolver::VelocityTargetedBandedFairness);
@@ -3562,6 +3616,7 @@ int main() {
         testIncrementalGeometryDefersAndDoesNotRebuildAnchorSection();
         testSimulationDriverFailureAppearsInGuiStatusStream();
         test1001PreviewCompletesBoundedly();
+        testSingleShortEntityClusterRetainsMidpointControl();
         test1002PreparedSliceBoundaries();
         testMdiToolChangeUsesAutoloadPrograms();
         testSimulationWorkerPersistsUntilReset();

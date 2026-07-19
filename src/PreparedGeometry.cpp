@@ -947,33 +947,13 @@ namespace ngc {
                 auto controls = curvatureMatchedSixControlBlend(
                     entities[index], entities[right], leftScale, rightScale, workspace);
                 if(right > index + 1) {
-                    std::vector<double> interiorLengths;
-                    auto interiorLength = 0.0;
-                    for(std::size_t entity = index + 1; entity < right; ++entity) {
-                        interiorLengths.push_back(entities[entity].length);
-                        interiorLength += entities[entity].length;
-                    }
-                    if(interiorLength >= 6.0 * blendScale) {
-                        const auto distances = spline_detail::evenlySpacedCompositeControlDistances(
-                            interiorLengths, blendScale);
-                        if(distances.empty()) return std::unexpected(
-                            "continuous short-entity spline has no control samples");
-                        std::vector<position_t> interior;
-                        auto entity = index + 1;
-                        auto entityStart = 0.0;
-                        for(const auto distance : distances) {
-                            while(entity + 1 < right
-                                  && distance > entityStart + entities[entity].length) {
-                                entityStart += entities[entity].length;
-                                ++entity;
-                            }
-                            interior.push_back(sourcePosition(entities[entity],
-                                std::clamp(distance - entityStart, 0.0,
-                                           entities[entity].length), workspace));
-                        }
-                        controls.insert(controls.begin() + 3,
-                                        interior.begin(), interior.end());
-                    }
+                    std::vector<position_t> interior;
+                    interior.reserve(right - index - 1);
+                    for(std::size_t entity = index + 1; entity < right; ++entity)
+                        interior.push_back(sourcePosition(
+                            entities[entity],0.5*entities[entity].length,workspace));
+                    controls.insert(controls.begin() + 3,
+                                    interior.begin(), interior.end());
                 }
                 std::size_t splineDegree = 3;
                 if(controls.size() > 6

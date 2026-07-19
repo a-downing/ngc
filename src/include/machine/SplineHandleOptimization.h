@@ -51,25 +51,6 @@ namespace ngc::spline_detail {
         return result;
     }
 
-    inline std::vector<double> evenlySpacedCompositeControlDistances(
-            const std::span<const double> entityLengths,const double programmedScale) {
-        std::vector<double> result;
-        if(entityLengths.empty()||!std::isfinite(programmedScale)||programmedScale<=0.0)
-            return result;
-        auto totalLength=0.0;
-        for(const auto length:entityLengths) {
-            if(!std::isfinite(length)||length<=0.0) return {};
-            totalLength+=length;
-        }
-        if(!std::isfinite(totalLength)||totalLength<=0.0) return {};
-        const auto controlCount=entityLengths.size();
-        result.reserve(controlCount);
-        for(std::size_t control=0;control<controlCount;++control)
-            result.push_back(totalLength*(static_cast<double>(control)+0.5)
-                /static_cast<double>(controlCount));
-        return result;
-    }
-
     inline Vector3 add(const Vector3 &a,const Vector3 &b) {
         return {a[0]+b[0],a[1]+b[1],a[2]+b[2]};
     }

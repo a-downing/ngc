@@ -3,6 +3,7 @@
 #include <memory>
 
 #include "machine/MachineConfiguration.h"
+#include "machine/SplineReconstruction.h"
 
 struct GLFWwindow;
 
@@ -13,7 +14,8 @@ class Application final {
 
 public:
     Application() = delete;
-    Application(GLFWwindow *window, const ngc::MachineConfiguration &configuration);
+    Application(GLFWwindow *window, const ngc::MachineConfiguration &configuration,
+                ngc::spline_detail::SplineFitSolver splineFitSolver);
     ~Application();
 
     Application(const Application &) = delete;

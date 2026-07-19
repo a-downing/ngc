@@ -67,8 +67,11 @@
 #include "gui/tool_table_strings_t.h"
 
 class ApplicationImpl final {
-    static ngc::GeometryStreamPolicy geometryPolicy(const ngc::TrajectoryLimits &limits) {
+    static ngc::GeometryStreamPolicy geometryPolicy(
+            const ngc::TrajectoryLimits &limits,
+            const ngc::spline_detail::SplineFitSolver splineFitSolver) {
         ngc::GeometryStreamPolicy result;
+        result.splineFitSolver=splineFitSolver;
         result.splineVelocityLimits={
             .pathAcceleration=limits.pathAcceleration,
             .pathJerk=limits.pathJerk,
@@ -411,14 +414,18 @@ class ApplicationImpl final {
 
 public:
     ApplicationImpl() = delete;
-    ApplicationImpl(GLFWwindow *window, const ngc::MachineConfiguration &configuration)
+    ApplicationImpl(GLFWwindow *window, const ngc::MachineConfiguration &configuration,
+                    const ngc::spline_detail::SplineFitSolver splineFitSolver)
         : m_window(window), m_simulationTiming(configuration.simulation),
           m_joggingConfiguration(configuration.jogging), m_machineUnit(configuration.unit),
           m_axes(configuration.axes), m_joints(configuration.joints),
-          m_worker(configuration.unit,geometryPolicy(configuration.trajectory)),
+          m_worker(configuration.unit,geometryPolicy(configuration.trajectory,splineFitSolver)),
           m_simulation(configuration),
           m_simulatedRapidSpeed(configuration.trajectory.rapidSpeed),
-          m_pathJerk(configuration.trajectory.pathJerk) { }
+          m_pathJerk(configuration.trajectory.pathJerk) {
+        if(!m_simulation.setSplineFitSolver(splineFitSolver))
+            PANIC("new simulation worker rejected its spline smoothing mode");
+    }
 
     void init() {
         m_glGenBuffers = reinterpret_cast<GlGenBuffersProc>(glfwGetProcAddress("glGenBuffers"));
@@ -2574,8 +2581,9 @@ public:
     }
 };
 
-Application::Application(GLFWwindow *window, const ngc::MachineConfiguration &configuration)
-    : m_impl(std::make_unique<ApplicationImpl>(window, configuration)) { }
+Application::Application(GLFWwindow *window, const ngc::MachineConfiguration &configuration,
+                         const ngc::spline_detail::SplineFitSolver splineFitSolver)
+    : m_impl(std::make_unique<ApplicationImpl>(window,configuration,splineFitSolver)) { }
 Application::~Application() = default;
 
 void Application::init() { m_impl->init(); }
