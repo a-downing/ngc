@@ -56,7 +56,8 @@ namespace ngc {
             void addRow(const double lower,const double upper,
                         const std::initializer_list<std::pair<std::size_t,double>> entries) {
                 for(const auto &[column,value]:entries) {
-                    if(std::abs(value)<=1e-18) continue;
+                    if(!std::isfinite(value)) PANIC("SCP LP row contains a non-finite coefficient");
+                    if(!trajectory_detail::scpRetainsMatrixCoefficient(value)) continue;
                     if(column>=static_cast<std::size_t>(model.num_col_))
                         PANIC("SCP LP row references an invalid column");
                     model.a_matrix_.index_.push_back(static_cast<HighsInt>(column));
@@ -2229,6 +2230,8 @@ namespace ngc {
                    ||highs.setOptionValue("threads",HighsInt {1})!=HighsStatus::kOk
                    ||highs.setOptionValue("solver",std::string {"simplex"})
                         !=HighsStatus::kOk
+                   ||highs.setOptionValue("small_matrix_value",
+                        trajectory_detail::SCP_SMALL_MATRIX_VALUE)!=HighsStatus::kOk
                    ||highs.setOptionValue("time_limit",
                         m_continuousPlanningEffort.scpSolveTimeLimit)!=HighsStatus::kOk
                    ||highs.setOptionValue("simplex_iteration_limit",
@@ -2237,10 +2240,10 @@ namespace ngc {
                                 !=HighsStatus::kOk)
                     return std::unexpected("continuous SCP could not configure HiGHS");
                 const auto passStatus=highs.passModel(lp.model);
-                if(passStatus==HighsStatus::kError) {
+                if(passStatus!=HighsStatus::kOk) {
                     return std::unexpected(std::format(
-                        "continuous SCP could not pass its LP to HiGHS: columns={} rows={} "
-                        "nonzeros={}",lp.model.num_col_,lp.model.num_row_,
+                        "continuous SCP model pass was not exact: status={} columns={} rows={} "
+                        "nonzeros={}",static_cast<int>(passStatus),lp.model.num_col_,lp.model.num_row_,
                         lp.model.a_matrix_.index_.size()));
                 }
                 if(m_continuousPlanningEffort.reuseScpBasis&&reusableScpBasis) {

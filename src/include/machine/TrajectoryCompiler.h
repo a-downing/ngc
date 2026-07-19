@@ -35,6 +35,15 @@ namespace ngc {
     }
 
     namespace trajectory_detail {
+        // HiGHS removes entries whose magnitude is less than or equal to its
+        // small_matrix_value. The builder and configured solver share this one
+        // cutoff so passModel cannot silently loosen the SCP model.
+        inline constexpr double SCP_SMALL_MATRIX_VALUE=1e-12;
+
+        constexpr bool scpRetainsMatrixCoefficient(const double value) {
+            return value>SCP_SMALL_MATRIX_VALUE||value<-SCP_SMALL_MATRIX_VALUE;
+        }
+
         enum class ScpSolveClassification : std::uint8_t {
             Optimal,
             TimeLimit,

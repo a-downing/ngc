@@ -2324,6 +2324,22 @@ namespace {
             ==ngc::spline_detail::SplineFitSolver::VelocityTargetedBandedFairness);
         using ngc::trajectory_detail::ScpSolveAction;
         using ngc::trajectory_detail::ScpSolveClassification;
+        static_assert(!ngc::trajectory_detail::scpRetainsMatrixCoefficient(0.0));
+        static_assert(!ngc::trajectory_detail::scpRetainsMatrixCoefficient(
+            ngc::trajectory_detail::SCP_SMALL_MATRIX_VALUE));
+        static_assert(!ngc::trajectory_detail::scpRetainsMatrixCoefficient(
+            -ngc::trajectory_detail::SCP_SMALL_MATRIX_VALUE));
+        static_assert(ngc::trajectory_detail::scpRetainsMatrixCoefficient(
+            2.0*ngc::trajectory_detail::SCP_SMALL_MATRIX_VALUE));
+        const auto matrixThreshold=ngc::trajectory_detail::SCP_SMALL_MATRIX_VALUE;
+        require(ngc::trajectory_detail::scpRetainsMatrixCoefficient(
+                    std::nextafter(matrixThreshold,std::numeric_limits<double>::infinity()))
+                    &&ngc::trajectory_detail::scpRetainsMatrixCoefficient(
+                        std::nextafter(-matrixThreshold,
+                            -std::numeric_limits<double>::infinity()))
+                    &&!ngc::trajectory_detail::scpRetainsMatrixCoefficient(
+                        std::nextafter(matrixThreshold,0.0)),
+                "SCP and HiGHS must share the exact inclusive small-matrix cutoff");
         static_assert(ngc::trajectory_detail::scpSolveAction(ScpSolveClassification::Optimal)
             ==ScpSolveAction::AcceptOptimal);
         static_assert(ngc::trajectory_detail::scpSolveAction(ScpSolveClassification::TimeLimit)
