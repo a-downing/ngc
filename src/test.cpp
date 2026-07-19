@@ -2451,62 +2451,23 @@ namespace {
             .axisJerk={501,501,501,501,501,501},
         };
         ngc::TrajectoryCompiler compiler(trajectoryLimits);
-        auto replayEffort=compiler.continuousPlanningEffort();
-        replayEffort.shareTimeLawCacheAcrossCompilations=false;
-        replayEffort.cacheScpLineSearchTrials=false;
-        replayEffort.reuseScpBasis=false;
-        compiler.setContinuousPlanningEffort(replayEffort);
+        auto uncachedEffort=compiler.continuousPlanningEffort();
+        uncachedEffort.shareTimeLawCacheAcrossCompilations=false;
+        uncachedEffort.cacheScpLineSearchTrials=false;
+        uncachedEffort.reuseScpBasis=false;
+        compiler.setContinuousPlanningEffort(uncachedEffort);
         compiler.reset(94,points.front());
         const auto planned=compiler.compileContinuous(*prepared,0.05);
         require(planned&&*planned,planned?"":planned.error());
-        ngc::TrajectoryCompiler shadowCompiler(trajectoryLimits);
-        auto shadowEffort=replayEffort;
-        shadowEffort.enableStationVisitReplay=false;
-        shadowEffort.measureStationVisitReplay=true;
-        shadowCompiler.setContinuousPlanningEffort(shadowEffort);
-        shadowCompiler.reset(94,points.front());
-        const auto shadowPlanned=shadowCompiler.compileContinuous(*prepared,0.05);
-        require(shadowPlanned&&*shadowPlanned,
-            shadowPlanned?"":shadowPlanned.error());
-        const auto replayCalls=ngc::totalTimeLawCalls((*planned)->timeLaw);
-        const auto shadowCalls=ngc::totalTimeLawCalls((*shadowPlanned)->timeLaw);
-        const auto &replayDiagnostics=(*planned)->timeLaw.stationVisitReplay;
-        const auto &shadowDiagnostics=(*shadowPlanned)->timeLaw.stationVisitReplay;
-        require((*planned)->accelerationAwareRescue
-                    &&(*planned)->correctionHistory.contains("pass 2:"),
-                "station-visit replay regression should exercise at least two rescue passes");
-        require(replayDiagnostics.comparableVisits>0
-                    &&replayDiagnostics.exactInputMatches>0
-                    &&replayDiagnostics.replayedVisits>0
-                    &&replayDiagnostics.replayedVisits
-                        ==replayDiagnostics.exactOutputMatches,
-                "a later rescue pass should find and replay an exact station visit");
-        require(shadowDiagnostics.replayedVisits==0
-                    &&shadowDiagnostics.exactInputMatches>0
-                    &&shadowDiagnostics.exactOutputMatches>0
-                    &&shadowDiagnostics.outputMismatches==0,
-                "replay-disabled shadow execution should confirm the cached visit output");
-        require(replayCalls.calls<shadowCalls.calls
-                    &&replayCalls.solverCalls<shadowCalls.solverCalls
-                    &&replayCalls.cacheMaterializations<shadowCalls.cacheMaterializations,
-                "an exact station replay should reduce scalar time-law work");
-        require(shadowCalls.calls-replayCalls.calls
-                        ==shadowDiagnostics.potentialTimeLawCalls
-                    &&shadowCalls.solverCalls-replayCalls.solverCalls
-                        ==shadowDiagnostics.potentialSolverCalls
-                    &&shadowCalls.cacheMaterializations-replayCalls.cacheMaterializations
-                        ==shadowDiagnostics.potentialMaterializations,
-                std::format("measured replay savings should match replay-disabled shadow "
-                    "evidence: calls {}-{}={} expected={} solvers {}-{}={} expected={} "
-                    "materializations {}-{}={} expected={}",
-                    shadowCalls.calls,replayCalls.calls,shadowCalls.calls-replayCalls.calls,
-                    shadowDiagnostics.potentialTimeLawCalls,
-                    shadowCalls.solverCalls,replayCalls.solverCalls,
-                    shadowCalls.solverCalls-replayCalls.solverCalls,
-                    shadowDiagnostics.potentialSolverCalls,
-                    shadowCalls.cacheMaterializations,replayCalls.cacheMaterializations,
-                    shadowCalls.cacheMaterializations-replayCalls.cacheMaterializations,
-                    shadowDiagnostics.potentialMaterializations));
+        const auto uncachedCalls=ngc::totalTimeLawCalls((*planned)->timeLaw);
+        require(std::ranges::all_of((*planned)->pieceTiming,[](const auto &piece) {
+                    return piece.velocityLimit>=piece.initialVelocityLimit*0.02
+                        &&piece.jerkLimit>=piece.initialJerkLimit*0.001;
+                }),
+                "numerically conditioned curved subdivision must not collapse local limits "
+                "in response to a nanosecond cubic");
+        require((*planned)->correctionPasses>1,
+                "the focused SCP fixture should still exercise exact local-limit correction");
 
         const auto planFingerprint=[](const ngc::ContinuousTrajectoryPlan &plan) {
             std::vector<std::uint64_t> result;
@@ -2586,23 +2547,14 @@ namespace {
                 for(const auto &span:chunk.stopTail) appendSpan(span);
                 appendInteger(chunk.events.size);
                 require(chunk.events.size==0,
-                    "focused replay plan should not contain scheduled events");
+                    "focused SCP plan should not contain scheduled events");
                 appendState(chunk.branchState);
                 appendState(chunk.stopState);
             }
             return result;
         };
-        require(planFingerprint(**planned)==planFingerprint(**shadowPlanned),
-                "station replay must preserve accepted station states, timing, and emitted spans");
-        require((*planned)->geometryVerificationAttempts
-                        ==(*shadowPlanned)->geometryVerificationAttempts
-                    &&(*planned)->geometryVerificationHighWater
-                        ==(*shadowPlanned)->geometryVerificationHighWater
-                    &&(*planned)->correctionHistory==(*shadowPlanned)->correctionHistory,
-                "station replay must preserve exact verification and correction outcomes");
-
         ngc::TrajectoryCompiler cachedScpCompiler(trajectoryLimits);
-        auto cachedScpEffort=shadowEffort;
+        auto cachedScpEffort=uncachedEffort;
         cachedScpEffort.cacheScpLineSearchTrials=true;
         cachedScpCompiler.setContinuousPlanningEffort(cachedScpEffort);
         cachedScpCompiler.reset(94,points.front());
@@ -2610,23 +2562,23 @@ namespace {
         require(cachedScpPlan&&*cachedScpPlan,
             cachedScpPlan?"":cachedScpPlan.error());
         const auto cachedScpCalls=ngc::totalTimeLawCalls((*cachedScpPlan)->timeLaw);
-        require(planFingerprint(**cachedScpPlan)==planFingerprint(**shadowPlanned)
+        require(planFingerprint(**cachedScpPlan)==planFingerprint(**planned)
                     &&(*cachedScpPlan)->correctionHistory
-                        ==(*shadowPlanned)->correctionHistory
+                        ==(*planned)->correctionHistory
                     &&(*cachedScpPlan)->geometryVerificationAttempts
-                        ==(*shadowPlanned)->geometryVerificationAttempts
+                        ==(*planned)->geometryVerificationAttempts
                     &&(*cachedScpPlan)->geometryVerificationHighWater
-                        ==(*shadowPlanned)->geometryVerificationHighWater,
+                        ==(*planned)->geometryVerificationHighWater,
                 "cached SCP trials must preserve accepted station states, exact timing, "
                 "emitted spans, and verification outcomes");
-        require(cachedScpCalls.solverCalls<shadowCalls.solverCalls
+        require(cachedScpCalls.solverCalls<uncachedCalls.solverCalls
                     &&(*cachedScpPlan)->scpMaterializationAttempts
-                        <(*shadowPlanned)->scpMaterializationAttempts,
+                        <(*planned)->scpMaterializationAttempts,
                 std::format("cached SCP trials should reduce scalar solves and full "
                     "materializations: solvers {} >= {} materializations {} >= {}",
-                    cachedScpCalls.solverCalls,shadowCalls.solverCalls,
+                    cachedScpCalls.solverCalls,uncachedCalls.solverCalls,
                     (*cachedScpPlan)->scpMaterializationAttempts,
-                    (*shadowPlanned)->scpMaterializationAttempts));
+                    (*planned)->scpMaterializationAttempts));
         require(cachedScpCalls.cacheFailureHits>0,
                 "a repeated cached scalar failure must remain a failed SCP trial");
 
@@ -2656,9 +2608,7 @@ namespace {
                     &&(*basisReusePlan)->scpAcceptedSteps
                         ==(*cachedScpPlan)->scpAcceptedSteps
                     &&(*basisReusePlan)->scpMaterializationAttempts
-                        ==(*cachedScpPlan)->scpMaterializationAttempts
-                    &&(*basisReusePlan)->accelerationAwareRescue
-                        ==(*cachedScpPlan)->accelerationAwareRescue,
+                        ==(*cachedScpPlan)->scpMaterializationAttempts,
                 "basis reuse must preserve the focused exact plan and verification outcome");
 
         ngc::TrajectoryCompiler reachabilityRowCompiler(trajectoryLimits);
@@ -2686,11 +2636,9 @@ namespace {
                     &&(*reachabilityRowPlan)->scpStationProposals
                         ==(*cachedScpPlan)->scpStationProposals
                     &&(*reachabilityRowPlan)->correctionPasses
-                        ==(*cachedScpPlan)->correctionPasses
-                    &&(*reachabilityRowPlan)->accelerationAwareRescue
-                        ==(*cachedScpPlan)->accelerationAwareRescue,
+                        ==(*cachedScpPlan)->correctionPasses,
                 "adjacent-station reachability rows should remain a default-off experiment "
-                "when they do not improve the focused pathological plan");
+                "when they do not improve the focused SCP plan");
 
         ngc::TrajectoryCompiler collisionCompiler(trajectoryLimits);
         auto collisionEffort=cachedScpEffort;
@@ -2703,9 +2651,9 @@ namespace {
         const auto collisionCalls=ngc::totalTimeLawCalls((*collisionPlan)->timeLaw);
         require(collisionCalls.cacheCollisions>0,
                 "a one-entry time-law cache should exercise exact-key collisions");
-        require(planFingerprint(**collisionPlan)==planFingerprint(**shadowPlanned)
+        require(planFingerprint(**collisionPlan)==planFingerprint(**planned)
                     &&(*collisionPlan)->correctionHistory
-                        ==(*shadowPlanned)->correctionHistory,
+                        ==(*planned)->correctionHistory,
                 "a colliding cache entry must not supply a nonmatching scalar result");
         require((*planned)->scpSolves>0,
                 "continuous timing should solve at least one HiGHS SCP subproblem");
@@ -2723,7 +2671,7 @@ namespace {
         }
 
         ngc::TrajectoryCompiler limitedCompiler(trajectoryLimits);
-        auto limitedEffort=replayEffort;
+        auto limitedEffort=uncachedEffort;
         // This fixture performs enough model setup before HiGHS checks its clock
         // that the minimum practical positive limit reliably selects kTimeLimit.
         limitedEffort.scpSolveTimeLimit=1e-12;

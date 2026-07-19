@@ -13,6 +13,18 @@ before item 1 was implemented, so its statement that replay repair could proceed
 is historical rather than a review of the completed fix below. Its additional
 model-fidelity and testing conclusions are incorporated here.
 
+Subsequent resolution: the focused rescue trigger was traced to curved-emission
+subdivision aligning a C2 cubic chain with a roughly 25 ns scalar phase. Each of
+the chain's three execution spans was roughly 8 ns, so endpoint-position
+subtraction error was divided by the cube of that duration and appeared as a
+spurious path-jerk violation. Curved subdivision now rejects phase-aligned splits
+below a coordinate- and jerk-scaled double-precision conditioning threshold; the
+ordered-geometry and exact emitted-polynomial gates remain final authority. The
+focused fixture and representative planning corpus then completed without rescue,
+and the legacy acceleration-aware optimizer, its station-visit replay, and its
+rescue-only configuration and diagnostics were removed. Rescue and replay results
+recorded below are historical evidence from before that removal.
+
 Investigation baseline: `HEAD` `8c47ef0`. The working tree had unrelated local
 changes in `machine.toml`, `TrajectoryPlanner.h`, `test.cpp`, and the simulation
 diagnostic. `src/TrajectoryCompiler.cpp` was unchanged, so the review's planner

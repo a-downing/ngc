@@ -156,9 +156,6 @@ namespace ngc {
         enum class TimeLawPurpose {
             ExactStop,
             ContinuousSeed,
-            StationCurrentVelocity,
-            StationCapVelocity,
-            StationVelocityBracket,
         };
 
         using TimeLawInputKey=std::array<std::uint64_t,8>;
@@ -235,12 +232,6 @@ namespace ngc {
                 switch(purpose) {
                     case TimeLawPurpose::ExactStop: return diagnostics.exactStop;
                     case TimeLawPurpose::ContinuousSeed: return diagnostics.continuousSeed;
-                    case TimeLawPurpose::StationCurrentVelocity:
-                        return diagnostics.stationCurrentVelocity;
-                    case TimeLawPurpose::StationCapVelocity:
-                        return diagnostics.stationCapVelocity;
-                    case TimeLawPurpose::StationVelocityBracket:
-                        return diagnostics.stationVelocityBracket;
                 }
                 PANIC("invalid time-law instrumentation purpose");
             }
@@ -396,6 +387,34 @@ namespace ngc {
                 span.end={terminal.position,terminal.velocity,terminal.acceleration};
                 state=terminal;
             }
+            return result;
+        }
+
+        double minimumNumericallyStableC2Duration(const KinematicPathState &from,
+                                                   const KinematicPathState &to,
+                                                   const TrajectoryLimits &limits) {
+            constexpr std::array components {
+                &position_t::x,&position_t::y,&position_t::z,
+                &position_t::a,&position_t::b,&position_t::c,
+            };
+            auto coordinateScale=1.0;
+            for(const auto component:components)
+                coordinateScale=std::max({coordinateScale,
+                    std::abs(from.position.*component),std::abs(to.position.*component)});
+            auto result=0.0;
+            const auto consider=[&](const double scale,const double jerkLimit) {
+                if(!std::isfinite(jerkLimit)||jerkLimit<=0.0) return;
+                // c2CubicChain divides the interval into three equal spans and
+                // recovers their jerks from an endpoint-position residual divided
+                // by h^3. Keep ordinary double-precision endpoint subtraction
+                // comfortably below the relevant jerk scale.
+                constexpr auto ROUNDING_BUDGET=1024.0*std::numeric_limits<double>::epsilon();
+                result=std::max(result,3.0*std::cbrt(ROUNDING_BUDGET*scale/jerkLimit));
+            };
+            consider(coordinateScale,limits.pathJerk);
+            for(const auto component:components)
+                consider(std::max({1.0,std::abs(from.position.*component),
+                    std::abs(to.position.*component)}),limits.axisJerk.*component);
             return result;
         }
 
@@ -1217,7 +1236,6 @@ namespace ngc {
             const PreparedContinuousGeometry &geometry, const double blendScale,
             std::optional<MotionState> requestedStartState,
             std::optional<MotionState> requestedEndState,
-            const unsigned requestedVelocitySearchIterations,
             InfiniteJerkTrajectoryTimeResult *infiniteJerkTime) {
         m_lastTimeLawDiagnostics={};
         TimeLawCompilationRecorder timeLawRecorder {m_lastTimeLawDiagnostics};
@@ -1228,14 +1246,7 @@ namespace ngc {
            ||m_limits.arcChordTolerance<=0.0||!positiveAxisLimits(m_limits.axisVelocity)
            ||!positiveAxisLimits(m_limits.axisAcceleration)||!positiveAxisLimits(m_limits.axisJerk))
             return std::unexpected("trajectory limits must be positive");
-        constexpr std::size_t MAX_REACHABILITY_ACCELERATION_CANDIDATES=32;
-        if(m_continuousPlanningEffort.reachabilitySweeps==0
-           ||m_continuousPlanningEffort.accelerationCandidates<6
-           ||m_continuousPlanningEffort.accelerationCandidates
-                >MAX_REACHABILITY_ACCELERATION_CANDIDATES
-           ||m_continuousPlanningEffort.candidateBudgetMultiplier==0
-           ||m_continuousPlanningEffort.candidateBudgetMultiplier>1024
-           ||m_continuousPlanningEffort.maximumLocalCorrectionPasses==0
+        if(m_continuousPlanningEffort.maximumLocalCorrectionPasses==0
            ||m_continuousPlanningEffort.maximumLocalCorrectionPasses>128
            ||m_continuousPlanningEffort.geometryVerificationBudgetMultiplier<36
            ||m_continuousPlanningEffort.geometryVerificationBudgetMultiplier>256
@@ -1486,21 +1497,6 @@ namespace ngc {
         const auto maximumTotalGeometryVerificationAttempts=
             std::max<std::size_t>(32768,pieces.size()
                 *m_continuousPlanningEffort.geometryVerificationBudgetMultiplier);
-        std::size_t curvedReachabilityStations=0;
-        for(std::size_t station=1;station<pieces.size();++station)
-            if(!pieces[station-1].linear||!pieces[station].linear)
-                ++curvedReachabilityStations;
-        const auto linearReachabilityStations=pieces.size()-1-curvedReachabilityStations;
-        const auto candidateBudgetMultiplier=
-            m_continuousPlanningEffort.candidateBudgetMultiplier;
-        const auto maximumCurvedCandidateEvaluationsPerPass=candidateBudgetMultiplier
-            *std::max<std::size_t>(32768,curvedReachabilityStations*128);
-        const auto maximumLinearCandidateEvaluationsPerPass=candidateBudgetMultiplier
-            *std::max<std::size_t>(32768,linearReachabilityStations*512);
-        const auto maximumTotalCurvedCandidateEvaluations=candidateBudgetMultiplier
-            *std::max<std::size_t>(524288,curvedReachabilityStations*1024);
-        const auto maximumTotalLinearCandidateEvaluations=candidateBudgetMultiplier
-            *std::max<std::size_t>(131072,linearReachabilityStations*2048);
         auto nextChunk=m_nextChunk;
         auto nextSpan=m_nextSpan;
         std::vector<SpanId> activationSpans(geometry.commands.size(),0);
@@ -1671,15 +1667,11 @@ namespace ngc {
         bool constraintsVerified=false;
         std::string correctionHistory;
         std::size_t totalGeometryVerificationAttempts=0;
-        std::size_t totalReachabilityCandidateEvaluations=0;
-        std::size_t totalCurvedCandidateEvaluations=0;
-        std::size_t totalLinearCandidateEvaluations=0;
         TimeLawWorkspace timeLawWorkspace;
         std::vector<double> previousStationVelocity;
         std::vector<double> previousStationAcceleration;
         std::vector<TimeLaw> previousPieceTiming;
         std::vector<std::size_t> previouslyCorrectedPieces;
-        bool useAccelerationAwareRescue=false;
         const auto bitExactDouble=[](const double left,const double right) {
             return std::bit_cast<std::uint64_t>(left)
                 ==std::bit_cast<std::uint64_t>(right);
@@ -1698,63 +1690,6 @@ namespace ngc {
             }
             return true;
         };
-        struct StationVisitKey {
-            // 5 visit/search fields, 15 scalar fields, and two complete
-            // 11-boundary TimeLaws at 1+6 words each require at most 154 words.
-            std::array<std::uint64_t,160> words {};
-            std::size_t size=0;
-
-            void push_back(const std::uint64_t value) {
-                if(size==words.size()) PANIC("station visit exact key exceeded capacity");
-                words[size++]=value;
-            }
-            bool operator==(const StationVisitKey &other) const {
-                return size==other.size
-                    &&std::equal(words.begin(),words.begin()+size,other.words.begin());
-            }
-        };
-        const auto appendFingerprintDouble=[](StationVisitKey &fingerprint,
-                                               const double value) {
-            fingerprint.push_back(std::bit_cast<std::uint64_t>(value));
-        };
-        const auto appendTimeLawFingerprint=[&](StationVisitKey &fingerprint,
-                                                const TimeLaw &timing) {
-            fingerprint.push_back(timing.size());
-            for(const auto &boundary:timing) {
-                appendFingerprintDouble(fingerprint,boundary.time);
-                appendFingerprintDouble(fingerprint,boundary.distance);
-                appendFingerprintDouble(fingerprint,boundary.velocity);
-                appendFingerprintDouble(fingerprint,boundary.acceleration);
-                appendFingerprintDouble(fingerprint,boundary.jerk);
-                fingerprint.push_back(boundary.ruckigBrakePhase?1U:0U);
-            }
-        };
-        struct StationVisitReplayRecord {
-            StationVisitKey input;
-            TimeLaw leftTiming;
-            TimeLaw rightTiming;
-            double velocity=0.0;
-            double acceleration=0.0;
-            std::size_t candidateEvaluations=0;
-            std::size_t endpointChecks=0;
-            std::size_t accelerationRejections=0;
-            std::size_t jerkRejections=0;
-            std::size_t velocityCandidateSets=0;
-            std::size_t capVelocitySearches=0;
-            std::size_t binaryVelocitySearchSteps=0;
-            bool improved=false;
-        };
-        constexpr auto NO_STATION_VISIT=std::numeric_limits<std::size_t>::max();
-        std::vector<StationVisitReplayRecord> previousStationVisits;
-        std::vector<std::size_t> previousStationVisitSlots;
-        // Retain bounded production memory. Offline profiles with more than
-        // three sweeps deliberately run without cross-pass visit snapshots.
-        const auto enableStationVisitReplay=
-            m_continuousPlanningEffort.enableStationVisitReplay
-            &&m_continuousPlanningEffort.reachabilitySweeps<=3;
-        const auto measureStationVisitReplay=
-            (m_continuousPlanningEffort.measureStationVisitReplay||enableStationVisitReplay)
-            &&m_continuousPlanningEffort.reachabilitySweeps<=3;
         std::optional<HighsBasis> reusableScpBasis;
         for(unsigned correctionPass=0;correctionPass<maximumLocalCorrectionPasses;
                 ++correctionPass) {
@@ -2497,445 +2432,8 @@ namespace ngc {
             result->scpSeconds+=std::chrono::duration<double>(
                 std::chrono::steady_clock::now()-scpStarted).count();
 
-            // The sparse pass is normally sufficient. If exact verification
-            // later predicts a pathological local-limit collapse, retry that
-            // horizon with a tightly bounded acceleration-aware refinement.
-            // This keeps the expensive search off ordinary horizons.
-            if(useAccelerationAwareRescue) {
-            const auto reachabilitySweeps=std::min(
-                2U,m_continuousPlanningEffort.reachabilitySweeps);
-            const auto reachabilityAccelerationCandidates=
-                m_continuousPlanningEffort.accelerationCandidates;
-            // Production rolling callers may request a coarser bounded refinement.
-            // The standalone diagnostic exporter can explicitly disable the large-
-            // horizon cap while leaving production defaults unchanged.
-            const auto requestedEffortVelocitySearchIterations=std::max(
-                requestedVelocitySearchIterations,
-                m_continuousPlanningEffort.minimumVelocitySearchIterations);
-            const auto reachabilityVelocitySearchIterations=std::min(
-                4U,std::max(1U,requestedEffortVelocitySearchIterations));
-            std::size_t reachabilityCandidateEvaluations=0;
-            std::size_t curvedCandidateEvaluations=0;
-            std::size_t linearCandidateEvaluations=0;
-            std::size_t activeStationVisits=0;
-            std::size_t velocityCandidateSets=0;
-            std::size_t capVelocitySearches=0;
-            std::size_t binaryVelocitySearchSteps=0;
-            std::size_t improvedStationVisits=0;
-            bool reachabilityCandidateBudgetExceeded=false;
-            const auto stationVisitSlotCount=measureStationVisitReplay
-                ?reachabilitySweeps*2*(pieces.size()>0?pieces.size()-1:0):0;
-            std::vector<StationVisitReplayRecord> currentStationVisits;
-            std::vector<std::size_t> currentStationVisitSlots(
-                stationVisitSlotCount,NO_STATION_VISIT);
-            currentStationVisits.reserve(measureStationVisitReplay
-                ?std::min(stationVisitSlotCount,2*pieces.size()):0);
-            std::optional<std::string> cachedMaterializationError;
-            const auto optimizeStation=[&](const std::size_t station,
-                                           const unsigned sweep,const bool reverse) {
-                if(reachabilityCandidateBudgetExceeded||cachedMaterializationError) return false;
-                const auto leftPiece=station-1;
-                const auto rightPiece=station;
-                const auto leftSeedSlope=(stationVelocity[station]*stationVelocity[station]
-                    -stationVelocity[station-1]*stationVelocity[station-1])
-                    /(2.0*pieces[leftPiece].length);
-                const auto rightSeedSlope=(stationVelocity[station+1]*stationVelocity[station+1]
-                    -stationVelocity[station]*stationVelocity[station])
-                    /(2.0*pieces[rightPiece].length);
-                const auto atCap=stationCaps[station]-stationVelocity[station]
-                    <=std::max(1e-10,stationCaps[station]*1e-9);
-                if(atCap||leftSeedSlope*rightSeedSlope<=0.0) return false;
-                ++activeStationVisits;
-                auto &replayDiagnostics=
-                    timeLawRecorder.instrumentation.diagnostics.stationVisitReplay;
-                if(measureStationVisitReplay) ++replayDiagnostics.activeVisits;
-                auto bestVelocity=stationVelocity[station];
-                auto bestAcceleration=stationAcceleration[station];
-                auto bestLeft=pieceTiming[leftPiece];
-                auto bestRight=pieceTiming[rightPiece];
-                auto bestDuration=bestLeft.back().time+bestRight.back().time;
-                auto improved=false;
-                const auto accelerationLimit=0.95*std::min(
-                    localLimits[leftPiece].acceleration,localLimits[rightPiece].acceleration);
-                const auto curvedCandidate=!pieces[leftPiece].linear||!pieces[rightPiece].linear;
-
-                StationVisitKey visitInput;
-                const auto visitSlot=((static_cast<std::size_t>(sweep)*2
-                    +(reverse?1U:0U))*(pieces.size()-1))+(station-1);
-                const StationVisitReplayRecord *matchingVisit=nullptr;
-                TimeLawCallDiagnostics timeLawBefore;
-                std::size_t candidatesBefore=0;
-                std::size_t endpointChecksBefore=0;
-                std::size_t accelerationRejectionsBefore=0;
-                std::size_t jerkRejectionsBefore=0;
-                std::size_t velocityCandidateSetsBefore=0;
-                std::size_t capVelocitySearchesBefore=0;
-                std::size_t binaryVelocitySearchStepsBefore=0;
-                std::chrono::steady_clock::time_point visitStarted;
-                if(measureStationVisitReplay) {
-                    visitInput.push_back(station);
-                    visitInput.push_back(sweep);
-                    visitInput.push_back(reverse?1U:0U);
-                    visitInput.push_back(reachabilityAccelerationCandidates);
-                    visitInput.push_back(reachabilityVelocitySearchIterations);
-                    appendFingerprintDouble(visitInput,stationVelocity[station-1]);
-                    appendFingerprintDouble(visitInput,stationVelocity[station]);
-                    appendFingerprintDouble(visitInput,stationVelocity[station+1]);
-                    appendFingerprintDouble(visitInput,stationAcceleration[station-1]);
-                    appendFingerprintDouble(visitInput,stationAcceleration[station]);
-                    appendFingerprintDouble(visitInput,stationAcceleration[station+1]);
-                    appendFingerprintDouble(visitInput,stationCaps[station]);
-                    appendFingerprintDouble(visitInput,pieces[leftPiece].length);
-                    appendFingerprintDouble(visitInput,pieces[rightPiece].length);
-                    appendFingerprintDouble(visitInput,localLimits[leftPiece].velocity);
-                    appendFingerprintDouble(visitInput,localLimits[leftPiece].acceleration);
-                    appendFingerprintDouble(visitInput,localLimits[leftPiece].jerk);
-                    appendFingerprintDouble(visitInput,localLimits[rightPiece].velocity);
-                    appendFingerprintDouble(visitInput,localLimits[rightPiece].acceleration);
-                    appendFingerprintDouble(visitInput,localLimits[rightPiece].jerk);
-                    appendTimeLawFingerprint(visitInput,pieceTiming[leftPiece]);
-                    appendTimeLawFingerprint(visitInput,pieceTiming[rightPiece]);
-                    if(visitSlot<previousStationVisitSlots.size()
-                       &&previousStationVisitSlots[visitSlot]!=NO_STATION_VISIT) {
-                        ++replayDiagnostics.comparableVisits;
-                        const auto &previous=previousStationVisits[
-                            previousStationVisitSlots[visitSlot]];
-                        if(previous.input==visitInput) {
-                            ++replayDiagnostics.exactInputMatches;
-                            matchingVisit=&previous;
-                        }
-                    }
-                    timeLawBefore=totalTimeLawCalls(
-                        timeLawRecorder.instrumentation.diagnostics);
-                    candidatesBefore=reachabilityCandidateEvaluations;
-                    endpointChecksBefore=timeLawRecorder.instrumentation.diagnostics
-                        .endpointFeasibility.candidateChecks;
-                    accelerationRejectionsBefore=timeLawRecorder.instrumentation.diagnostics
-                        .endpointFeasibility.accelerationRejections;
-                    jerkRejectionsBefore=timeLawRecorder.instrumentation.diagnostics
-                        .endpointFeasibility.jerkRejections;
-                    velocityCandidateSetsBefore=velocityCandidateSets;
-                    capVelocitySearchesBefore=capVelocitySearches;
-                    binaryVelocitySearchStepsBefore=binaryVelocitySearchSteps;
-                    visitStarted=std::chrono::steady_clock::now();
-                }
-
-                if(enableStationVisitReplay&&matchingVisit) {
-                    ++replayDiagnostics.replayedVisits;
-                    reachabilityCandidateEvaluations+=matchingVisit->candidateEvaluations;
-                    totalReachabilityCandidateEvaluations+=matchingVisit->candidateEvaluations;
-                    auto &passEvaluations=curvedCandidate
-                        ?curvedCandidateEvaluations:linearCandidateEvaluations;
-                    auto &totalEvaluations=curvedCandidate
-                        ?totalCurvedCandidateEvaluations:totalLinearCandidateEvaluations;
-                    passEvaluations+=matchingVisit->candidateEvaluations;
-                    totalEvaluations+=matchingVisit->candidateEvaluations;
-                    const auto passBound=curvedCandidate
-                        ?maximumCurvedCandidateEvaluationsPerPass
-                        :maximumLinearCandidateEvaluationsPerPass;
-                    const auto totalBound=curvedCandidate
-                        ?maximumTotalCurvedCandidateEvaluations
-                        :maximumTotalLinearCandidateEvaluations;
-                    if(passEvaluations>passBound||totalEvaluations>totalBound) {
-                        reachabilityCandidateBudgetExceeded=true;
-                        return false;
-                    }
-                    auto &endpointDiagnostics=
-                        timeLawRecorder.instrumentation.diagnostics.endpointFeasibility;
-                    endpointDiagnostics.candidateChecks+=matchingVisit->endpointChecks;
-                    endpointDiagnostics.accelerationRejections+=
-                        matchingVisit->accelerationRejections;
-                    endpointDiagnostics.jerkRejections+=matchingVisit->jerkRejections;
-                    velocityCandidateSets+=matchingVisit->velocityCandidateSets;
-                    capVelocitySearches+=matchingVisit->capVelocitySearches;
-                    binaryVelocitySearchSteps+=matchingVisit->binaryVelocitySearchSteps;
-                    stationVelocity[station]=matchingVisit->velocity;
-                    stationAcceleration[station]=matchingVisit->acceleration;
-                    pieceTiming[leftPiece]=matchingVisit->leftTiming;
-                    pieceTiming[rightPiece]=matchingVisit->rightTiming;
-                    if(matchingVisit->improved) ++improvedStationVisits;
-                    ++replayDiagnostics.exactOutputMatches;
-                    if(currentStationVisitSlots[visitSlot]!=NO_STATION_VISIT)
-                        PANIC("duplicate acceleration-aware station replay slot");
-                    currentStationVisitSlots[visitSlot]=currentStationVisits.size();
-                    currentStationVisits.push_back(*matchingVisit);
-                    return matchingVisit->improved;
-                }
-
-                const auto evaluate=[&](const double velocity,const double acceleration,
-                                        const TimeLawPurpose purpose) {
-                    ++reachabilityCandidateEvaluations;
-                    ++totalReachabilityCandidateEvaluations;
-                    if((reachabilityCandidateEvaluations&127U)==0) reportProgress();
-                    auto &passEvaluations=curvedCandidate
-                        ?curvedCandidateEvaluations:linearCandidateEvaluations;
-                    auto &totalEvaluations=curvedCandidate
-                        ?totalCurvedCandidateEvaluations:totalLinearCandidateEvaluations;
-                    ++passEvaluations;
-                    ++totalEvaluations;
-                    const auto passBound=curvedCandidate
-                        ?maximumCurvedCandidateEvaluationsPerPass
-                        :maximumLinearCandidateEvaluationsPerPass;
-                    const auto totalBound=curvedCandidate
-                        ?maximumTotalCurvedCandidateEvaluations
-                        :maximumTotalLinearCandidateEvaluations;
-                    if(passEvaluations>passBound||totalEvaluations>totalBound) {
-                        reachabilityCandidateBudgetExceeded=true;
-                        return false;
-                    }
-                    if(velocity<0.0||velocity>stationCaps[station]*(1.0+1e-10)
-                       ||std::abs(acceleration)>accelerationLimit*(1.0+1e-10)) return false;
-                    auto &endpointDiagnostics=
-                        timeLawRecorder.instrumentation.diagnostics.endpointFeasibility;
-                    ++endpointDiagnostics.candidateChecks;
-                    auto endpointResult=stateWithinCoupledLimits(
-                        pieceEndGeometry[leftPiece],leftPiece,velocity,acceleration);
-                    if(endpointResult==CoupledEndpointResult::Feasible)
-                        endpointResult=stateWithinCoupledLimits(
-                            pieceStartGeometry[rightPiece],rightPiece,velocity,acceleration);
-                    if(endpointResult!=CoupledEndpointResult::Feasible) {
-                        if(endpointResult==CoupledEndpointResult::Acceleration)
-                            ++endpointDiagnostics.accelerationRejections;
-                        else
-                            ++endpointDiagnostics.jerkRejections;
-                        return false;
-                    }
-                    auto left=candidateTimeLawBetween(timeLawWorkspace,
-                        timeLawRecorder.instrumentation,true,
-                        purpose,correctionPass>0,pieces[leftPiece].length,
-                        stationVelocity[station-1],stationAcceleration[station-1],
-                        velocity,acceleration,localLimits[leftPiece].velocity,
-                        localLimits[leftPiece].acceleration,localLimits[leftPiece].jerk);
-                    if(!left.successful) return false;
-                    auto right=candidateTimeLawBetween(timeLawWorkspace,
-                        timeLawRecorder.instrumentation,true,
-                        purpose,correctionPass>0,pieces[rightPiece].length,
-                        velocity,acceleration,stationVelocity[station+1],
-                        stationAcceleration[station+1],localLimits[rightPiece].velocity,
-                        localLimits[rightPiece].acceleration,localLimits[rightPiece].jerk);
-                    if(!right.successful) return false;
-                    const auto duration=left.duration+right.duration;
-                    if(duration<bestDuration-1e-12) {
-                        if(!left.timing) {
-                            if(auto materialized=materializeCandidateTimeLaw(timeLawWorkspace,
-                                timeLawRecorder.instrumentation,purpose,
-                                left,
-                                pieces[leftPiece].length,stationVelocity[station-1],
-                                stationAcceleration[station-1],velocity,acceleration,
-                                localLimits[leftPiece].velocity,
-                                localLimits[leftPiece].acceleration,
-                                localLimits[leftPiece].jerk))
-                                left.timing=std::move(*materialized);
-                            else {
-                                cachedMaterializationError=materialized.error();
-                                return false;
-                            }
-                        }
-                        if(!right.timing) {
-                            if(auto materialized=materializeCandidateTimeLaw(timeLawWorkspace,
-                                timeLawRecorder.instrumentation,purpose,
-                                right,
-                                pieces[rightPiece].length,velocity,acceleration,
-                                stationVelocity[station+1],stationAcceleration[station+1],
-                                localLimits[rightPiece].velocity,
-                                localLimits[rightPiece].acceleration,
-                                localLimits[rightPiece].jerk))
-                                right.timing=std::move(*materialized);
-                            else {
-                                cachedMaterializationError=materialized.error();
-                                return false;
-                            }
-                        }
-                        bestDuration=duration;
-                        bestVelocity=velocity;
-                        bestAcceleration=acceleration;
-                        bestLeft=*left.timing;
-                        bestRight=*right.timing;
-                        improved=true;
-                    }
-                    return true;
-                };
-                const auto evaluateVelocity=[&](const double velocity,
-                                                const TimeLawPurpose purpose) {
-                    ++velocityCandidateSets;
-                    const auto leftSlope=(velocity*velocity
-                        -stationVelocity[station-1]*stationVelocity[station-1])
-                        /(2.0*pieces[leftPiece].length);
-                    const auto rightSlope=(stationVelocity[station+1]*stationVelocity[station+1]
-                        -velocity*velocity)/(2.0*pieces[rightPiece].length);
-                    const auto minmod=leftSlope*rightSlope>0.0
-                        ?std::copysign(std::min(std::abs(leftSlope),std::abs(rightSlope)),leftSlope)
-                        :0.0;
-                    std::array<double,MAX_REACHABILITY_ACCELERATION_CANDIDATES> candidates {};
-                    std::size_t candidateCount=0;
-                    candidates[candidateCount++]=stationAcceleration[station];
-                    candidates[candidateCount++]=0.0;
-                    candidates[candidateCount++]=minmod;
-                    candidates[candidateCount++]=std::midpoint(leftSlope,rightSlope);
-                    candidates[candidateCount++]=leftSlope;
-                    candidates[candidateCount++]=rightSlope;
-                    const auto gridCandidates=reachabilityAccelerationCandidates-candidateCount;
-                    for(std::size_t grid=0;grid<gridCandidates;++grid) {
-                        const auto fraction=gridCandidates==1?0.5
-                            :static_cast<double>(grid)/static_cast<double>(gridCandidates-1);
-                        candidates[candidateCount++]=std::lerp(
-                            -accelerationLimit,accelerationLimit,fraction);
-                    }
-                    auto feasible=false;
-                    std::array<double,MAX_REACHABILITY_ACCELERATION_CANDIDATES> uniqueCandidates {};
-                    std::size_t uniqueCandidateCount=0;
-                    const auto accelerationTolerance=std::max(1e-12,accelerationLimit*1e-12);
-                    for(std::size_t candidateIndex=0;candidateIndex<candidateCount;
-                        ++candidateIndex) {
-                        const auto candidate=candidates[candidateIndex];
-                        const auto clamped=
-                            std::clamp(candidate,-accelerationLimit,accelerationLimit);
-                        auto duplicate=false;
-                        for(std::size_t index=0;index<uniqueCandidateCount;++index)
-                            if(std::abs(uniqueCandidates[index]-clamped)
-                               <=accelerationTolerance) {
-                                duplicate=true;
-                                break;
-                            }
-                        if(!duplicate) uniqueCandidates[uniqueCandidateCount++]=clamped;
-                    }
-                    const auto velocityTolerance=
-                        std::max(1e-12,stationCaps[station]*1e-12);
-                    for(std::size_t index=0;index<uniqueCandidateCount;++index) {
-                        const auto candidate=uniqueCandidates[index];
-                        if(std::abs(velocity-stationVelocity[station])<=velocityTolerance
-                           &&std::abs(candidate-stationAcceleration[station])
-                               <=accelerationTolerance) {
-                            feasible=true;
-                            continue;
-                        }
-                        feasible=evaluate(velocity,candidate,purpose)||feasible;
-                        if(reachabilityCandidateBudgetExceeded) break;
-                    }
-                    return feasible;
-                };
-                (void)evaluateVelocity(stationVelocity[station],
-                    TimeLawPurpose::StationCurrentVelocity);
-                const auto cap=stationCaps[station];
-                if(!reachabilityCandidateBudgetExceeded
-                   &&cap>stationVelocity[station]+1e-10) {
-                    ++capVelocitySearches;
-                    if(!evaluateVelocity(cap,TimeLawPurpose::StationCapVelocity)) {
-                        auto low=stationVelocity[station];
-                        auto high=cap;
-                        for(unsigned iteration=0;
-                            iteration<reachabilityVelocitySearchIterations;++iteration) {
-                            ++binaryVelocitySearchSteps;
-                            const auto middle=std::midpoint(low,high);
-                            if(evaluateVelocity(middle,
-                                    TimeLawPurpose::StationVelocityBracket)) low=middle;
-                            else high=middle;
-                            if(reachabilityCandidateBudgetExceeded) break;
-                        }
-                    }
-                }
-                stationVelocity[station]=bestVelocity;
-                stationAcceleration[station]=bestAcceleration;
-                pieceTiming[leftPiece]=bestLeft;
-                pieceTiming[rightPiece]=bestRight;
-                if(improved) ++improvedStationVisits;
-                if(measureStationVisitReplay) {
-                    const auto visitSeconds=std::chrono::duration<double>(
-                        std::chrono::steady_clock::now()-visitStarted).count();
-                    if(matchingVisit) {
-                        if(matchingVisit->improved==improved
-                           &&bitExactDouble(matchingVisit->velocity,
-                               stationVelocity[station])
-                           &&bitExactDouble(matchingVisit->acceleration,
-                               stationAcceleration[station])
-                           &&bitExactTimeLaw(matchingVisit->leftTiming,
-                               pieceTiming[leftPiece])
-                           &&bitExactTimeLaw(matchingVisit->rightTiming,
-                               pieceTiming[rightPiece])) {
-                            ++replayDiagnostics.exactOutputMatches;
-                            const auto timeLawAfter=totalTimeLawCalls(
-                                timeLawRecorder.instrumentation.diagnostics);
-                            replayDiagnostics.potentialCandidateEvaluations+=
-                                reachabilityCandidateEvaluations-candidatesBefore;
-                            replayDiagnostics.potentialEndpointChecks+=
-                                timeLawRecorder.instrumentation.diagnostics.endpointFeasibility
-                                    .candidateChecks-endpointChecksBefore;
-                            replayDiagnostics.potentialTimeLawCalls+=
-                                timeLawAfter.calls-timeLawBefore.calls;
-                            replayDiagnostics.potentialSolverCalls+=
-                                timeLawAfter.solverCalls-timeLawBefore.solverCalls;
-                            replayDiagnostics.potentialMaterializations+=
-                                timeLawAfter.cacheMaterializations
-                                    -timeLawBefore.cacheMaterializations;
-                            replayDiagnostics.potentialTimeLawSeconds+=
-                                timeLawAfter.seconds-timeLawBefore.seconds;
-                            replayDiagnostics.potentialVisitSeconds+=visitSeconds;
-                        } else ++replayDiagnostics.outputMismatches;
-                    }
-                    if(currentStationVisitSlots[visitSlot]!=NO_STATION_VISIT)
-                        PANIC("duplicate acceleration-aware station visit slot");
-                    currentStationVisitSlots[visitSlot]=currentStationVisits.size();
-                    currentStationVisits.push_back({
-                        .input=visitInput,
-                        .leftTiming=pieceTiming[leftPiece],
-                        .rightTiming=pieceTiming[rightPiece],
-                        .velocity=stationVelocity[station],
-                        .acceleration=stationAcceleration[station],
-                        .candidateEvaluations=
-                            reachabilityCandidateEvaluations-candidatesBefore,
-                        .endpointChecks=timeLawRecorder.instrumentation.diagnostics
-                            .endpointFeasibility.candidateChecks-endpointChecksBefore,
-                        .accelerationRejections=timeLawRecorder.instrumentation.diagnostics
-                            .endpointFeasibility.accelerationRejections
-                                -accelerationRejectionsBefore,
-                        .jerkRejections=timeLawRecorder.instrumentation.diagnostics
-                            .endpointFeasibility.jerkRejections-jerkRejectionsBefore,
-                        .velocityCandidateSets=velocityCandidateSets-velocityCandidateSetsBefore,
-                        .capVelocitySearches=capVelocitySearches-capVelocitySearchesBefore,
-                        .binaryVelocitySearchSteps=
-                            binaryVelocitySearchSteps-binaryVelocitySearchStepsBefore,
-                        .improved=improved,
-                    });
-                }
-                return improved;
-            };
-            for(unsigned sweep=0;sweep<reachabilitySweeps;++sweep) {
-                auto sweepImproved=false;
-                for(std::size_t station=1;station<pieces.size();++station)
-                    sweepImproved=optimizeStation(station,sweep,false)||sweepImproved;
-                for(std::size_t station=pieces.size();station-->1;)
-                    sweepImproved=optimizeStation(station,sweep,true)||sweepImproved;
-                if(!sweepImproved||reachabilityCandidateBudgetExceeded) break;
-            }
-            if(cachedMaterializationError)
-                return std::unexpected(std::format(
-                    "continuous reachability cache materialization failed on pass {}: {}",
-                    correctionPass,*cachedMaterializationError));
-            if(reachabilityCandidateBudgetExceeded)
-                return std::unexpected(std::format(
-                    "continuous acceleration-aware reachability resource bound exceeded: "
-                    "pass={} pass_evaluations={} curved_pass={}/{} linear_pass={}/{} "
-                    "total_evaluations={} curved_total={}/{} linear_total={}/{} pieces={} "
-                    "curved_stations={} linear_stations={} active_visits={} improvements={} "
-                    "velocity_sets={} cap_searches={} binary_steps={}",correctionPass,
-                    reachabilityCandidateEvaluations,curvedCandidateEvaluations,
-                    maximumCurvedCandidateEvaluationsPerPass,linearCandidateEvaluations,
-                    maximumLinearCandidateEvaluationsPerPass,totalReachabilityCandidateEvaluations,
-                    totalCurvedCandidateEvaluations,maximumTotalCurvedCandidateEvaluations,
-                    totalLinearCandidateEvaluations,maximumTotalLinearCandidateEvaluations,
-                    pieces.size(),curvedReachabilityStations,linearReachabilityStations,
-                    activeStationVisits,improvedStationVisits,velocityCandidateSets,
-                    capVelocitySearches,binaryVelocitySearchSteps));
-            previousStationVisits=std::move(currentStationVisits);
-            previousStationVisitSlots=std::move(currentStationVisitSlots);
-            } else {
-                previousStationVisits.clear();
-                previousStationVisitSlots.clear();
-            }
-            result->reachabilityCandidateEvaluations=totalReachabilityCandidateEvaluations;
-            const auto reachabilityDuration=std::accumulate(pieceTiming.begin(),pieceTiming.end(),0.0,
+            const auto optimizedDuration=std::accumulate(pieceTiming.begin(),pieceTiming.end(),0.0,
                 [](const double total,const auto &timing) { return total+timing.back().time; });
-            result->accelerationAwareDuration=reachabilityDuration;
             result->ruckigBrakePhases=std::accumulate(
                 pieceTiming.begin(),pieceTiming.end(),std::size_t {0},
                 [](const std::size_t total,const auto &timing) {
@@ -3191,6 +2689,13 @@ namespace ngc {
                                     const auto time=iterator->time;
                                     if(time<=fromTime+minimumSide||time>=toTime-minimumSide) return;
                                     const auto candidateSplit=time/totalDuration;
+                                    const auto candidateState=kinematicAt(
+                                        pieceIndex,stateAt(candidateSplit));
+                                    if(time-fromTime<minimumNumericallyStableC2Duration(
+                                            kinematicAt(pieceIndex,from),candidateState,m_limits)
+                                       ||toTime-time<minimumNumericallyStableC2Duration(
+                                            candidateState,kinematicAt(pieceIndex,to),m_limits))
+                                        return;
                                     if(!phaseSplit
                                        ||std::abs(candidateSplit-std::midpoint(u0,u1))
                                           <std::abs(*phaseSplit-std::midpoint(u0,u1)))
@@ -3297,7 +2802,7 @@ namespace ngc {
             correctionHistory+=std::format(
                 "{}pass {}: factor={} piece={} input={} geometry={} piece_length={} "
                 "span_id={} staged_span={} span_duration={} constraint={} axis={} measured={} "
-                "limit={} measured_over_limit={} timing_candidate={} reachability_duration={} "
+                "limit={} measured_over_limit={} timing_candidate={} optimized_duration={} "
                 "scp_iterations={} scp_accepted_steps={} "
                 "max_station_acceleration={} station_state=[v={} a={} -> v={} a={}] "
                 "local_limits=[v={} a={} j={}]",
@@ -3306,7 +2811,7 @@ namespace ngc {
                 pieces[worstPiece].length,worstViolation.spanId,worstViolation.stagedSpan,
                 worstViolation.duration,worstViolation.constraint,worstViolation.axis,
                 worstViolation.measured,worstViolation.limit,worstViolation.ratio,
-                "sparse-scp",reachabilityDuration,
+                "sparse-scp",optimizedDuration,
                 m_continuousPlanningEffort.scpIterations,result->scpAcceptedSteps,
                 maximumStationAcceleration,
                 stationVelocity[worstPiece],stationAcceleration[worstPiece],
@@ -3316,37 +2821,6 @@ namespace ngc {
             if(worst<=1.0+1e-9) {
                 constraintsVerified=true;
                 break;
-            }
-            if(!useAccelerationAwareRescue) {
-                auto pathologicalCorrection=false;
-                for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
-                    if(correction[pieceIndex]<=1.0+1e-9) continue;
-                    const auto factor=correction[pieceIndex]*1.01;
-                    const auto projectedVelocity=localLimits[pieceIndex].velocity/factor;
-                    const auto projectedJerk=localLimits[pieceIndex].jerk
-                        /(factor*factor*factor);
-                    if(projectedVelocity<initialLocalLimits[pieceIndex].velocity*0.02
-                       ||projectedJerk<initialLocalLimits[pieceIndex].jerk*0.001) {
-                        pathologicalCorrection=true;
-                        break;
-                    }
-                }
-                if(pathologicalCorrection) {
-                    useAccelerationAwareRescue=true;
-                    result->accelerationAwareRescue=true;
-                    localLimits=initialLocalLimits;
-                    previousStationVelocity.clear();
-                    previousStationAcceleration.clear();
-                    previousPieceTiming.clear();
-                    previouslyCorrectedPieces.clear();
-                    previousStationVisits.clear();
-                    previousStationVisitSlots.clear();
-                    correctionHistory+=std::format(
-                        "{}pass {}: restored initial local limits and enabled bounded "
-                        "acceleration-aware rescue",correctionHistory.empty()?"":"; ",
-                        correctionPass);
-                    continue;
-                }
             }
             previousStationVelocity=stationVelocity;
             previousStationAcceleration=stationAcceleration;

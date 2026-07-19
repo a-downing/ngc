@@ -126,7 +126,6 @@ namespace ngc {
         std::chrono::steady_clock::time_point m_planningActivityStarted{};
         std::function<void(const ContinuousTrajectoryPlan &,
             std::span<const TrajectoryPlannerInput>)> m_continuousDiagnosticCallback;
-        static constexpr unsigned ROLLING_VELOCITY_SEARCH_ITERATIONS = 6;
 
         static constexpr std::array AXIS_COMPONENTS {
             &position_t::x, &position_t::y, &position_t::z,
@@ -894,7 +893,7 @@ namespace ngc {
                         "scp_accepted={} scp_materializations={} scp_seconds={:.6f} "
                         "correction_passes={} "
                         "scp_fallback={} fallback_count={} fallback_pass={} "
-                        "fallback_iteration={} rescue={}",
+                        "fallback_iteration={}",
                         continuous->pieceTiming.size(),actualDuration,
                         continuous->velocityOnlySeedDuration,slowest->input,
                         slowest->length,nominal,slowest->duration,
@@ -912,8 +911,7 @@ namespace ngc {
                         name(continuous->scpResourceFallback.reason),
                         continuous->scpResourceFallback.occurrences,
                         continuous->scpResourceFallback.correctionPass,
-                        continuous->scpResourceFallback.scpIteration,
-                        continuous->accelerationAwareRescue);
+                        continuous->scpResourceFallback.scpIteration);
                 } else {
                     m_lastContinuousPlanSummary="continuous plan has no piece timing diagnostics";
                 }
@@ -993,8 +991,7 @@ namespace ngc {
                         suffixProbe.setProgressCallback(m_compiler.progressCallback());
                         suffixProbe.reset(1,boundary.position);
                         auto suffix=suffixProbe.compileContinuous(
-                            split->suffix,blendScale,boundary,std::nullopt,
-                            ROLLING_VELOCITY_SEARCH_ITERATIONS);
+                            split->suffix,blendScale,boundary,std::nullopt);
                         m_diagnostics.timeLaw+=suffixProbe.lastTimeLawDiagnostics();
                         m_diagnostics.rollingSuffixProbeTimeLaw+=
                             suffixProbe.lastTimeLawDiagnostics();
@@ -1010,8 +1007,7 @@ namespace ngc {
                             split->prefix.pieces.size(),
                             split->prefix.diagnostics.nominalDuration));
                         auto prefix=prefixPlanner.compileContinuous(
-                            split->prefix,blendScale,m_continuousBoundary,boundary,
-                            ROLLING_VELOCITY_SEARCH_ITERATIONS);
+                            split->prefix,blendScale,m_continuousBoundary,boundary);
                         m_diagnostics.timeLaw+=prefixPlanner.lastTimeLawDiagnostics();
                         m_diagnostics.rollingPrefixProbeTimeLaw+=
                             prefixPlanner.lastTimeLawDiagnostics();
@@ -1047,8 +1043,7 @@ namespace ngc {
                     m_preparedWindow->commands.size(),m_preparedWindow->pieces.size(),
                     m_preparedWindow->diagnostics.nominalDuration));
                 auto continuous=m_compiler.compileContinuous(*m_preparedWindow,blendScale,
-                    m_continuousBoundary,std::nullopt,
-                    movingBoundary?ROLLING_VELOCITY_SEARCH_ITERATIONS:12U);
+                    m_continuousBoundary,std::nullopt);
                 m_diagnostics.timeLaw+=m_compiler.lastTimeLawDiagnostics();
                 if(!continuous) return std::unexpected(std::format(
                     "fatal prepared continuous-motion compilation failure: {}; cause: {}",
