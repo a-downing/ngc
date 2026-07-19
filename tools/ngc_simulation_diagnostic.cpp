@@ -195,11 +195,17 @@ int main(const int argc,char **argv) {
     const auto finalSnapshot=worker.snapshot();
     const auto geometrySeconds=finalSnapshot.geometryStream.preparationSeconds;
     const auto plannerSeconds=finalSnapshot.trajectoryPlanning.totalPlanningSeconds;
+    const auto averageWindowSeconds=finalSnapshot.trajectoryPlanning.continuousHorizons==0
+        ?0.0:finalSnapshot.trajectoryPlanning.totalContinuousHorizonSeconds
+            /static_cast<double>(finalSnapshot.trajectoryPlanning.continuousHorizons);
     std::println("final status={} t={:.6f}s planned={:.6f}s "
         "geometry_processing={:.6f}s planner_processing={:.6f}s "
-        "worst_window={:.6f}s total_processing={:.6f}s ticks={} error='{}'",
+        "best_window={:.6f}s average_window={:.6f}s worst_window={:.6f}s "
+        "total_processing={:.6f}s ticks={} error='{}'",
         statusName(finalSnapshot.status),finalSnapshot.programElapsedSeconds,
         finalSnapshot.trajectoryPlanning.plannedDuration,geometrySeconds,plannerSeconds,
+        finalSnapshot.trajectoryPlanning.minimumContinuousHorizonSeconds,
+        averageWindowSeconds,
         finalSnapshot.trajectoryPlanning.maximumContinuousHorizonSeconds,
         geometrySeconds+plannerSeconds,finalSnapshot.servoTicks,finalSnapshot.error);
     return 0;

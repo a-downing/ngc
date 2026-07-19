@@ -92,6 +92,7 @@ namespace ngc {
         std::uint64_t continuousHorizons = 0;
         double firstContinuousHorizonSeconds = 0.0;
         double lastContinuousHorizonSeconds = 0.0;
+        double minimumContinuousHorizonSeconds = 0.0;
         double maximumContinuousHorizonSeconds = 0.0;
         double totalContinuousHorizonSeconds = 0.0;
         std::uint64_t rollingBoundaryCandidates = 0;
@@ -540,8 +541,13 @@ namespace ngc {
                 m_diagnostics.maximumPlanningSeconds,planningSeconds);
             m_diagnostics.totalPlanningSeconds+=planningSeconds;
             if(continuous) {
-                if(m_diagnostics.continuousHorizons==0)
+                if(m_diagnostics.continuousHorizons==0) {
                     m_diagnostics.firstContinuousHorizonSeconds=planningSeconds;
+                    m_diagnostics.minimumContinuousHorizonSeconds=planningSeconds;
+                } else {
+                    m_diagnostics.minimumContinuousHorizonSeconds=std::min(
+                        m_diagnostics.minimumContinuousHorizonSeconds,planningSeconds);
+                }
                 ++m_diagnostics.continuousHorizons;
                 m_diagnostics.lastContinuousHorizonSeconds=planningSeconds;
                 m_diagnostics.maximumContinuousHorizonSeconds=std::max(

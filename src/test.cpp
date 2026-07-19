@@ -362,6 +362,15 @@ namespace {
                             snapshot.trajectoryPlanning.maximumWindowCommands,
                             snapshot.trajectoryPlanning.continuousHorizons,
                             snapshot.trajectoryPlanning.rollingBoundaryCandidates));
+        const auto averageHorizonSeconds=
+            snapshot.trajectoryPlanning.totalContinuousHorizonSeconds
+                /static_cast<double>(snapshot.trajectoryPlanning.continuousHorizons);
+        require(snapshot.trajectoryPlanning.minimumContinuousHorizonSeconds>0.0
+                    &&snapshot.trajectoryPlanning.minimumContinuousHorizonSeconds
+                        <=averageHorizonSeconds
+                    &&averageHorizonSeconds
+                        <=snapshot.trajectoryPlanning.maximumContinuousHorizonSeconds,
+                "continuous planning diagnostics should retain ordered best, average, and worst window times");
         require(std::ranges::none_of(snapshot.statusMessages,[](const auto &entry) {
             return entry.kind==ngc::InterpreterStatusKind::Error;
         }),"successful multi-packet refill should not publish a GUI error");
