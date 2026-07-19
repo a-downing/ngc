@@ -1755,6 +1755,7 @@ namespace ngc {
         const auto measureStationVisitReplay=
             (m_continuousPlanningEffort.measureStationVisitReplay||enableStationVisitReplay)
             &&m_continuousPlanningEffort.reachabilitySweeps<=3;
+        std::optional<HighsBasis> reusableScpBasis;
         for(unsigned correctionPass=0;correctionPass<maximumLocalCorrectionPasses;
                 ++correctionPass) {
             reportProgress();
@@ -2307,6 +2308,25 @@ namespace ngc {
                         "nonzeros={}",lp.model.num_col_,lp.model.num_row_,
                         lp.model.a_matrix_.index_.size()));
                 }
+                if(m_continuousPlanningEffort.reuseScpBasis&&reusableScpBasis) {
+                    ++result->scpBasisReuseAttempts;
+                    if(reusableScpBasis->valid
+                       &&reusableScpBasis->col_status.size()
+                            ==static_cast<std::size_t>(lp.model.num_col_)
+                       &&reusableScpBasis->row_status.size()
+                            ==static_cast<std::size_t>(lp.model.num_row_)) {
+                        if(highs.setBasis(*reusableScpBasis,"NGC SCP reuse")
+                                !=HighsStatus::kOk)
+                            return std::unexpected(std::format(
+                                "continuous SCP could not apply a dimension-checked HiGHS "
+                                "basis on correction pass {} iteration {}: columns={} rows={}",
+                                correctionPass,scpIteration,lp.model.num_col_,lp.model.num_row_));
+                        ++result->scpBasisReuseApplied;
+                    } else {
+                        ++result->scpBasisDimensionMismatches;
+                        reusableScpBasis.reset();
+                    }
+                }
                 ++result->scpSolves;
                 const auto solveStatus=highs.run();
                 const auto &solveInfo=highs.getInfo();
@@ -2352,6 +2372,15 @@ namespace ngc {
                 if(!solution.value_valid
                    ||solution.col_value.size()!=static_cast<std::size_t>(variableCount))
                     return std::unexpected("continuous SCP HiGHS solution has no primal values");
+                if(m_continuousPlanningEffort.reuseScpBasis) {
+                    const auto &basis=highs.getBasis();
+                    if(basis.valid
+                       &&basis.col_status.size()==static_cast<std::size_t>(lp.model.num_col_)
+                       &&basis.row_status.size()==static_cast<std::size_t>(lp.model.num_row_))
+                        reusableScpBasis=basis;
+                    else
+                        reusableScpBasis.reset();
+                }
 
                 std::vector<double> proposedVelocity(referenceVelocity.size());
                 std::vector<double> proposedAcceleration(referenceAcceleration.size());

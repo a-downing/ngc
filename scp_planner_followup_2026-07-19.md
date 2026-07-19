@@ -257,7 +257,7 @@ justify enabling the rows or removing acceleration-aware rescue.
 
 ### 5. Add basis reuse before increasing SCP iterations
 
-Status: pending experiment
+Status: completed
 
 Retain a valid HiGHS basis across same-dimension SCP iterations and, where valid,
 across correction passes. Apply it only after checking row and column dimensions.
@@ -267,6 +267,36 @@ net improvement.
 Do not raise the default `scpIterations` until basis reuse and trial caching are
 benchmarked together. More iterations do not by themselves solve the greedy
 working set's inability to accept locally worsening coordinated moves.
+
+Implementation: after an optimal HiGHS solve, the planner retains its valid
+basis. Before the next SCP model, it applies that basis only when both column and
+row counts match; a mismatch is recorded and uses a cold solve. A
+dimension-checked `setBasis()` failure remains a detailed fatal planner error.
+Diagnostics expose reuse attempts, successful applications, dimension
+mismatches, station proposals, line-search trials, simplex iterations, SCP time,
+materializations, and correction passes. The offline diagnostic accepts
+`--scp-basis-reuse=on|off`. Basis reuse is enabled by default; adjacent
+reachability rows remain disabled and the default stays at one SCP iteration.
+
+Regression evidence: the focused pathological cluster fixture applies all four
+eligible bases with no dimension mismatch, reduces simplex iterations from 92
+to 38, and produces a bit-exact identical plan, correction history, verification
+outcome, accepted-step count, materialization count, and rescue activation.
+Three-run local medians on representative first rolling horizons were:
+
+| Horizon | Simplex iterations, off -> on | Median SCP seconds, off -> on | Materializations, off -> on | Applied/mismatched bases |
+| --- | ---: | ---: | ---: | ---: |
+| `adaptive_pockets.ngc` (178 pieces) | 3288 -> 1090 | 0.048420 -> 0.030959 | 5995 -> 6084 | 6/0 |
+| `adaptive.ngc` (77 pieces) | 708 -> 446 | 0.011000 -> 0.008476 | 953 -> 953 | 3/0 |
+| `1001.ngc` (11 pieces) | 42 -> 31 | 0.001373 -> 0.001015 | 62 -> 62 | 1/0 |
+| `1002_3d.ngc` (179 pieces) | 1319 -> 513 | 0.025217 -> 0.018750 | 4846 -> 4854 | 4/1 |
+
+SCP time improves by 23% to 36% and simplex iterations by 26% to 67% across
+the selected set. Accepted/proposed steps, correction-pass counts, rescue state,
+and displayed plan duration are unchanged. Two large cases perform slightly
+more scalar materializations because a warm simplex basis can select a different
+degenerate LP optimum, but the net SCP time still improves. The 179-piece case
+also proves that a changed row count is detected and cold-started safely.
 
 ### 6. Evaluate a feasibility-only rolling suffix probe
 
@@ -326,7 +356,8 @@ accepted. Item 1 now adds multi-pass rescue, actual replay, replay-disabled
 equivalence, exact emitted-plan, verification-outcome, and scalar-work evidence.
 Items 2 and 3 now cover expected solver-resource fallback and cached SCP trials.
 Item 4 evaluated and rejected adjacent-station LP coupling for the selected
-workloads. Basis reuse remains uncovered pending its experiment.
+workloads. Item 5 enables dimension-checked basis reuse after controlled A/B
+evidence while retaining the one-iteration default.
 
 A bounded diagnostic using the locally modified machine configuration observed:
 

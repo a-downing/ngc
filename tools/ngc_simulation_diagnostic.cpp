@@ -72,11 +72,11 @@ namespace {
 }
 
 int main(const int argc,char **argv) {
-    if(argc>6) {
+    if(argc>7) {
         std::println(stderr,"usage: ngc_simulation_diagnostic [program.ngc] "
             "[maximum-program-seconds] [tick-multiplier] "
             "[--smoother=coordinate|uniform|peak-targeted|velocity-targeted] "
-            "[--scp-reachability-rows=on|off]");
+            "[--scp-reachability-rows=on|off] [--scp-basis-reuse=on|off]");
         return 2;
     }
     const std::filesystem::path program=argc>1?argv[1]:"adaptive_pockets.ngc";
@@ -84,6 +84,7 @@ int main(const int argc,char **argv) {
     const auto multiplier=argc>3?std::atoi(argv[3]):10;
     auto smoother=ngc::spline_detail::continuousSplineFitSolver();
     auto scpReachabilityRows=false;
+    auto scpBasisReuse=ngc::ContinuousPlanningEffort{}.reuseScpBasis;
     for(auto argument=4;argument<argc;++argument) {
         const auto option=std::string_view{argv[argument]};
         if(option.starts_with("--smoother=")) {
@@ -97,6 +98,10 @@ int main(const int argc,char **argv) {
             scpReachabilityRows=true;
         } else if(option=="--scp-reachability-rows=off") {
             scpReachabilityRows=false;
+        } else if(option=="--scp-basis-reuse=on") {
+            scpBasisReuse=true;
+        } else if(option=="--scp-basis-reuse=off") {
+            scpBasisReuse=false;
         } else {
             std::println(stderr,"unknown diagnostic option: {}",option);
             return 2;
@@ -135,6 +140,7 @@ int main(const int argc,char **argv) {
     }
     ngc::ContinuousPlanningEffort planningEffort;
     planningEffort.addScpAdjacentReachabilityRows=scpReachabilityRows;
+    planningEffort.reuseScpBasis=scpBasisReuse;
     if(!worker.setContinuousPlanningEffort(planningEffort)) {
         std::println(stderr,"simulation worker rejected the planning-effort selection");
         return 1;
@@ -145,8 +151,8 @@ int main(const int argc,char **argv) {
     }
 
     std::println("program={} multiplier={} stop_after={:.3f}s smoother={} "
-        "scp_reachability_rows={}",program.string(),multiplier,maximumProgramSeconds,
-        smootherName(smoother),scpReachabilityRows);
+        "scp_reachability_rows={} scp_basis_reuse={}",program.string(),multiplier,
+        maximumProgramSeconds,smootherName(smoother),scpReachabilityRows,scpBasisReuse);
     ngc::EpochId lastEpoch=0;
     ngc::ChunkId lastChunk=0;
     ngc::SpanId lastSpan=0;

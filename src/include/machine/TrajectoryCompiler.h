@@ -123,6 +123,7 @@ namespace ngc {
         // Experimental HiGHS-backed sequential linearization. These bounds
         // are NRT planning limits, not RT execution data.
         bool addScpAdjacentReachabilityRows = false;
+        bool reuseScpBasis = true;
         unsigned scpIterations = 1;
         unsigned scpLineSearchSteps = 8;
         std::size_t scpSimplexIterationLimitMultiplier = 64;
@@ -335,6 +336,9 @@ namespace ngc {
         std::size_t scpSolves = 0;
         std::size_t scpSimplexIterations = 0;
         std::size_t scpAdjacentReachabilityRows = 0;
+        std::size_t scpBasisReuseAttempts = 0;
+        std::size_t scpBasisReuseApplied = 0;
+        std::size_t scpBasisDimensionMismatches = 0;
         std::size_t scpStationProposals = 0;
         std::size_t scpLineSearchTrials = 0;
         std::size_t scpAcceptedSteps = 0;

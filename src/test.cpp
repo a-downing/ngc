@@ -2454,6 +2454,7 @@ namespace {
         auto replayEffort=compiler.continuousPlanningEffort();
         replayEffort.shareTimeLawCacheAcrossCompilations=false;
         replayEffort.cacheScpLineSearchTrials=false;
+        replayEffort.reuseScpBasis=false;
         compiler.setContinuousPlanningEffort(replayEffort);
         compiler.reset(94,points.front());
         const auto planned=compiler.compileContinuous(*prepared,0.05);
@@ -2628,6 +2629,37 @@ namespace {
                     (*shadowPlanned)->scpMaterializationAttempts));
         require(cachedScpCalls.cacheFailureHits>0,
                 "a repeated cached scalar failure must remain a failed SCP trial");
+
+        ngc::TrajectoryCompiler basisReuseCompiler(trajectoryLimits);
+        auto basisReuseEffort=cachedScpEffort;
+        basisReuseEffort.reuseScpBasis=true;
+        basisReuseCompiler.setContinuousPlanningEffort(basisReuseEffort);
+        basisReuseCompiler.reset(94,points.front());
+        const auto basisReusePlan=basisReuseCompiler.compileContinuous(*prepared,0.05);
+        require(basisReusePlan&&*basisReusePlan,
+            basisReusePlan?"":basisReusePlan.error());
+        require((*basisReusePlan)->scpBasisReuseAttempts>0
+                    &&(*basisReusePlan)->scpBasisReuseApplied
+                        ==(*basisReusePlan)->scpBasisReuseAttempts
+                    &&(*basisReusePlan)->scpBasisDimensionMismatches==0,
+                "same-dimension correction passes should apply every retained HiGHS basis");
+        require((*basisReusePlan)->scpSimplexIterations
+                    <(*cachedScpPlan)->scpSimplexIterations,
+                "basis reuse should reduce simplex iterations on the focused correction fixture");
+        require(planFingerprint(**basisReusePlan)==planFingerprint(**cachedScpPlan)
+                    &&(*basisReusePlan)->correctionHistory
+                        ==(*cachedScpPlan)->correctionHistory
+                    &&(*basisReusePlan)->geometryVerificationAttempts
+                        ==(*cachedScpPlan)->geometryVerificationAttempts
+                    &&(*basisReusePlan)->geometryVerificationHighWater
+                        ==(*cachedScpPlan)->geometryVerificationHighWater
+                    &&(*basisReusePlan)->scpAcceptedSteps
+                        ==(*cachedScpPlan)->scpAcceptedSteps
+                    &&(*basisReusePlan)->scpMaterializationAttempts
+                        ==(*cachedScpPlan)->scpMaterializationAttempts
+                    &&(*basisReusePlan)->accelerationAwareRescue
+                        ==(*cachedScpPlan)->accelerationAwareRescue,
+                "basis reuse must preserve the focused exact plan and verification outcome");
 
         ngc::TrajectoryCompiler reachabilityRowCompiler(trajectoryLimits);
         auto reachabilityRowEffort=cachedScpEffort;
