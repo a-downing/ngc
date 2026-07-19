@@ -122,6 +122,7 @@ namespace ngc {
         std::size_t timeLawCacheEntries = 0;
         // Experimental HiGHS-backed sequential linearization. These bounds
         // are NRT planning limits, not RT execution data.
+        bool addScpAdjacentReachabilityRows = false;
         unsigned scpIterations = 1;
         unsigned scpLineSearchSteps = 8;
         std::size_t scpSimplexIterationLimitMultiplier = 64;
@@ -333,9 +334,13 @@ namespace ngc {
         std::size_t geometryVerificationHighWater = 0;
         std::size_t scpSolves = 0;
         std::size_t scpSimplexIterations = 0;
+        std::size_t scpAdjacentReachabilityRows = 0;
+        std::size_t scpStationProposals = 0;
+        std::size_t scpLineSearchTrials = 0;
         std::size_t scpAcceptedSteps = 0;
         std::size_t scpMaterializationAttempts = 0;
         double scpSeconds = 0.0;
+        unsigned correctionPasses = 0;
         // Bounded NRT evidence for the first expected solver-resource fallback
         // in this plan. occurrences includes later correction-pass fallbacks.
         struct ResourceFallbackDiagnostic {

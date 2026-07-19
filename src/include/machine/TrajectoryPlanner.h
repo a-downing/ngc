@@ -889,7 +889,9 @@ namespace ngc {
                         "length={:.6g} nominal={:.6g}s actual={:.6g}s ratio={:.3f} "
                         "programmed_v={:.6g} local_v={:.6g} entry_v={:.6g} exit_v={:.6g} "
                         "local_a={:.6g} local_j={:.6g} scp_solves={} scp_iterations={} "
+                        "scp_reachability_rows={} scp_proposals={} scp_trials={} "
                         "scp_accepted={} scp_materializations={} scp_seconds={:.6f} "
+                        "correction_passes={} "
                         "scp_fallback={} fallback_count={} fallback_pass={} "
                         "fallback_iteration={} rescue={}",
                         continuous->pieceTiming.size(),actualDuration,
@@ -900,8 +902,11 @@ namespace ngc {
                         slowest->entryVelocity,slowest->exitVelocity,
                         slowest->accelerationLimit,slowest->jerkLimit,
                         continuous->scpSolves,continuous->scpSimplexIterations,
+                        continuous->scpAdjacentReachabilityRows,
+                        continuous->scpStationProposals,continuous->scpLineSearchTrials,
                         continuous->scpAcceptedSteps,continuous->scpMaterializationAttempts,
-                        continuous->scpSeconds,name(continuous->scpResourceFallback.reason),
+                        continuous->scpSeconds,continuous->correctionPasses,
+                        name(continuous->scpResourceFallback.reason),
                         continuous->scpResourceFallback.occurrences,
                         continuous->scpResourceFallback.correctionPass,
                         continuous->scpResourceFallback.scpIteration,

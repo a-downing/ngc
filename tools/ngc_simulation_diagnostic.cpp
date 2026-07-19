@@ -72,23 +72,35 @@ namespace {
 }
 
 int main(const int argc,char **argv) {
-    if(argc>5) {
+    if(argc>6) {
         std::println(stderr,"usage: ngc_simulation_diagnostic [program.ngc] "
             "[maximum-program-seconds] [tick-multiplier] "
-            "[--smoother=coordinate|uniform|peak-targeted|velocity-targeted]");
+            "[--smoother=coordinate|uniform|peak-targeted|velocity-targeted] "
+            "[--scp-reachability-rows=on|off]");
         return 2;
     }
     const std::filesystem::path program=argc>1?argv[1]:"adaptive_pockets.ngc";
     const auto maximumProgramSeconds=argc>2?std::strtod(argv[2],nullptr):60.0;
     const auto multiplier=argc>3?std::atoi(argv[3]):10;
     auto smoother=ngc::spline_detail::continuousSplineFitSolver();
-    if(argc>4) {
-        const auto parsed=parseSmoother(argv[4]);
-        if(!parsed) {
-            std::println(stderr,"{}",parsed.error());
+    auto scpReachabilityRows=false;
+    for(auto argument=4;argument<argc;++argument) {
+        const auto option=std::string_view{argv[argument]};
+        if(option.starts_with("--smoother=")) {
+            const auto parsed=parseSmoother(option);
+            if(!parsed) {
+                std::println(stderr,"{}",parsed.error());
+                return 2;
+            }
+            smoother=*parsed;
+        } else if(option=="--scp-reachability-rows=on") {
+            scpReachabilityRows=true;
+        } else if(option=="--scp-reachability-rows=off") {
+            scpReachabilityRows=false;
+        } else {
+            std::println(stderr,"unknown diagnostic option: {}",option);
             return 2;
         }
-        smoother=*parsed;
     }
 
     auto configuration=ngc::loadMachineConfiguration("machine.toml");
@@ -121,13 +133,20 @@ int main(const int argc,char **argv) {
         std::println(stderr,"simulation worker rejected the smoother selection");
         return 1;
     }
+    ngc::ContinuousPlanningEffort planningEffort;
+    planningEffort.addScpAdjacentReachabilityRows=scpReachabilityRows;
+    if(!worker.setContinuousPlanningEffort(planningEffort)) {
+        std::println(stderr,"simulation worker rejected the planning-effort selection");
+        return 1;
+    }
     if(!worker.start(programs,tools,true)) {
         std::println(stderr,"simulation worker rejected the run");
         return 1;
     }
 
-    std::println("program={} multiplier={} stop_after={:.3f}s smoother={}",
-        program.string(),multiplier,maximumProgramSeconds,smootherName(smoother));
+    std::println("program={} multiplier={} stop_after={:.3f}s smoother={} "
+        "scp_reachability_rows={}",program.string(),multiplier,maximumProgramSeconds,
+        smootherName(smoother),scpReachabilityRows);
     ngc::EpochId lastEpoch=0;
     ngc::ChunkId lastChunk=0;
     ngc::SpanId lastSpan=0;

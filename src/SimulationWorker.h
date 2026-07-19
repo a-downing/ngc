@@ -261,6 +261,12 @@ public:
         m_geometryPolicy.splineFitSolver = solver;
         return true;
     }
+    bool setContinuousPlanningEffort(const ngc::ContinuousPlanningEffort &effort) {
+        std::scoped_lock lock(m_mutex);
+        if(m_running || m_start || m_home || m_activeJog) return false;
+        m_driver.setContinuousPlanningEffort(effort);
+        return true;
+    }
     void setRapidSpeed(const double speed) {
         std::scoped_lock lock(m_mutex);
         m_limits.rapidSpeed = std::max(speed, 1e-6);

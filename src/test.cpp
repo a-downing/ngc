@@ -2629,6 +2629,37 @@ namespace {
         require(cachedScpCalls.cacheFailureHits>0,
                 "a repeated cached scalar failure must remain a failed SCP trial");
 
+        ngc::TrajectoryCompiler reachabilityRowCompiler(trajectoryLimits);
+        auto reachabilityRowEffort=cachedScpEffort;
+        reachabilityRowEffort.addScpAdjacentReachabilityRows=true;
+        reachabilityRowCompiler.setContinuousPlanningEffort(reachabilityRowEffort);
+        reachabilityRowCompiler.reset(94,points.front());
+        const auto reachabilityRowPlan=
+            reachabilityRowCompiler.compileContinuous(*prepared,0.05);
+        require(reachabilityRowPlan&&*reachabilityRowPlan,
+            reachabilityRowPlan?"":reachabilityRowPlan.error());
+        const auto planDuration=[](const ngc::ContinuousTrajectoryPlan &plan) {
+            return std::accumulate(plan.pieceTiming.begin(),plan.pieceTiming.end(),0.0,
+                [](const double total,const auto &piece) {
+                    return total+piece.duration;
+                });
+        };
+        require((*reachabilityRowPlan)->scpAdjacentReachabilityRows
+                    ==2*expectedTimingIntervals.size()*(*reachabilityRowPlan)->scpSolves,
+                "enabled adjacent-station reachability must add two tracked LP rows per piece");
+        require(planFingerprint(**reachabilityRowPlan)==planFingerprint(**cachedScpPlan)
+                    &&planDuration(**reachabilityRowPlan)==planDuration(**cachedScpPlan)
+                    &&(*reachabilityRowPlan)->scpAcceptedSteps
+                        ==(*cachedScpPlan)->scpAcceptedSteps
+                    &&(*reachabilityRowPlan)->scpStationProposals
+                        ==(*cachedScpPlan)->scpStationProposals
+                    &&(*reachabilityRowPlan)->correctionPasses
+                        ==(*cachedScpPlan)->correctionPasses
+                    &&(*reachabilityRowPlan)->accelerationAwareRescue
+                        ==(*cachedScpPlan)->accelerationAwareRescue,
+                "adjacent-station reachability rows should remain a default-off experiment "
+                "when they do not improve the focused pathological plan");
+
         ngc::TrajectoryCompiler collisionCompiler(trajectoryLimits);
         auto collisionEffort=cachedScpEffort;
         collisionEffort.timeLawCacheEntries=1;

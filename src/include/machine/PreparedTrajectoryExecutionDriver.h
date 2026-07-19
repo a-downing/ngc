@@ -224,6 +224,9 @@ namespace ngc {
         }
 
         void setLimits(const TrajectoryLimits &limits) { m_planner.setLimits(limits); }
+        void setContinuousPlanningEffort(const ContinuousPlanningEffort &effort) {
+            m_planner.setContinuousPlanningEffort(effort);
+        }
         void setPlanningProgressCallback(std::function<void()> callback) {
             m_planner.setProgressCallback(std::move(callback));
         }

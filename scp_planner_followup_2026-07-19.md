@@ -192,7 +192,7 @@ speedup claim.
 
 ### 4. Add adjacent-station reachability relaxations
 
-Status: pending experiment
+Status: rejected experiment
 
 Add linearized acceleration-energy inequalities in both directions for each
 piece. They should shape the LP proposal without replacing exact jerk-limited
@@ -213,6 +213,15 @@ v0_ref^2 - v1_ref^2
 Track row offsets explicitly so reference-containment diagnostics do not depend
 on the current assumption that the first deviation row is `2*station`.
 
+Implementation: an explicit default-off NRT effort switch adds both linearized
+rows per timing piece using the current local scalar acceleration limit and
+piece length. Station-deviation and per-piece row-group bases are recorded
+explicitly. Every constructed model still passes the complete reference-point
+containment check before HiGHS runs. Plan diagnostics report the number of added
+rows, station proposals, line-search trials, accepted steps, full
+materializations, SCP time, and correction-pass count. The offline simulation
+diagnostic accepts `--scp-reachability-rows=on|off` for repeatable A/B runs.
+
 Evaluation criteria:
 
 - The verified reference remains contained in every generated LP.
@@ -221,6 +230,30 @@ Evaluation criteria:
 - Final exact duration is no worse on the selected benchmark set.
 - Solver time, materialization attempts, and correction-pass count are reported;
   no claim of improvement should be accepted from LP time alone.
+
+Evaluation evidence: the focused pathological cluster fixture adds 120 rows but
+produces the same bit-exact plan, 50 accepted steps from 55 proposals, 118 line
+search trials, 189 full materializations, five correction passes, and the same
+acceleration-aware rescue activation. Four representative first rolling
+horizons produced these deterministic planning counts:
+
+| Horizon | Accepted/proposed, off -> on | Trials, off -> on | Materializations, off -> on | Passes, off -> on |
+| --- | ---: | ---: | ---: | ---: |
+| `adaptive_pockets.ngc` (178 pieces) | 723/1239 -> 723/1239 | 5830 -> 5828 | 5995 -> 6021 | 7 -> 7 |
+| `adaptive.ngc` (77 pieces) | 300/304 -> 300/304 | 332 -> 332 | 953 -> 953 | 4 -> 4 |
+| `1001.ngc` (11 pieces) | 20/20 -> 20/20 | 20 -> 20 | 62 -> 62 | 2 -> 2 |
+| `1002_3d.ngc` (179 pieces) | 694/1068 -> 690/1068 | 3762 -> 3765 | 4846 -> 4831 | 6 -> 6 |
+
+No selected workload improved accepted-step fraction or correction count. The
+178-piece horizon's final scalar timing increased slightly from
+8.237769412604234 seconds to 8.237800265554284 seconds, and the 179-piece case
+accepted four fewer station steps. Single-run SCP wall times were also higher in
+all five comparisons, but that noisy observation is not used as proof. The
+velocity-only seed is already adjacent-reachability limited; the remaining
+exact rejections and pathological correction are dominated by jerk-limited and
+emitted-polynomial behavior that these acceleration-energy rows do not model.
+The switch therefore remains off by default, and the experiment does not
+justify enabling the rows or removing acceleration-aware rescue.
 
 ### 5. Add basis reuse before increasing SCP iterations
 
@@ -292,8 +325,8 @@ that an SCP subproblem was solved and that at least one station update was
 accepted. Item 1 now adds multi-pass rescue, actual replay, replay-disabled
 equivalence, exact emitted-plan, verification-outcome, and scalar-work evidence.
 Items 2 and 3 now cover expected solver-resource fallback and cached SCP trials.
-Basis reuse and adjacent-station LP coupling remain uncovered pending their
-respective experiments.
+Item 4 evaluated and rejected adjacent-station LP coupling for the selected
+workloads. Basis reuse remains uncovered pending its experiment.
 
 A bounded diagnostic using the locally modified machine configuration observed:
 
