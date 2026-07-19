@@ -197,9 +197,10 @@ int main(const int argc,char **argv) {
     const auto plannerSeconds=finalSnapshot.trajectoryPlanning.totalPlanningSeconds;
     std::println("final status={} t={:.6f}s planned={:.6f}s "
         "geometry_processing={:.6f}s planner_processing={:.6f}s "
-        "total_processing={:.6f}s ticks={} error='{}'",
+        "worst_window={:.6f}s total_processing={:.6f}s ticks={} error='{}'",
         statusName(finalSnapshot.status),finalSnapshot.programElapsedSeconds,
         finalSnapshot.trajectoryPlanning.plannedDuration,geometrySeconds,plannerSeconds,
+        finalSnapshot.trajectoryPlanning.maximumContinuousHorizonSeconds,
         geometrySeconds+plannerSeconds,finalSnapshot.servoTicks,finalSnapshot.error);
     return 0;
 }
