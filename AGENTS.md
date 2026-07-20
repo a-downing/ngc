@@ -6,6 +6,8 @@ Never use LaTeX in responses for this repository because the Codex UI does not r
 
 Keep this file focused on durable repository-wide constraints. Do not turn it into a changelog, benchmark notebook, dated checkpoint, or task backlog. Verify implementation claims against current code and tests, and update this guide when an architectural invariant changes.
 
+For C++ changes, follow the repository's dedicated [C++ style guide](docs/cpp_style.md). Treat it as the formatting authority for new and modified C++ code.
+
 ## Continuous-path terminology
 
 Use these names consistently in code, diagnostics, research notes, and discussion:
