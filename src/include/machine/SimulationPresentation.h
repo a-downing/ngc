@@ -14,9 +14,11 @@
 
 namespace ngc {
     enum class SimulationStatus { Stopped, Running, Holding, Paused, Completed, Error };
+    enum class SimulationActivity { Idle, Program, Homing, Jogging };
 
     struct SimulationSnapshot {
         SimulationStatus status = SimulationStatus::Stopped;
+        SimulationActivity activity = SimulationActivity::Idle;
         position_t machinePosition{};
         position_t toolPosition{};
         ToolPose toolPose{};

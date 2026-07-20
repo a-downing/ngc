@@ -134,15 +134,9 @@ namespace ngc::operator_control {
             m_velocityRefreshRequested = false;
             return std::nullopt;
         }
-        if(snapshot.status == SimulationStatus::Running
-           || snapshot.status == SimulationStatus::Paused
-           || snapshot.status == SimulationStatus::Error) {
-            m_error = "pendant jog ignored because the machine is not idle";
-            m_pending.reset();
-            m_pendingVelocity.reset();
-            m_velocityRefreshRequested = false;
-            return std::nullopt;
-        }
+        // Retain the bounded follow-up increment while pendant motion still
+        // owns the worker, including its completion handoff to idle.
+        if(snapshot.activity == SimulationActivity::Jogging) return std::nullopt;
 
         JogAction action;
         if(m_pending) {

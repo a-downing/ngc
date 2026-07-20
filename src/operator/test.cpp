@@ -53,6 +53,7 @@ namespace {
 
         snapshot.jogging = true;
         snapshot.status = ngc::SimulationStatus::Running;
+        snapshot.activity = ngc::SimulationActivity::Jogging;
         controller.consume(ngc::pendant::JogWheel {
             ngc::pendant::Axis::X, 2, ngc::pendant::JogIncrement::Coarse,
         });
@@ -62,7 +63,12 @@ namespace {
         require(!controller.next(snapshot),
                 "one follow-up Step increment must wait for the active jog to finish");
         snapshot.jogging = false;
+        require(!controller.next(snapshot),
+                "a follow-up Step increment must survive the pendant completion handoff");
+        require(!controller.takeError(),
+                "pendant-owned motion must not be reported as a non-idle machine");
         snapshot.status = ngc::SimulationStatus::Completed;
+        snapshot.activity = ngc::SimulationActivity::Idle;
         const auto coarseAction = controller.next(snapshot);
         const auto *coarseStart = coarseAction
             ? std::get_if<ngc::StartIncrementalJogRequest>(&*coarseAction) : nullptr;
@@ -87,6 +93,7 @@ namespace {
         controller.submitted(*start, true);
         snapshot.jogging = true;
         snapshot.status = ngc::SimulationStatus::Running;
+        snapshot.activity = ngc::SimulationActivity::Jogging;
         controller.consume(ngc::pendant::JogWheel { ngc::pendant::Axis::Y, 5 });
         controller.consume(ngc::pendant::CancelPendantActivity {
             ngc::pendant::CancelReason::SelectionChanged,
@@ -98,6 +105,7 @@ namespace {
         controller.submitted(*stop, true);
         snapshot.jogging = false;
         snapshot.status = ngc::SimulationStatus::Completed;
+        snapshot.activity = ngc::SimulationActivity::Idle;
         require(!controller.next(snapshot),
                 "selector cancellation should discard wheel counts queued behind the active jog");
     }
@@ -115,13 +123,18 @@ namespace {
 
         snapshot.homedJoints = allConfiguredJoints(*configuration);
         snapshot.status = ngc::SimulationStatus::Running;
+        snapshot.activity = ngc::SimulationActivity::Program;
         snapshot.jogging = false;
         controller.consume(ngc::pendant::JogWheel { ngc::pendant::Axis::Z, 1 });
-        require(!controller.next(snapshot), "pendant should not queue motion behind a running program");
+        const auto busyAction = controller.next(snapshot);
+        require(busyAction && std::holds_alternative<ngc::StartIncrementalJogRequest>(*busyAction),
+                "the worker, not a stale presentation snapshot, should arbitrate pendant ownership");
+        controller.submitted(*busyAction, false);
         error = controller.takeError();
-        require(error && error->find("not idle") != std::string::npos,
+        require(error && error->find("rejected") != std::string::npos,
                 "busy pendant rejection should be diagnosable");
         snapshot.status = ngc::SimulationStatus::Completed;
+        snapshot.activity = ngc::SimulationActivity::Idle;
         require(!controller.next(snapshot),
                 "a rejected busy pendant step must never execute later when the machine becomes idle");
     }

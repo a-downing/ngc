@@ -2351,6 +2351,8 @@ public:
             ImGuiInputTextFlags_ReadOnly);
         ImGui::Separator();
         if(!m_errorMessage.empty()) ImGui::TextColored(ImVec4_Redish, "ERROR: %s", m_errorMessage.c_str());
+        if(simulation.status == ngc::SimulationStatus::Error && !simulation.error.empty())
+            ImGui::TextColored(ImVec4_Redish, "MOTION ERROR: %s", simulation.error.c_str());
         for(const auto &error : m_worker.parserErrors()) {
             ImGui::TextColored(ImVec4_Redish, "ERROR: %s", error.text().c_str());
         }

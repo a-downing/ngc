@@ -187,6 +187,7 @@ public:
         m_pendingFeedHoldRequest.reset();
         m_pendingFeedResumeRequest.reset();
         m_snapshot.status = ngc::SimulationStatus::Running;
+        m_snapshot.activity = ngc::SimulationActivity::Program;
         m_cv.notify_all();
         return true;
     }
@@ -208,6 +209,7 @@ public:
         m_stop = false;
         m_paused = false;
         m_snapshot.status = ngc::SimulationStatus::Running;
+        m_snapshot.activity = ngc::SimulationActivity::Homing;
         m_snapshot.error.clear();
         m_cv.notify_all();
         return true;
@@ -230,6 +232,7 @@ public:
         m_activeJog = *jog;
         m_jogControls.push_back(request);
         m_snapshot.status = ngc::SimulationStatus::Running;
+        m_snapshot.activity = ngc::SimulationActivity::Jogging;
         m_snapshot.jogging = true;
         m_snapshot.lastJogStopReason.reset();
         m_cv.notify_all();
@@ -680,6 +683,7 @@ private:
             m_stop = false;
             m_running = false;
             m_snapshot.status = ngc::SimulationStatus::Stopped;
+            m_snapshot.activity = ngc::SimulationActivity::Idle;
             m_snapshot.hasActiveMotion = false;
             return false;
         }
@@ -690,6 +694,7 @@ private:
     void failHoming(const std::string &message) {
         std::scoped_lock lock(m_mutex);
         m_snapshot.status = ngc::SimulationStatus::Error;
+        m_snapshot.activity = ngc::SimulationActivity::Idle;
         m_snapshot.error = message;
         m_snapshot.hasActiveMotion = false;
         m_running = false;
@@ -822,6 +827,7 @@ private:
         {
             std::scoped_lock lock(m_mutex);
             m_snapshot.status = ngc::SimulationStatus::Running;
+            m_snapshot.activity = ngc::SimulationActivity::Homing;
             m_snapshot.error.clear();
             m_snapshot.servoTicks = 0;
             clearPresentation();
@@ -915,6 +921,7 @@ private:
         std::scoped_lock lock(m_mutex);
         m_running = false;
         m_snapshot.status = ngc::SimulationStatus::Completed;
+        m_snapshot.activity = ngc::SimulationActivity::Idle;
         m_snapshot.hasActiveMotion = false;
         m_homedJoints = allJoints;
         m_snapshot.homedJoints = m_homedJoints;
@@ -924,6 +931,7 @@ private:
     void failJog(const std::string &message) {
         std::scoped_lock lock(m_mutex);
         m_snapshot.status = ngc::SimulationStatus::Error;
+        m_snapshot.activity = ngc::SimulationActivity::Idle;
         m_snapshot.error = message;
         m_snapshot.hasActiveMotion = false;
         m_snapshot.jogging = false;
@@ -941,6 +949,7 @@ private:
         {
             std::scoped_lock lock(m_mutex);
             m_snapshot.status = ngc::SimulationStatus::Running;
+            m_snapshot.activity = ngc::SimulationActivity::Jogging;
             m_snapshot.error.clear();
             m_snapshot.jogging = true;
             m_snapshot.homedJoints = m_homedJoints;
@@ -1018,6 +1027,7 @@ private:
         m_running = false;
         m_activeJog.reset();
         m_snapshot.status = ngc::SimulationStatus::Completed;
+        m_snapshot.activity = ngc::SimulationActivity::Idle;
         m_snapshot.jogging = false;
         m_snapshot.hasActiveMotion = false;
         m_snapshot.activeJogTarget.reset();
@@ -1071,6 +1081,7 @@ private:
             m_start = false; m_running = true; m_programRunning = true; m_stop = false;
             if(!preserve) { m_snapshot = {}; clearPresentation(); }
             m_snapshot.status = ngc::SimulationStatus::Running;
+            m_snapshot.activity = ngc::SimulationActivity::Program;
             m_snapshot.servoPeriodSeconds = m_servoPeriod;
             m_snapshot.schedulerPeriodSeconds = m_schedulerPeriod;
             m_snapshot.servoTicksPerSchedulerPeriod = m_servoTicksPerSchedulerPeriod;
@@ -1096,7 +1107,7 @@ private:
             if(!m_driver.begin(epoch, startingPosition)) {
                 m_session.reportError("simulation trajectory driver failed to initialize its backend control channels");
                 m_session.stop();
-                lock.lock(); m_snapshot.status = ngc::SimulationStatus::Error; m_snapshot.error = "motion backend control channel is full"; m_running = false; m_programRunning = false; lock.unlock();
+                lock.lock(); m_snapshot.status = ngc::SimulationStatus::Error; m_snapshot.activity = ngc::SimulationActivity::Idle; m_snapshot.error = "motion backend control channel is full"; m_running = false; m_programRunning = false; lock.unlock();
                 continue;
             }
             m_geometryProducer = std::make_unique<ngc::GeometryStreamProducer>(
@@ -1228,7 +1239,7 @@ private:
             for(;;) {
                 lock.lock();
                 if(m_join || m_stop) {
-                    const auto joining = m_join; m_stop = false; m_running = false; m_programRunning = false; m_snapshot.status = ngc::SimulationStatus::Stopped;
+                    const auto joining = m_join; m_stop = false; m_running = false; m_programRunning = false; m_snapshot.status = ngc::SimulationStatus::Stopped; m_snapshot.activity = ngc::SimulationActivity::Idle;
                     copyTimingSnapshot();
                     stopExecutor.store(true, std::memory_order_release);
                     executorRefillRequested.store(false,std::memory_order_release);
@@ -1310,14 +1321,17 @@ private:
                 const auto pacingError = executorError.load(std::memory_order_acquire);
                 if(pacingError != 0) {
                     m_snapshot.status = ngc::SimulationStatus::Error;
+                    m_snapshot.activity = ngc::SimulationActivity::Idle;
                     m_snapshot.error = "Windows servo pacer failed with error " + std::to_string(pacingError);
                     m_running = false;
                     m_programRunning = false;
                 } else if(m_snapshot.status == ngc::SimulationStatus::Error) {
                     m_running = false;
                     m_programRunning = false;
+                    m_snapshot.activity = ngc::SimulationActivity::Idle;
                 } else if(state == ngc::PreparedDriverState::Error) {
                     m_snapshot.status = ngc::SimulationStatus::Error;
+                    m_snapshot.activity = ngc::SimulationActivity::Idle;
                     m_snapshot.error = *m_driver.error(); m_running = false; m_programRunning = false;
                 } else if(state == ngc::PreparedDriverState::Completed) {
                     for(const auto &[id,block]:m_deferredCompletedBlocks) {
@@ -1347,6 +1361,7 @@ private:
                             m_running = false;
                             m_programRunning = false;
                             m_snapshot.status = ngc::SimulationStatus::Completed;
+                            m_snapshot.activity = ngc::SimulationActivity::Idle;
                         }
                     }
                     break;
@@ -1384,6 +1399,7 @@ private:
                 state = m_driver.state();
                 if(state == ngc::PreparedDriverState::Error) {
                     m_snapshot.status = ngc::SimulationStatus::Error;
+                    m_snapshot.activity = ngc::SimulationActivity::Idle;
                     m_snapshot.error = *m_driver.error();
                     m_running = false;
                     m_programRunning = false;
