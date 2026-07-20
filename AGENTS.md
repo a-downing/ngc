@@ -54,7 +54,7 @@ Model pendant profiles translate device-session events into model-independent op
 
 P2-S Zero mode stages a desired work coordinate at the current physical point in configured fine-distance increments. Button release preserves this staging so a firmware-recognized double click can commit it; selection or safety changes discard it. Commit updates the active WCS canonical memory and cached offset only while no motion owner is active. It must not be implemented as generated G-code.
 
-P2-S Velocity mode requires the EN button to remain held after a fresh release/press cycle. Its byte-1 rate code is five times the unsigned wheel counts in an approximately 50 ms firmware window; byte-0 deltas supply direction. Bytes 4-5 form a wrapping diagnostic accumulator and must not command motion. Velocity updates retain one stable jog token, renew its dead-man lease, and recompute jerk-limited motion from the current PVA state. Zero rate, button release, selector/safety changes, disconnect, or lease expiry request a constrained stop.
+P2-S Velocity mode requires the EN button to remain held after a fresh release/press cycle. Timestamp byte-0 detents when their reports arrive and require two same-direction detent reports within the bounded pairing interval before starting motion. Derive velocity from the smoothed inter-detent period; do not command velocity from the byte-1 50 ms rate code or the wrapping bytes 4-5 firmware motion accumulator. Accumulator changes may provide periodic opportunities to renew the command or evaluate the missed-detent deadline, but accumulator magnitude or decay must not prolong motion. A direction reversal resets the estimator and requires a new pair. Velocity updates retain one stable jog token, renew its dead-man lease, and recompute jerk-limited motion from the current PVA state. A missed-detent deadline, button release, selector/safety change, disconnect, or lease expiry requests a constrained stop.
 
 `operator_control::JogController` is the shared NRT authority that converts model-independent pendant jog intentions into bounded backend controls. After homing, pendant axis selections produce logical-axis jog targets; joint-group and individual-joint targets remain service/pre-homing operations. It must reject rather than defer pendant motion while another owner is active. Step jogging is bounded to one active/submitted increment plus at most one pending follow-up: one accepted wheel report produces one signed configured increment regardless of its raw count magnitude, and additional detents are ignored once that single lookahead slot is occupied. A cancellation discards the follow-up and requests a token-matched constrained stop. Fine/coarse Step distances are typed machine configuration; Step execution uses the selected axis/coupled joints' full physical velocity, acceleration, and jerk limits.
 
@@ -79,10 +79,11 @@ Build and test with:
 
 ```powershell
 cmake --build build
-ctest --test-dir build --output-on-failure
+.\build\ngc_tests.exe
+ctest --test-dir build -E "^ngc_tests$" --output-on-failure
 ```
 
-Tests are framework-free in `src/test.cpp`. CTest runs them from the source directory because `Machine` loads `tool_table.txt` relative to the working directory. Project warning, optimization, and debug-symbol flags are target-scoped; dependency targets must not inherit project flags. Project targets and the vendored Ruckig target intentionally use `-O2`.
+Tests are framework-free executables, with the core suite in `src/test.cpp`. The core suite loads `machine.toml` and `tool_table.txt` relative to its working directory, so run `build\ngc_tests.exe` from the source directory and exclude its build-directory CTest registration as shown above. Project warning, optimization, and debug-symbol flags are target-scoped; dependency targets must not inherit project flags. Project targets and the vendored Ruckig target intentionally use `-O2`.
 
 ## Configuration and interpreter semantics
 
