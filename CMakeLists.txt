@@ -118,7 +118,6 @@ target_include_directories(ngc_tests PRIVATE src)
 target_link_libraries(ngc_tests PRIVATE ngc_core glm::glm-header-only)
 ngc_target_defaults(ngc_tests)
 add_test(NAME ngc_tests COMMAND ngc_tests)
-set_tests_properties(ngc_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_executable(ngc_simulation_diagnostic tools/ngc_simulation_diagnostic.cpp)
 target_include_directories(ngc_simulation_diagnostic PRIVATE src)
@@ -136,7 +135,7 @@ target_link_libraries(ngc_spline_geometry_analyzer PRIVATE ngc_core)
 ngc_target_defaults(ngc_spline_geometry_analyzer)
 add_test(NAME ngc_spline_geometry_analyzer_test
     COMMAND ngc_spline_geometry_analyzer
-        ${CMAKE_SOURCE_DIR}/tools/testdata/spline_geometry_analyzer_snapshot.txt
+        --self-test-fixture
         --optimize-all 0.005 10.0
         ${CMAKE_CURRENT_BINARY_DIR}/spline_geometry_analyzer_test.csv)
 set_tests_properties(ngc_spline_geometry_analyzer_test PROPERTIES
@@ -144,7 +143,7 @@ set_tests_properties(ngc_spline_geometry_analyzer_test PROPERTIES
         "optimized 1 variable-control short-entity splines from 1 captured splines")
 add_test(NAME ngc_spline_half_entity_controls_test
     COMMAND ngc_spline_geometry_analyzer
-        ${CMAKE_SOURCE_DIR}/tools/testdata/spline_geometry_analyzer_snapshot.txt
+        --self-test-fixture
         --half-entity-controls
         ${CMAKE_CURRENT_BINARY_DIR}/spline_half_entity_controls_test.csv)
 set_tests_properties(ngc_spline_half_entity_controls_test PROPERTIES

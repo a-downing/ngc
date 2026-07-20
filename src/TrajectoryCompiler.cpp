@@ -18,6 +18,7 @@
 #include <span>
 #include <tuple>
 #include <type_traits>
+#include <unordered_map>
 #include <vector>
 
 #include <highs/Highs.h>
@@ -878,9 +879,14 @@ namespace ngc {
 
         enum class CoupledEndpointResult { Feasible, Acceleration, Jerk };
 
+        struct GeometryActivation {
+            std::size_t input=0;
+            double distance=0.0;
+        };
+
        struct GeometryPiece {
             std::size_t input=0;
-            std::vector<std::size_t> activationInputs{};
+            std::vector<GeometryActivation> activations{};
             double length=0.0;
             double speed=0.0;
             bool linear=false;
@@ -1283,14 +1289,20 @@ namespace ngc {
                 ?prepared.clusterKnotIntervals.size():1;
         pieces.reserve(timingPieceCount);
         auto workspace=std::make_shared<CurveEvaluationWorkspace>();
+        std::unordered_map<PreparedCommandId,std::size_t> inputById;
+        inputById.reserve(geometry.commands.size());
+        for(std::size_t input=0;input<geometry.commands.size();++input)
+            if(!inputById.emplace(geometry.commands[input].id,input).second)
+                return std::unexpected(std::format(
+                    "prepared geometry contains duplicate command {}",
+                    geometry.commands[input].id));
         const auto inputFor=[&](const PreparedCommandId id)
                 ->std::expected<std::size_t,std::string> {
-            const auto found=std::ranges::find_if(geometry.commands,
-                [id](const auto &command) { return command.id==id; });
-            if(found==geometry.commands.end())
+            const auto found=inputById.find(id);
+            if(found==inputById.end())
                 return std::unexpected(std::format(
                     "prepared piece references unknown command {}",id));
-            return static_cast<std::size_t>(found-geometry.commands.begin());
+            return found->second;
         };
         for(const auto &prepared:geometry.pieces) {
             if(!prepared.curve||prepared.length()<=1e-12||prepared.programmedFeed<=0.0)
@@ -1299,20 +1311,12 @@ namespace ngc {
                 return std::unexpected(std::format(
                     "prepared continuous piece {} has no usable geometric samples",
                     prepared.id));
-            const auto primaryId=prepared.activationCommands.empty()
-                ?prepared.primaryCommand:prepared.activationCommands.front();
-            const auto primary=inputFor(primaryId);
+            const auto primary=inputFor(prepared.primaryCommand);
             if(!primary) return std::unexpected(primary.error());
-            std::vector<std::size_t> activations;
-            for(const auto id:prepared.activationCommands) {
-                const auto input=inputFor(id);
-                if(!input) return std::unexpected(input.error());
-                if(*input!=*primary) activations.push_back(*input);
-            }
+            auto nextActivation=std::size_t{0};
             const auto appendTimingPiece=[&](
                     const double from,const double to,const double speed,
-                    const std::span<const PreparedGeometricSample> samples,
-                    std::vector<std::size_t> activationInputs)
+                    const std::span<const PreparedGeometricSample> samples)
                     ->std::expected<void,std::string> {
                 const auto length=to-from;
                 const auto sampleOffset=from-prepared.curveFrom;
@@ -1340,10 +1344,28 @@ namespace ngc {
                             "prepared continuous piece {} timing samples are not ordered",
                             prepared.id));
 
+                std::vector<GeometryActivation> activations;
+                const auto finalInterval=std::abs(to-prepared.curveTo)<=distanceTolerance;
+                while(nextActivation<prepared.activationStations.size()) {
+                    const auto &station=prepared.activationStations[nextActivation];
+                    if(!std::isfinite(station.curveDistance)
+                       ||station.curveDistance<from-distanceTolerance)
+                        return std::unexpected(std::format(
+                            "prepared continuous piece {} has an unordered activation station",
+                            prepared.id));
+                    if(station.curveDistance>=to-distanceTolerance
+                       &&!(finalInterval&&station.curveDistance<=to+distanceTolerance)) break;
+                    const auto input=inputFor(station.command);
+                    if(!input) return std::unexpected(input.error());
+                    activations.push_back({*input,
+                        std::clamp(station.curveDistance-from,0.0,length)});
+                    ++nextActivation;
+                }
+
                 const auto curve=prepared.curve;
                 pieces.push_back({
                     .input=*primary,
-                    .activationInputs=std::move(activationInputs),
+                    .activations=std::move(activations),
                     .length=length,
                     .speed=speed,
                     .linear=prepared.curve->geometricallyLinear,
@@ -1382,9 +1404,12 @@ namespace ngc {
 
             if(prepared.kind!=PreparedPieceKind::ClusterSpline) {
                 if(auto appended=appendTimingPiece(prepared.curveFrom,prepared.curveTo,
-                        prepared.programmedFeed,prepared.geometricSamples,
-                        std::move(activations)); !appended)
+                        prepared.programmedFeed,prepared.geometricSamples); !appended)
                     return std::unexpected(appended.error());
+                if(nextActivation!=prepared.activationStations.size())
+                    return std::unexpected(std::format(
+                        "prepared continuous piece {} has activation stations outside its interval",
+                        prepared.id));
                 continue;
             }
             if(prepared.clusterKnotIntervals.empty())
@@ -1413,16 +1438,18 @@ namespace ngc {
                         prepared.id,intervalIndex));
                 const auto samples=std::span{prepared.geometricSamples}.subspan(
                     interval.firstGeometricSample,interval.geometricSampleCount);
-                auto intervalActivations=intervalIndex==0
-                    ?std::move(activations):std::vector<std::size_t>{};
                 if(auto appended=appendTimingPiece(interval.curveFrom,interval.curveTo,
-                        interval.programmedFeed,samples,std::move(intervalActivations)); !appended)
+                        interval.programmedFeed,samples); !appended)
                     return std::unexpected(appended.error());
                 expectedFrom=interval.curveTo;
             }
             if(std::abs(expectedFrom-prepared.curveTo)>1e-10)
                 return std::unexpected(std::format(
                     "prepared cluster spline {} knot intervals do not cover the curve",
+                    prepared.id));
+            if(nextActivation!=prepared.activationStations.size())
+                return std::unexpected(std::format(
+                    "prepared cluster spline {} has activation stations outside its intervals",
                     prepared.id));
         }
         if(pieces.empty()) return std::unexpected("continuous path produced no geometry");
@@ -2712,11 +2739,30 @@ namespace ngc {
                         }
                         normalSpans.insert(normalSpans.end(),chain.begin(),chain.end());
                         normalSpanPieces.insert(normalSpanPieces.end(),chain.size(),pieceIndex);
-                        if(activationSpans[piece.input]==0)
-                            activationSpans[piece.input]=chain.front().id;
-                        for(const auto input:piece.activationInputs)
-                            if(activationSpans[input]==0)
-                                activationSpans[input]=chain.front().id;
+                        const auto activationTolerance=std::max(
+                            1e-12,piece.length*1e-10);
+                        const auto finalEmission=
+                            localTo>=piece.length-activationTolerance;
+                        for(const auto &activation:piece.activations) {
+                            if(activationSpans[activation.input]!=0
+                               ||activation.distance<localFrom-activationTolerance
+                               ||(activation.distance>=localTo-activationTolerance
+                                  &&!(finalEmission&&activation.distance
+                                        <=localTo+activationTolerance))) continue;
+                            auto owningSpan=chain.size()-1;
+                            for(std::size_t chainSpan=0;
+                                    chainSpan+1<chain.size();++chainSpan) {
+                                const auto fraction=static_cast<double>(chainSpan+1)
+                                    /static_cast<double>(chain.size());
+                                const auto boundaryDistance=stateAt(
+                                    std::lerp(u0,u1,fraction)).distance;
+                                if(activation.distance<boundaryDistance-activationTolerance) {
+                                    owningSpan=chainSpan;
+                                    break;
+                                }
+                            }
+                            activationSpans[activation.input]=chain[owningSpan].id;
+                        }
                         nextSpan+=chain.size();
                         return std::nullopt;
                 };
@@ -2905,13 +2951,28 @@ namespace ngc {
             predecessor=chunk.branch;
         }
 
-        for(std::size_t input=1;input<activationSpans.size();++input)
-            if(activationSpans[input]==0) activationSpans[input]=activationSpans[input-1];
         m_nextChunk=nextChunk;
         m_nextSpan=nextSpan;
         m_previousBranch=result->chunks.back().branch;
         m_position=expectedEnd;
-        result->activationSpans=std::move(activationSpans);
+        std::unordered_map<SpanId,std::size_t> activationChunk;
+        activationChunk.reserve(normalSpans.size());
+        for(std::size_t chunk=0;chunk<result->chunks.size();++chunk)
+            for(const auto &span:result->chunks[chunk].normalMotion)
+                activationChunk.emplace(span.id,chunk);
+        for(std::size_t input=0;input<activationSpans.size();++input) {
+            if(!geometry.commands[input].presentationActivation) continue;
+            const auto span=activationSpans[input];
+            const auto owner=activationChunk.find(span);
+            if(span==0||owner==activationChunk.end())
+                return std::unexpected(std::format(
+                    "prepared command {} has no emitted activation owner",
+                    geometry.commands[input].id));
+            result->activations.push_back({input,span,owner->second});
+        }
+        std::ranges::sort(result->activations,{},[](const TimedCommandActivation &activation) {
+            return std::pair{activation.chunk,activation.input};
+        });
         result->timeLaw=timeLawRecorder.instrumentation.diagnostics;
         return result;
     }

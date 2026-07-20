@@ -45,10 +45,6 @@ namespace ngc {
         explicit Impl(Unit unit) {
             m_unit = unit;
             m_memory.init(gVars);
-            auto result = m_toolTable.load();
-            if(!result) {
-                throw std::runtime_error(std::format("failed to load tool table: {}", result.error()));
-            }
             beginProgramRun();
         }
 

@@ -53,18 +53,16 @@ namespace ngc {
         template<typename Observe>
         void observePlanned(const PlannedExecution &planned, const std::size_t itemIndex,
                             Observe &&observe) {
-            for(std::size_t index = 0; index < planned.inputs.size(); ++index) {
-                if(index >= planned.activationItems.size() || planned.activationItems[index] != itemIndex)
-                    continue;
-                const auto &input = planned.inputs[index];
-                if(!input.presentationActivation) continue;
-                const auto activation = index < planned.activationSpans.size()
-                    ? planned.activationSpans[index] : SpanId{};
+            auto activation=std::ranges::lower_bound(
+                planned.activations,itemIndex,{},&TimedCommandActivation::chunk);
+            for(;activation!=planned.activations.end()
+                    &&activation->chunk==itemIndex;++activation) {
+                const auto &input=planned.inputs[activation->input];
                 const auto &item = planned.items[itemIndex];
                 if constexpr(std::invocable<Observe, const MachineCommand &, const ExecutionItem &,
                                              const TrajectoryPlanningMetadata &,
                                              const TrajectoryCommandPresentation &, SpanId>)
-                    observe(input.command, item, input.metadata, input.presentation, activation);
+                    observe(input.command,item,input.metadata,input.presentation,activation->span);
                 else if constexpr(std::invocable<Observe, const MachineCommand &, const ExecutionItem &,
                                                   const TrajectoryPlanningMetadata &>)
                     observe(input.command, item, input.metadata);
@@ -128,6 +126,10 @@ namespace ngc {
             return std::visit([&](auto &&value) -> bool {
                 using T = std::decay_t<decltype(value)>;
                 if constexpr(std::same_as<T, PreparedGeometrySlice>) {
+                    if(m_planner.windowSize()!=0&&m_planner.preparedChainEnded()) {
+                        m_deferredMessage=std::move(message);
+                        return planWindow();
+                    }
                     if(!appendSlice(value)) {
                         m_deferredMessage = std::move(message);
                         return planWindow();
@@ -248,10 +250,12 @@ namespace ngc {
                     return false;
                 }
                 observePlanned(*m_pending, m_pendingItem, std::forward<Observe>(observe));
-                for(std::size_t index = 0; index < m_pending->inputs.size(); ++index)
-                    if(index < m_pending->activationItems.size()
-                       &&m_pending->activationItems[index] == m_pendingItem
-                       &&std::holds_alternative<ProbeMove>(m_pending->inputs[index].command))
+                auto activation=std::ranges::lower_bound(
+                    m_pending->activations,m_pendingItem,{},&TimedCommandActivation::chunk);
+                for(;activation!=m_pending->activations.end()
+                        &&activation->chunk==m_pendingItem;++activation)
+                    if(std::holds_alternative<ProbeMove>(
+                            m_pending->inputs[activation->input].command))
                         m_probePending = true;
                 ++m_outstandingChunks;
                 ++m_pendingItem;
@@ -363,6 +367,10 @@ namespace ngc {
         }
         const std::string &lastContinuousCorrectionHistory() const {
             return m_planner.lastContinuousCorrectionHistory();
+        }
+        bool hasPendingPublication() const { return m_pending!=nullptr; }
+        bool hasUnpublishedRollingContinuation() const {
+            return m_planner.hasRollingContinuation();
         }
         std::string activity() const {
             if(m_error) return "error: "+*m_error;

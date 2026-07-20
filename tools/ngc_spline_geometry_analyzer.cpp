@@ -1198,9 +1198,7 @@ namespace {
             <<csvPath.string()<<" and "<<svgPath.string()<<'\n';
     }
 
-    Snapshot readSnapshot(const std::filesystem::path &path) {
-        std::ifstream input(path);
-        if(!input) throw std::runtime_error("could not open geometry snapshot");
+    Snapshot readSnapshot(std::istream &input) {
         std::string word;
         input>>word;
         const auto version2=word=="ngc_spline_geometry_v2";
@@ -1251,6 +1249,31 @@ namespace {
         }
         if(!input) throw std::runtime_error("incomplete geometry snapshot");
         return result;
+    }
+
+    Snapshot readSnapshot(const std::filesystem::path &path) {
+        if(path=="--self-test-fixture") {
+            std::istringstream input{R"SNAPSHOT(ngc_spline_geometry_v1
+primitive_count 3
+line 0 80 0 0 0 0 0 0 1 0 0 0 0 0
+arc 1 80 1 0 0 0 0 0 0 1 0 0 0 0 0 0 0 0 0 1
+line 2 80 0 1 0 0 0 0 0 2 0 0 0 0
+spline_count 1
+spline 0 1 0 2 7 2
+control 0.5 0 0 0 0 0
+control 0.7 0 0 0 0 0
+control 0.9 0.1 0 0 0 0
+control 0.9 0.5 0 0 0 0
+control 0.5 0.9 0 0 0 0
+control 0 1.3 0 0 0 0
+control 0 1.5 0 0 0 0
+boundaries 0 2.5707963267948966
+)SNAPSHOT"};
+            return readSnapshot(input);
+        }
+        std::ifstream input(path);
+        if(!input) throw std::runtime_error("could not open geometry snapshot");
+        return readSnapshot(input);
     }
 }
 

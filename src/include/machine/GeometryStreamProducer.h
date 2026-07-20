@@ -171,7 +171,8 @@ namespace ngc {
             for(const auto &command : m_continuous) retained.insert(command.id);
             for(const auto &piece : m_pendingPieces) {
                 retained.insert(piece.primaryCommand);
-                retained.insert(piece.activationCommands.begin(), piece.activationCommands.end());
+                for(const auto &station:piece.activationStations)
+                    retained.insert(station.command);
                 retained.insert(piece.sourceCommands.begin(), piece.sourceCommands.end());
             }
             std::erase_if(m_commandRecords, [&](const auto &entry) {
@@ -191,7 +192,8 @@ namespace ngc {
             std::set<PreparedCommandId> referenced;
             for(const auto &piece : slice.pieces) {
                 referenced.insert(piece.primaryCommand);
-                referenced.insert(piece.activationCommands.begin(), piece.activationCommands.end());
+                for(const auto &station:piece.activationStations)
+                    referenced.insert(station.command);
                 referenced.insert(piece.sourceCommands.begin(), piece.sourceCommands.end());
             }
             for(const auto id : referenced) {

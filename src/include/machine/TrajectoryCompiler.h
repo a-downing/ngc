@@ -272,9 +272,18 @@ namespace ngc {
         return total;
     }
 
+    struct TimedCommandActivation {
+        std::size_t input = 0;
+        SpanId span = 0;
+        std::size_t chunk = 0;
+    };
+
     struct ContinuousTrajectoryPlan {
         std::vector<PlanChunk> chunks;
-        std::vector<SpanId> activationSpans;
+        // Ordered by chunk and then prepared-command input. Geometry supplies
+        // curve-distance stations; continuous emission resolves their timed
+        // execution ownership before the plan reaches TrajectoryPlanner.
+        std::vector<TimedCommandActivation> activations;
         // NRT-only development evidence; never crosses MotionBackend.
         std::vector<ContinuousPieceTimingDiagnostic> pieceTiming;
         double velocityOnlySeedDuration = 0.0;

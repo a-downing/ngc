@@ -160,8 +160,17 @@ int main(const int argc,char **argv) {
     ngc::SpanId lastSpan=0;
     std::string lastPlan;
     auto lastReport=std::chrono::steady_clock::now();
+    auto reportedWorstWindow=0.0;
     for(;;) {
         const auto snapshot=worker.snapshot();
+        if(snapshot.trajectoryPlanning.maximumContinuousHorizonSeconds
+                >reportedWorstWindow+0.01) {
+            reportedWorstWindow=
+                snapshot.trajectoryPlanning.maximumContinuousHorizonSeconds;
+            std::println("SLOW_WINDOW {:.6f}s driver={} plan={}",reportedWorstWindow,
+                snapshot.trajectoryDriverActivity,
+                snapshot.trajectoryContinuousPlanSummary);
+        }
         if(snapshot.trajectoryContinuousPlanSummary!=lastPlan) {
             lastPlan=snapshot.trajectoryContinuousPlanSummary;
             if(!lastPlan.empty()) {
@@ -235,5 +244,12 @@ int main(const int argc,char **argv) {
         averageWindowSeconds,
         finalSnapshot.trajectoryPlanning.maximumContinuousHorizonSeconds,
         geometrySeconds+plannerSeconds,finalSnapshot.servoTicks,finalSnapshot.error);
+    std::println("rolling candidates={} suffix_failures={} prefix_failures={} "
+        "max_suffix_pieces={} rolling_search={:.6f}s",
+        finalSnapshot.trajectoryPlanning.rollingBoundaryCandidates,
+        finalSnapshot.trajectoryPlanning.rollingSuffixProbeFailures,
+        finalSnapshot.trajectoryPlanning.rollingPrefixProbeFailures,
+        finalSnapshot.trajectoryPlanning.maximumRollingSuffixProbePieces,
+        finalSnapshot.trajectoryPlanning.rollingSearchSeconds);
     return 0;
 }

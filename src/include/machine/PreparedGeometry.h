@@ -163,6 +163,10 @@ namespace ngc {
         double curveFrom = 0.0;
         double curveTo = 0.0;
         double programmedFeed = 0.0;
+        // Producer-computed static geometric velocity cap. Rolling horizon
+        // selection combines it with programmed feed; exact dynamic timing
+        // and future runtime feed scaling remain planner-owned.
+        double geometricVelocityLimit = std::numeric_limits<double>::infinity();
         std::size_t firstGeometricSample = 0;
         std::size_t geometricSampleCount = 0;
     };
@@ -174,6 +178,14 @@ namespace ngc {
         double curveTo = 0.0;
     };
 
+    struct PreparedActivationStation {
+        PreparedCommandId command = 0;
+        // Absolute arc distance on the immutable prepared curve. The geometry
+        // producer owns this source-to-curve association; timing later maps it
+        // to an emitted execution span.
+        double curveDistance = 0.0;
+    };
+
     struct PreparedPathPiece {
         PreparedPieceId id = 0;
         PreparedPieceKind kind = PreparedPieceKind::RetainedLineSection;
@@ -182,9 +194,9 @@ namespace ngc {
         double curveTo = 0.0;
         double programmedFeed = 0.0;
         PreparedCommandId primaryCommand = 0;
-        std::vector<PreparedCommandId> activationCommands;
+        std::vector<PreparedActivationStation> activationStations;
         // Source entities whose geometry this piece represents. This is
-        // deliberately separate from activationCommands: a junction blend
+        // deliberately separate from activationStations: a junction blend
         // involves both adjacent source entities while presentation activates
         // only at the owning command boundary.
         std::vector<PreparedCommandId> sourceCommands;

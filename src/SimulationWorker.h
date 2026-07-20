@@ -341,7 +341,13 @@ private:
         presentation.activeBlocks = captured.activeBlocks;
         presentation.command = command;
         const auto key = std::visit([](const auto &value) { return ChunkKey { value.epoch, value.id }; }, item);
-        if(const auto *chunk=std::get_if<ngc::PlanChunk>(&item)) {
+        // A packet may own many prepared activation stations. Their
+        // presentation and block ownership are distinct, but the packet's
+        // execution spans are not; index those bounded spans only once so
+        // activation bookkeeping cannot delay publication of the next
+        // dependent packet until after the backend reaches the branch.
+        if(const auto *chunk=std::get_if<ngc::PlanChunk>(&item);
+           chunk&&!m_chunks.contains(key)) {
             const auto retainSpan=[&](const ngc::AxisPolynomialSpan &span,
                                       const std::uint32_t ordinal,const bool stopTail) {
                 const auto scaled=[](const ngc::position_t &value,const double factor) {
@@ -965,6 +971,8 @@ private:
             std::atomic<std::uint32_t> executorError{0};
             std::atomic<bool> executorBatchActive{false};
             std::atomic<bool> executorRefillRequested{false};
+            std::atomic<bool> nrtRefillActive{false};
+            std::atomic<bool> rollingSupplyActive{false};
             const auto updateMaximum = [](std::atomic<double> &target, const double value) {
                 auto current = target.load(std::memory_order_relaxed);
                 while(current < value && !target.compare_exchange_weak(
@@ -993,7 +1001,26 @@ private:
                     const auto multiplier = m_executorTickMultiplier.load(std::memory_order_relaxed);
                     const auto ticksThisPeriod = static_cast<std::uint64_t>(m_servoTicksPerSchedulerPeriod)
                         * multiplier;
-                    executorBatchActive.store(true, std::memory_order_release);
+                    if(multiplier>1) {
+                        for(;;) {
+                            while((nrtRefillActive.load(std::memory_order_acquire)
+                                   ||rollingSupplyActive.load(std::memory_order_acquire))
+                                  &&!stopExecutor.load(std::memory_order_relaxed)
+                                  &&!m_executorPaused.load(std::memory_order_relaxed))
+                                std::this_thread::yield();
+                            if(stopExecutor.load(std::memory_order_relaxed)
+                               ||m_executorPaused.load(std::memory_order_relaxed)) break;
+                            executorBatchActive.store(true,std::memory_order_release);
+                            if(!nrtRefillActive.load(std::memory_order_acquire)
+                               &&!rollingSupplyActive.load(std::memory_order_acquire)) break;
+                            executorBatchActive.store(false,std::memory_order_release);
+                        }
+                        if(stopExecutor.load(std::memory_order_relaxed)
+                           ||m_executorPaused.load(std::memory_order_relaxed)) {
+                            executorBatchActive.store(false,std::memory_order_release);
+                            continue;
+                        }
+                    } else executorBatchActive.store(true, std::memory_order_release);
                     for(std::uint64_t tick = 0; tick < ticksThisPeriod
                         && !stopExecutor.load(std::memory_order_relaxed)
                         && !m_executorPaused.load(std::memory_order_relaxed); ++tick) {
@@ -1091,6 +1118,20 @@ private:
                     continue;
                 }
                 m_snapshot.status = ngc::SimulationStatus::Running;
+                struct NrtRefillGuard {
+                    std::atomic<bool> &active;
+                    bool enabled = false;
+                    NrtRefillGuard(std::atomic<bool> &value,const bool enable)
+                        :active(value),enabled(enable) {
+                        if(enabled) active.store(true,std::memory_order_release);
+                    }
+                    void release() {
+                        if(enabled) active.store(false,std::memory_order_release);
+                        enabled=false;
+                    }
+                    ~NrtRefillGuard() { release(); }
+                } nrtRefillGuard{nrtRefillActive,
+                    m_executorTickMultiplier.load(std::memory_order_relaxed)>1};
                 if(executorBatchActive.load(std::memory_order_acquire)) {
                     copyTimingSnapshot();
                     lock.unlock();
@@ -1175,6 +1216,10 @@ private:
                 m_snapshot.trajectoryPlanning = m_driver.planningDiagnostics();
                 copyTimingSnapshot();
                 executorRefillRequested.store(false,std::memory_order_release);
+                rollingSupplyActive.store(
+                    m_executorTickMultiplier.load(std::memory_order_relaxed)>1
+                    &&m_driver.hasUnpublishedRollingContinuation()
+                    &&!m_driver.hasPendingPublication(),std::memory_order_release);
                 state = m_driver.state();
                 if(state == ngc::PreparedDriverState::Error) {
                     m_snapshot.status = ngc::SimulationStatus::Error;
@@ -1201,6 +1246,7 @@ private:
                     std::this_thread::yield();
                     continue;
                 }
+                nrtRefillGuard.release();
                 m_cv.wait_for(lock, std::chrono::duration<double>(m_servoPeriod),
                               [&] { return m_join || m_stop || m_paused; });
                 lock.unlock();

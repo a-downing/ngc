@@ -15,6 +15,7 @@
 #include <type_traits>
 #include <tuple>
 #include <utility>
+#include <unordered_set>
 #include <vector>
 
 #include "machine/TrajectoryCompiler.h"
@@ -52,26 +53,25 @@ namespace ngc {
         TrajectoryPlanningMetadata metadata;
         std::vector<ExecutionItem> items;
         std::vector<TrajectoryPlannerInput> inputs;
-        std::vector<SpanId> activationSpans;
-        std::vector<std::size_t> activationItems;
+        std::vector<TimedCommandActivation> activations;
 
         template<typename Item>
         PlannedExecution(MachineCommand commandValue, TrajectoryPlanningMetadata metadataValue,
                          Item &&itemValue, std::vector<TrajectoryPlannerInput> inputValues,
-                         std::vector<SpanId> activationSpanValues = {})
+                         const SpanId activationSpan = 0)
             : command(std::move(commandValue)), metadata(std::move(metadataValue)),
-              items{ExecutionItem{std::forward<Item>(itemValue)}}, inputs(std::move(inputValues)),
-              activationSpans(std::move(activationSpanValues)),activationItems(inputs.size(),0) { }
+              items{ExecutionItem{std::forward<Item>(itemValue)}}, inputs(std::move(inputValues)) {
+            if(!inputs.empty()&&inputs.front().presentationActivation)
+                activations.push_back({0,activationSpan,0});
+        }
 
         PlannedExecution(MachineCommand commandValue,TrajectoryPlanningMetadata metadataValue,
                          std::vector<ExecutionItem> itemValues,
                          std::vector<TrajectoryPlannerInput> inputValues,
-                         std::vector<SpanId> activationSpanValues,
-                         std::vector<std::size_t> activationItemValues)
+                         std::vector<TimedCommandActivation> activationValues)
             : command(std::move(commandValue)),metadata(std::move(metadataValue)),
               items(std::move(itemValues)),inputs(std::move(inputValues)),
-              activationSpans(std::move(activationSpanValues)),
-              activationItems(std::move(activationItemValues)) { }
+              activations(std::move(activationValues)) { }
 
     };
 
@@ -98,6 +98,7 @@ namespace ngc {
         std::uint64_t rollingBoundaryCandidates = 0;
         std::uint64_t rollingSuffixProbeFailures = 0;
         std::uint64_t rollingPrefixProbeFailures = 0;
+        std::size_t maximumRollingSuffixProbePieces = 0;
         double rollingSearchSeconds = 0.0;
         // All attempted scalar Ruckig solves, including failed rolling probes.
         TimeLawDiagnostics timeLaw;
@@ -250,29 +251,72 @@ namespace ngc {
             }
         }
 
+        static double preparedNominalDuration(const PreparedPathPiece &piece) {
+            if(piece.kind==PreparedPieceKind::ClusterSpline
+               &&!piece.clusterKnotIntervals.empty())
+                return std::accumulate(piece.clusterKnotIntervals.begin(),
+                    piece.clusterKnotIntervals.end(),0.0,
+                    [](const double total,const PreparedClusterKnotInterval &interval) {
+                        return interval.programmedFeed>0.0
+                            ?total+(interval.curveTo-interval.curveFrom)
+                                /interval.programmedFeed
+                            :total;
+                    });
+            return piece.programmedFeed>0.0
+                ?piece.length()/piece.programmedFeed:0.0;
+        }
+
+        static double preparedPredictedDuration(
+                const PreparedClusterKnotInterval &interval) {
+            const auto velocity=std::min(
+                interval.programmedFeed,interval.geometricVelocityLimit);
+            return velocity>0.0
+                ?(interval.curveTo-interval.curveFrom)/velocity:0.0;
+        }
+
+        static double preparedPredictedDuration(const PreparedPathPiece &piece) {
+            if(piece.kind==PreparedPieceKind::ClusterSpline
+               &&!piece.clusterKnotIntervals.empty())
+                return std::accumulate(piece.clusterKnotIntervals.begin(),
+                    piece.clusterKnotIntervals.end(),0.0,
+                    [](const double total,const PreparedClusterKnotInterval &interval) {
+                        return total+preparedPredictedDuration(interval);
+                    });
+            return preparedNominalDuration(piece);
+        }
+
+        static std::size_t preparedTimingPieceCount(
+                const PreparedContinuousGeometry &geometry) {
+            return std::accumulate(geometry.pieces.begin(),geometry.pieces.end(),
+                std::size_t{0},[](const std::size_t total,
+                                  const PreparedPathPiece &piece) {
+                    return total+(piece.kind==PreparedPieceKind::ClusterSpline
+                        ?piece.clusterKnotIntervals.size():std::size_t{1});
+                });
+        }
+
         static PreparedContinuousGeometry geometryForPieces(
                 const PreparedContinuousGeometry &source,
                 std::vector<PreparedPathPiece> pieces) {
             PreparedContinuousGeometry result;
             result.pieces=std::move(pieces);
-            std::vector<PreparedCommandId> referenced;
-            std::vector<PreparedCommandId> activated;
+            std::unordered_set<PreparedCommandId> referenced;
+            std::unordered_set<PreparedCommandId> activated;
+            referenced.reserve(source.commands.size());
+            activated.reserve(source.commands.size());
             for(const auto &piece:result.pieces) {
-                referenced.push_back(piece.primaryCommand);
-                referenced.insert(referenced.end(),piece.activationCommands.begin(),
-                    piece.activationCommands.end());
-                referenced.insert(referenced.end(),piece.sourceCommands.begin(),
-                    piece.sourceCommands.end());
-                activated.insert(activated.end(),piece.activationCommands.begin(),
-                    piece.activationCommands.end());
-                if(piece.programmedFeed>0.0)
-                    result.diagnostics.nominalDuration+=piece.length()/piece.programmedFeed;
+                referenced.insert(piece.primaryCommand);
+                for(const auto &station:piece.activationStations) {
+                    referenced.insert(station.command);
+                    activated.insert(station.command);
+                }
+                result.diagnostics.nominalDuration+=preparedNominalDuration(piece);
             }
             for(const auto &record:source.commands) {
-                if(!std::ranges::contains(referenced,record.id)) continue;
+                if(!referenced.contains(record.id)) continue;
                 auto retained=record;
                 retained.presentationActivation=retained.presentationActivation
-                    &&std::ranges::contains(activated,record.id);
+                    &&activated.contains(record.id);
                 result.commands.push_back(std::move(retained));
             }
             return result;
@@ -286,21 +330,75 @@ namespace ngc {
         };
 
         std::optional<PreparedRollingSplit> splitPreparedGeometry(
-                const std::size_t pieceIndex,const double localDistance) const {
-            if(!m_preparedWindow||pieceIndex>=m_preparedWindow->pieces.size())
-                return std::nullopt;
-            const auto &source=*m_preparedWindow;
+                const PreparedContinuousGeometry &source,const std::size_t pieceIndex,
+                const double localDistance) const {
+            if(pieceIndex>=source.pieces.size()) return std::nullopt;
             const auto &piece=source.pieces[pieceIndex];
-            if(piece.kind!=PreparedPieceKind::RetainedLineSection
-               ||!piece.curve->geometricallyLinear||localDistance<=1e-10
+            const auto retainedLine=piece.kind==PreparedPieceKind::RetainedLineSection
+                &&piece.curve->geometricallyLinear;
+            const auto cluster=piece.kind==PreparedPieceKind::ClusterSpline;
+            if((!retainedLine&&!cluster)||localDistance<=1e-10
                ||piece.length()-localDistance<=1e-10) return std::nullopt;
             auto prefixPiece=piece;
             auto suffixPiece=piece;
             prefixPiece.curveTo=piece.curveFrom+localDistance;
             suffixPiece.curveFrom=prefixPiece.curveTo;
-            suffixPiece.activationCommands.clear();
-            resamplePreparedPiece(prefixPiece);
-            resamplePreparedPiece(suffixPiece);
+            const auto firstSuffixActivation=std::ranges::lower_bound(
+                piece.activationStations,suffixPiece.curveFrom,{},
+                &PreparedActivationStation::curveDistance);
+            prefixPiece.activationStations.assign(
+                piece.activationStations.begin(),firstSuffixActivation);
+            suffixPiece.activationStations.assign(
+                firstSuffixActivation,piece.activationStations.end());
+            // Activation stations are partitioned with the geometry above.
+            // The retained suffix needs its primary command for timing plus
+            // only the commands at its remaining stations; retaining every
+            // represented source command would make each later proof scale
+            // with the original cluster size.
+            if(cluster) suffixPiece.sourceCommands={suffixPiece.primaryCommand};
+            auto velocityLimit=piece.programmedFeed;
+            if(retainedLine) {
+                resamplePreparedPiece(prefixPiece);
+                resamplePreparedPiece(suffixPiece);
+            } else {
+                const auto absoluteDistance=piece.curveFrom+localDistance;
+                const auto tolerance=std::max(1e-10,piece.length()*1e-10);
+                auto suffixInterval=piece.clusterKnotIntervals.size();
+                for(std::size_t interval=1;
+                        interval<piece.clusterKnotIntervals.size();++interval)
+                    if(std::abs(piece.clusterKnotIntervals[interval].curveFrom
+                                -absoluteDistance)<=tolerance
+                       &&std::abs(piece.clusterKnotIntervals[interval-1].curveTo
+                                   -absoluteDistance)<=tolerance) {
+                        suffixInterval=interval;
+                        break;
+                    }
+                if(suffixInterval==piece.clusterKnotIntervals.size())
+                    return std::nullopt;
+                const auto firstSuffixSample=
+                    piece.clusterKnotIntervals[suffixInterval].firstGeometricSample;
+                if(firstSuffixSample==0
+                   ||firstSuffixSample>=piece.geometricSamples.size())
+                    return std::nullopt;
+
+                prefixPiece.clusterKnotIntervals.resize(suffixInterval);
+                suffixPiece.clusterKnotIntervals.erase(
+                    suffixPiece.clusterKnotIntervals.begin(),
+                    suffixPiece.clusterKnotIntervals.begin()
+                        +static_cast<std::ptrdiff_t>(suffixInterval));
+                prefixPiece.geometricSamples.resize(firstSuffixSample+1);
+                suffixPiece.geometricSamples.assign(
+                    piece.geometricSamples.begin()
+                        +static_cast<std::ptrdiff_t>(firstSuffixSample),
+                    piece.geometricSamples.end());
+                for(auto &sample:suffixPiece.geometricSamples)
+                    sample.distance-=localDistance;
+                for(auto &interval:suffixPiece.clusterKnotIntervals)
+                    interval.firstGeometricSample-=firstSuffixSample;
+                velocityLimit=std::min(
+                    prefixPiece.clusterKnotIntervals.back().programmedFeed,
+                    suffixPiece.clusterKnotIntervals.front().programmedFeed);
+            }
 
             std::vector<PreparedPathPiece> prefixPieces;
             prefixPieces.reserve(pieceIndex+1);
@@ -315,7 +413,6 @@ namespace ngc {
                 source.pieces.end());
 
             const auto boundary=preparedBoundary(piece,localDistance);
-            auto velocityLimit=piece.programmedFeed;
             for(const auto component:AXIS_COMPONENTS) {
                 const auto tangent=std::abs(boundary.tangent.*component);
                 if(tangent>1e-15) velocityLimit=std::min(velocityLimit,
@@ -328,6 +425,45 @@ namespace ngc {
                 .unitBoundary={boundary.position,boundary.tangent,boundary.curvature},
                 .velocityLimit=velocityLimit,
             };
+        }
+
+        PreparedContinuousGeometry suffixStopFeasibilityPrefix(
+                const PreparedContinuousGeometry &source) const {
+            const auto target=m_compiler.limits().lookaheadDuration;
+            auto precedingDuration=0.0;
+            for(std::size_t index=0;index<source.pieces.size();++index) {
+                const auto &piece=source.pieces[index];
+                const auto duration=preparedPredictedDuration(piece);
+                if(piece.kind==PreparedPieceKind::RetainedLineSection
+                   &&piece.curve->geometricallyLinear
+                   &&precedingDuration<target
+                   &&precedingDuration+duration>target) {
+                    const auto localDistance=(target-precedingDuration)
+                        *piece.programmedFeed;
+                    if(auto split=splitPreparedGeometry(source,index,localDistance))
+                        return std::move(split->prefix);
+                } else if(piece.kind==PreparedPieceKind::ClusterSpline) {
+                    auto intervalDuration=0.0;
+                    for(std::size_t interval=0;
+                            interval+1<piece.clusterKnotIntervals.size();++interval) {
+                        const auto &knot=piece.clusterKnotIntervals[interval];
+                        if(knot.programmedFeed<=0.0) break;
+                        intervalDuration+=preparedPredictedDuration(knot);
+                        if(precedingDuration+intervalDuration<target) continue;
+                        if(auto split=splitPreparedGeometry(source,index,
+                                knot.curveTo-piece.curveFrom))
+                            return std::move(split->prefix);
+                        break;
+                    }
+                }
+                precedingDuration+=duration;
+                if(precedingDuration<target||index+1==source.pieces.size()) continue;
+                std::vector<PreparedPathPiece> prefixPieces(
+                    source.pieces.begin(),source.pieces.begin()
+                        +static_cast<std::ptrdiff_t>(index+1));
+                return geometryForPieces(source,std::move(prefixPieces));
+            }
+            return source;
         }
 
         static std::vector<TrajectoryPlannerInput> preparedInputs(
@@ -678,11 +814,12 @@ namespace ngc {
                 m_preparedChain=slice.chain;
             }
             auto &geometry=*m_preparedWindow;
+            std::unordered_set<PreparedCommandId> knownCommands;
+            knownCommands.reserve(geometry.commands.size()+slice.commands.size());
+            for(const auto &record:geometry.commands) knownCommands.insert(record.id);
+            for(const auto &record:slice.commands) knownCommands.insert(record.id);
             const auto knownCommand=[&](const PreparedCommandId id) {
-                return std::ranges::any_of(geometry.commands,
-                           [id](const auto &record) { return record.id==id; })
-                    ||std::ranges::any_of(slice.commands,
-                           [id](const auto &record) { return record.id==id; });
+                return knownCommands.contains(id);
             };
             for(const auto &piece : slice.pieces) {
                 if(!piece.curve) return reject(std::format("piece {} has no curve", piece.id));
@@ -691,9 +828,17 @@ namespace ngc {
                 if(!knownCommand(piece.primaryCommand)) return reject(std::format(
                     "piece {} references unknown primary command {}", piece.id,
                     piece.primaryCommand));
-                for(const auto id : piece.activationCommands)
-                    if(!knownCommand(id)) return reject(std::format(
-                        "piece {} references unknown activation command {}", piece.id, id));
+                for(const auto &station : piece.activationStations) {
+                    if(!knownCommand(station.command)) return reject(std::format(
+                        "piece {} references unknown activation command {}",
+                        piece.id,station.command));
+                    if(!std::isfinite(station.curveDistance)
+                       ||station.curveDistance<piece.curveFrom-1e-10
+                       ||station.curveDistance>piece.curveTo+1e-10)
+                        return reject(std::format(
+                            "piece {} has activation command {} outside its curve interval",
+                            piece.id,station.command));
+                }
                 for(const auto id : piece.sourceCommands)
                     if(!knownCommand(id)) return reject(std::format(
                         "piece {} references unknown source command {}", piece.id, id));
@@ -720,7 +865,11 @@ namespace ngc {
             }
             geometry.pieces.insert(geometry.pieces.end(),
                 slice.pieces.begin(),slice.pieces.end());
-            geometry.diagnostics.nominalDuration+=slice.nominalDuration;
+            geometry.diagnostics.nominalDuration+=std::accumulate(
+                slice.pieces.begin(),slice.pieces.end(),0.0,
+                [](const double total,const PreparedPathPiece &piece) {
+                    return total+preparedNominalDuration(piece);
+                });
             return true;
         }
 
@@ -771,8 +920,7 @@ namespace ngc {
             },*item);
             return std::make_unique<PlannedExecution>(
                 input.command, input.metadata, std::move(*item),
-                std::vector<TrajectoryPlannerInput>{std::move(input)},
-                std::vector<SpanId>{activation});
+                std::vector<TrajectoryPlannerInput>{std::move(input)},activation);
         }
 
         std::expected<std::unique_ptr<PlannedExecution>, std::string> planWindow(
@@ -818,25 +966,7 @@ namespace ngc {
                 std::vector<ExecutionItem> items;
                 items.reserve(continuous->chunks.size());
                 for(auto &chunk:continuous->chunks) items.emplace_back(std::move(chunk));
-                std::vector<std::size_t> activationItems(continuous->activationSpans.size(),0);
-                for(std::size_t input=0;input<continuous->activationSpans.size();++input) {
-                    const auto activation=continuous->activationSpans[input];
-                    if(activation==0&&!inputs[input].presentationActivation) continue;
-                    const auto owner=std::ranges::find_if(items,[&](const auto &item) {
-                        const auto &chunk=std::get<PlanChunk>(item);
-                        return std::ranges::any_of(chunk.normalMotion,[&](const auto &span) {
-                            return span.id==activation;
-                        });
-                    });
-                    if(owner==items.end()) return std::unexpected(std::format(
-                        "fatal continuous-motion metadata failure: {}; activation span {} for input {} "
-                        "does not belong to any packet",context,activation,input));
-                    activationItems[input]=static_cast<std::size_t>(
-                        std::distance(items.begin(),owner));
-                }
-                const auto activeInputs=std::ranges::count_if(inputs,[](const auto &input) {
-                    return input.presentationActivation;
-                });
+                const auto activeInputs=continuous->activations.size();
                 m_diagnostics.publishedTimeLaw+=continuous->timeLaw;
                 if(m_continuousDiagnosticCallback)
                     m_continuousDiagnosticCallback(*continuous,inputs);
@@ -889,8 +1019,7 @@ namespace ngc {
                 m_lastContinuousCorrectionHistory=continuous->correctionHistory;
                 auto planned=std::make_unique<PlannedExecution>(
                     std::move(representativeCommand),std::move(representativeMetadata),
-                    std::move(items),std::move(inputs),std::move(continuous->activationSpans),
-                    std::move(activationItems));
+                    std::move(items),std::move(inputs),std::move(continuous->activations));
                 for(std::size_t item=0;item<planned->items.size();++item)
                     record(planned->items[item],item==0?activeInputs:0);
                 const auto planningSeconds=std::chrono::duration<double>(
@@ -911,14 +1040,18 @@ namespace ngc {
                     double distance = 0.0;
                 };
                 std::vector<Candidate> candidates;
-                auto totalDuration=m_preparedWindow->diagnostics.nominalDuration;
+                const auto totalDuration=std::accumulate(
+                    m_preparedWindow->pieces.begin(),m_preparedWindow->pieces.end(),0.0,
+                    [](const double total,const PreparedPathPiece &piece) {
+                        return total+preparedPredictedDuration(piece);
+                    });
                 auto precedingDuration=0.0;
                 constexpr std::array FRACTIONS{0.25,0.5,0.75};
                 for(std::size_t index=0;index<m_preparedWindow->pieces.size()
-                    &&candidates.size()<8&&!m_preparedChainEnded;++index) {
+                    &&candidates.size()<8;++index) {
                     const auto &piece=m_preparedWindow->pieces[index];
                     if(piece.programmedFeed<=0.0) break;
-                    const auto duration=piece.length()/piece.programmedFeed;
+                    const auto duration=preparedPredictedDuration(piece);
                     if(piece.kind==PreparedPieceKind::RetainedLineSection
                        &&piece.curve->geometricallyLinear) {
                         for(const auto fraction:FRACTIONS) {
@@ -931,13 +1064,35 @@ namespace ngc {
                                 candidates.push_back({index,piece.length()*fraction});
                             if(candidates.size()>=8) break;
                         }
+                    } else if(piece.kind==PreparedPieceKind::ClusterSpline) {
+                        auto clusterDuration=0.0;
+                        for(std::size_t interval=0;
+                                interval+1<piece.clusterKnotIntervals.size();++interval) {
+                            const auto &knot=piece.clusterKnotIntervals[interval];
+                            if(knot.programmedFeed<=0.0) break;
+                            clusterDuration+=preparedPredictedDuration(knot);
+                            const auto prefixDuration=precedingDuration+clusterDuration;
+                            const auto suffixDuration=totalDuration-prefixDuration;
+                            if(prefixDuration>=m_compiler.limits().lookaheadDuration
+                               &&suffixDuration>1e-9
+                               &&(allowTerminalStop||suffixDuration
+                                    >=m_compiler.limits().lookaheadDuration))
+                                candidates.push_back({index,
+                                    knot.curveTo-piece.curveFrom});
+                            if(candidates.size()>=8) break;
+                        }
                     }
                     precedingDuration+=duration;
                 }
 
                 for(const auto &candidate:candidates) {
-                    auto split=splitPreparedGeometry(candidate.piece,candidate.distance);
+                    auto split=splitPreparedGeometry(
+                        *m_preparedWindow,candidate.piece,candidate.distance);
                     if(!split) continue;
+                    const auto suffixProof=suffixStopFeasibilityPrefix(split->suffix);
+                    m_diagnostics.maximumRollingSuffixProbePieces=std::max(
+                        m_diagnostics.maximumRollingSuffixProbePieces,
+                        preparedTimingPieceCount(suffixProof));
                     const auto initialVelocityFraction=m_lastRollingVelocityFraction
                         ?std::min(1.0,2.0**m_lastRollingVelocityFraction):1.0;
                     for(unsigned attempt=0;attempt<6;++attempt) {
@@ -952,9 +1107,9 @@ namespace ngc {
                         };
                         setPlanningActivity(std::format(
                             "proving prepared G64 suffix: candidate_piece={} attempt={} "
-                            "commands={} pieces={} nominal={:.3f}s",
-                            candidate.piece,attempt,split->suffix.commands.size(),
-                            split->suffix.pieces.size(),
+                            "commands={} pieces={} nominal={:.3f}s retained_nominal={:.3f}s",
+                            candidate.piece,attempt,suffixProof.commands.size(),
+                            suffixProof.pieces.size(),suffixProof.diagnostics.nominalDuration,
                             split->suffix.diagnostics.nominalDuration));
                         TrajectoryCompiler suffixProbe(m_compiler.limits());
                         suffixProbe.setContinuousPlanningEffort(
@@ -962,7 +1117,7 @@ namespace ngc {
                         suffixProbe.setProgressCallback(m_compiler.progressCallback());
                         suffixProbe.reset(1,boundary.position);
                         auto suffix=suffixProbe.compileContinuous(
-                            split->suffix,blendScale,boundary,std::nullopt);
+                            suffixProof,blendScale,boundary,std::nullopt);
                         m_diagnostics.timeLaw+=suffixProbe.lastTimeLawDiagnostics();
                         m_diagnostics.rollingSuffixProbeTimeLaw+=
                             suffixProbe.lastTimeLawDiagnostics();

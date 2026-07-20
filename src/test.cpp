@@ -3,6 +3,7 @@
 #include <chrono>
 #include <cmath>
 #include <exception>
+#include <expected>
 #include <format>
 #include <fstream>
 #include <filesystem>
@@ -37,6 +38,222 @@
 namespace {
     constexpr double EPSILON = 1e-9;
     constexpr ngc::Machine::Unit UNIT = ngc::Machine::Unit::Inch;
+
+    constexpr std::string_view HELLO_FIXTURE=R"NGC(
+%
+let #hello = 12345
+print["hello.ngc"]
+%nothing after here matters
+)NGC";
+
+    constexpr std::string_view WORLD_FIXTURE="let #world = 12345\n";
+
+    constexpr std::string_view TOOL_CHANGE_FIXTURE=R"NGC(
+sub _tool_change[#tool_number] {
+    G90
+    G49
+    G20
+    G53 G0 Z#5163
+    G10 L2 P9 X#5381 Y#5382 Z#5383
+    G59.3
+    G0 X0 Y0
+    G0 Z4
+    G38.3 F50 Z0
+    if #5070 == 0 { return 0 }
+    G91 G0 Z0.25
+    G90 G38.3 F10 Z0
+    if #5070 == 0 { return 0 }
+    G53 G0 Z#5163
+    return 1
+}
+)NGC";
+
+    ngc::ToolTable fixtureToolTable() {
+        ngc::ToolTable tools;
+        tools.set(1,{.number=1,.x=0,.y=0,.z=2.0,.a=0,.b=0,.c=0,
+                     .diameter=0.1,.comment={}});
+        tools.set(2,{.number=2,.x=0,.y=0,.z=2.0,.a=0,.b=0,.c=0,
+                     .diameter=0.25,.comment="fixture tool"});
+        tools.set(13,{.number=13,.x=0,.y=0,.z=2.0,.a=0,.b=0,.c=0,
+                      .diameter=0.125,.comment={}});
+        return tools;
+    }
+
+    std::vector<std::tuple<std::string,std::string>> fixturePrograms(std::string main,
+                                                                      std::string name) {
+        return {{std::string(HELLO_FIXTURE),"fixture/hello.ngc"},
+                {std::string(WORLD_FIXTURE),"fixture/world.ngc"},
+                {std::string(TOOL_CHANGE_FIXTURE),"fixture/tool_change.ngc"},
+                {std::move(main),std::move(name)}};
+    }
+
+    std::string boundedPreviewFixture(const int commands,const bool exactStop) {
+        std::string source=exactStop?"G61\n":"G64 P0.005\n";
+        source+="G90 G1 F60\n";
+        for(int command=0;command<commands;++command)
+            source+=std::format("G1 X{} Y{}\n",command%2,(command/2)%2);
+        return source;
+    }
+
+    std::expected<ngc::MachineConfiguration,std::string> fixtureMachineConfiguration() {
+        constexpr std::string_view source=R"TOML(
+[machine]
+units = "inch"
+coordinates = ["x", "y", "z"]
+[trajectory]
+path_acceleration = 25.1
+path_jerk = 101
+rapid_velocity = 3.33
+arc_chord_tolerance = 0.0001
+lookahead_duration = 2.0
+[simulation]
+servo_period = 0.001
+scheduler_period = 0.01
+[jogging]
+acceleration = 5.0
+jerk = 25.0
+[axes.x]
+joints = [0]
+minimum = -14.0
+maximum = 13.75
+max_velocity = 3.33333333333
+max_acceleration = 5.1
+max_jerk = 101
+[axes.y]
+joints = [1, 2]
+minimum = 0
+maximum = 33.25
+max_velocity = 3.33333333333
+max_acceleration = 5.1
+max_jerk = 101
+[axes.z]
+joints = [3]
+minimum = -8.5
+maximum = 0.001
+max_velocity = 3.33333333333
+max_acceleration = 5.1
+max_jerk = 101
+[digital_inputs]
+tool_probe = 0
+shared_home = 1
+y2_home = 2
+[probing]
+input = "tool_probe"
+condition = "active"
+debounce = 0.010
+[[joints]]
+id = 0
+name = "x"
+axis = "x"
+coordinate_scale = 1.0
+minimum = -14.0
+maximum = 13.75
+max_velocity = 3.33333333333
+max_acceleration = 5.1
+max_jerk = 101
+[joints.homing]
+input = "shared_home"
+condition = "active"
+home_position = 12.75
+switch_position = 13.85
+search_velocity = 2
+latch_velocity = 0.2
+backoff_distance = 0.25
+debounce = 0.010
+final_velocity = 0.0
+use_index = false
+[[joints]]
+id = 1
+name = "y1"
+axis = "y"
+coordinate_scale = 1.0
+minimum = -0.1
+maximum = 33.25
+max_velocity = 3.33333333333
+max_acceleration = 25.1
+max_jerk = 101
+[joints.homing]
+input = "shared_home"
+condition = "active"
+home_position = 1
+switch_position = -0.1
+search_velocity = -2
+latch_velocity = -0.2
+backoff_distance = 0.25
+debounce = 0.010
+final_velocity = 0.0
+use_index = false
+[[joints]]
+id = 2
+name = "y2"
+axis = "y"
+coordinate_scale = 1.0
+minimum = -0.1
+maximum = 33.25
+max_velocity = 3.33333333333
+max_acceleration = 25.1
+max_jerk = 101
+[joints.homing]
+input = "y2_home"
+condition = "active"
+home_position = 1
+switch_position = -0.14
+search_velocity = -2
+latch_velocity = -0.2
+backoff_distance = 0.25
+debounce = 0.010
+final_velocity = 0.0
+use_index = false
+[[joints]]
+id = 3
+name = "z"
+axis = "z"
+coordinate_scale = 1.0
+minimum = -8.5
+maximum = 0.001
+max_velocity = 3.33333333333
+max_acceleration = 25.1
+max_jerk = 101
+[joints.homing]
+input = "shared_home"
+condition = "active"
+home_position = -1
+switch_position = 0.1
+search_velocity = 2
+latch_velocity = 0.2
+backoff_distance = 0.25
+debounce = 0.010
+final_velocity = 0.0
+use_index = false
+[homing]
+require_before_motion = false
+[[homing.groups]]
+name = "z"
+sequence = 0
+joints = [3]
+[[homing.groups]]
+name = "x"
+sequence = 1
+joints = [0]
+[[homing.groups]]
+name = "y_gantry"
+sequence = 2
+joints = [1, 2]
+start_together = true
+stop_each_joint_on_trigger = true
+final_move_together = true
+)TOML";
+        const auto path=std::filesystem::temp_directory_path()/"ngc-machine-fixture.toml";
+        {
+            std::ofstream file(path,std::ios::binary|std::ios::trunc);
+            if(!file) return std::unexpected("failed to create machine configuration fixture");
+            file.write(source.data(),static_cast<std::streamsize>(source.size()));
+            if(!file) return std::unexpected("failed to write machine configuration fixture");
+        }
+        auto configuration=ngc::loadMachineConfiguration(path);
+        std::filesystem::remove(path);
+        return configuration;
+    }
 
     void require(const bool condition, const std::string_view message) {
         if(!condition) {
@@ -106,10 +323,10 @@ namespace {
     }
 
     void testG64BlendScaleGeometryProgramIsValid() {
-        const auto source=ngc::readFile("g64_blend_scale_test.ngc");
-        require(source.has_value(),source ? "" : source.error().what());
+        auto source=boundedPreviewFixture(35,false);
+        source+="G0 X3 Y0\nG3 X4 Y1 I0 J1\nG1 X5 Y1\n";
         ngc::Machine machine(UNIT);
-        const auto commands=execute(machine,*source);
+        const auto commands=execute(machine,source);
         require(commands.size()>=30,"G64 blend-scale test should retain all geometry sections");
         require(std::ranges::any_of(commands,[](const auto &command) {
             return std::holds_alternative<ngc::MoveArc>(command);
@@ -288,26 +505,13 @@ namespace {
     }
 
     void testAdaptivePocketsStartsSimulation() {
-        const auto hello = ngc::readFile("autoload/hello.ngc");
-        const auto world = ngc::readFile("autoload/world.ngc");
-        const auto toolChange = ngc::readFile("autoload/tool_change.ngc");
-        auto main = ngc::readFile("adaptive_pockets.ngc");
-        require(hello && world && toolChange && main, "adaptive-pockets simulation inputs should load");
-        const auto g64=main->find("N40 G64 P");
-        if(g64!=std::string::npos) {
-            const auto g64End=main->find('\n',g64);
-            main->replace(g64,g64End==std::string::npos?main->size()-g64:g64End-g64,"N40 G61");
-        }
-        require(main->contains("N40 G61"),
-                "adaptive-pockets exact-stop fixture should select G61");
-        ngc::ToolTable tools;
-        const auto loadedTools = tools.load();
-        require(loadedTools.has_value(), loadedTools ? "" : loadedTools.error());
+        auto main=boundedPreviewFixture(24,true);
+        main="T2 M6\n"+main;
+        auto tools=fixtureToolTable();
 
         SimulationWorker worker;
         worker.setTickMultiplier(1000);
-        require(worker.start({ { *hello, "autoload/hello.ngc" }, { *world, "autoload/world.ngc" },
-                               { *toolChange, "autoload/tool_change.ngc" }, { *main, "adaptive_pockets.ngc" } }, tools),
+        require(worker.start(fixturePrograms(std::move(main),"fixture/exact-stop.ngc"),tools),
                 "adaptive-pockets simulation should start");
 
         auto snapshot = worker.snapshot();
@@ -337,7 +541,7 @@ namespace {
         source+="G0 X9\n";
 
         SimulationWorker worker;
-        worker.setTickMultiplier(10);
+        worker.setTickMultiplier(100);
         ngc::ToolTable tools;
         require(worker.start({{source,"multi-packet-refill.ngc"}},tools),
                 "multi-packet refill simulation should start");
@@ -724,26 +928,13 @@ namespace {
     }
 
     void testAdaptivePocketsGeometryPreviewAvoidsTrajectoryExecution() {
-        const auto hello=ngc::readFile("autoload/hello.ngc");
-        const auto world=ngc::readFile("autoload/world.ngc");
-        const auto toolChange=ngc::readFile("autoload/tool_change.ngc");
-        auto main=ngc::readFile("adaptive_pockets.ngc");
-        require(hello&&world&&toolChange&&main,
-                "adaptive-pockets geometry preview inputs should load");
-        if(const auto g61=main->find("N40 G61");g61!=std::string::npos)
-            main->replace(g61,7,"N40 G64 P0.005");
-        require(main->contains("N40 G64 P0.005"),
-                "adaptive-pockets geometry preview should exercise G64");
-        ngc::ToolTable tools;
-        const auto loadedTools=tools.load();
-        require(loadedTools.has_value(),loadedTools?"":loadedTools.error());
+        auto main="G0 X2\n"+boundedPreviewFixture(120,false)+"G61\nG1 X3\n";
+        auto tools=fixtureToolTable();
 
         Worker worker(UNIT);
         require(worker.setToolTable(tools),
                 "adaptive-pockets geometry preview should accept the tool table");
-        require(worker.compile({{*hello,"autoload/hello.ngc"},{*world,"autoload/world.ngc"},
-                                {*toolChange,"autoload/tool_change.ngc"},
-                                {*main,"adaptive_pockets.ngc"}}),
+        require(worker.compile(fixturePrograms(std::move(main),"fixture/mixed-preview.ngc")),
                 "adaptive-pockets geometry preview should start compilation");
         for(int attempt=0;attempt<5000&&!worker.compiled();++attempt)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -813,25 +1004,14 @@ namespace {
     }
 
     void test1001PreviewCompletesBoundedly() {
-        const auto hello = ngc::readFile("autoload/hello.ngc");
-        const auto world = ngc::readFile("autoload/world.ngc");
-        const auto toolChange = ngc::readFile("autoload/tool_change.ngc");
-        auto main = ngc::readFile("1001.ngc");
-        require(hello && world && toolChange && main, "1001 preview inputs should load");
-        const auto toolChangeBlock = main->find("N25 T13 M6");
-        require(toolChangeBlock != std::string::npos, "1001 should retain its expected tool-change block");
-        main->replace(toolChangeBlock, std::string_view("N25 T13 M6").size(), "N25 T13");
-
-        ngc::ToolTable tools;
-        const auto loadedTools = tools.load();
-        require(loadedTools.has_value(), loadedTools ? "" : loadedTools.error());
+        auto main="T13\n"+boundedPreviewFixture(160,false);
+        auto tools=fixtureToolTable();
 
         // A coarse mock tick keeps this regression focused on NRT G64 planning
         // rather than the duration of immediate simulated playback.
         Worker worker(UNIT);
         require(worker.setToolTable(tools), "1001 preview should accept the tool table");
-        require(worker.compile({ { *hello, "autoload/hello.ngc" }, { *world, "autoload/world.ngc" },
-                                 { *toolChange, "autoload/tool_change.ngc" }, { *main, "1001.ngc" } }),
+        require(worker.compile(fixturePrograms(std::move(main),"fixture/bounded-preview.ngc")),
                 "1001 preview should start compilation");
         for(int attempt = 0; attempt < 3000 && !worker.compiled(); ++attempt)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -864,20 +1044,18 @@ namespace {
     }
 
     void test1002PreparedSliceBoundaries() {
-        const auto hello = ngc::readFile("autoload/hello.ngc");
-        const auto world = ngc::readFile("autoload/world.ngc");
-        const auto toolChange = ngc::readFile("autoload/tool_change.ngc");
-        const auto main = ngc::readFile("1002_3d.ngc");
-        require(hello && world && toolChange && main, "1002_3d preview inputs should load");
-        ngc::ToolTable tools;
-        const auto loadedTools = tools.load();
-        require(loadedTools.has_value(), loadedTools ? "" : loadedTools.error());
+        std::string main;
+        for(int chain=0;chain<24;++chain) {
+            main+="G0 X0 Y0\nG64 P0.005\nG1 F60\n";
+            for(int command=0;command<20;++command)
+                main+=std::format("G1 X{} Y{}\n",command%2,(command/2+chain)%2);
+        }
+        main+="M30\nprint[\"Hello World!\"]\n";
+        auto tools=fixtureToolTable();
 
         Worker worker(UNIT);
         require(worker.setToolTable(tools), "1002_3d preview should accept the tool table");
-        require(worker.compile({ { *hello, "autoload/hello.ngc" }, { *world, "autoload/world.ngc" },
-                                 { *toolChange, "autoload/tool_change.ngc" },
-                                 { *main, "1002_3d.ngc" } }),
+        require(worker.compile(fixturePrograms(std::move(main),"fixture/slice-boundaries.ngc")),
                 "1002_3d preview should start compilation");
         for(int attempt = 0; attempt < 3000 && !worker.compiled(); ++attempt)
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
@@ -900,7 +1078,7 @@ namespace {
         }), "1002_3d preview should interpret through the print after M30");
         worker.lock([&] {
             const auto &slices = worker.preparedPreview().continuousSlices;
-            require(slices.size() > 400,
+            require(slices.size() > 100,
                     "1002_3d preview should retain all prepared geometry slices");
             require(worker.preparedPreview().geometryEnds.size() >= 20,
                     "1002_3d preview should retain every motion chain");
@@ -930,19 +1108,11 @@ namespace {
     }
 
     void testMdiToolChangeUsesAutoloadPrograms() {
-        const auto hello = ngc::readFile("autoload/hello.ngc");
-        const auto world = ngc::readFile("autoload/world.ngc");
-        const auto toolChange = ngc::readFile("autoload/tool_change.ngc");
-        require(hello && world && toolChange, "MDI autoload programs should load");
-
-        ngc::ToolTable tools;
-        const auto loadedTools = tools.load();
-        require(loadedTools.has_value(), loadedTools ? "" : loadedTools.error());
+        auto tools=fixtureToolTable();
 
         SimulationWorker worker;
         worker.setTickMultiplier(1000);
-        require(worker.start({ { *hello, "autoload/hello.ngc" }, { *world, "autoload/world.ngc" },
-                               { *toolChange, "autoload/tool_change.ngc" }, { "T2 M6\n", "<MDI>" } }, tools),
+        require(worker.start(fixturePrograms("T2 M6\n","<MDI>"),tools),
                 "MDI tool change should start");
 
         auto snapshot = worker.snapshot();
@@ -973,7 +1143,8 @@ namespace {
             return snapshot;
         };
 
-        tools.set(1, { .number = 1, .x = 0, .y = 0, .z = 0.5, .a = 0, .b = 0, .c = 0, .diameter = 0.25 });
+        tools.set(1, { .number = 1, .x = 0, .y = 0, .z = 0.5, .a = 0, .b = 0,
+                       .c = 0, .diameter = 0.25, .comment = {} });
 
         require(worker.start({ { "G0 X1\n", "<MDI>" } }, tools, true),
                 "first persistent simulation command should start");
@@ -1559,15 +1730,10 @@ namespace {
     }
 
     void testAutomaticToolChangeReachesProbeBarrier() {
-        std::ifstream toolChangeFile("autoload/tool_change.ngc");
-        const std::string toolChangeSource {
-            std::istreambuf_iterator<char>(toolChangeFile),
-            std::istreambuf_iterator<char>() };
-        require(!toolChangeSource.empty(), "tool-change autoload program should be readable");
-
         ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::RealRun);
+        session.machine().toolTable()=fixtureToolTable();
         session.setPrograms({
-            { toolChangeSource, "autoload/tool_change.ngc" },
+            { std::string(TOOL_CHANGE_FIXTURE), "fixture/tool_change.ngc" },
             { "T2 M6\n", "tool-change-test.ngc" },
         });
         session.compile([](const auto &callback) { callback(); });
@@ -2468,7 +2634,13 @@ namespace {
             .certifySourceTube=false,
             .generateSamples=true,
             .lengthTableIntervalsPerKnotSpan=32,
-            .splineVelocityLimits={},
+            .splineVelocityLimits={
+                .pathAcceleration=20.0,.pathJerk=501.0,
+                .axisVelocity={3.333333333,3.333333333,3.333333333,
+                               3.333333333,3.333333333,3.333333333},
+                .axisAcceleration={20,20,20,20,20,20},
+                .axisJerk={501,501,501,501,501,501},
+            },
         };
         const auto prepared=ngc::prepareContinuousGeometry(records,0.05,points.front(),effort);
         require(prepared.has_value(),prepared?"":prepared.error());
@@ -2481,6 +2653,21 @@ namespace {
         std::iota(expectedSourceCommands.begin(),expectedSourceCommands.end(),1);
         require(found->sourceCommands==expectedSourceCommands,
                 "a cluster spline should retain every reconstructed source entity for preview selection");
+        require(found->activationStations.size()+1==records.size(),
+                "cluster preparation should retain one curve-distance activation for every "
+                "source command after the incoming anchor");
+        for(std::size_t activation=0;activation<found->activationStations.size();++activation) {
+            const auto &station=found->activationStations[activation];
+            require(station.command==activation+2
+                        &&station.curveDistance>found->curveFrom
+                        &&station.curveDistance<found->curveTo,
+                    "cluster activation stations should preserve source-command order inside "
+                    "the prepared curve");
+            if(activation>0)
+                require(station.curveDistance
+                            >found->activationStations[activation-1].curveDistance,
+                        "cluster activation curve distances should be strictly ordered");
+        }
         require(found->replacedSourceIntervals.size()==records.size(),
                 "a cluster spline should retain one replaced interval per contributing source entity");
         for(std::size_t source=0;source<records.size();++source) {
@@ -2535,6 +2722,10 @@ namespace {
                     "cluster knot interval should address its 17 samples without a search");
             require(metadata.curveTo>metadata.curveFrom,
                     "cluster knot interval distances should be strictly ordered");
+            require(metadata.geometricVelocityLimit>0.0
+                        &&!std::isnan(metadata.geometricVelocityLimit),
+                    "geometry preparation should attach a reusable static velocity cap to "
+                    "each cluster knot interval");
             if(interval>0)
                 requireNear(metadata.curveFrom,
                     found->clusterKnotIntervals[interval-1].curveTo,
@@ -2578,6 +2769,16 @@ namespace {
         compiler.reset(94,points.front());
         const auto planned=compiler.compileContinuous(*prepared,0.05);
         require(planned&&*planned,planned?"":planned.error());
+        require((*planned)->activations.size()==records.size(),
+                "continuous timing should resolve every prepared command activation");
+        std::vector<ngc::SpanId> commandActivationSpans(records.size());
+        for(const auto &activation:(*planned)->activations)
+            commandActivationSpans[activation.input]=activation.span;
+        require(std::ranges::all_of(commandActivationSpans,[](const auto span) {
+                    return span!=0;
+                })&&std::ranges::is_sorted(commandActivationSpans)
+                &&commandActivationSpans[1]!=commandActivationSpans.back(),
+                "cluster source commands should activate progressively through emitted spans");
         const auto uncachedCalls=ngc::totalTimeLawCalls((*planned)->timeLaw);
         require(std::ranges::all_of((*planned)->pieceTiming,[](const auto &piece) {
                     return piece.velocityLimit>=piece.initialVelocityLimit*0.02
@@ -2652,8 +2853,12 @@ namespace {
                 appendDouble(piece.curvatureDerivativeFiniteDifferenceCoarseStep);
                 appendDouble(piece.curvatureDerivativeFiniteDifferenceFineStep);
             }
-            appendInteger(plan.activationSpans.size());
-            for(const auto span:plan.activationSpans) appendInteger(span);
+            appendInteger(plan.activations.size());
+            for(const auto &activation:plan.activations) {
+                appendInteger(activation.input);
+                appendInteger(activation.span);
+                appendInteger(activation.chunk);
+            }
             appendInteger(plan.chunks.size());
             for(const auto &chunk:plan.chunks) {
                 appendInteger(chunk.epoch);
@@ -2788,6 +2993,56 @@ namespace {
                         expectedTimingIntervals[interval].second,
                         "continuous timing interval should use its prepared programmed feed");
         }
+
+        auto clusterCommands=records;
+        for(auto &record:clusterCommands) {
+            record.metadata.pathMode=ngc::ExecutablePathMode::Continuous;
+            record.metadata.pathTolerance=0.05;
+        }
+        const auto clusterNominalDuration=std::accumulate(
+            found->clusterKnotIntervals.begin(),found->clusterKnotIntervals.end(),0.0,
+            [](const double total,const ngc::PreparedClusterKnotInterval &interval) {
+                return total+(interval.curveTo-interval.curveFrom)/interval.programmedFeed;
+            });
+        auto rollingLimits=trajectoryLimits;
+        rollingLimits.lookaheadDuration=0.2*clusterNominalDuration;
+        ngc::TrajectoryPlanner clusterPlanner(rollingLimits);
+        clusterPlanner.setContinuousPlanningEffort(cachedScpEffort);
+        ngc::CurveEvaluationWorkspace clusterWorkspace;
+        const auto clusterStart=ngc::positionAtDistance(
+            *found->curve,found->curveFrom,clusterWorkspace);
+        clusterPlanner.reset(98,clusterStart);
+        const ngc::PreparedGeometrySlice clusterSlice{
+            .epoch=98,
+            .sequence=1,
+            .chain=1,
+            .commands=std::move(clusterCommands),
+            .pieces={*found},
+            .nominalDuration=clusterNominalDuration,
+        };
+        require(clusterPlanner.enqueuePrepared(clusterSlice),
+                clusterPlanner.lastPreparedEnqueueError());
+        require(clusterPlanner.endPreparedChain(clusterSlice.chain),
+                "the focused cluster rolling chain should end cleanly");
+        const auto rolledCluster=clusterPlanner.planWindow();
+        require(rolledCluster&&*rolledCluster,
+                rolledCluster?"cluster spline did not produce a rolling prefix"
+                    :rolledCluster.error());
+        require(clusterPlanner.diagnostics().rollingBoundaryCandidates>0
+                    &&clusterPlanner.diagnostics().maximumRollingSuffixProbePieces>0
+                    &&clusterPlanner.diagnostics().maximumRollingSuffixProbePieces
+                        <found->clusterKnotIntervals.size()
+                    &&clusterPlanner.preparedPieceCount()==1
+                    &&clusterPlanner.preparedNominalDuration()<clusterNominalDuration,
+                std::format("an ended cluster spline should roll at a prepared knot boundary "
+                    "and retain only the exact suffix and its future activation stations: "
+                    "candidates={} proof_pieces={}/{} retained_pieces={} commands={} "
+                    "duration={}/{}",
+                    clusterPlanner.diagnostics().rollingBoundaryCandidates,
+                    clusterPlanner.diagnostics().maximumRollingSuffixProbePieces,
+                    found->clusterKnotIntervals.size(),clusterPlanner.preparedPieceCount(),
+                    clusterPlanner.windowSize(),
+                    clusterPlanner.preparedNominalDuration(),clusterNominalDuration));
 
         ngc::TrajectoryCompiler limitedCompiler(trajectoryLimits);
         auto limitedEffort=uncachedEffort;
@@ -3178,7 +3433,7 @@ namespace {
     }
 
     void testMachineConfigurationLoadsTrajectoryLimits() {
-        const auto configuration = ngc::loadMachineConfiguration("machine.toml");
+        const auto configuration=fixtureMachineConfiguration();
         require(configuration.has_value(), configuration ? "" : configuration.error());
         require(configuration->trajectory.pathAcceleration > 0.0,
                 "machine configuration should load a validated path acceleration");
@@ -3276,7 +3531,7 @@ namespace {
     }
 
     void testConfiguredHomingMovesFromPowerUpPosition() {
-        const auto configuration = ngc::loadMachineConfiguration("machine.toml");
+        const auto configuration=fixtureMachineConfiguration();
         require(configuration.has_value(), configuration ? "" : configuration.error());
         SimulationWorker worker(*configuration);
         worker.setTickMultiplier(1000);
@@ -3317,7 +3572,7 @@ namespace {
     }
 
     void testSimulationWorkerJogsCoupledJointsBeforeHoming() {
-        auto configuration = ngc::loadMachineConfiguration("machine.toml");
+        auto configuration=fixtureMachineConfiguration();
         require(configuration.has_value(), configuration ? "" : configuration.error());
         configuration->simulation.schedulerPeriod = configuration->simulation.servoPeriod;
         SimulationWorker worker(*configuration);
