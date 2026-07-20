@@ -22,6 +22,7 @@
 #include <vector>
 
 #include <highs/Highs.h>
+#include <path_tempo/Planner.h>
 #include <ruckig/ruckig.hpp>
 
 namespace ngc {
@@ -150,9 +151,7 @@ namespace ngc {
         };
 
         struct TimeLawWorkspace {
-            ruckig::InputParameter<1> input;
-            ruckig::Ruckig<1> generator;
-            ruckig::Trajectory<1> trajectory;
+            path_tempo::ScalarTransitionPlanner planner;
         };
 
         enum class TimeLawPurpose {
@@ -627,113 +626,42 @@ namespace ngc {
                 const double length,const double fromVelocity,const double fromAcceleration,
                 const double toVelocity,const double toAcceleration,
                 const double requestedVelocity,const double acceleration,const double jerk) {
-            if(length<=0.0||fromVelocity<0.0||toVelocity<0.0||requestedVelocity<=0.0
-               ||std::abs(fromAcceleration)>acceleration*(1.0+1e-10)
-               ||std::abs(toAcceleration)>acceleration*(1.0+1e-10)
-               ||acceleration<=0.0||jerk<=0.0)
-                return std::unexpected("local time law received invalid distance, state, or limits");
-            if(std::isinf(acceleration)) {
-                if(std::abs(fromVelocity-toVelocity)>1e-12||fromVelocity<=0.0
-                   ||std::abs(fromAcceleration)>1e-12||std::abs(toAcceleration)>1e-12)
-                    return std::unexpected(
-                        "unbounded-acceleration local time law requires equal positive speeds and zero acceleration");
-                return TimeLaw {
-                    {0.0,0.0,fromVelocity,0.0},
-                    {length/fromVelocity,length,toVelocity,0.0},
-                };
-            }
-            auto &input=workspace.input;
-            input.current_position={0.0};
-            input.current_velocity={fromVelocity};
-            input.current_acceleration={fromAcceleration};
-            input.target_position={length};
-            input.target_velocity={toVelocity};
-            input.target_acceleration={toAcceleration};
-            input.max_velocity = {requestedVelocity}; input.max_acceleration = {acceleration}; input.max_jerk = {jerk};
-            auto &generator=workspace.generator;
-            auto &trajectory=workspace.trajectory;
-            if(generator.calculate(input, trajectory) != ruckig::Result::Working)
-                return std::unexpected(std::format(
-                    "Ruckig failed local position timing: length={} state (v={}, a={}) -> "
-                    "(v={}, a={}) limits v={} a={} j={}",length,fromVelocity,fromAcceleration,
-                    toVelocity,toAcceleration,requestedVelocity,acceleration,jerk));
-            const auto profiles=trajectory.get_profiles();
-            const auto &profile=profiles.front().front();
-            TimeLaw result {{
-                0.0,0.0,fromVelocity,fromAcceleration,0.0}};
+            const auto transition=workspace.planner.solve({
+                .piece=0,
+                .length=length,
+                .beginning={.velocity=fromVelocity,.acceleration=fromAcceleration},
+                .ending={.velocity=toVelocity,.acceleration=toAcceleration},
+                .maximumVelocity=requestedVelocity,
+                .maximumAcceleration=acceleration,
+                .maximumJerk=jerk,
+            });
+            if(!transition) return std::unexpected(transition.error().message);
+
+            TimeLaw result {{0.0,0.0,fromVelocity,fromAcceleration,0.0}};
             auto phaseTime=0.0;
-            const auto appendPhase=[&](const double duration,const double phaseJerk,
-                                       const bool ruckigBrakePhase=false) {
-                if(duration<=1e-12) return;
+            for(const auto &segment:*transition) {
                 auto &from=result.back();
-                from.jerk=phaseJerk;
-                from.ruckigBrakePhase=ruckigBrakePhase;
-                phaseTime+=duration;
+                from.jerk=segment.jerk();
+                from.ruckigBrakePhase=segment.initialStateCorrection;
+                phaseTime+=segment.duration;
                 result.push_back({
                     phaseTime,
-                    from.distance+from.velocity*duration
-                        +0.5*from.acceleration*duration*duration
-                        +phaseJerk*duration*duration*duration/6.0,
-                    from.velocity+from.acceleration*duration
-                        +0.5*phaseJerk*duration*duration,
-                    from.acceleration+phaseJerk*duration,
+                    segment.position(segment.duration),
+                    segment.velocity(segment.duration),
+                    segment.acceleration(segment.duration),
                     0.0,
                 });
-            };
-            for(std::size_t phase=0;phase<profile.brake.t.size();++phase)
-                appendPhase(profile.brake.t[phase],profile.brake.j[phase],true);
-            for(std::size_t phase=0;phase<profile.t.size();++phase) {
-                appendPhase(profile.t[phase],profile.j[phase]);
             }
-            appendPhase(trajectory.get_duration()-phaseTime,0.0);
             result.front().time=0.0;
             result.front().distance=0.0;
             result.front().velocity=fromVelocity;
             result.front().acceleration=fromAcceleration;
-            result.back().time=trajectory.get_duration();
+            result.back().time=transition->duration();
             result.back().distance=length;
             result.back().velocity=toVelocity;
             result.back().acceleration=toAcceleration;
             result.back().jerk=0.0;
-            const auto distanceTolerance=std::max(1e-12,length*1e-9);
-            const auto velocityTolerance=std::max(1e-12,requestedVelocity*1e-10);
-            for(std::size_t boundary=0;boundary<result.size();++boundary) {
-                const auto &state=result[boundary];
-                if(!std::isfinite(state.time)||!std::isfinite(state.distance)
-                   ||!std::isfinite(state.velocity)||!std::isfinite(state.acceleration)
-                   ||state.distance < -distanceTolerance
-                   ||state.distance > length+distanceTolerance
-                   ||state.velocity < -distanceTolerance
-                   ||(boundary>0&&(state.time<=result[boundary-1].time
-                       ||state.distance<result[boundary-1].distance-distanceTolerance)))
-                    return std::unexpected(std::format(
-                        "Ruckig produced a non-monotone local path law at boundary {} of {}: "
-                        "time={} distance={} velocity={} acceleration={} previous time={} "
-                        "previous distance={} length={} tolerance={}",boundary,result.size(),
-                        state.time,state.distance,state.velocity,state.acceleration,
-                        boundary?result[boundary-1].time:0.0,
-                        boundary?result[boundary-1].distance:0.0,length,distanceTolerance));
-            }
-            for(std::size_t phase=1;phase<result.size();++phase) {
-                const auto &from=result[phase-1];
-                const auto duration=result[phase].time-from.time;
-                auto minimumVelocity=std::min(from.velocity,result[phase].velocity);
-                if(std::abs(from.jerk)>1e-15) {
-                    const auto extremum=-from.acceleration/from.jerk;
-                    if(extremum>0.0&&extremum<duration)
-                        minimumVelocity=std::min(minimumVelocity,from.velocity
-                            +from.acceleration*extremum
-                            +0.5*from.jerk*extremum*extremum);
-                }
-                if(minimumVelocity < -velocityTolerance)
-                    return std::unexpected(std::format(
-                        "Ruckig local position timing reverses path direction in phase {}: "
-                        "minimum_velocity={} tolerance={} duration={} length={} "
-                        "state (v={}, a={}) -> (v={}, a={}) limits v={} a={} j={}",
-                        phase-1,minimumVelocity,velocityTolerance,duration,length,
-                        fromVelocity,fromAcceleration,toVelocity,toAcceleration,
-                        requestedVelocity,acceleration,jerk));
-            }
+
             return result;
         }
 

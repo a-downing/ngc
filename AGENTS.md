@@ -64,7 +64,7 @@ The VistaCNC P2-S LCD is two eight-character rows and requires periodic output r
 
 ## Build and test
 
-The supported development environment is Windows with Clang, Ninja, CMake, and vcpkg. GLM comes from vcpkg; GLFW, ImGui, and toml++ are submodules. The fixed-DoF offline Ruckig subset is vendored under `src/third_party/ruckig`; preserve its license and follow its provenance README when updating upstream files or the NGC-owned facade.
+The supported development environment is Windows with Clang, Ninja, CMake, and vcpkg. GLM comes from vcpkg; GLFW, ImGui, toml++, and PathTempo are submodules. PathTempo provides the pinned unmodified upstream Ruckig dependency used by both trajectory timing and NGC's other NRT motion generation.
 
 Configure a fresh Release build with:
 
@@ -85,7 +85,7 @@ cmake --build build
 ctest --test-dir build -E "^ngc_tests$" --output-on-failure
 ```
 
-Tests are framework-free executables, with the core suite in `src/test.cpp`. The core suite loads `machine.toml` and `tool_table.txt` relative to its working directory, so run `build\ngc_tests.exe` from the source directory and exclude its build-directory CTest registration as shown above. Project warning, optimization, and debug-symbol flags are target-scoped; dependency targets must not inherit project flags. Project targets and the vendored Ruckig target intentionally use `-O2`.
+Tests are framework-free executables, with the core suite in `src/test.cpp`. The core suite loads `machine.toml` and `tool_table.txt` relative to its working directory, so run `build\ngc_tests.exe` from the source directory and exclude its build-directory CTest registration as shown above. Project warning, optimization, and debug-symbol flags are target-scoped; dependency targets must not inherit project flags. Project targets and PathTempo intentionally use `-O2`.
 
 ## Configuration and interpreter semantics
 
@@ -149,7 +149,7 @@ Each run starts from reset state and must not append to a prior run. Consumer-th
 
 ## Trajectory planning and RT-facing execution
 
-`ExactStopTrajectoryPlanner` treats canonical exact-stop motion as rest-to-rest jerk-limited motion. It uses the vendored offline Ruckig solver, maps scalar phases to XYZABC cubic polynomials, and validates aggregate path plus per-axis velocity, acceleration, and jerk. Lines and endpoint-exact arcs share the fixed-capacity `PlanChunk` representation. Exact polynomial extrema are final authority; preliminary samples or analytic caps are not proof.
+`ExactStopTrajectoryPlanner` treats canonical exact-stop motion as rest-to-rest jerk-limited motion. It uses PathTempo's scalar transition solver, maps its time-domain cubic phases to XYZABC cubic polynomials, and validates aggregate path plus per-axis velocity, acceleration, and jerk. Lines and endpoint-exact arcs share the fixed-capacity `PlanChunk` representation. Exact polynomial extrema are final authority; preliminary samples or analytic caps are not proof.
 
 `BoundedLookaheadTrajectoryPlanner` collects compatible prepared G64 pieces across slice boundaries. `trajectory.lookahead_duration` is a minimum predicted duration for attempting a rolling prefix, not a hard horizon or semantic stop. Rolling splits require a dynamically feasible nonzero PVA boundary and a proved stop-feasible initial suffix section; the proof section is bounded near the lookahead duration and may end before the retained suffix so an unbounded cluster does not enter every feasibility probe. Rolling boundaries may use retained-line interiors or prepared cluster-spline knot boundaries; cluster splits partition the existing immutable curve, knot-interval timing metadata, and geometric samples without reconstructing geometry. Do not enable arc-interior anchors by weakening exact boundary equivalence. Protected boundaries or `PreparedContinuousEnd` finalize the remaining chain.
 

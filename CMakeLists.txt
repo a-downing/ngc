@@ -21,21 +21,6 @@ set(OpenGL_GL_PREFERENCE LEGACY)
 find_package(OpenGL REQUIRED)
 find_package(glm CONFIG REQUIRED)
 add_subdirectory(glfw)
-add_library(ngc_ruckig STATIC
-        src/third_party/ruckig/src/brake.cpp
-        src/third_party/ruckig/src/position_first_step1.cpp
-        src/third_party/ruckig/src/position_first_step2.cpp
-        src/third_party/ruckig/src/position_second_step1.cpp
-        src/third_party/ruckig/src/position_second_step2.cpp
-        src/third_party/ruckig/src/position_third_step1.cpp
-        src/third_party/ruckig/src/position_third_step2.cpp
-        src/third_party/ruckig/src/velocity_second_step1.cpp
-        src/third_party/ruckig/src/velocity_second_step2.cpp
-        src/third_party/ruckig/src/velocity_third_step1.cpp
-        src/third_party/ruckig/src/velocity_third_step2.cpp)
-target_include_directories(ngc_ruckig PUBLIC src/third_party/ruckig/include)
-target_compile_definitions(ngc_ruckig PUBLIC _USE_MATH_DEFINES)
-target_compile_options(ngc_ruckig PRIVATE -O2)
 
 set(BUILD_EXAMPLES OFF)
 set(BUILD_TESTS OFF)
@@ -64,6 +49,8 @@ unset(BUILD_EXAMPLES)
 unset(ZLIB)
 unset(HIGHS_NO_DEFAULT_THREADS)
 
+add_subdirectory(path_tempo)
+
 add_library(ngc_core STATIC
         src/ArcInterpolation.cpp
         src/InfiniteJerkTrajectoryTime.cpp
@@ -77,7 +64,7 @@ add_library(ngc_core STATIC
         src/ToolTable.cpp)
 target_include_directories(ngc_core PUBLIC src/include)
 target_include_directories(ngc_core SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/highs)
-target_link_libraries(ngc_core PRIVATE ngc_ruckig tomlplusplus::tomlplusplus highs::highs)
+target_link_libraries(ngc_core PRIVATE PathTempo::PathTempo ruckig::ruckig tomlplusplus::tomlplusplus highs::highs)
 ngc_target_defaults(ngc_core)
 
 add_library(ngc_operator STATIC
