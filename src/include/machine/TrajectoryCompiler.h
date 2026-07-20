@@ -297,6 +297,9 @@ namespace ngc {
         std::size_t scpBasisReuseAttempts = 0;
         std::size_t scpBasisReuseApplied = 0;
         std::size_t scpBasisDimensionMismatches = 0;
+        std::size_t scpModelUpdateAttempts = 0;
+        std::size_t scpModelUpdatesApplied = 0;
+        std::size_t scpModelStructureMismatches = 0;
         std::size_t scpStationProposals = 0;
         std::size_t scpLineSearchTrials = 0;
         std::size_t scpAcceptedSteps = 0;

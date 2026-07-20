@@ -2919,6 +2919,11 @@ final_move_together = true
                         ==(*basisReusePlan)->scpBasisReuseAttempts
                     &&(*basisReusePlan)->scpBasisDimensionMismatches==0,
                 "same-dimension correction passes should apply every retained HiGHS basis");
+        require((*basisReusePlan)->scpModelUpdateAttempts>0
+                    &&(*basisReusePlan)->scpModelUpdatesApplied
+                        ==(*basisReusePlan)->scpModelUpdateAttempts
+                    &&(*basisReusePlan)->scpModelStructureMismatches==0,
+                "same-structure correction passes should update the retained HiGHS model");
         require((*basisReusePlan)->scpSimplexIterations
                     <(*cachedScpPlan)->scpSimplexIterations,
                 "basis reuse should reduce simplex iterations on the focused correction fixture");

@@ -1717,6 +1717,20 @@ namespace ngc {
             return true;
         };
         std::optional<HighsBasis> reusableScpBasis;
+        // Correction passes retain the same LP shape in the common case. Keep one
+        // configured solver so structure-stable passes can update bounds and
+        // coefficients without rebuilding HiGHS' model ownership each time.
+        Highs persistentScpSolver;
+        if(persistentScpSolver.setOptionValue("output_flag",false)!=HighsStatus::kOk
+           ||persistentScpSolver.setOptionValue("threads",HighsInt {1})!=HighsStatus::kOk
+           ||persistentScpSolver.setOptionValue("solver",std::string {"simplex"})
+                !=HighsStatus::kOk
+           ||persistentScpSolver.setOptionValue("small_matrix_value",
+                trajectory_detail::SCP_SMALL_MATRIX_VALUE)!=HighsStatus::kOk
+           ||persistentScpSolver.setOptionValue("time_limit",
+                m_continuousPlanningEffort.scpSolveTimeLimit)!=HighsStatus::kOk)
+            return std::unexpected("continuous SCP could not configure HiGHS");
+        std::optional<HighsLp> persistentScpModel;
         for(unsigned correctionPass=0;correctionPass<maximumLocalCorrectionPasses;
                 ++correctionPass) {
             reportProgress();
@@ -2250,27 +2264,65 @@ namespace ngc {
                         correctionPass,scpIteration));
                 }
 
-                Highs highs;
-                if(highs.setOptionValue("output_flag",false)!=HighsStatus::kOk
-                   ||highs.setOptionValue("threads",HighsInt {1})!=HighsStatus::kOk
-                   ||highs.setOptionValue("solver",std::string {"simplex"})
-                        !=HighsStatus::kOk
-                   ||highs.setOptionValue("small_matrix_value",
-                        trajectory_detail::SCP_SMALL_MATRIX_VALUE)!=HighsStatus::kOk
-                   ||highs.setOptionValue("time_limit",
-                        m_continuousPlanningEffort.scpSolveTimeLimit)!=HighsStatus::kOk
-                   ||highs.setOptionValue("simplex_iteration_limit",
+                auto &highs=persistentScpSolver;
+                if(highs.setOptionValue("simplex_iteration_limit",
                         static_cast<HighsInt>(m_continuousPlanningEffort
                             .scpSimplexIterationLimitMultiplier*variableCount))
                                 !=HighsStatus::kOk)
                     return std::unexpected("continuous SCP could not configure HiGHS");
-                const auto passStatus=highs.passModel(lp.model);
-                if(passStatus!=HighsStatus::kOk) {
-                    return std::unexpected(std::format(
-                        "continuous SCP model pass was not exact: status={} columns={} rows={} "
-                        "nonzeros={}",static_cast<int>(passStatus),lp.model.num_col_,lp.model.num_row_,
-                        lp.model.a_matrix_.index_.size()));
+                const auto sameStructure=m_continuousPlanningEffort.reuseScpBasis
+                    &&persistentScpModel
+                    &&persistentScpModel->num_col_==lp.model.num_col_
+                    &&persistentScpModel->num_row_==lp.model.num_row_
+                    &&persistentScpModel->a_matrix_.format_==lp.model.a_matrix_.format_
+                    &&persistentScpModel->a_matrix_.start_==lp.model.a_matrix_.start_
+                    &&persistentScpModel->a_matrix_.index_==lp.model.a_matrix_.index_;
+                if(m_continuousPlanningEffort.reuseScpBasis&&persistentScpModel) {
+                    ++result->scpModelUpdateAttempts;
+                    if(sameStructure) ++result->scpModelUpdatesApplied;
+                    else ++result->scpModelStructureMismatches;
                 }
+                if(!sameStructure) {
+                    const auto passStatus=highs.passModel(lp.model);
+                    if(passStatus!=HighsStatus::kOk) {
+                        return std::unexpected(std::format(
+                            "continuous SCP model pass was not exact: status={} columns={} rows={} "
+                            "nonzeros={}",static_cast<int>(passStatus),lp.model.num_col_,
+                            lp.model.num_row_,lp.model.a_matrix_.index_.size()));
+                    }
+                } else {
+                    auto updateStatus=HighsStatus::kOk;
+                    if(persistentScpModel->col_cost_!=lp.model.col_cost_)
+                        updateStatus=highs.changeColsCost(0,lp.model.num_col_-1,
+                            lp.model.col_cost_.data());
+                    if(updateStatus==HighsStatus::kOk
+                       &&(persistentScpModel->col_lower_!=lp.model.col_lower_
+                          ||persistentScpModel->col_upper_!=lp.model.col_upper_))
+                        updateStatus=highs.changeColsBounds(0,lp.model.num_col_-1,
+                            lp.model.col_lower_.data(),lp.model.col_upper_.data());
+                    if(updateStatus==HighsStatus::kOk
+                       &&(persistentScpModel->row_lower_!=lp.model.row_lower_
+                          ||persistentScpModel->row_upper_!=lp.model.row_upper_))
+                        updateStatus=highs.changeRowsBounds(0,lp.model.num_row_-1,
+                            lp.model.row_lower_.data(),lp.model.row_upper_.data());
+                    for(HighsInt row=0;updateStatus==HighsStatus::kOk
+                            &&row<lp.model.num_row_;++row) {
+                        for(auto entry=lp.model.a_matrix_.start_[row];
+                                entry<lp.model.a_matrix_.start_[row+1];++entry) {
+                            if(persistentScpModel->a_matrix_.value_[entry]
+                                    ==lp.model.a_matrix_.value_[entry]) continue;
+                            updateStatus=highs.changeCoeff(row,
+                                lp.model.a_matrix_.index_[entry],
+                                lp.model.a_matrix_.value_[entry]);
+                            if(updateStatus!=HighsStatus::kOk) break;
+                        }
+                    }
+                    if(updateStatus!=HighsStatus::kOk)
+                        return std::unexpected(std::format(
+                            "continuous SCP could not update a structure-stable HiGHS model on "
+                            "correction pass {} iteration {}",correctionPass,scpIteration));
+                }
+                persistentScpModel=lp.model;
                 if(m_continuousPlanningEffort.reuseScpBasis&&reusableScpBasis) {
                     ++result->scpBasisReuseAttempts;
                     if(reusableScpBasis->valid

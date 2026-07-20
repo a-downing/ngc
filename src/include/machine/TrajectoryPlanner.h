@@ -991,6 +991,8 @@ namespace ngc {
                         "local_a={:.6g} local_j={:.6g} scp_solves={} scp_iterations={} "
                         "scp_reachability_rows={} scp_proposals={} scp_trials={} "
                         "scp_basis_attempts={} scp_basis_applied={} scp_basis_mismatches={} "
+                        "scp_model_attempts={} scp_model_applied={} "
+                        "scp_model_mismatches={} "
                         "scp_accepted={} scp_materializations={} scp_seconds={:.6f} "
                         "correction_passes={} "
                         "scp_fallback={} fallback_count={} fallback_pass={} "
@@ -1007,6 +1009,9 @@ namespace ngc {
                         continuous->scpStationProposals,continuous->scpLineSearchTrials,
                         continuous->scpBasisReuseAttempts,continuous->scpBasisReuseApplied,
                         continuous->scpBasisDimensionMismatches,
+                        continuous->scpModelUpdateAttempts,
+                        continuous->scpModelUpdatesApplied,
+                        continuous->scpModelStructureMismatches,
                         continuous->scpAcceptedSteps,continuous->scpMaterializationAttempts,
                         continuous->scpSeconds,continuous->correctionPasses,
                         name(continuous->scpResourceFallback.reason),
