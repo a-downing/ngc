@@ -440,6 +440,8 @@ public:
 
         if(!result) {
             m_errorMessage = "failed to load tool table";
+        } else if(!m_worker.setToolTable(m_tools)) {
+            m_errorMessage = "tool table was loaded, but cannot be applied while the worker is busy";
         }
 
         auto autoload = readAutoloadSources();
