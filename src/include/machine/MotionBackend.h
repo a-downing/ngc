@@ -229,6 +229,11 @@ namespace ngc {
     // Renewals and stops apply only to the exactly matching active jog token;
     // delayed requests for an old token cannot revive or stop a newer jog.
     struct RenewJogLeaseRequest { RequestId id = 0; JogId jog = 0; };
+    struct SetContinuousJogVelocityRequest {
+        RequestId id = 0;
+        JogId jog = 0;
+        double signedVelocity = 0.0;
+    };
     struct StopJogRequest { RequestId id = 0; JogId jog = 0; };
 
     struct EnableRequest { RequestId id = 0; };
@@ -243,7 +248,7 @@ namespace ngc {
                                         FeedHoldRequest, ResumeRequest, AbortRequest, ResetRequest,
                                         SetJointPositionRequest, StartContinuousJogRequest,
                                         StartIncrementalJogRequest, RenewJogLeaseRequest,
-                                        StopJogRequest>;
+                                        SetContinuousJogVelocityRequest, StopJogRequest>;
     static_assert(std::is_trivially_copyable_v<ControlRequest>);
 
     struct ChunkAccepted { EpochId epoch; ChunkId chunk; };

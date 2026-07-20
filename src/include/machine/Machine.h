@@ -26,6 +26,7 @@ namespace ngc {
 
         void beginProgramRun();
         const position_t &workOffset() const;
+        void setActiveWorkOffset(Axis axis, double value);
         const position_t &toolOffset() const;
         ToolGeometry toolGeometry() const;
         position_t physicalToolOffset() const;

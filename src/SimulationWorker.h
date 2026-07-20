@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <deque>
+#include <expected>
 #include <mutex>
 #include <map>
 #include <memory>
@@ -16,6 +17,7 @@
 #include <tuple>
 #include <unordered_map>
 #include <set>
+#include <string>
 #include <vector>
 
 #include "evaluator/InterpreterSession.h"
@@ -132,12 +134,18 @@ public:
         m_snapshot.servoPeriodSeconds = m_servoPeriod;
         m_snapshot.schedulerPeriodSeconds = m_schedulerPeriod;
         m_snapshot.servoTicksPerSchedulerPeriod = m_servoTicksPerSchedulerPeriod;
+        m_snapshot.activeWorkCoordinateSystem = ngc::WorkCoordinateSystem {
+            std::string(ngc::name(*m_session.machine().state().modeCoordSys)),
+            m_session.machine().workOffset(),
+        };
+        m_snapshot.activeToolOffset = m_session.machine().toolOffset();
         m_thread = std::thread(&SimulationWorker::work, this);
     }
     explicit SimulationWorker(const ngc::MachineConfiguration &configuration)
         : m_session(configuration.unit, ngc::InterpretationMode::Simulation),
           m_geometryPolicy(geometryPolicy(configuration.trajectory)),
-          m_backend(configuration.feedHold, configuration.trajectory),
+          m_backend(configuration.feedHold, configuration.trajectory,
+                    configuration.axes, configuration.joints),
           m_driver(m_backend, m_geometryForward, m_geometryFeedback, m_geometryCancelled,
                    configuration.trajectory), m_limits(configuration.trajectory),
           m_axes(configuration.axes), m_joints(configuration.joints), m_homing(configuration.homing),
@@ -148,6 +156,11 @@ public:
         m_snapshot.servoPeriodSeconds = m_servoPeriod;
         m_snapshot.schedulerPeriodSeconds = m_schedulerPeriod;
         m_snapshot.servoTicksPerSchedulerPeriod = m_servoTicksPerSchedulerPeriod;
+        m_snapshot.activeWorkCoordinateSystem = ngc::WorkCoordinateSystem {
+            std::string(ngc::name(*m_session.machine().state().modeCoordSys)),
+            m_session.machine().workOffset(),
+        };
+        m_snapshot.activeToolOffset = m_session.machine().toolOffset();
         m_snapshot.machinePosition = { 6.0, 6.0, -6.0, 0.0, 0.0, 0.0 };
         updateHomingToolPose();
         m_thread = std::thread(&SimulationWorker::work, this);
@@ -236,12 +249,57 @@ public:
         return true;
     }
 
+    bool setJogVelocity(const ngc::SetContinuousJogVelocityRequest &request) {
+        std::scoped_lock lock(m_mutex);
+        if(!m_activeJog || *m_activeJog != request.jog) return false;
+        std::erase_if(m_jogControls, [&](const auto &control) {
+            if(const auto *renewal = std::get_if<ngc::RenewJogLeaseRequest>(&control))
+                return renewal->jog == request.jog;
+            if(const auto *update = std::get_if<ngc::SetContinuousJogVelocityRequest>(&control))
+                return update->jog == request.jog;
+            return false;
+        });
+        if(m_jogControls.size() >= MAX_PENDING_JOG_CONTROLS) return false;
+        m_jogControls.emplace_back(request);
+        m_cv.notify_all();
+        return true;
+    }
+
+    std::expected<void, std::string>
+    setActiveWorkCoordinate(const ngc::Machine::Axis axis, const double workPosition) {
+        std::scoped_lock lock(m_mutex);
+        if(m_running || m_start || m_home || m_activeJog
+           || m_snapshot.status == ngc::SimulationStatus::Error)
+            return std::unexpected("cannot change a work offset while motion owns the machine");
+        if(!std::isfinite(workPosition))
+            return std::unexpected("requested work coordinate is not finite");
+        const auto machinePosition = axisComponent(m_snapshot.machinePosition, axis);
+        const auto toolOffset = axisComponent(m_snapshot.activeToolOffset, axis);
+        const auto offset = machinePosition - toolOffset - workPosition;
+        m_session.machine().setActiveWorkOffset(axis, offset);
+        m_snapshot.activeWorkCoordinateSystem = ngc::WorkCoordinateSystem {
+            std::string(ngc::name(*m_session.machine().state().modeCoordSys)),
+            m_session.machine().workOffset(),
+        };
+        const auto updated = *m_snapshot.activeWorkCoordinateSystem;
+        const auto existing = std::ranges::find_if(
+            m_snapshot.usedWorkCoordinateSystems,
+            [&](const auto &value) { return value.name == updated.name; });
+        if(existing == m_snapshot.usedWorkCoordinateSystems.end())
+            m_snapshot.usedWorkCoordinateSystems.push_back(updated);
+        else
+            *existing = updated;
+        return {};
+    }
+
     bool stopJog(const ngc::RequestId request, const ngc::JogId jog) {
         std::scoped_lock lock(m_mutex);
         if(!m_activeJog || *m_activeJog != jog) return false;
         std::erase_if(m_jogControls, [&](const auto &control) {
             const auto *renewal = std::get_if<ngc::RenewJogLeaseRequest>(&control);
-            return renewal && renewal->jog == jog;
+            if(renewal) return renewal->jog == jog;
+            const auto *update = std::get_if<ngc::SetContinuousJogVelocityRequest>(&control);
+            return update && update->jog == jog;
         });
         if(std::ranges::any_of(m_jogControls, [&](const auto &control) {
             const auto *stop = std::get_if<ngc::StopJogRequest>(&control);
@@ -495,6 +553,7 @@ private:
         m_snapshot.activeBlocks = presentation.activeBlocks;
         m_snapshot.activeModalGCodes = presentation.modalGCodes;
         m_snapshot.activeWorkCoordinateSystem = presentation.workCoordinateSystem;
+        m_snapshot.activeToolOffset = presentation.activeToolOffset;
         if(presentation.workCoordinateSystem) {
             const auto system = std::ranges::find_if(m_snapshot.usedWorkCoordinateSystems,
                 [&](const auto &value) { return value.name == presentation.workCoordinateSystem->name; });

@@ -115,6 +115,16 @@ tangential_jerk = 25.0
 [jogging]
 acceleration = 5.0
 jerk = 25.0
+[pendant]
+enabled = true
+driver = "vistacnc_p2s"
+[pendant.step]
+fine_distance = 0.001
+coarse_distance = 0.01
+[pendant.velocity]
+full_scale_counts_per_second = 400.0
+max_velocity_percent = 100
+lease_duration = 0.1
 [axes.x]
 joints = [0]
 minimum = -14.0
@@ -2579,16 +2589,29 @@ final_move_together = true
         require(backend.trySubmit(heldJog) == ngc::SubmitResult::Submitted,
                 "second continuous jog should submit from held state");
         backend.advanceTick(0.01, true);
-        require(backend.trySubmit(ngc::StopJogRequest { 44, 999 }) == ngc::SubmitResult::Submitted,
+        require(backend.trySubmit(ngc::SetContinuousJogVelocityRequest {
+                    44, heldJog.jog, -0.25 }) == ngc::SubmitResult::Submitted,
+                "matching continuous-jog velocity update should use the bounded control channel");
+        backend.advance(0.0);
+        ngc::ExecutionSnapshot reversed;
+        bool haveReversed = false;
+        while(backend.tryTakeSnapshot(reversed)) { }
+        for(int tick = 0; tick < 500; ++tick) {
+            backend.advanceTick(0.001, true);
+            while(backend.tryTakeSnapshot(reversed)) haveReversed = true;
+        }
+        require(haveReversed && reversed.commandedJoints.velocity[1] < 0.0,
+                "velocity update should reverse the active stable-token jog through constrained motion");
+        require(backend.trySubmit(ngc::StopJogRequest { 45, 999 }) == ngc::SubmitResult::Submitted,
                 "stale-token stop should still traverse the bounded control channel");
-        require(backend.trySubmit(ngc::StopJogRequest { 45, heldJog.jog }) == ngc::SubmitResult::Submitted,
+        require(backend.trySubmit(ngc::StopJogRequest { 46, heldJog.jog }) == ngc::SubmitResult::Submitted,
                 "matching stop should traverse the bounded control channel");
         backend.runUntilIdle(0.001);
         bool staleStopRejected = false;
         std::optional<ngc::JogStopped> requestedStop;
         while(backend.tryTakeEvent(event)) {
             if(const auto *completed = std::get_if<ngc::RequestCompleted>(&event))
-                if(completed->request == 44) staleStopRejected = !completed->succeeded;
+                if(completed->request == 45) staleStopRejected = !completed->succeeded;
             if(const auto *jogEvent = std::get_if<ngc::JogStopped>(&event)) requestedStop = *jogEvent;
         }
         require(staleStopRejected, "a delayed token must not stop a newer jog");
@@ -3944,6 +3967,16 @@ final_move_together = true
         require(configuration->feedHold.tangentialAcceleration > 0.0
                     && configuration->feedHold.tangentialJerk > 0.0,
                 "machine configuration should load positive feed-hold braking limits");
+        require(configuration->pendant.enabled
+                    && configuration->pendant.driver == ngc::PendantDriver::VistaCncP2s
+                    && configuration->pendant.step.fineDistance > 0.0
+                    && configuration->pendant.step.coarseDistance > 0.0
+                    && configuration->pendant.velocity.maxVelocityScale > 0.0
+                    && configuration->pendant.velocity.maxVelocityScale <= 1.0
+                    && configuration->pendant.velocity.fullScaleCountsPerSecond > 0.0
+                    && configuration->pendant.velocity.leaseDuration
+                        >= configuration->simulation.servoPeriod,
+                "machine configuration should load validated VistaCNC P2-S jog settings");
 
         require(!configuration->coordinates.empty(),
                 "machine configuration should load at least one logical coordinate");

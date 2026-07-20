@@ -1,5 +1,7 @@
 #include "machine/MockMotionBackend.h"
 
+#include "machine/MachineConfiguration.h"
+
 #include <algorithm>
 #include <cmath>
 #include <limits>
@@ -164,6 +166,59 @@ namespace ngc {
             ruckig::Trajectory<1> trajectory;
         };
         std::optional<JogRuntime> m_jog;
+        std::vector<AxisConfiguration> m_axes;
+        std::vector<JointConfiguration> m_joints;
+
+    public:
+        Impl() = default;
+        Impl(const std::vector<AxisConfiguration> &axes,
+             const std::vector<JointConfiguration> &joints)
+            : m_axes(axes), m_joints(joints) { }
+
+    private:
+
+        JointMask axisJoints(const AxisId axis) const {
+            const auto machineAxis = static_cast<Machine::Axis>(static_cast<std::uint8_t>(axis));
+            const auto configured = std::ranges::find(m_axes, machineAxis, &AxisConfiguration::axis);
+            if(configured == m_axes.end()) return 0;
+            JointMask result = 0;
+            for(const auto joint : configured->joints) result |= JointMask { 1 } << joint;
+            return result;
+        }
+
+        void updateConfiguredAxisFromJoints(const Machine::Axis axis) {
+            double position = 0.0;
+            double velocity = 0.0;
+            double acceleration = 0.0;
+            std::size_t count = 0;
+            for(const auto &joint : m_joints) {
+                if(joint.axis != axis || std::abs(joint.coordinateScale) <= 1e-12) continue;
+                position += m_snapshot.commandedJoints.position[joint.id] / joint.coordinateScale;
+                velocity += m_snapshot.commandedJoints.velocity[joint.id] / joint.coordinateScale;
+                acceleration += m_snapshot.commandedJoints.acceleration[joint.id] / joint.coordinateScale;
+                ++count;
+            }
+            if(count == 0) return;
+            const auto id = static_cast<AxisId>(static_cast<std::uint8_t>(axis));
+            axisComponent(m_snapshot.commanded.position, id) = position / static_cast<double>(count);
+            axisComponent(m_snapshot.commanded.velocity, id) = velocity / static_cast<double>(count);
+            axisComponent(m_snapshot.commanded.acceleration, id) = acceleration / static_cast<double>(count);
+            m_snapshot.feedback = m_snapshot.commanded;
+        }
+
+        void updateConfiguredJointsFromAxis(const AxisId axis) {
+            const auto machineAxis = static_cast<Machine::Axis>(static_cast<std::uint8_t>(axis));
+            for(const auto &joint : m_joints) {
+                if(joint.axis != machineAxis) continue;
+                m_snapshot.commandedJoints.position[joint.id]
+                    = axisComponent(m_snapshot.commanded.position, axis) * joint.coordinateScale;
+                m_snapshot.commandedJoints.velocity[joint.id]
+                    = axisComponent(m_snapshot.commanded.velocity, axis) * joint.coordinateScale;
+                m_snapshot.commandedJoints.acceleration[joint.id]
+                    = axisComponent(m_snapshot.commanded.acceleration, axis) * joint.coordinateScale;
+            }
+            m_snapshot.feedbackJoints = m_snapshot.commandedJoints;
+        }
 
         static std::uint64_t secondsToNanoseconds(const double seconds) {
             constexpr auto scale=1.0e9;
@@ -185,6 +240,11 @@ namespace ngc {
     public:
         Impl(const FeedHoldConfiguration &feedHold, const TrajectoryLimits &trajectory)
             : m_feedHoldLimits(feedHold), m_trajectoryLimits(trajectory) { }
+        Impl(const FeedHoldConfiguration &feedHold, const TrajectoryLimits &trajectory,
+             const std::vector<AxisConfiguration> &axes,
+             const std::vector<JointConfiguration> &joints)
+            : m_feedHoldLimits(feedHold), m_trajectoryLimits(trajectory),
+              m_axes(axes), m_joints(joints) { }
 
         PublishResult publish(const ExecutionItem &item) noexcept {
             const auto valid = std::visit([](const auto &value) {
@@ -660,7 +720,8 @@ namespace ngc {
         }
 
         bool validJogTarget(const JogTarget &target) const {
-            if(target.type == JogTargetType::Axis) return target.joints == 0;
+            if(target.type == JogTargetType::Axis)
+                return target.joints == 0 && (m_axes.empty() || axisJoints(target.axis) != 0);
             if(target.joints == 0) return false;
             if(target.type == JogTargetType::Joint)
                 return (target.joints & (target.joints - 1)) == 0;
@@ -680,6 +741,7 @@ namespace ngc {
                 axisComponent(m_snapshot.commanded.velocity, jog.target.axis) = jog.velocity;
                 axisComponent(m_snapshot.commanded.acceleration, jog.target.axis) = jog.acceleration;
                 m_snapshot.feedback = m_snapshot.commanded;
+                updateConfiguredJointsFromAxis(jog.target.axis);
                 return;
             }
             for(JointId joint = 0; joint < MAX_JOINTS; ++joint) {
@@ -694,13 +756,14 @@ namespace ngc {
         bool calculateJogPosition(const double distance, const double velocity) {
             auto &jog = *m_jog;
             ruckig::InputParameter<1> input;
-            input.current_position = {0.0};
-            input.current_velocity = {jogVelocity(jog.target)};
-            input.current_acceleration = {jogAcceleration(jog.target)};
+            input.current_position = {jog.position};
+            input.current_velocity = {jog.velocity};
+            input.current_acceleration = {jog.acceleration};
             input.target_position = {distance};
             input.target_velocity = {0.0};
             input.target_acceleration = {0.0};
-            input.max_velocity = {std::min(velocity, jog.limits.velocity)};
+            input.max_velocity = {std::max(std::min(velocity, jog.limits.velocity),
+                                           std::abs(jog.velocity))};
             input.max_acceleration = {jog.limits.acceleration};
             input.max_jerk = {jog.limits.jerk};
             ruckig::Ruckig<1> generator;
@@ -723,6 +786,29 @@ namespace ngc {
             input.max_jerk = {limits.jerk};
             ruckig::Ruckig<1> generator;
             return generator.calculate(input, jog.trajectory) == ruckig::Result::Working;
+        }
+
+        bool setContinuousJogVelocity(const double signedVelocity) {
+            if(!m_jog || !m_jog->continuous || m_jog->stopping
+               || !std::isfinite(signedVelocity) || std::abs(signedVelocity) <= 1e-12)
+                return false;
+            auto &jog = *m_jog;
+            jog.cruiseVelocity = std::clamp(
+                signedVelocity, -jog.limits.velocity, jog.limits.velocity);
+            bool calculated = false;
+            if(jog.travel.enabled) {
+                const auto target = jog.cruiseVelocity < 0.0
+                    ? jog.travel.minimum - jog.axisOrigin
+                    : jog.travel.maximum - jog.axisOrigin;
+                calculated = calculateJogPosition(target, std::abs(jog.cruiseVelocity));
+            } else {
+                calculated = calculateJogVelocity(jog.cruiseVelocity);
+            }
+            if(!calculated) return false;
+            jog.elapsed = 0.0;
+            jog.cruising = false;
+            jog.leaseTicks = jog.leasePeriod;
+            return true;
         }
 
         template<typename Request>
@@ -776,7 +862,8 @@ namespace ngc {
             if(!calculated) { m_jog.reset(); return false; }
             jog.elapsed = 0.0;
             m_snapshot.state = BackendState::Running;
-            m_snapshot.activeJoints = request.target.type == JogTargetType::Axis ? 0 : request.target.joints;
+            m_snapshot.activeJoints = request.target.type == JogTargetType::Axis
+                ? axisJoints(request.target.axis) : request.target.joints;
             return true;
         }
 
@@ -1338,6 +1425,8 @@ namespace ngc {
                             m_snapshot.commandedJoints.acceleration[joint] = 0.0;
                             m_snapshot.feedbackJoints = m_snapshot.commandedJoints;
                         }
+                        if(success) for(const auto &axis : m_axes)
+                            updateConfiguredAxisFromJoints(axis.axis);
                     } else if constexpr(std::same_as<T, StartContinuousJogRequest>
                                         || std::same_as<T, StartIncrementalJogRequest>) {
                         success = initializeJog(value);
@@ -1345,6 +1434,9 @@ namespace ngc {
                         success = m_jog && m_jog->continuous && !m_jog->stopping
                             && m_jog->id == value.jog;
                         if(success) m_jog->leaseTicks = m_jog->leasePeriod;
+                    } else if constexpr(std::same_as<T, SetContinuousJogVelocityRequest>) {
+                        success = m_jog && m_jog->id == value.jog
+                            && setContinuousJogVelocity(value.signedVelocity);
                     } else if constexpr(std::same_as<T, StopJogRequest>) {
                         success = m_jog && m_jog->id == value.jog
                             && beginJogStop(JogStopReason::RequestedStop);
@@ -1488,6 +1580,14 @@ namespace ngc {
     MockMotionBackend::MockMotionBackend(const FeedHoldConfiguration &feedHold,
                                          const TrajectoryLimits &trajectory)
         : m_impl(std::make_unique<Impl>(feedHold, trajectory)) { }
+    MockMotionBackend::MockMotionBackend(const std::vector<AxisConfiguration> &axes,
+                                         const std::vector<JointConfiguration> &joints)
+        : m_impl(std::make_unique<Impl>(axes, joints)) { }
+    MockMotionBackend::MockMotionBackend(const FeedHoldConfiguration &feedHold,
+                                         const TrajectoryLimits &trajectory,
+                                         const std::vector<AxisConfiguration> &axes,
+                                         const std::vector<JointConfiguration> &joints)
+        : m_impl(std::make_unique<Impl>(feedHold, trajectory, axes, joints)) { }
     MockMotionBackend::~MockMotionBackend() = default;
     PublishResult MockMotionBackend::tryPublish(const ExecutionItem &item) noexcept { return m_impl->publish(item); }
     SubmitResult MockMotionBackend::trySubmit(const ControlRequest &request) noexcept { return m_impl->submit(request); }

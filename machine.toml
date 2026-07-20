@@ -33,9 +33,26 @@ tangential_jerk = 25.0
 # Global reduced limits used while accelerating into a jog.
 # Controlled jogging stops use the configured physical axis/joint limits.
 # machine-units / second^2
-acceleration = 5.0
+acceleration = 2.5
 # machine-units / second^3
 jerk = 25.0
+
+[pendant]
+enabled = true
+driver = "vistacnc_p2s"
+
+[pendant.step]
+# machine-units per handwheel detent with the EN button released/held
+fine_distance = 0.001
+coarse_distance = 0.01
+
+[pendant.velocity]
+# wheel rate that commands max_velocity_percent; higher rates are clamped
+full_scale_counts_per_second = 400.0
+# percentage of the selected axis/joints' configured maximum velocity
+max_velocity_percent = 100
+# maximum time without a matching update/renewal before a constrained stop
+lease_duration = 0.1
 
 # Logical machine axes. Multiple joints may map to one axis; Y uses two joints
 # so its gantry can be squared during homing and coupled during normal motion.

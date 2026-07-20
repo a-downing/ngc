@@ -29,6 +29,26 @@ namespace ngc {
         double tangentialJerk = 25.0;
     };
 
+    enum class PendantDriver { VistaCncP2s };
+
+    struct PendantStepConfiguration {
+        double fineDistance = 0.0;
+        double coarseDistance = 0.0;
+    };
+
+    struct PendantVelocityConfiguration {
+        double maxVelocityScale = 0.0;
+        double fullScaleCountsPerSecond = 0.0;
+        double leaseDuration = 0.0;
+    };
+
+    struct PendantConfiguration {
+        bool enabled = false;
+        PendantDriver driver = PendantDriver::VistaCncP2s;
+        PendantStepConfiguration step;
+        PendantVelocityConfiguration velocity;
+    };
+
     struct AxisConfiguration {
         Machine::Axis axis = Machine::Axis::X;
         std::vector<JointId> joints;
@@ -97,6 +117,7 @@ namespace ngc {
         SimulationTiming simulation;
         FeedHoldConfiguration feedHold;
         JoggingConfiguration jogging;
+        PendantConfiguration pendant;
         std::vector<AxisConfiguration> axes;
         std::vector<DigitalInputConfiguration> digitalInputs;
         ProbingConfiguration probing;

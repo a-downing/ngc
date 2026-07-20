@@ -7,11 +7,20 @@
 #include "machine/MockTrajectoryDiagnostics.h"
 
 namespace ngc {
+    struct AxisConfiguration;
+    struct JointConfiguration;
+
     class MockMotionBackend final : public MotionBackend, public SimulatedClockControl,
                                     public MockTrajectoryDiagnostics {
     public:
         explicit MockMotionBackend(const FeedHoldConfiguration &feedHold = {},
                                    const TrajectoryLimits &trajectory = {});
+        MockMotionBackend(const std::vector<AxisConfiguration> &axes,
+                          const std::vector<JointConfiguration> &joints);
+        MockMotionBackend(const FeedHoldConfiguration &feedHold,
+                          const TrajectoryLimits &trajectory,
+                          const std::vector<AxisConfiguration> &axes,
+                          const std::vector<JointConfiguration> &joints);
         ~MockMotionBackend() override;
         MockMotionBackend(const MockMotionBackend &) = delete;
         MockMotionBackend &operator=(const MockMotionBackend &) = delete;

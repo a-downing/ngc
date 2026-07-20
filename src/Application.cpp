@@ -63,6 +63,11 @@
 
 #include "machine/ToolTable.h"
 #include "machine/MachineCommand.h"
+#include "operator/OperatorJogController.h"
+#include "operator/PendantTouchOffController.h"
+#include "pendant/VistaCncP2sDisplay.h"
+#include "pendant/VistaCncP2sManager.h"
+#include "pendant/VistaCncP2sProfile.h"
 
 #include "gui/tool_table_strings_t.h"
 
@@ -165,11 +170,16 @@ class ApplicationImpl final {
 
     ngc::SimulationTiming m_simulationTiming;
     ngc::JoggingConfiguration m_joggingConfiguration;
+    ngc::PendantConfiguration m_pendantConfiguration;
     ngc::Machine::Unit m_machineUnit;
     std::vector<ngc::AxisConfiguration> m_axes;
     std::vector<ngc::JointConfiguration> m_joints;
     Worker m_worker;
     SimulationWorker m_simulation;
+    ngc::operator_control::JogController m_operatorJogController;
+    ngc::operator_control::TouchOffController m_pendantTouchOffController;
+    std::unique_ptr<ngc::pendant::vista_cnc_p2s::Manager> m_pendantManager;
+    ngc::pendant::vista_cnc_p2s::Profile m_pendantProfile;
     int m_simulationTickMultiplier = 1;
     double m_simulatedRapidSpeed;
     double m_pathJerk;
@@ -392,20 +402,25 @@ class ApplicationImpl final {
         const glm::dvec3 center { position.x, position.y, position.z };
         // World-space size is intentional: the marker grows when the user zooms in.
         const auto halfSize = m_machineUnit == ngc::Machine::Unit::Inch ? 0.5 : 12.5;
-        const glm::dvec3 x { halfSize, 0.0, 0.0 };
-        const glm::dvec3 y { 0.0, halfSize, 0.0 };
-        const glm::dvec3 z { 0.0, 0.0, halfSize };
+        // Keep a true three-dimensional orthogonal crosshair, but rotate the
+        // complete basis 45 degrees about every machine axis so it cannot lie
+        // directly over the MCS or WCS triads.
+        const auto quarterTurn = std::numbers::pi / 4.0;
+        const auto rotation = glm::angleAxis(quarterTurn, glm::dvec3(0.0, 0.0, 1.0))
+            * glm::angleAxis(quarterTurn, glm::dvec3(0.0, 1.0, 0.0))
+            * glm::angleAxis(quarterTurn, glm::dvec3(1.0, 0.0, 0.0));
+        const auto x = rotation * glm::dvec3(halfSize, 0.0, 0.0);
+        const auto y = rotation * glm::dvec3(0.0, halfSize, 0.0);
+        const auto z = rotation * glm::dvec3(0.0, 0.0, halfSize);
 
         glDisable(GL_DEPTH_TEST);
         glLineWidth(2.0f);
+        glColor3d(1.0, 0.85, 0.05);
         glBegin(GL_LINES);
-        glColor3d(1.0, 0.25, 0.2);
         glVertex3dv(glm::value_ptr(center - x));
         glVertex3dv(glm::value_ptr(center + x));
-        glColor3d(0.25, 1.0, 0.3);
         glVertex3dv(glm::value_ptr(center - y));
         glVertex3dv(glm::value_ptr(center + y));
-        glColor3d(0.25, 0.55, 1.0);
         glVertex3dv(glm::value_ptr(center - z));
         glVertex3dv(glm::value_ptr(center + z));
         glEnd();
@@ -417,10 +432,13 @@ public:
     ApplicationImpl(GLFWwindow *window, const ngc::MachineConfiguration &configuration,
                     const ngc::spline_detail::SplineFitSolver splineFitSolver)
         : m_window(window), m_simulationTiming(configuration.simulation),
-          m_joggingConfiguration(configuration.jogging), m_machineUnit(configuration.unit),
+          m_joggingConfiguration(configuration.jogging),
+          m_pendantConfiguration(configuration.pendant), m_machineUnit(configuration.unit),
           m_axes(configuration.axes), m_joints(configuration.joints),
           m_worker(configuration.unit,geometryPolicy(configuration.trajectory,splineFitSolver)),
           m_simulation(configuration),
+          m_operatorJogController(configuration),
+          m_pendantTouchOffController(configuration),
           m_simulatedRapidSpeed(configuration.trajectory.rapidSpeed),
           m_pathJerk(configuration.trajectory.pathJerk) {
         if(!m_simulation.setSplineFitSolver(splineFitSolver))
@@ -442,6 +460,18 @@ public:
             m_errorMessage = "failed to load tool table";
         } else if(!m_worker.setToolTable(m_tools)) {
             m_errorMessage = "tool table was loaded, but cannot be applied while the worker is busy";
+        }
+
+        if(m_pendantConfiguration.enabled) {
+            switch(m_pendantConfiguration.driver) {
+                case ngc::PendantDriver::VistaCncP2s: {
+                    auto manager = ngc::pendant::vista_cnc_p2s::Manager::open();
+                    if(manager) m_pendantManager = std::move(*manager);
+                    else m_errorMessage = std::format(
+                        "failed to open VistaCNC P2-S pendant: {}", manager.error().message);
+                    break;
+                }
+            }
         }
 
         auto autoload = readAutoloadSources();
@@ -470,6 +500,7 @@ public:
     }
 
     void terminate() {
+        if(m_pendantManager) m_pendantManager->stop();
         m_stopPreviewVisibilityRequested.store(true, std::memory_order_release);
         {
             std::scoped_lock lock(m_previewVisibilityMutex);
@@ -595,10 +626,27 @@ public:
         for(const auto *lines:toolpathLines)
             for(std::size_t index=1;index<lines->size();index+=2)
                 consider((*lines)[index-1],(*lines)[index]);
-        if(!bestPoint) return false;
+        if(!bestPoint) {
+            auto activeWorkOrigin = m_worker.lock([&] {
+                return m_worker.machine().workOffset();
+            });
+            const auto simulation = m_simulation.snapshot();
+            if(simulation.activeWorkCoordinateSystem)
+                activeWorkOrigin = simulation.activeWorkCoordinateSystem->offset;
+
+            const glm::dvec3 machineOrigin { 0.0, 0.0, 0.0 };
+            const glm::dvec3 workOrigin {
+                activeWorkOrigin.x, activeWorkOrigin.y, activeWorkOrigin.z,
+            };
+            const auto machineDifference = mouse - project(machineOrigin);
+            const auto workDifference = mouse - project(workOrigin);
+            bestPoint = glm::dot(machineDifference, machineDifference)
+                    <= glm::dot(workDifference, workDifference)
+                ? machineOrigin : workOrigin;
+        }
 
         // Preserve the current screen transform while making the selected
-        // toolpath point the sole pivot for this rotation drag.
+        // toolpath point or coordinate-system origin the sole pivot for this drag.
         const auto compensation=m_modelOrientation*displayOffset(*bestPoint-m_modelPivot);
         m_viewPan.x+=compensation.x;
         m_viewPan.y+=compensation.z;
@@ -1407,10 +1455,7 @@ public:
             if(match == coordinates.used.end()) coordinates.used.push_back(workCoordinateSystem);
             else *match = workCoordinateSystem;
         }
-        const auto simulationActive = simulationCoordinates.status == ngc::SimulationStatus::Running
-            || simulationCoordinates.status == ngc::SimulationStatus::Holding
-            || simulationCoordinates.status == ngc::SimulationStatus::Paused;
-        if(simulationActive && simulationCoordinates.activeWorkCoordinateSystem) {
+        if(simulationCoordinates.activeWorkCoordinateSystem) {
             coordinates.active = *simulationCoordinates.activeWorkCoordinateSystem;
         }
 
@@ -2359,7 +2404,9 @@ public:
             m_previewAfterCompile = false;
         }
 
-        const auto simulation = m_simulation.snapshot();
+        auto simulation = m_simulation.snapshot();
+        processPendant(simulation);
+        simulation = m_simulation.snapshot();
         const auto &viewport = *ImGui::GetMainViewport();
         m_toolbarHeight = ImGui::GetFrameHeight() + ImGui::GetStyle().WindowPadding.y * 2.0f;
         const auto contentBottom = viewport.Pos.y + viewport.Size.y - m_statusBarHeight;
@@ -2383,6 +2430,84 @@ public:
         if(m_enableOpenDialog) renderOpenDialog();
         if(m_enableMemoryWindow) renderMemoryWindow();
         if(m_enableToolWindow) renderToolWindow();
+    }
+
+    void processPendant(const ngc::SimulationSnapshot &simulation) {
+        if(!m_pendantManager) return;
+        const auto machineAxis = [](const ngc::pendant::Axis axis) {
+            switch(axis) {
+                case ngc::pendant::Axis::X: return ngc::Machine::Axis::X;
+                case ngc::pendant::Axis::Y: return ngc::Machine::Axis::Y;
+                case ngc::pendant::Axis::Z: return ngc::Machine::Axis::Z;
+                case ngc::pendant::Axis::A: return ngc::Machine::Axis::A;
+                case ngc::pendant::Axis::B: return ngc::Machine::Axis::B;
+                case ngc::pendant::Axis::C: return ngc::Machine::Axis::C;
+            }
+            return ngc::Machine::Axis::X;
+        };
+        ngc::pendant::vista_cnc_p2s::ManagerEvent event;
+        while(m_pendantManager->tryTakeEvent(event)) {
+            if(const auto *disconnected = std::get_if<ngc::pendant::vista_cnc_p2s::Disconnected>(&event))
+                m_errorMessage = std::format(
+                    "VistaCNC P2-S pendant disconnected: {}", disconnected->error.message);
+            if(const auto *failed = std::get_if<ngc::pendant::vista_cnc_p2s::DisplayFailed>(&event))
+                m_errorMessage = std::format(
+                    "VistaCNC P2-S display update failed: {}", failed->error.message);
+            for(const auto &intent : m_pendantProfile.consume(event)) {
+                m_operatorJogController.consume(intent);
+                m_pendantTouchOffController.consume(intent);
+            }
+        }
+
+        if(const auto action = m_operatorJogController.next(simulation)) {
+            const auto accepted = std::visit([&](const auto &request) {
+                using T = std::decay_t<decltype(request)>;
+                if constexpr(std::same_as<T, ngc::StartIncrementalJogRequest>
+                             || std::same_as<T, ngc::StartContinuousJogRequest>)
+                    return m_simulation.startJog(ngc::ControlRequest { request });
+                else if constexpr(std::same_as<T, ngc::SetContinuousJogVelocityRequest>)
+                    return m_simulation.setJogVelocity(request);
+                else if constexpr(std::same_as<T, ngc::RenewJogLeaseRequest>)
+                    return m_simulation.renewJog(request.id, request.jog);
+                else
+                    return m_simulation.stopJog(request.id, request.jog);
+            }, *action);
+            m_operatorJogController.submitted(*action, accepted);
+        }
+        if(auto error = m_operatorJogController.takeError())
+            m_errorMessage = std::format("VistaCNC P2-S pendant: {}", *error);
+        if(auto error = m_pendantTouchOffController.takeError())
+            m_errorMessage = std::format("VistaCNC P2-S pendant: {}", *error);
+        if(const auto commit = m_pendantTouchOffController.takeCommit()) {
+            if(auto applied = m_simulation.setActiveWorkCoordinate(
+                    machineAxis(commit->axis), commit->workPosition); !applied)
+                m_errorMessage = std::format(
+                    "VistaCNC P2-S touch-off was not applied: {}", applied.error());
+        }
+
+        const auto device = m_pendantManager->snapshot();
+        const auto selectedAxis = m_pendantProfile.snapshot().selectedAxis;
+        if(device.connected && selectedAxis) {
+            const auto selectedMachineAxis = machineAxis(*selectedAxis);
+            const auto workOffset = simulation.activeWorkCoordinateSystem
+                ? simulation.activeWorkCoordinateSystem->offset : ngc::position_t {};
+            const auto workPosition = simulation.machinePosition
+                - workOffset - simulation.activeToolOffset;
+            const auto workCoordinateSystem = simulation.activeWorkCoordinateSystem
+                ? std::string_view(simulation.activeWorkCoordinateSystem->name)
+                : std::string_view("G54");
+            const auto position = axisValue(workPosition, selectedMachineAxis);
+            const auto &touchOff = m_pendantTouchOffController.snapshot();
+            const auto display = m_pendantProfile.snapshot().mode == ngc::pendant::Mode::Zero
+                    && touchOff.axis == selectedAxis
+                ? ngc::pendant::vista_cnc_p2s::formatZeroDisplay(
+                    workCoordinateSystem, *selectedAxis, position, touchOff.workPosition)
+                : ngc::pendant::vista_cnc_p2s::formatPositionDisplay(
+                    workCoordinateSystem, *selectedAxis, position);
+            if(auto queued = m_pendantManager->setDisplay(display); !queued)
+                m_errorMessage = std::format(
+                    "VistaCNC P2-S display update failed: {}", queued.error().message);
+        }
     }
 
     void renderToolWindow() {

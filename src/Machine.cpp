@@ -74,6 +74,24 @@ namespace ngc {
         position_t physicalToolOffset() const { return toolGeometry().offset; }
         void prepareToolChange(const int toolNumber) { m_physicalToolNumber = toolNumber; }
         template<typename Self> auto &memory(this Self &&self) { return std::forward<Self>(self).m_memory; }
+
+        void setActiveWorkOffset(const Axis axis, const double value) {
+            const auto component = [&] {
+                switch(axis) {
+                    case Axis::X: return 0U;
+                    case Axis::Y: return 1U;
+                    case Axis::Z: return 2U;
+                    case Axis::A: return 3U;
+                    case Axis::B: return 4U;
+                    case Axis::C: return 5U;
+                }
+                PANIC("invalid machine axis");
+            }();
+            const auto result = m_memory.write(
+                offsetStartAddress(*m_state.modeCoordSys) + component, value, true);
+            if(!result) PANIC("active work offset address must be writable internally");
+            m_workOffset = offset(*m_state.modeCoordSys);
+        }
         template<typename Self> auto &toolTable(this Self &&self) { return std::forward<Self>(self).m_toolTable; }
         template<typename Self> auto &state(this Self &&self) { return std::forward<Self>(self).m_state; }
 
@@ -619,6 +637,9 @@ namespace ngc {
 
     void Machine::beginProgramRun() { m_impl->beginProgramRun(); }
     const position_t &Machine::workOffset() const { return m_impl->workOffset(); }
+    void Machine::setActiveWorkOffset(const Axis axis, const double value) {
+        m_impl->setActiveWorkOffset(axis, value);
+    }
     const position_t &Machine::toolOffset() const { return m_impl->toolOffset(); }
     ToolGeometry Machine::toolGeometry() const { return m_impl->toolGeometry(); }
     position_t Machine::physicalToolOffset() const { return m_impl->physicalToolOffset(); }

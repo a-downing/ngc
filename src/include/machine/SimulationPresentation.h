@@ -68,6 +68,7 @@ namespace ngc {
         std::string error;
         std::vector<InterpreterStatusMessage> statusMessages;
         std::optional<WorkCoordinateSystem> activeWorkCoordinateSystem;
+        position_t activeToolOffset{};
         std::vector<std::string> activeModalGCodes;
         std::vector<WorkCoordinateSystem> usedWorkCoordinateSystems;
         std::vector<BlockExecution> activeBlocks;

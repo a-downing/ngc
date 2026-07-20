@@ -13,6 +13,8 @@ function(ngc_target_defaults target)
     target_link_options(${target} PRIVATE -g)
 endfunction()
 
+add_subdirectory(src/pendant)
+
 set(IMGUI_DIR imgui)
 
 set(OpenGL_GL_PREFERENCE LEGACY)
@@ -78,6 +80,19 @@ target_include_directories(ngc_core SYSTEM PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/h
 target_link_libraries(ngc_core PRIVATE ngc_ruckig tomlplusplus::tomlplusplus highs::highs)
 ngc_target_defaults(ngc_core)
 
+add_library(ngc_operator STATIC
+        src/operator/OperatorJogController.cpp
+        src/operator/PendantTouchOffController.cpp)
+target_include_directories(ngc_operator PUBLIC src/include)
+target_link_libraries(ngc_operator PUBLIC ngc_core ngc_pendant)
+ngc_target_defaults(ngc_operator)
+
+add_executable(ngc_operator_tests src/operator/test.cpp)
+target_link_libraries(ngc_operator_tests PRIVATE ngc_operator)
+ngc_target_defaults(ngc_operator_tests)
+add_test(NAME ngc_operator_tests COMMAND ngc_operator_tests)
+set_tests_properties(ngc_operator_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+
 add_library(ngc_imgui STATIC
         ${IMGUI_DIR}/backends/imgui_impl_glfw.cpp
         ${IMGUI_DIR}/backends/imgui_impl_opengl3.cpp
@@ -107,6 +122,7 @@ target_include_directories(imgui_main PRIVATE
 
 target_link_libraries(imgui_main
         ngc_core
+        ngc_operator
         ngc_imgui
         OpenGL::GL
         OpenGL::GLU
@@ -124,11 +140,9 @@ target_include_directories(ngc_simulation_diagnostic PRIVATE src)
 target_link_libraries(ngc_simulation_diagnostic PRIVATE ngc_core)
 ngc_target_defaults(ngc_simulation_diagnostic)
 
-add_executable(pendant_probe tools/pendant_probe.cpp)
-ngc_target_defaults(pendant_probe)
-if(WIN32)
-    target_link_libraries(pendant_probe PRIVATE hid setupapi)
-endif()
+add_executable(vistacnc_p2s_probe tools/vistacnc_p2s_probe.cpp)
+ngc_target_defaults(vistacnc_p2s_probe)
+target_link_libraries(vistacnc_p2s_probe PRIVATE ngc_pendant)
 
 add_executable(ngc_spline_geometry_analyzer tools/ngc_spline_geometry_analyzer.cpp)
 target_link_libraries(ngc_spline_geometry_analyzer PRIVATE ngc_core)

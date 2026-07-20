@@ -157,6 +157,7 @@ namespace ngc {
             const auto *simulation = document["simulation"].as_table();
             const auto *feedHold = document["feed_hold"].as_table();
             const auto *jogging = document["jogging"].as_table();
+            const auto *pendant = document["pendant"].as_table();
             const auto *axes = document["axes"].as_table();
             const auto *digitalInputs = document["digital_inputs"].as_table();
             const auto *probing = document["probing"].as_table();
@@ -237,6 +238,63 @@ namespace ngc {
             result.simulation = { *servoPeriod, *schedulerPeriod };
             result.feedHold = { *feedHoldAcceleration, *feedHoldJerk };
             result.jogging = { *jogAcceleration, *jogJerk };
+
+            if(pendant) {
+                const auto enabled = requiredBool(*pendant, "enabled", path);
+                if(!enabled) return std::unexpected(enabled.error());
+                result.pendant.enabled = *enabled;
+                if(*enabled) {
+                    const auto driver = requiredString(*pendant, "driver", path);
+                    if(!driver) return std::unexpected(driver.error());
+                    if(*driver != "vistacnc_p2s")
+                        return std::unexpected(configurationError(
+                            path, "pendant.driver", "must be 'vistacnc_p2s'",
+                            pendant->get("driver")));
+                    result.pendant.driver = PendantDriver::VistaCncP2s;
+                    const auto *step = pendant->get("step")
+                        ? pendant->get("step")->as_table() : nullptr;
+                    if(!step)
+                        return std::unexpected(configurationError(
+                            path, "pendant.step", "missing table", pendant->get("step")));
+                    const auto fineDistance = positiveNumber(*step, "fine_distance", path);
+                    const auto coarseDistance = positiveNumber(*step, "coarse_distance", path);
+                    if(!fineDistance) return std::unexpected(fineDistance.error());
+                    if(!coarseDistance) return std::unexpected(coarseDistance.error());
+                    if(*coarseDistance <= *fineDistance)
+                        return std::unexpected(configurationError(
+                            path, "pendant.step.coarse_distance",
+                            "must be greater than fine_distance",
+                            step->get("coarse_distance")));
+                    result.pendant.step = {
+                        *fineDistance, *coarseDistance,
+                    };
+                    const auto *velocity = pendant->get("velocity")
+                        ? pendant->get("velocity")->as_table() : nullptr;
+                    if(!velocity)
+                        return std::unexpected(configurationError(
+                            path, "pendant.velocity", "missing table", pendant->get("velocity")));
+                    const auto maxVelocityPercent = positiveNumber(
+                        *velocity, "max_velocity_percent", path);
+                    const auto fullScaleCounts = positiveNumber(
+                        *velocity, "full_scale_counts_per_second", path);
+                    const auto leaseDuration = positiveNumber(*velocity, "lease_duration", path);
+                    if(!maxVelocityPercent) return std::unexpected(maxVelocityPercent.error());
+                    if(!fullScaleCounts) return std::unexpected(fullScaleCounts.error());
+                    if(!leaseDuration) return std::unexpected(leaseDuration.error());
+                    if(*maxVelocityPercent > 100.0)
+                        return std::unexpected(configurationError(
+                            path, "pendant.velocity.max_velocity_percent", "must not exceed 100",
+                            velocity->get("max_velocity_percent")));
+                    if(*leaseDuration < result.simulation.servoPeriod)
+                        return std::unexpected(configurationError(
+                            path, "pendant.velocity.lease_duration",
+                            "must be at least one simulation servo period",
+                            velocity->get("lease_duration")));
+                    result.pendant.velocity = {
+                        *maxVelocityPercent / 100.0, *fullScaleCounts, *leaseDuration,
+                    };
+                }
+            }
 
             std::unordered_set<JointId> axisJointIds;
             for(const auto axis : result.coordinates) {
