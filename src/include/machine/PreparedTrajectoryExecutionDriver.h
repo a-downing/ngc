@@ -330,6 +330,7 @@ namespace ngc {
                 } else if(const auto *held = std::get_if<BackendHeld>(&event)) {
                     if(held->epoch == m_epoch) {
                         m_waitingForHeld = false;
+                        if(held->reason == BackendHoldReason::FeedHold) continue;
                         (void)releaseSynchronizationIfHeld();
                         if(m_planner.hasRollingContinuation()) {
                             fail("motion stopped on a rolling-horizon packet branch with retained prepared geometry");

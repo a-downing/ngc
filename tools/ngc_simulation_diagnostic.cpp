@@ -18,6 +18,7 @@ namespace {
         switch(status) {
             case ngc::SimulationStatus::Stopped: return "Stopped";
             case ngc::SimulationStatus::Running: return "Running";
+            case ngc::SimulationStatus::Holding: return "Holding";
             case ngc::SimulationStatus::Paused: return "Paused";
             case ngc::SimulationStatus::Completed: return "Completed";
             case ngc::SimulationStatus::Error: return "Error";
@@ -30,6 +31,7 @@ namespace {
             case ngc::BackendState::Disabled: return "Disabled";
             case ngc::BackendState::Held: return "Held";
             case ngc::BackendState::Running: return "Running";
+            case ngc::BackendState::Holding: return "Holding";
             case ngc::BackendState::Faulted: return "Faulted";
         }
         return "Unknown";

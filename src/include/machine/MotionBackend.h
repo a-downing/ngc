@@ -168,7 +168,7 @@ namespace ngc {
     using ExecutionItem = std::variant<PlanChunk, TriggeredMove, TriggeredJointMove>;
     static_assert(std::is_trivially_copyable_v<ExecutionItem>);
 
-    enum class BackendState : std::uint8_t { Disabled, Held, Running, Faulted };
+    enum class BackendState : std::uint8_t { Disabled, Held, Running, Holding, Faulted };
     enum class BranchChoice : std::uint8_t { Continue, Stop };
     enum class PublishResult : std::uint8_t { Published, Full, Invalid };
     enum class SubmitResult : std::uint8_t { Submitted, Full };
@@ -284,7 +284,8 @@ namespace ngc {
         JointMotionState jointState;
     };
     struct RequestCompleted { RequestId request; bool succeeded; };
-    struct BackendHeld { EpochId epoch; MotionState state; };
+    enum class BackendHoldReason : std::uint8_t { StopBranch, FeedHold };
+    struct BackendHeld { EpochId epoch; MotionState state; BackendHoldReason reason; };
     struct BackendFault { std::uint32_t code; };
     using ExecutionEvent = std::variant<ChunkAccepted, ChunkRejected, ChunkRetired, BranchSelected,
                                         TriggeredMoveCompleted, TriggeredJointMoveCompleted,
@@ -301,6 +302,8 @@ namespace ngc {
         double queuedNormalMotionSeconds = 0.0;
         double committedNormalMotionSeconds = 0.0;
         double stopBranchRemainingSeconds = 0.0;
+        double executionRate = 1.0;
+        double executionRateAcceleration = 0.0;
         std::uint32_t queuedExecutionItems = 0;
         BranchSequence lastBranch = 0;
         MotionState commanded{};

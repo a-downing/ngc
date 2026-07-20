@@ -24,6 +24,11 @@ namespace ngc {
         double jerk = 0.0;
     };
 
+    struct FeedHoldConfiguration {
+        double tangentialAcceleration = 5.0;
+        double tangentialJerk = 25.0;
+    };
+
     struct AxisConfiguration {
         Machine::Axis axis = Machine::Axis::X;
         std::vector<JointId> joints;
@@ -90,6 +95,7 @@ namespace ngc {
         std::vector<Machine::Axis> coordinates;
         TrajectoryLimits trajectory;
         SimulationTiming simulation;
+        FeedHoldConfiguration feedHold;
         JoggingConfiguration jogging;
         std::vector<AxisConfiguration> axes;
         std::vector<DigitalInputConfiguration> digitalInputs;

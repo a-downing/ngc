@@ -25,7 +25,17 @@ namespace ngc {
         ChunkId chunk = 0;
         SpanId span = 0;
         position_t position{};
+        position_t velocity{};
+        position_t acceleration{};
+        position_t jerk{};
         double magnitude = 0.0;
+        double physicalTime = 0.0;
+        double referenceTime = 0.0;
+        double executionRate = 1.0;
+        double executionRateAcceleration = 0.0;
+        double executionRateJerk = 0.0;
+        bool feedHolding = false;
+        bool stopTail = false;
     };
 
     // Development-only retained diagnostics. This is deliberately separate from

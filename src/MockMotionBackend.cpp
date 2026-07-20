@@ -69,6 +69,10 @@ namespace ngc {
             return { component(&position_t::x), component(&position_t::y), component(&position_t::z),
                      component(&position_t::a), component(&position_t::b), component(&position_t::c) };
         }
+
+        position_t thirdDerivative(const AxisPolynomialSpan &span) {
+            return scaled(span.a, 6.0 * span.inverseDurationCubed);
+        }
     }
 
     class MockMotionBackend::Impl {
@@ -98,6 +102,14 @@ namespace ngc {
         std::vector<ExecutedJerkSample> m_executedJerkSamples;
         std::optional<ExecutedJerkSample> m_latestExecutedJerkSample;
         std::uint64_t m_continuationSequence = 0;
+        FeedHoldConfiguration m_feedHoldLimits;
+        TrajectoryLimits m_trajectoryLimits;
+        bool m_feedHolding = false;
+        double m_executionRate = 1.0;
+        double m_executionRateAcceleration = 0.0;
+        double m_executionRateJerk = 0.0;
+        double m_physicalElapsed = 0.0;
+        double m_referenceElapsed = 0.0;
         MockTrajectorySnapshot m_trajectoryDiagnostics;
         struct TriggeredRuntime {
             position_t start{};
@@ -167,6 +179,9 @@ namespace ngc {
         }
 
     public:
+        Impl(const FeedHoldConfiguration &feedHold, const TrajectoryLimits &trajectory)
+            : m_feedHoldLimits(feedHold), m_trajectoryLimits(trajectory) { }
+
         PublishResult publish(const ExecutionItem &item) noexcept {
             const auto valid = std::visit([](const auto &value) {
                 using T = std::decay_t<decltype(value)>;
@@ -254,18 +269,29 @@ namespace ngc {
                 if(!replaced) (void)m_pendingSyntheticInputs.push(input);
             }
             seconds = std::max(seconds, 0.0);
-            const auto availableProgramSeconds = seconds;
+            const auto physicalSeconds = seconds;
+            m_physicalElapsed += physicalSeconds;
             if(m_jog) {
                 advanceJog(seconds);
                 if(shouldPublishSnapshot || !m_jog) publishSnapshot();
                 return;
             }
-            if(m_snapshot.state != BackendState::Running) {
+            if(m_snapshot.state != BackendState::Running
+               && m_snapshot.state != BackendState::Holding) {
                 if(shouldPublishSnapshot) publishSnapshot();
                 return;
             }
             if(!m_active) activateNext();
+            if(m_feedHolding && !m_active) {
+                finishFeedHold();
+                if(shouldPublishSnapshot) publishSnapshot();
+                return;
+            }
             const auto executedActiveMotion = m_active.has_value();
+            if(m_feedHolding && m_active
+               && std::holds_alternative<PlanChunk>(activeItem()))
+                seconds = feedHoldReferenceAdvance(physicalSeconds);
+            const auto availableProgramSeconds = seconds;
             while(m_active && seconds > 0.0) {
                 if(std::holds_alternative<TriggeredMove>(activeItem())) {
                     advanceTriggered(seconds);
@@ -276,9 +302,6 @@ namespace ngc {
                     continue;
                 }
                 const auto &span = currentSpan();
-                m_currentProgramJerkMagnitude.store(
-                    magnitude(scaled(span.a,6.0*span.inverseDurationCubed)),
-                    std::memory_order_relaxed);
                 const auto remaining = std::max(span.duration - m_spanElapsed, 0.0);
                 const auto consumed = std::min(seconds, remaining);
                 seconds -= consumed;
@@ -286,8 +309,11 @@ namespace ngc {
                 const auto u = span.duration > 0.0 ? std::clamp(m_spanElapsed * span.inverseDuration, 0.0, 1.0) : 1.0;
                 m_snapshot.activeSpan = span.id;
                 m_snapshot.spanProgress = u;
-                m_snapshot.commanded = { evaluate(span, u), derivative(span, u), secondDerivative(span, u) };
+                m_snapshot.commanded = retimedState(span, u);
                 m_snapshot.feedback = m_snapshot.commanded;
+                const auto jerk = retimedJerk(span, u);
+                m_currentProgramJerkMagnitude.store(magnitude(jerk), std::memory_order_relaxed);
+                m_lastAdvanceProgramSeconds = availableProgramSeconds - seconds;
                 recordCalculatedPosition();
                 if(m_spanElapsed + 1e-12 < span.duration) break;
                 completeSpan();
@@ -295,10 +321,17 @@ namespace ngc {
             if(!m_active)
                 m_currentProgramJerkMagnitude.store(0.0,std::memory_order_relaxed);
             m_lastAdvanceProgramSeconds = availableProgramSeconds - seconds;
+            m_referenceElapsed += m_lastAdvanceProgramSeconds;
+            m_snapshot.executionRate = m_executionRate;
+            m_snapshot.executionRateAcceleration = m_executionRateAcceleration;
+            if(m_feedHolding && m_snapshot.state != BackendState::Faulted
+               && m_executionRate == 0.0)
+                finishFeedHold();
             // Always publish terminal/held state even inside a decimated batch so
             // NRT cannot observe completion before its matching final snapshot.
             if(shouldPublishSnapshot || (executedActiveMotion && !m_active)
-               || m_snapshot.state != BackendState::Running)
+               || (m_snapshot.state != BackendState::Running
+                   && m_snapshot.state != BackendState::Holding))
                 publishSnapshot();
         }
 
@@ -353,6 +386,143 @@ namespace ngc {
         const AxisPolynomialSpan &currentSpan() const {
             const auto &chunk = activeChunk();
             return m_stopping ? chunk.stopTail[m_span] : chunk.normalMotion[m_span];
+        }
+
+        bool feedHoldAccelerationInterval(const position_t &referenceVelocity,
+                                          const position_t &referenceAcceleration,
+                                          double &lower, double &upper) const {
+            lower = -std::numeric_limits<double>::infinity();
+            upper = std::numeric_limits<double>::infinity();
+            const auto rateSquared = m_executionRate * m_executionRate;
+            const auto constrain = [&](const double velocity, const double acceleration,
+                                       const double limit) {
+                if(!std::isfinite(limit)) return true;
+                const auto base = acceleration * rateSquared;
+                if(std::abs(velocity) <= 1e-12) return std::abs(base) <= limit * (1.0 + 1e-9) + 1e-9;
+                auto first = (-limit - base) / velocity;
+                auto second = (limit - base) / velocity;
+                if(first > second) std::swap(first, second);
+                lower = std::max(lower, first);
+                upper = std::min(upper, second);
+                return lower <= upper + 1e-12;
+            };
+            if(!constrain(referenceVelocity.x, referenceAcceleration.x,
+                          m_trajectoryLimits.axisAcceleration.x)
+               || !constrain(referenceVelocity.y, referenceAcceleration.y,
+                             m_trajectoryLimits.axisAcceleration.y)
+               || !constrain(referenceVelocity.z, referenceAcceleration.z,
+                             m_trajectoryLimits.axisAcceleration.z)
+               || !constrain(referenceVelocity.a, referenceAcceleration.a,
+                             m_trajectoryLimits.axisAcceleration.a)
+               || !constrain(referenceVelocity.b, referenceAcceleration.b,
+                             m_trajectoryLimits.axisAcceleration.b)
+               || !constrain(referenceVelocity.c, referenceAcceleration.c,
+                             m_trajectoryLimits.axisAcceleration.c)) return false;
+
+            const auto base = scaled(referenceAcceleration, rateSquared);
+            const auto quadratic = dot(referenceVelocity, referenceVelocity);
+            const auto linear = 2.0 * dot(base, referenceVelocity);
+            const auto constant = dot(base, base)
+                - m_trajectoryLimits.pathAcceleration * m_trajectoryLimits.pathAcceleration;
+            if(quadratic <= 1e-24) return constant <= 1e-9;
+            const auto discriminant = linear * linear - 4.0 * quadratic * constant;
+            if(discriminant < -1e-9) return false;
+            const auto root = std::sqrt(std::max(discriminant, 0.0));
+            lower = std::max(lower, (-linear - root) / (2.0 * quadratic));
+            upper = std::min(upper, (-linear + root) / (2.0 * quadratic));
+            return lower <= upper + 1e-12;
+        }
+
+        double feedHoldReferenceAdvance(const double physicalSeconds) {
+            const auto &span = currentSpan();
+            const auto u = span.duration > 0.0
+                ? std::clamp(m_spanElapsed * span.inverseDuration, 0.0, 1.0) : 1.0;
+            const auto referenceVelocity = derivative(span, u);
+            const auto referenceAcceleration = secondDerivative(span, u);
+            const auto referenceSpeed = magnitude(referenceVelocity);
+            if(referenceSpeed <= 1e-10
+               && magnitude(scaled(referenceAcceleration,
+                                   m_executionRate * m_executionRate)) <= 1e-9) {
+                m_executionRate = 0.0;
+                m_executionRateAcceleration = 0.0;
+                m_executionRateJerk = 0.0;
+                return 0.0;
+            }
+
+            double feasibleLower = 0.0;
+            double feasibleUpper = 0.0;
+            if(!feedHoldAccelerationInterval(referenceVelocity, referenceAcceleration,
+                                             feasibleLower, feasibleUpper)) {
+                m_snapshot.state = BackendState::Faulted;
+                m_snapshot.faultCode = 4;
+                emit(BackendFault { 4 });
+                return 0.0;
+            }
+
+            const auto safeReferenceSpeed = std::max(referenceSpeed, 1e-9);
+            const auto requestedLower = -m_feedHoldLimits.tangentialAcceleration
+                / safeReferenceSpeed;
+            const auto brakingAcceleration = std::clamp(
+                requestedLower, feasibleLower, feasibleUpper);
+            const auto rateJerkLimit = m_feedHoldLimits.tangentialJerk / safeReferenceSpeed;
+            const auto release = m_executionRateAcceleration < 0.0
+                && m_executionRate <= m_executionRateAcceleration * m_executionRateAcceleration
+                    / (2.0 * std::max(rateJerkLimit, 1e-12)) + 1e-12;
+            auto requestedJerk = release ? rateJerkLimit : -rateJerkLimit;
+            auto nextAcceleration = m_executionRateAcceleration
+                + requestedJerk * physicalSeconds;
+            if(release && nextAcceleration > 0.0) nextAcceleration = 0.0;
+            if(!release && nextAcceleration < brakingAcceleration)
+                nextAcceleration = brakingAcceleration;
+            nextAcceleration = std::clamp(nextAcceleration, feasibleLower, feasibleUpper);
+            m_executionRateJerk = physicalSeconds > 0.0
+                ? (nextAcceleration - m_executionRateAcceleration) / physicalSeconds : 0.0;
+
+            auto nextRate = m_executionRate
+                + 0.5 * (m_executionRateAcceleration + nextAcceleration) * physicalSeconds;
+            if(nextRate <= 1e-10) {
+                nextRate = 0.0;
+                nextAcceleration = 0.0;
+            }
+            nextRate = std::clamp(nextRate, 0.0, 1.0);
+            const auto referenceAdvance = 0.5 * (m_executionRate + nextRate) * physicalSeconds;
+            m_executionRate = nextRate;
+            m_executionRateAcceleration = nextAcceleration;
+            return referenceAdvance;
+        }
+
+        MotionState retimedState(const AxisPolynomialSpan &span, const double u) const {
+            const auto referenceVelocity = derivative(span, u);
+            const auto referenceAcceleration = secondDerivative(span, u);
+            return {
+                evaluate(span, u),
+                scaled(referenceVelocity, m_executionRate),
+                scaled(referenceAcceleration, m_executionRate * m_executionRate)
+                    + scaled(referenceVelocity, m_executionRateAcceleration),
+            };
+        }
+
+        position_t retimedJerk(const AxisPolynomialSpan &span, const double u) const {
+            const auto referenceVelocity = derivative(span, u);
+            const auto referenceAcceleration = secondDerivative(span, u);
+            return scaled(thirdDerivative(span),
+                          m_executionRate * m_executionRate * m_executionRate)
+                + scaled(referenceAcceleration,
+                         3.0 * m_executionRate * m_executionRateAcceleration)
+                + scaled(referenceVelocity, m_executionRateJerk);
+        }
+
+        void finishFeedHold() {
+            m_feedHolding = false;
+            m_snapshot.state = BackendState::Held;
+            m_snapshot.commanded.velocity = {};
+            m_snapshot.commanded.acceleration = {};
+            m_snapshot.feedback = m_snapshot.commanded;
+            m_snapshot.executionRate = 0.0;
+            m_snapshot.executionRateAcceleration = 0.0;
+            emit(BackendHeld {
+                m_snapshot.epoch, m_snapshot.commanded, BackendHoldReason::FeedHold,
+            });
         }
         void release(const std::uint8_t index) { m_planSlots[index].occupied.store(false, std::memory_order_release); }
 
@@ -720,7 +890,7 @@ namespace ngc {
             emit(ChunkRetired { move.epoch, move.id });
             m_snapshot.state = BackendState::Held;
             m_snapshot.lastBranch = move.branch;
-            emit(BackendHeld { move.epoch, stopped });
+            emit(BackendHeld { move.epoch, stopped, BackendHoldReason::StopBranch });
             removeSyntheticInput(move.moveId);
             release(*m_active);
             m_active.reset();
@@ -898,7 +1068,9 @@ namespace ngc {
             m_snapshot.state = BackendState::Held;
             m_snapshot.lastBranch = move.branch;
             m_snapshot.activeJoints = 0;
-            emit(BackendHeld { move.epoch, m_snapshot.commanded });
+            emit(BackendHeld {
+                move.epoch, m_snapshot.commanded, BackendHoldReason::StopBranch,
+            });
             removeSyntheticJointInputs(move.moveId);
             release(*m_active);
             m_active.reset();
@@ -980,18 +1152,32 @@ namespace ngc {
                         }
                         if(m_active) release(*m_active);
                         m_active.reset(); m_snapshot.state = BackendState::Disabled;
+                        m_feedHolding = false;
                     } else if constexpr(std::same_as<T, StartRequest> || std::same_as<T, ResumeRequest>) {
                         success = !m_jog;
-                        if(success) { m_snapshot.epoch = value.epoch; m_snapshot.state = BackendState::Running; }
+                        if(success) {
+                            m_snapshot.epoch = value.epoch;
+                            m_snapshot.state = BackendState::Running;
+                            m_feedHolding = false;
+                            m_executionRate = 1.0;
+                            m_executionRateAcceleration = 0.0;
+                            m_executionRateJerk = 0.0;
+                        }
                     } else if constexpr(std::same_as<T, FeedHoldRequest>) {
-                        if(m_active) { m_stopping = true; m_span = 0; m_spanElapsed = 0.0; }
-                        else if(m_jog) success = beginJogStop(JogStopReason::RequestedStop);
-                        else m_snapshot.state = BackendState::Held;
+                        success = !m_jog
+                            && (m_snapshot.state == BackendState::Running
+                                || m_snapshot.state == BackendState::Holding)
+                            && (!m_active || std::holds_alternative<PlanChunk>(activeItem()));
+                        if(success) {
+                            m_feedHolding = true;
+                            m_snapshot.state = BackendState::Holding;
+                        }
                     } else if constexpr(std::same_as<T, AbortRequest>) {
                         if(m_jog) success = beginJogStop(JogStopReason::Aborted);
                         else {
                             if(m_active) release(*m_active);
                             m_active.reset(); m_snapshot.state = BackendState::Held;
+                            m_feedHolding = false;
                         }
                     } else if constexpr(std::same_as<T, ResetRequest>) {
                         if(m_jog) {
@@ -1011,6 +1197,12 @@ namespace ngc {
                             release(discarded);
                         }
                         m_stopping = false; m_span = 0; m_nextEvent = 0; m_spanElapsed = 0.0;
+                        m_feedHolding = false;
+                        m_executionRate = 1.0;
+                        m_executionRateAcceleration = 0.0;
+                        m_executionRateJerk = 0.0;
+                        m_physicalElapsed = 0.0;
+                        m_referenceElapsed = 0.0;
                         m_snapshot = {}; m_snapshot.epoch = value.nextEpoch;
                         m_snapshot.commandedJoints = commandedJoints;
                         m_snapshot.feedbackJoints = feedbackJoints;
@@ -1071,7 +1263,19 @@ namespace ngc {
                 emit(ChunkRetired { chunk.epoch, chunk.id });
                 m_snapshot.state = BackendState::Held;
                 m_snapshot.lastBranch = chunk.branch;
-                emit(BackendHeld { chunk.epoch, chunk.stopState });
+                const auto reason = m_feedHolding
+                    ? BackendHoldReason::FeedHold : BackendHoldReason::StopBranch;
+                if(m_feedHolding) {
+                    m_feedHolding = false;
+                    m_executionRate = 0.0;
+                    m_executionRateAcceleration = 0.0;
+                    m_executionRateJerk = 0.0;
+                    m_snapshot.executionRate = 0.0;
+                    m_snapshot.executionRateAcceleration = 0.0;
+                }
+                emit(BackendHeld {
+                    chunk.epoch, chunk.stopState, reason,
+                });
                 release(*m_active);
                 m_active.reset();
                 return;
@@ -1138,13 +1342,25 @@ namespace ngc {
                 .chunk=chunk.id,
                 .span=spanId,
                 .position=m_snapshot.commanded.position,
+                .velocity=m_snapshot.commanded.velocity,
+                .acceleration=m_snapshot.commanded.acceleration,
+                .jerk=retimedJerk(currentSpan(), m_snapshot.spanProgress),
                 .magnitude=m_currentProgramJerkMagnitude.load(std::memory_order_relaxed),
+                .physicalTime=m_physicalElapsed,
+                .referenceTime=m_referenceElapsed + m_lastAdvanceProgramSeconds,
+                .executionRate=m_executionRate,
+                .executionRateAcceleration=m_executionRateAcceleration,
+                .executionRateJerk=m_executionRateJerk,
+                .feedHolding=m_feedHolding,
+                .stopTail=stopTail,
             };
         }
 
     };
 
-    MockMotionBackend::MockMotionBackend() : m_impl(std::make_unique<Impl>()) { }
+    MockMotionBackend::MockMotionBackend(const FeedHoldConfiguration &feedHold,
+                                         const TrajectoryLimits &trajectory)
+        : m_impl(std::make_unique<Impl>(feedHold, trajectory)) { }
     MockMotionBackend::~MockMotionBackend() = default;
     PublishResult MockMotionBackend::tryPublish(const ExecutionItem &item) noexcept { return m_impl->publish(item); }
     SubmitResult MockMotionBackend::trySubmit(const ControlRequest &request) noexcept { return m_impl->submit(request); }

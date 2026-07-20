@@ -109,6 +109,9 @@ lookahead_duration = 2.0
 [simulation]
 servo_period = 0.001
 scheduler_period = 0.01
+[feed_hold]
+tangential_acceleration = 5.0
+tangential_jerk = 25.0
 [jogging]
 acceleration = 5.0
 jerk = 25.0
@@ -2017,6 +2020,129 @@ final_move_together = true
                 "mock diagnostics should distinguish the executed stop tail");
     }
 
+    void testMockBackendFeedHoldBrakesAlongActiveTrajectory() {
+        ngc::TrajectoryLimits limits;
+        limits.pathAcceleration = 4.0;
+        limits.axisAcceleration = ngc::position_t { 4.0, 4.0, 4.0, 4.0, 4.0, 4.0 };
+        ngc::MockMotionBackend backend(
+            ngc::FeedHoldConfiguration { 2.0, 10.0 }, limits);
+
+        ngc::PlanChunk chunk;
+        chunk.epoch = 17;
+        chunk.id = 31;
+        chunk.branch = 41;
+        require(chunk.normalMotion.push(linearSpan(201, 0.0, 10.0, 10.0)),
+                "feed-hold test normal span should fit");
+        auto stop = linearSpan(202, 10.0, 10.0, 1e-6);
+        stop.end.position.x = 10.0;
+        require(chunk.stopTail.push(stop), "feed-hold test stop tail should fit");
+        chunk.branchState = chunk.normalMotion[0].end;
+        chunk.stopState.position.x = 10.0;
+
+        require(backend.tryPublish(chunk) == ngc::PublishResult::Published,
+                "feed-hold test chunk should publish");
+        require(backend.trySubmit(ngc::StartRequest { 1, 17 }) == ngc::SubmitResult::Submitted,
+                "feed-hold test should submit start");
+        backend.advanceTick(0.5, true);
+        ngc::ExecutionSnapshot snapshot;
+        while(backend.tryTakeSnapshot(snapshot)) { }
+        const auto holdStart = snapshot.commanded;
+        requireNear(holdStart.position.x, 0.5,
+                    "feed hold should begin from the currently executed position");
+
+        require(backend.trySubmit(ngc::FeedHoldRequest { 2 }) == ngc::SubmitResult::Submitted,
+                "feed-hold request should fit in the control channel");
+        bool sawHolding = false;
+        bool sawVelocityReduction = false;
+        for(int tick = 0; tick < 5000 && snapshot.state != ngc::BackendState::Held; ++tick) {
+            backend.advanceTick(0.001, true);
+            while(backend.tryTakeSnapshot(snapshot)) {
+                sawHolding = sawHolding || snapshot.state == ngc::BackendState::Holding;
+                sawVelocityReduction = sawVelocityReduction
+                    || (snapshot.commanded.velocity.x > 0.0
+                        && snapshot.commanded.velocity.x < holdStart.velocity.x - 1e-8);
+                require(std::abs(snapshot.commanded.acceleration.x) <= 4.0 + 1e-8,
+                        "feed hold should preserve the configured X acceleration limit");
+                require(snapshot.executionRate >= -1e-12 && snapshot.executionRate <= 1.0 + 1e-12,
+                        "feed-hold execution rate should remain bounded");
+            }
+        }
+        require(sawHolding, "feed hold should expose a moving Holding state");
+        require(sawVelocityReduction, "feed hold should reduce velocity before becoming held");
+        require(snapshot.state == ngc::BackendState::Held,
+                "feed hold should reach a stationary backend state");
+        require(snapshot.commanded.position.x > holdStart.position.x
+                && snapshot.commanded.position.x < 10.0,
+                "feed hold should brake forward on normal motion before its branch");
+        require(std::abs(snapshot.commanded.velocity.x) <= 1e-12
+                && std::abs(snapshot.commanded.acceleration.x) <= 1e-12,
+                "BackendHeld should publish zero velocity and acceleration");
+
+        bool sawFeedHeld = false;
+        bool selectedStopTail = false;
+        ngc::ExecutionEvent event;
+        while(backend.tryTakeEvent(event)) {
+            if(const auto *held = std::get_if<ngc::BackendHeld>(&event))
+                sawFeedHeld = held->reason == ngc::BackendHoldReason::FeedHold;
+            if(const auto *branch = std::get_if<ngc::BranchSelected>(&event))
+                selectedStopTail = branch->choice == ngc::BranchChoice::Stop;
+        }
+        require(sawFeedHeld, "feed hold should identify its held-state reason");
+        require(!selectedStopTail,
+                "a feed hold completed inside normal motion should not select the stop tail");
+
+        const auto samples = backend.takeExecutedJerkSamples();
+        require(std::ranges::any_of(samples, [](const auto &sample) {
+                    return sample.feedHolding && sample.executionRate < 1.0;
+                }),
+                "mock servo telemetry should retain feed-hold execution-rate samples");
+    }
+
+    void testSimulationWorkerFeedHoldReachesPausedAtRest() {
+        const auto configuration = ngc::loadMachineConfiguration("machine.toml");
+        require(configuration.has_value(), configuration ? "" : configuration.error());
+        SimulationWorker worker(*configuration);
+        ngc::ToolTable tools;
+        const std::vector<std::tuple<std::string, std::string>> program {
+            { "G1 F60 G53 X10\n", "feed-hold-worker.ngc" },
+        };
+        require(worker.start(program, tools, true),
+                "feed-hold worker regression should start a program");
+
+        auto snapshot = worker.snapshot();
+        for(int attempt = 0; attempt < 10000
+            && !(snapshot.status == ngc::SimulationStatus::Running
+                 && snapshot.trajectoryBackendVelocity > 1e-4); ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(snapshot.status == ngc::SimulationStatus::Running
+                && snapshot.trajectoryBackendVelocity > 1e-4,
+                "feed-hold worker regression should observe active program motion");
+        const auto holdStart = snapshot.machinePosition.x;
+        require(worker.feedHold(), "active program motion should accept Feed Hold");
+
+        bool sawHolding = false;
+        for(int attempt = 0; attempt < 10000
+            && snapshot.status != ngc::SimulationStatus::Paused
+            && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+            sawHolding = sawHolding || snapshot.status == ngc::SimulationStatus::Holding;
+        }
+        require(snapshot.status == ngc::SimulationStatus::Paused,
+                std::format("feed hold should reach Paused rather than freezing or failing: {}",
+                            snapshot.error));
+        require(sawHolding, "SimulationWorker should expose Holding while the backend brakes");
+        require(snapshot.machinePosition.x > holdStart && snapshot.machinePosition.x < 10.0,
+                "SimulationWorker feed hold should stop forward on the active path");
+        require(snapshot.trajectoryBackendVelocity <= 1e-10
+                && snapshot.trajectoryBackendAcceleration <= 1e-10,
+                "SimulationWorker should publish Paused only at rest");
+        worker.stop();
+        worker.join();
+    }
+
     void testJogControlUsesBoundedBackendTransport() {
         const ngc::JogTarget group {
             .type = ngc::JogTargetType::JointGroup,
@@ -3461,6 +3587,9 @@ final_move_together = true
         require(configuration->jogging.acceleration>0.0
                     &&configuration->jogging.jerk>0.0,
                 "machine configuration should load positive global jog limits");
+        require(configuration->feedHold.tangentialAcceleration > 0.0
+                    && configuration->feedHold.tangentialJerk > 0.0,
+                "machine configuration should load positive feed-hold braking limits");
 
         require(!configuration->coordinates.empty(),
                 "machine configuration should load at least one logical coordinate");
@@ -3875,6 +4004,8 @@ int main() {
         testAdaptivePocketsGeometryPreviewAvoidsTrajectoryExecution();
         testIncrementalGeometryDefersAndDoesNotRebuildAnchorSection();
         testSimulationDriverFailureAppearsInGuiStatusStream();
+        testMockBackendFeedHoldBrakesAlongActiveTrajectory();
+        testSimulationWorkerFeedHoldReachesPausedAtRest();
         test1001PreviewCompletesBoundedly();
         testSingleShortEntityClusterRetainsMidpointControl();
         test1002PreparedSliceBoundaries();
