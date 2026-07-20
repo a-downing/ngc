@@ -1,5 +1,8 @@
 #include "pendant/VistaCncP2sProfile.h"
 
+#include <algorithm>
+#include <cmath>
+#include <cstdlib>
 #include <type_traits>
 
 namespace ngc::pendant::vista_cnc_p2s {
@@ -44,6 +47,14 @@ namespace ngc::pendant::vista_cnc_p2s {
         }
     }
 
+    void Profile::resetVelocityEstimator() noexcept {
+        m_velocityDirection = 0;
+        m_lastVelocityCountsPerSecond = 0;
+        m_previousVelocityDetentTime.reset();
+        m_velocityDeadline.reset();
+        m_smoothedVelocityDetentPeriodSeconds = 0.0;
+    }
+
     std::vector<Intent> Profile::consume(const ManagerEvent &event) {
         std::vector<Intent> intents;
         std::visit([&](const auto &value) {
@@ -52,6 +63,7 @@ namespace ngc::pendant::vista_cnc_p2s {
                 initialize(m_snapshot, value.state);
                 m_snapshot.wheelArmed = false;
                 m_canArmWheel = value.state.wheelButton == WheelButton::Released;
+                resetVelocityEstimator();
                 intents.emplace_back(ConnectionChanged { true, {} });
                 intents.emplace_back(MachineOffChanged { m_snapshot.machineOff });
                 intents.emplace_back(EmergencyStopSwitchChanged { m_snapshot.emergencyStop });
@@ -90,7 +102,7 @@ namespace ngc::pendant::vista_cnc_p2s {
                 if(selectionChanged || safetyLevelChanged) m_snapshot.wheelArmed = false;
                 if(selectionChanged || safetyLevelChanged
                    || m_snapshot.wheelButton != WheelButton::Pressed)
-                    m_velocityDirection = 0;
+                    resetVelocityEstimator();
                 if(m_snapshot.machineOff != previous.machineOff)
                     intents.emplace_back(MachineOffChanged { m_snapshot.machineOff });
                 if(m_snapshot.emergencyStop != previous.emergencyStop)
@@ -115,7 +127,6 @@ namespace ngc::pendant::vista_cnc_p2s {
                     && !m_snapshot.rightSelectorTransient && !selectionChanged && !safetyLevelChanged;
                 const auto wheelChanged = contains(value.changes, InputChange::Wheel)
                     && value.state.wheelDelta != 0;
-                if(wheelChanged) m_velocityDirection = value.state.wheelDelta < 0 ? -1 : 1;
                 if(actionsAllowed && wheelChanged && m_snapshot.mode == Mode::Step
                    && m_snapshot.selectedAxis) {
                     const auto increment = m_snapshot.wheelButton == WheelButton::Pressed
@@ -128,15 +139,72 @@ namespace ngc::pendant::vista_cnc_p2s {
                 const auto wheelActionsAllowed = actionsAllowed
                     && m_snapshot.wheelButton == WheelButton::Pressed && m_snapshot.wheelArmed;
                 const auto velocityChanged = wheelChanged
-                    || contains(value.changes, InputChange::WheelRate);
+                    || contains(value.changes, InputChange::WheelRate)
+                    || contains(value.changes, InputChange::WheelMotionAccumulator);
                 if(wheelActionsAllowed && velocityChanged && m_snapshot.mode == Mode::Velocity
                    && m_snapshot.selectedAxis) {
-                    constexpr std::int32_t RATE_CODE_TO_COUNTS_PER_SECOND = 4;
-                    intents.emplace_back(JogVelocity {
-                        *m_snapshot.selectedAxis,
-                        m_velocityDirection * static_cast<std::int32_t>(value.state.wheelRateCode)
-                            * RATE_CODE_TO_COUNTS_PER_SECOND,
-                    });
+                    using Seconds = std::chrono::duration<double>;
+                    constexpr double SMOOTHING_PREVIOUS_WEIGHT = 0.5;
+                    constexpr double MAX_PAIR_PERIOD_SECONDS = 0.3;
+                    constexpr double MIN_DEADLINE_SECONDS = 0.05;
+                    constexpr double MAX_DEADLINE_SECONDS = 0.2;
+                    constexpr double DEADLINE_PERIODS = 1.5;
+
+                    if(wheelChanged) {
+                        const auto direction = value.state.wheelDelta < 0 ? -1 : 1;
+                        const auto elapsedSeconds = m_previousVelocityDetentTime
+                            ? Seconds(value.arrivalTime - *m_previousVelocityDetentTime).count()
+                            : 0.0;
+                        const auto sameDirection = direction == m_velocityDirection;
+                        const auto haveUsablePair = sameDirection && elapsedSeconds > 0.0
+                            && elapsedSeconds <= MAX_PAIR_PERIOD_SECONDS;
+                        if(!haveUsablePair) {
+                            const auto wasMoving = m_lastVelocityCountsPerSecond != 0;
+                            resetVelocityEstimator();
+                            m_velocityDirection = direction;
+                            m_previousVelocityDetentTime = value.arrivalTime;
+                            m_velocityDeadline = value.arrivalTime
+                                + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                    Seconds(MAX_PAIR_PERIOD_SECONDS));
+                            if(wasMoving)
+                                intents.emplace_back(JogVelocity {
+                                    *m_snapshot.selectedAxis, 0,
+                                });
+                        } else {
+                            const auto counts = std::abs(
+                                static_cast<int>(value.state.wheelDelta));
+                            const auto samplePeriod = elapsedSeconds / counts;
+                            m_smoothedVelocityDetentPeriodSeconds
+                                = m_smoothedVelocityDetentPeriodSeconds > 0.0
+                                ? SMOOTHING_PREVIOUS_WEIGHT
+                                        * m_smoothedVelocityDetentPeriodSeconds
+                                    + (1.0 - SMOOTHING_PREVIOUS_WEIGHT) * samplePeriod
+                                : samplePeriod;
+                            m_velocityDirection = direction;
+                            m_previousVelocityDetentTime = value.arrivalTime;
+                            m_lastVelocityCountsPerSecond = direction
+                                * std::max(1, static_cast<int>(std::lround(
+                                    1.0 / m_smoothedVelocityDetentPeriodSeconds)));
+                            const auto deadlineSeconds = std::clamp(
+                                DEADLINE_PERIODS * m_smoothedVelocityDetentPeriodSeconds,
+                                MIN_DEADLINE_SECONDS, MAX_DEADLINE_SECONDS);
+                            m_velocityDeadline = value.arrivalTime
+                                + std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+                                    Seconds(deadlineSeconds));
+                            intents.emplace_back(JogVelocity {
+                                *m_snapshot.selectedAxis, m_lastVelocityCountsPerSecond,
+                            });
+                        }
+                    } else if(m_velocityDeadline && value.arrivalTime >= *m_velocityDeadline) {
+                        const auto wasMoving = m_lastVelocityCountsPerSecond != 0;
+                        resetVelocityEstimator();
+                        if(wasMoving)
+                            intents.emplace_back(JogVelocity { *m_snapshot.selectedAxis, 0 });
+                    } else if(m_lastVelocityCountsPerSecond != 0) {
+                        intents.emplace_back(JogVelocity {
+                            *m_snapshot.selectedAxis, m_lastVelocityCountsPerSecond,
+                        });
+                    }
                 }
                 if(wheelActionsAllowed && wheelChanged) {
                     if(m_snapshot.mode == Mode::Zero && m_snapshot.selectedAxis)
@@ -154,12 +222,14 @@ namespace ngc::pendant::vista_cnc_p2s {
                 m_snapshot.connected = false;
                 m_snapshot.wheelArmed = false;
                 m_canArmWheel = false;
+                resetVelocityEstimator();
                 intents.emplace_back(CancelPendantActivity { CancelReason::Disconnected });
                 intents.emplace_back(ConnectionChanged { false, value.error.message });
             } else if constexpr(std::same_as<T, Stopped>) {
                 m_snapshot.connected = false;
                 m_snapshot.wheelArmed = false;
                 m_canArmWheel = false;
+                resetVelocityEstimator();
                 intents.emplace_back(CancelPendantActivity { CancelReason::Stopped });
                 intents.emplace_back(ConnectionChanged { false, {} });
             }

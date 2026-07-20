@@ -13,6 +13,8 @@ namespace ngc::pendant::vista_cnc_p2s {
             if(current.machineOff != previous.machineOff) changes |= InputChange::MachineOff;
             if(current.emergencyStop != previous.emergencyStop) changes |= InputChange::EmergencyStop;
             if(current.wheelRateCode != previous.wheelRateCode) changes |= InputChange::WheelRate;
+            if(current.wheelMotionAccumulator != previous.wheelMotionAccumulator)
+                changes |= InputChange::WheelMotionAccumulator;
             return changes;
         }
 
@@ -115,6 +117,7 @@ namespace ngc::pendant::vista_cnc_p2s {
                 return;
             }
 
+            const auto arrivalTime = std::chrono::steady_clock::now();
             ++reportSequence;
             if(input->wheelDeltaValid) cumulativeWheelCounts += input->wheelDelta;
             if(!previous) {
@@ -126,7 +129,7 @@ namespace ngc::pendant::vista_cnc_p2s {
                     m_snapshot.state = *input;
                     m_snapshot.error.reset();
                 }
-                publish(Connected { reportSequence, cumulativeWheelCounts, *input });
+                publish(Connected { reportSequence, cumulativeWheelCounts, *input, arrivalTime });
             } else {
                 const auto changes = changesBetween(*previous, *input);
                 {
@@ -136,7 +139,9 @@ namespace ngc::pendant::vista_cnc_p2s {
                     m_snapshot.state = *input;
                 }
                 if(changes != InputChange::None)
-                    publish(InputChanged { reportSequence, cumulativeWheelCounts, changes, *input });
+                    publish(InputChanged {
+                        reportSequence, cumulativeWheelCounts, changes, *input, arrivalTime,
+                    });
             }
             previous = *input;
         }

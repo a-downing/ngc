@@ -53,7 +53,7 @@ Byte 1 was decoded with released/held-button captures in both directions and at 
 
 Bytes 4-5 are not required to recover direction or rate. The isolated-detent decay sequence was `0x0222`, `0x01ec`, `0x01b3`, `0x017d`, `0x0147`, `0x0111`, `0x00db`, `0x00a5`, `0x006c`, `0x0036`, and zero at roughly 50 ms intervals. Fast rotation reached the 16-bit boundary and wrapped, so this field cannot safely be interpreted as an absolute speed command.
 
-NGC Velocity mode therefore uses signed byte-0 direction and the byte-1 rate code. Motion requires a fresh ordinary wheel-button press, rate zero requests a constrained stop, button release independently requests a stop, and a backend dead-man lease stops motion if reports or renewals cease.
+NGC Velocity mode therefore timestamps signed byte-0 detents at receipt rather than using the quantized byte-1 rate code. Motion requires a fresh ordinary wheel-button press and two same-direction detent reports close enough to measure an interval. Later detents update a smoothed interval-derived velocity. Byte 4-5 accumulator changes provide periodic opportunities to renew the command or detect a missed-detent deadline, but their magnitude does not determine or prolong velocity. Direction reversal resets the estimator and requires a new pair; button release independently requests a stop, and the backend dead-man lease stops motion if reports or renewals cease.
 
 ## Capture procedure
 

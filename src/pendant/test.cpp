@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <cstdint>
 #include <iostream>
@@ -262,8 +263,8 @@ namespace {
         auto transport = std::make_unique<MockHidTransport>();
         transport->inputs = {
             { 0, 10, 0, 0x01, 0x01, 0, 0, 0, 0 },
-            { 0, 12, 0, 0x41, 0x01, 0, 0, 0, 0 },
-            { 0, 12, 0, 0x41, 0x11, 0, 0, 0, 0 },
+            { 0, 12, 0, 0x41, 0x01, 0x02, 0x22, 0, 0 },
+            { 0, 12, 0, 0x41, 0x11, 0x02, 0x22, 0, 0 },
         };
         auto driver = std::make_unique<protocol::Driver>(std::move(transport));
         protocol::Manager manager(std::move(driver));
@@ -271,7 +272,8 @@ namespace {
         auto event = manager.waitTakeEvent(std::chrono::seconds(1));
         const auto *connected = event ? std::get_if<protocol::Connected>(&*event) : nullptr;
         require(connected && connected->reportSequence == 1
-                && connected->cumulativeWheelCounts == 0,
+                && connected->cumulativeWheelCounts == 0
+                && connected->arrivalTime.time_since_epoch().count() != 0,
                 "manager should publish the initial decoded state as a connection event");
 
         event = manager.waitTakeEvent(std::chrono::seconds(1));
@@ -280,7 +282,9 @@ namespace {
                 && changed->cumulativeWheelCounts == 2,
                 "manager should preserve ordered cumulative wheel counts");
         require(protocol::contains(changed->changes, protocol::InputChange::Wheel)
-                && protocol::contains(changed->changes, protocol::InputChange::WheelButton),
+                && protocol::contains(changed->changes, protocol::InputChange::WheelButton)
+                && protocol::contains(
+                    changed->changes, protocol::InputChange::WheelMotionAccumulator),
                 "manager should report every meaningful change from one input report atomically");
         require(!protocol::contains(changed->changes, protocol::InputChange::LeftSelector),
                 "manager should not mark unchanged controls");
@@ -557,8 +561,11 @@ namespace {
                 "a later held wheel movement should continue using the coarse increment");
     }
 
-    void testProfileDecodesHeldVelocityModeRateAndStop() {
+    void testProfileEstimatesHeldVelocityFromDetentTiming() {
         namespace protocol = ngc::pendant::vista_cnc_p2s;
+        const auto at = [](const std::int64_t milliseconds) {
+            return std::chrono::steady_clock::time_point(std::chrono::milliseconds(milliseconds));
+        };
         protocol::Profile profile;
         protocol::InputState state;
         state.leftSelector = protocol::LeftSelector::Velocity;
@@ -573,26 +580,57 @@ namespace {
         state.wheelDeltaValid = true;
         state.wheelDelta = -1;
         state.wheelRateCode = 5;
+        state.wheelMotionAccumulator = 0x0222;
         auto intents = profile.consume(protocol::InputChanged {
-            3, -1, protocol::InputChange::Wheel | protocol::InputChange::WheelRate, state,
+            3, -1, protocol::InputChange::Wheel | protocol::InputChange::WheelRate
+                | protocol::InputChange::WheelMotionAccumulator, state, at(10),
         });
-        const auto *velocity = findIntent<ngc::pendant::JogVelocity>(intents);
-        require(velocity && velocity->axis == ngc::pendant::Axis::X
-                && velocity->countsPerSecond == -20,
-                "P2-S rate code should decode to signed counts per second while held");
+        auto *velocity = findIntent<ngc::pendant::JogVelocity>(intents);
+        require(!velocity,
+                "the first velocity-mode detent should only prime the timing estimator");
 
         state.wheelDelta = 0;
         state.wheelRateCode = 0;
+        state.wheelMotionAccumulator = 0x01ec;
         intents = profile.consume(protocol::InputChanged {
-            4, -1, protocol::InputChange::WheelRate, state,
+            4, -1, protocol::InputChange::WheelRate
+                | protocol::InputChange::WheelMotionAccumulator, state, at(60),
+        });
+        velocity = findIntent<ngc::pendant::JogVelocity>(intents);
+        require(!velocity,
+                "firmware decay alone should not turn one detent into velocity motion");
+
+        state.wheelDelta = -1;
+        state.wheelMotionAccumulator = 0x02f0;
+        intents = profile.consume(protocol::InputChanged {
+            5, -2, protocol::InputChange::Wheel
+                | protocol::InputChange::WheelMotionAccumulator, state, at(110),
+        });
+        velocity = findIntent<ngc::pendant::JogVelocity>(intents);
+        require(velocity && velocity->axis == ngc::pendant::Axis::X
+                && velocity->countsPerSecond == -10,
+                "two detents 100 ms apart should start a 10-count-per-second jog");
+
+        state.wheelDelta = 0;
+        state.wheelMotionAccumulator = 0x02ba;
+        intents = profile.consume(protocol::InputChanged {
+            6, -2, protocol::InputChange::WheelMotionAccumulator, state, at(160),
+        });
+        velocity = findIntent<ngc::pendant::JogVelocity>(intents);
+        require(velocity && velocity->countsPerSecond == -10,
+                "accumulator reports before the missed-detent deadline should renew the lease");
+
+        state.wheelMotionAccumulator = 0x0214;
+        intents = profile.consume(protocol::InputChanged {
+            7, -2, protocol::InputChange::WheelMotionAccumulator, state, at(260),
         });
         velocity = findIntent<ngc::pendant::JogVelocity>(intents);
         require(velocity && velocity->countsPerSecond == 0,
-                "P2-S zero rate code should stop velocity jogging without waiting for release");
+                "missing the next expected detent should stop without waiting for accumulator zero");
 
         state.wheelButton = protocol::WheelButton::Released;
         intents = profile.consume(protocol::InputChanged {
-            5, -1, protocol::InputChange::WheelButton, state,
+            8, -2, protocol::InputChange::WheelButton, state, at(270),
         });
         const auto *cancel = findIntent<ngc::pendant::CancelPendantActivity>(intents);
         require(cancel && cancel->reason == ngc::pendant::CancelReason::ButtonReleased,
@@ -612,7 +650,7 @@ int main() {
         testProfileMapsVerifiedWheelModesConservatively();
         testProfileMapsTouchOffFeedOverrideAndSafetyLevels();
         testProfileStepModeUsesHeldStateImmediatelyAfterConnection();
-        testProfileDecodesHeldVelocityModeRateAndStop();
+        testProfileEstimatesHeldVelocityFromDetentTiming();
     } catch(const std::exception &error) {
         std::cerr << "ngc_pendant_tests failed: " << error.what() << '\n';
         return 1;

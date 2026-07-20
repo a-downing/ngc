@@ -26,6 +26,7 @@ namespace ngc::pendant::vista_cnc_p2s {
         MachineOff = 1 << 4,
         EmergencyStop = 1 << 5,
         WheelRate = 1 << 6,
+        WheelMotionAccumulator = 1 << 7,
     };
 
     constexpr InputChange operator|(const InputChange left, const InputChange right) noexcept {
@@ -46,6 +47,7 @@ namespace ngc::pendant::vista_cnc_p2s {
         std::uint64_t reportSequence = 0;
         std::int64_t cumulativeWheelCounts = 0;
         InputState state;
+        std::chrono::steady_clock::time_point arrivalTime{};
     };
 
     struct InputChanged {
@@ -53,6 +55,7 @@ namespace ngc::pendant::vista_cnc_p2s {
         std::int64_t cumulativeWheelCounts = 0;
         InputChange changes = InputChange::None;
         InputState state;
+        std::chrono::steady_clock::time_point arrivalTime{};
     };
 
     struct Disconnected { HidError error; };
