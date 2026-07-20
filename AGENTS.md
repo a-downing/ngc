@@ -164,6 +164,8 @@ Mock probing and homing policy stay outside `MotionBackend`. Synthetic mock inpu
 
 Jogging uses the bounded backend control/event channel, never generated G-code or `ExecutionItem`. Continuous jogs require renewal of a stable token before a fixed-tick dead-man lease expires; expiry and UI release request a constrained stop. Axis, coupled-joint-group, and individual-joint targets are mutually exclusive with other motion ownership. `SimulationWorker` is the sole NRT producer of mock jog controls; the GUI must not write directly to the backend. The backend lease remains authoritative if UI renewal stops.
 
+Program feed hold is backend-owned motion, not a frozen NRT scheduler or servo clock. A hold request begins on-path braking on the next servo tick by retiming the precomputed trajectory, reports `Holding` while moving, and reports `Paused` only after `BackendHeld` establishes zero velocity and acceleration. A stop tail may be entered only at its validated branch state. The initial mock-only retimer constrains acceleration and its requested tangential braking profile while retaining executed per-axis and aggregate jerk as diagnostics; it does not establish a production jerk guarantee or resume contract.
+
 `MockTrajectoryDiagnostics` and executed-servo jerk samples are mock-only. They record states actually calculated at the configured servo period and must not be reconstructed by the GUI or added to `MotionBackend`. Keep the executed time-domain jerk diagnostic distinct from the prepared cluster's full geometric jerk coefficient and from normal sharpness.
 
 ## Preview and presentation

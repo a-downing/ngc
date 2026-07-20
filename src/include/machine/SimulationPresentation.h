@@ -13,7 +13,7 @@
 #include "machine/MotionBackend.h"
 
 namespace ngc {
-    enum class SimulationStatus { Stopped, Running, Paused, Completed, Error };
+    enum class SimulationStatus { Stopped, Running, Holding, Paused, Completed, Error };
 
     struct SimulationSnapshot {
         SimulationStatus status = SimulationStatus::Stopped;
@@ -52,6 +52,8 @@ namespace ngc {
         std::uint32_t trajectoryBackendFaultCode = 0;
         double trajectoryBackendVelocity = 0.0;
         double trajectoryBackendAcceleration = 0.0;
+        double trajectoryBackendExecutionRate = 1.0;
+        double trajectoryBackendExecutionRateAcceleration = 0.0;
         std::string trajectoryBackendSpanDetail;
         GeometryStreamDiagnostics geometryStream;
         bool hasActiveMotion = false;

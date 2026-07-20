@@ -155,6 +155,7 @@ namespace ngc {
             const auto *machine = document["machine"].as_table();
             const auto *trajectory = document["trajectory"].as_table();
             const auto *simulation = document["simulation"].as_table();
+            const auto *feedHold = document["feed_hold"].as_table();
             const auto *jogging = document["jogging"].as_table();
             const auto *axes = document["axes"].as_table();
             const auto *digitalInputs = document["digital_inputs"].as_table();
@@ -164,6 +165,7 @@ namespace ngc {
             if(!machine) return std::unexpected(configurationError(path, "machine", "missing table"));
             if(!trajectory) return std::unexpected(configurationError(path, "trajectory", "missing table"));
             if(!simulation) return std::unexpected(configurationError(path, "simulation", "missing table"));
+            if(!feedHold) return std::unexpected(configurationError(path, "feed_hold", "missing table"));
             if(!jogging) return std::unexpected(configurationError(path, "jogging", "missing table"));
             if(!axes) return std::unexpected(configurationError(path, "axes", "missing table"));
             if(!digitalInputs)
@@ -206,6 +208,9 @@ namespace ngc {
             const auto lookaheadDuration = positiveNumber(*trajectory, "lookahead_duration", path);
             const auto servoPeriod = positiveNumber(*simulation, "servo_period", path);
             const auto schedulerPeriod = positiveNumber(*simulation, "scheduler_period", path);
+            const auto feedHoldAcceleration = positiveNumber(
+                *feedHold, "tangential_acceleration", path);
+            const auto feedHoldJerk = positiveNumber(*feedHold, "tangential_jerk", path);
             const auto jogAcceleration = positiveNumber(*jogging, "acceleration", path);
             const auto jogJerk = positiveNumber(*jogging, "jerk", path);
             if(!acceleration) return std::unexpected(acceleration.error());
@@ -215,6 +220,8 @@ namespace ngc {
             if(!lookaheadDuration) return std::unexpected(lookaheadDuration.error());
             if(!servoPeriod) return std::unexpected(servoPeriod.error());
             if(!schedulerPeriod) return std::unexpected(schedulerPeriod.error());
+            if(!feedHoldAcceleration) return std::unexpected(feedHoldAcceleration.error());
+            if(!feedHoldJerk) return std::unexpected(feedHoldJerk.error());
             if(!jogAcceleration) return std::unexpected(jogAcceleration.error());
             if(!jogJerk) return std::unexpected(jogJerk.error());
             const auto schedulerTicks = *schedulerPeriod / *servoPeriod;
@@ -228,6 +235,7 @@ namespace ngc {
             result.trajectory.arcChordTolerance = *chordTolerance;
             result.trajectory.lookaheadDuration = *lookaheadDuration;
             result.simulation = { *servoPeriod, *schedulerPeriod };
+            result.feedHold = { *feedHoldAcceleration, *feedHoldJerk };
             result.jogging = { *jogAcceleration, *jogJerk };
 
             std::unordered_set<JointId> axisJointIds;

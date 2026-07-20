@@ -1352,6 +1352,7 @@ public:
         });
         const auto simulationCoordinates = m_simulation.snapshot();
         const auto continuingStatus=m_lastJerkCombStatus==ngc::SimulationStatus::Running
+            ||m_lastJerkCombStatus==ngc::SimulationStatus::Holding
             ||m_lastJerkCombStatus==ngc::SimulationStatus::Paused;
         const auto newSimulation=simulationCoordinates.status==ngc::SimulationStatus::Running
             &&(!continuingStatus
@@ -1405,6 +1406,7 @@ public:
             else *match = workCoordinateSystem;
         }
         const auto simulationActive = simulationCoordinates.status == ngc::SimulationStatus::Running
+            || simulationCoordinates.status == ngc::SimulationStatus::Holding
             || simulationCoordinates.status == ngc::SimulationStatus::Paused;
         if(simulationActive && simulationCoordinates.activeWorkCoordinateSystem) {
             coordinates.active = *simulationCoordinates.activeWorkCoordinateSystem;
@@ -1755,6 +1757,7 @@ public:
                               "Green is executed cubic path jerk; red is unused capacity.");
 
         const auto simulationActive = simulation.status == ngc::SimulationStatus::Running
+            || simulation.status == ngc::SimulationStatus::Holding
             || simulation.status == ngc::SimulationStatus::Paused;
         ImGui::SameLine();
         ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
@@ -1768,12 +1771,11 @@ public:
         }
         ImGui::EndDisabled();
         ImGui::SameLine();
-        ImGui::BeginDisabled(!simulationActive);
-        if(ImGui::Button(simulation.status == ngc::SimulationStatus::Paused ? "Resume" : "Pause")) {
-            if(simulation.status == ngc::SimulationStatus::Paused) m_simulation.resume();
-            else m_simulation.pause();
-        }
+        ImGui::BeginDisabled(simulation.status != ngc::SimulationStatus::Running);
+        if(ImGui::Button("Feed Hold")) (void)m_simulation.feedHold();
+        ImGui::EndDisabled();
         ImGui::SameLine();
+        ImGui::BeginDisabled(!simulationActive);
         if(ImGui::Button("Stop")) m_simulation.stop();
         ImGui::EndDisabled();
 
@@ -1944,6 +1946,7 @@ public:
         ImGui::SetNextItemWidth(std::max(1.0f, ImGui::GetContentRegionAvail().x - buttonWidth
                                                - ImGui::GetStyle().ItemSpacing.x));
         const auto simulationActive = simulation.status == ngc::SimulationStatus::Running
+            || simulation.status == ngc::SimulationStatus::Holding
             || simulation.status == ngc::SimulationStatus::Paused;
         ImGui::BeginDisabled(simulationActive);
         const auto submittedWithEnter = ImGui::InputText("##mdi_input", &m_mdiInput,
@@ -2050,6 +2053,7 @@ public:
         ImGui::Separator();
 
         const auto otherMotion = (simulation.status == ngc::SimulationStatus::Running
+                                  || simulation.status == ngc::SimulationStatus::Holding
                                   || simulation.status == ngc::SimulationStatus::Paused)
             && !simulation.jogging;
         bool heldThisFrame = false;
@@ -2205,6 +2209,7 @@ public:
             switch(simulation.status) {
                 case ngc::SimulationStatus::Stopped: return "Stopped";
                 case ngc::SimulationStatus::Running: return "Running";
+                case ngc::SimulationStatus::Holding: return "Holding";
                 case ngc::SimulationStatus::Paused: return "Paused";
                 case ngc::SimulationStatus::Completed: return "Completed";
                 case ngc::SimulationStatus::Error: return "Error";
@@ -2256,13 +2261,15 @@ public:
                     case ngc::BackendState::Disabled: return "Disabled";
                     case ngc::BackendState::Held: return "Held";
                     case ngc::BackendState::Running: return "Running";
+                    case ngc::BackendState::Holding: return "Holding";
                     case ngc::BackendState::Faulted: return "Faulted";
                 }
                 return "Unknown";
             };
             diagnosticText+=std::format(
                 "\nTrajectory backend: {} epoch={} chunk={} span={} progress={:.6f} "
-                "velocity={:.6g} acceleration={:.6g} branch={} fault={}\n"
+                "velocity={:.6g} acceleration={:.6g} rate={:.6f} rate-accel={:.6g} "
+                "branch={} fault={}\n"
                 "Committed normal motion: {:.6f} s (active {:.6f} s + queued {:.6f} s, "
                 "{} items)    Stop branch: {:.6f} s",
                 backendState(simulation.trajectoryBackendState),
@@ -2270,6 +2277,8 @@ public:
                 simulation.trajectoryBackendSpan,simulation.trajectoryBackendSpanProgress,
                 simulation.trajectoryBackendVelocity,
                 simulation.trajectoryBackendAcceleration,
+                simulation.trajectoryBackendExecutionRate,
+                simulation.trajectoryBackendExecutionRateAcceleration,
                 simulation.trajectoryBackendLastBranch,simulation.trajectoryBackendFaultCode,
                 simulation.trajectoryBackendCommittedNormalSeconds,
                 simulation.trajectoryBackendActiveNormalRemainingSeconds,

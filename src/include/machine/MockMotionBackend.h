@@ -3,13 +3,15 @@
 #include <memory>
 
 #include "machine/MotionBackend.h"
+#include "machine/MachineConfiguration.h"
 #include "machine/MockTrajectoryDiagnostics.h"
 
 namespace ngc {
     class MockMotionBackend final : public MotionBackend, public SimulatedClockControl,
                                     public MockTrajectoryDiagnostics {
     public:
-        MockMotionBackend();
+        explicit MockMotionBackend(const FeedHoldConfiguration &feedHold = {},
+                                   const TrajectoryLimits &trajectory = {});
         ~MockMotionBackend() override;
         MockMotionBackend(const MockMotionBackend &) = delete;
         MockMotionBackend &operator=(const MockMotionBackend &) = delete;

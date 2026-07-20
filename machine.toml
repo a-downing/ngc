@@ -21,6 +21,14 @@ servo_period = 0.001
 # seconds between Windows mock-executor scheduler wakes (100 Hz)
 scheduler_period = 0.01
 
+[feed_hold]
+# Experimental mock-backend on-path feed hold. These bound the requested
+# tangential braking profile; full and per-axis executed jerk are diagnostic.
+# machine-units / second^2
+tangential_acceleration = 5.0
+# machine-units / second^3
+tangential_jerk = 25.0
+
 [jogging]
 # Global reduced limits used while accelerating into a jog.
 # Controlled jogging stops use the configured physical axis/joint limits.
