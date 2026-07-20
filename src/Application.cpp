@@ -1773,8 +1773,15 @@ public:
         }
         ImGui::EndDisabled();
         ImGui::SameLine();
-        ImGui::BeginDisabled(simulation.status != ngc::SimulationStatus::Running);
-        if(ImGui::Button("Feed Hold")) (void)m_simulation.feedHold();
+        const auto feedControlAvailable = simulation.status == ngc::SimulationStatus::Paused
+            || (simulation.status == ngc::SimulationStatus::Running
+                && simulation.trajectoryBackendExecutionRate >= 1.0 - 1e-10);
+        ImGui::BeginDisabled(!feedControlAvailable);
+        if(ImGui::Button(simulation.status == ngc::SimulationStatus::Paused
+                         ? "Resume" : "Feed Hold")) {
+            if(simulation.status == ngc::SimulationStatus::Paused) (void)m_simulation.resume();
+            else (void)m_simulation.feedHold();
+        }
         ImGui::EndDisabled();
         ImGui::SameLine();
         ImGui::BeginDisabled(!simulationActive);

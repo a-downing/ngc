@@ -2091,11 +2091,252 @@ final_move_together = true
         require(!selectedStopTail,
                 "a feed hold completed inside normal motion should not select the stop tail");
 
+        const auto heldPosition = snapshot.commanded.position.x;
+        require(backend.trySubmit(ngc::ResumeRequest { 3, 17 }) == ngc::SubmitResult::Submitted,
+                "held normal motion should accept a resume request");
+        bool sawResumeAcceleration = false;
+        bool resumeAccepted = false;
+        for(int tick = 0; tick < 5000
+            && !(snapshot.state == ngc::BackendState::Running
+                 && snapshot.executionRate >= 1.0 - 1e-10); ++tick) {
+            backend.advanceTick(0.001, true);
+            while(backend.tryTakeSnapshot(snapshot)) {
+                sawResumeAcceleration = sawResumeAcceleration
+                    || (snapshot.executionRate > 0.0
+                        && snapshot.executionRate < 1.0
+                        && snapshot.executionRateAcceleration > 0.0);
+                require(snapshot.commanded.position.x + 1e-12 >= heldPosition,
+                        "feed resume should continue from the held normal-motion cursor");
+                require(std::abs(snapshot.commanded.acceleration.x) <= 4.0 + 1e-8,
+                        "feed resume should preserve the configured X acceleration limit");
+            }
+            while(backend.tryTakeEvent(event)) {
+                if(const auto *completed = std::get_if<ngc::RequestCompleted>(&event))
+                    if(completed->request == 3) resumeAccepted = completed->succeeded;
+            }
+        }
+        require(resumeAccepted, "backend should acknowledge feed resume");
+        require(sawResumeAcceleration,
+                "feed resume should accelerate through an intermediate execution rate");
+        require(snapshot.state == ngc::BackendState::Running
+                && snapshot.executionRate >= 1.0 - 1e-10,
+                "feed resume should restore the normal execution rate");
+        require(snapshot.commanded.position.x > heldPosition,
+                "feed resume should advance along the retained normal branch");
+
         const auto samples = backend.takeExecutedJerkSamples();
         require(std::ranges::any_of(samples, [](const auto &sample) {
                     return sample.feedHolding && sample.executionRate < 1.0;
                 }),
                 "mock servo telemetry should retain feed-hold execution-rate samples");
+        require(std::ranges::any_of(samples, [](const auto &sample) {
+                    return !sample.feedHolding && sample.executionRate > 0.0
+                        && sample.executionRate < 1.0
+                        && sample.executionRateAcceleration > 0.0;
+                }),
+                "mock servo telemetry should retain feed-resume acceleration samples");
+    }
+
+    void testMockBackendFeedHoldStopBranchIsFatal() {
+        ngc::TrajectoryLimits limits;
+        limits.pathAcceleration = 4.0;
+        limits.axisAcceleration = ngc::position_t { 4.0, 4.0, 4.0, 4.0, 4.0, 4.0 };
+        ngc::MockMotionBackend backend(
+            ngc::FeedHoldConfiguration { 0.01, 0.1 }, limits);
+
+        ngc::PlanChunk chunk;
+        chunk.epoch = 18;
+        chunk.id = 32;
+        chunk.branch = 42;
+        require(chunk.normalMotion.push(linearSpan(203, 0.0, 0.1, 0.1)),
+                "feed-hold branch-fault normal span should fit");
+        require(chunk.stopTail.push(linearSpan(204, 0.1, 0.1, 1e-6)),
+                "feed-hold branch-fault stop tail should fit");
+        chunk.branchState = chunk.normalMotion[0].end;
+        chunk.stopState = chunk.branchState;
+
+        require(backend.tryPublish(chunk) == ngc::PublishResult::Published,
+                "feed-hold branch-fault chunk should publish");
+        require(backend.trySubmit(ngc::StartRequest { 4, 18 }) == ngc::SubmitResult::Submitted,
+                "feed-hold branch-fault test should submit start");
+        backend.advanceTick(0.09, true);
+        require(backend.trySubmit(ngc::FeedHoldRequest { 5 }) == ngc::SubmitResult::Submitted,
+                "feed-hold branch-fault request should fit");
+
+        ngc::ExecutionSnapshot snapshot;
+        for(int tick = 0; tick < 1000 && snapshot.state != ngc::BackendState::Faulted; ++tick) {
+            backend.advanceTick(0.001, true);
+            while(backend.tryTakeSnapshot(snapshot)) { }
+        }
+        require(snapshot.state == ngc::BackendState::Faulted && snapshot.faultCode == 5,
+                "feed hold reaching a stop branch should be a fatal backend condition");
+
+        bool selectedStop = false;
+        bool sawFault = false;
+        bool sawHeld = false;
+        ngc::ExecutionEvent event;
+        while(backend.tryTakeEvent(event)) {
+            if(const auto *branch = std::get_if<ngc::BranchSelected>(&event))
+                selectedStop = branch->choice == ngc::BranchChoice::Stop;
+            if(const auto *fault = std::get_if<ngc::BackendFault>(&event))
+                sawFault = fault->code == 5;
+            sawHeld = sawHeld || std::holds_alternative<ngc::BackendHeld>(event);
+        }
+        require(selectedStop && sawFault && !sawHeld,
+                "feed-hold branch exhaustion should report STOP and fault without entering Held");
+        require(backend.trySubmit(ngc::ResumeRequest { 6, 18 }) == ngc::SubmitResult::Submitted,
+                "post-fault resume request should fit for rejection testing");
+        backend.advanceTick(0.0, true);
+        bool resumeRejected = false;
+        while(backend.tryTakeEvent(event))
+            if(const auto *completed = std::get_if<ngc::RequestCompleted>(&event))
+                if(completed->request == 6) resumeRejected = !completed->succeeded;
+        require(resumeRejected, "feed resume should be rejected after stop-branch failure");
+    }
+
+    void testMockBackendFeedHoldPausesAndResumesProbeApproach() {
+        ngc::MockMotionBackend backend;
+        const ngc::TriggeredMove probe {
+            .epoch = 19,
+            .id = 33,
+            .branch = 43,
+            .moveId = 53,
+            .target = { 10.0, 0.0, 0.0, 0.0, 0.0, 0.0 },
+            .limits = {
+                .velocity = { 1.0, 0.0, 0.0, 0.0, 0.0, 0.0 },
+                .acceleration = { 2.0, 0.0, 0.0, 0.0, 0.0, 0.0 },
+                .jerk = { 10.0, 0.0, 0.0, 0.0, 0.0, 0.0 },
+            },
+            .input = 0,
+            .condition = ngc::InputCondition::Active,
+            .triggerRequired = false,
+        };
+        require(backend.tryPublish(probe) == ngc::PublishResult::Published,
+                "probe feed-hold fixture should publish");
+        require(backend.trySubmit(ngc::StartRequest { 7, 19 }) == ngc::SubmitResult::Submitted,
+                "probe feed-hold fixture should start");
+        backend.advanceTick(0.5, true);
+        ngc::ExecutionSnapshot snapshot;
+        while(backend.tryTakeSnapshot(snapshot)) { }
+        require(snapshot.state == ngc::BackendState::Running
+                && snapshot.commanded.velocity.x > 0.0,
+                "probe approach should be moving before feed hold");
+
+        require(backend.trySubmit(ngc::FeedHoldRequest { 8 }) == ngc::SubmitResult::Submitted,
+                "moving probe approach should accept feed hold");
+        for(int tick = 0; tick < 5000 && snapshot.state != ngc::BackendState::Held; ++tick) {
+            backend.advanceTick(0.001, true);
+            while(backend.tryTakeSnapshot(snapshot)) { }
+        }
+        require(snapshot.state == ngc::BackendState::Held
+                && snapshot.commanded.velocity.length() <= 1e-12
+                && snapshot.commanded.acceleration.length() <= 1e-12,
+                "probe feed hold should reach a stationary held state");
+        const auto heldPosition = snapshot.commanded.position.x;
+
+        bool sawFeedHeld = false;
+        bool completedProbe = false;
+        bool selectedBranch = false;
+        bool holdAccepted = false;
+        ngc::ExecutionEvent event;
+        while(backend.tryTakeEvent(event)) {
+            if(const auto *held = std::get_if<ngc::BackendHeld>(&event))
+                sawFeedHeld = held->reason == ngc::BackendHoldReason::FeedHold;
+            completedProbe = completedProbe
+                || std::holds_alternative<ngc::TriggeredMoveCompleted>(event);
+            selectedBranch = selectedBranch || std::holds_alternative<ngc::BranchSelected>(event);
+            if(const auto *completed = std::get_if<ngc::RequestCompleted>(&event))
+                if(completed->request == 8) holdAccepted = completed->succeeded;
+        }
+        require(holdAccepted && sawFeedHeld && !completedProbe && !selectedBranch,
+                std::format("holding a probe should retain it without reporting completion or a "
+                            "branch (accepted={} held={} completed={} branch={} position={})",
+                            holdAccepted, sawFeedHeld, completedProbe, selectedBranch,
+                            snapshot.commanded.position.x));
+
+        require(backend.trySubmit(ngc::ResumeRequest { 9, 19 }) == ngc::SubmitResult::Submitted,
+                "held probe approach should accept resume");
+        bool resumeAccepted = false;
+        for(int tick = 0; tick < 5000
+            && !(snapshot.state == ngc::BackendState::Running
+                 && snapshot.commanded.velocity.x > 1e-4); ++tick) {
+            backend.advanceTick(0.001, true);
+            while(backend.tryTakeSnapshot(snapshot)) { }
+            while(backend.tryTakeEvent(event))
+                if(const auto *completed = std::get_if<ngc::RequestCompleted>(&event))
+                    if(completed->request == 9) resumeAccepted = completed->succeeded;
+        }
+        require(resumeAccepted && snapshot.state == ngc::BackendState::Running
+                && snapshot.commanded.velocity.x > 1e-4,
+                "probe resume should generate a new moving approach from rest");
+        require(snapshot.commanded.position.x >= heldPosition && snapshot.commanded.position.x < 10.0,
+                "probe resume should continue toward the original target from its held position");
+    }
+
+    void testMockBackendProbeContactDuringFeedHoldStopIsDetected() {
+        ngc::MockMotionBackend backend;
+        const ngc::TriggeredMove probe {
+            .epoch = 20,
+            .id = 34,
+            .branch = 44,
+            .moveId = 54,
+            .target = { 10.0, 0.0, 0.0, 0.0, 0.0, 0.0 },
+            .limits = {
+                .velocity = { 1.0, 0.0, 0.0, 0.0, 0.0, 0.0 },
+                .acceleration = { 2.0, 0.0, 0.0, 0.0, 0.0, 0.0 },
+                .jerk = { 10.0, 0.0, 0.0, 0.0, 0.0, 0.0 },
+            },
+            .input = 0,
+            .condition = ngc::InputCondition::Active,
+            .triggerRequired = true,
+        };
+        require(backend.tryPublish(probe) == ngc::PublishResult::Published,
+                "feed-hold contact fixture should publish");
+        require(backend.trySubmit(ngc::StartRequest { 10, 20 }) == ngc::SubmitResult::Submitted,
+                "feed-hold contact fixture should start");
+        backend.advanceTick(0.5, true);
+        ngc::ExecutionSnapshot snapshot;
+        while(backend.tryTakeSnapshot(snapshot)) { }
+        require(snapshot.commanded.velocity.x > 0.0,
+                "feed-hold contact fixture should be moving before hold");
+        const auto contactPosition = snapshot.commanded.position.x + 0.01;
+        require(backend.configureSyntheticInput(
+                    probe.moveId, { contactPosition, 0.0, 0.0, 0.0, 0.0, 0.0 }),
+                "feed-hold contact transition should fit");
+        require(backend.trySubmit(ngc::FeedHoldRequest { 11 }) == ngc::SubmitResult::Submitted,
+                "feed-hold contact request should fit");
+
+        for(int tick = 0; tick < 5000 && snapshot.state != ngc::BackendState::Held; ++tick) {
+            backend.advanceTick(0.001, true);
+            while(backend.tryTakeSnapshot(snapshot)) { }
+        }
+        require(snapshot.state == ngc::BackendState::Held,
+                "contact during feed-hold braking should finish in Held");
+
+        bool holdAccepted = false;
+        bool sawFeedHeld = false;
+        bool selectedStop = false;
+        std::optional<ngc::TriggeredMoveCompleted> completion;
+        ngc::ExecutionEvent event;
+        while(backend.tryTakeEvent(event)) {
+            if(const auto *completed = std::get_if<ngc::RequestCompleted>(&event))
+                if(completed->request == 11) holdAccepted = completed->succeeded;
+            if(const auto *held = std::get_if<ngc::BackendHeld>(&event))
+                sawFeedHeld = sawFeedHeld
+                    || held->reason == ngc::BackendHoldReason::FeedHold;
+            if(const auto *branch = std::get_if<ngc::BranchSelected>(&event))
+                selectedStop = selectedStop || branch->choice == ngc::BranchChoice::Stop;
+            if(const auto *triggered = std::get_if<ngc::TriggeredMoveCompleted>(&event))
+                completion = *triggered;
+        }
+        require(holdAccepted, "probe feed hold should be accepted before contact");
+        require(completion && completion->status == ngc::TriggeredMoveStatus::Triggered,
+                "contact sampled during feed-hold braking should complete the probe as triggered");
+        require(completion->triggerState.position.x + 1e-12 >= contactPosition
+                && completion->triggerState.position.x <= contactPosition + 0.0011,
+                "probe contact should latch at the first servo sample crossing the transition");
+        require(selectedStop && !sawFeedHeld,
+                "probe contact should supersede feed hold and complete through the probe branch");
     }
 
     void testSimulationWorkerFeedHoldReachesPausedAtRest() {
@@ -2139,7 +2380,120 @@ final_move_together = true
         require(snapshot.trajectoryBackendVelocity <= 1e-10
                 && snapshot.trajectoryBackendAcceleration <= 1e-10,
                 "SimulationWorker should publish Paused only at rest");
+        const auto heldPosition = snapshot.machinePosition.x;
+        require(worker.resume(), "a completed feed hold should accept Resume");
+        require(!worker.feedHold(),
+                "a second feed hold should wait until resume restores normal execution rate");
+        for(int attempt = 0; attempt < 10000
+            && !(snapshot.status == ngc::SimulationStatus::Running
+                 && snapshot.trajectoryBackendVelocity > 1e-4); ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(snapshot.status == ngc::SimulationStatus::Running
+                && snapshot.trajectoryBackendVelocity > 1e-4,
+                std::format("feed resume should return to moving Running state: {}",
+                            snapshot.error));
+        require(snapshot.machinePosition.x >= heldPosition && snapshot.machinePosition.x < 10.0,
+                "feed resume should continue forward from the held path cursor");
         worker.stop();
+        worker.join();
+    }
+
+    void testSimulationWorkerFeedHoldResumesProbeApproach() {
+        const auto configuration = ngc::loadMachineConfiguration("machine.toml");
+        require(configuration.has_value(), configuration ? "" : configuration.error());
+        SimulationWorker worker(*configuration);
+        ngc::ToolTable tools;
+        const std::vector<std::tuple<std::string, std::string>> program {
+            { "G38.3 F60 X10\n", "feed-hold-probe-worker.ngc" },
+        };
+        require(worker.start(program, tools, true),
+                "probe feed-hold worker regression should start");
+
+        auto snapshot = worker.snapshot();
+        for(int attempt = 0; attempt < 10000
+            && !(snapshot.status == ngc::SimulationStatus::Running
+                 && snapshot.trajectoryBackendVelocity > 1e-4); ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(snapshot.status == ngc::SimulationStatus::Running
+                && snapshot.trajectoryBackendVelocity > 1e-4,
+                std::format("probe approach should begin moving before feed hold: {}",
+                            snapshot.error));
+        require(snapshot.trajectoryBackendSpan == 0,
+                "triggered probe motion should remain distinct from normal execution spans");
+        const auto holdStart = snapshot.machinePosition.x;
+        require(worker.feedHold(), "moving probe approach should accept Feed Hold");
+        for(int attempt = 0; attempt < 10000
+            && snapshot.status != ngc::SimulationStatus::Paused
+            && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(snapshot.status == ngc::SimulationStatus::Paused,
+                std::format("probe feed hold should reach Paused: {}", snapshot.error));
+        require(snapshot.machinePosition.x >= holdStart && snapshot.machinePosition.x < 10.0,
+                "probe feed hold should stop before the probe target");
+        const auto heldPosition = snapshot.machinePosition.x;
+
+        require(worker.resume(), "held probe approach should accept Resume");
+        for(int attempt = 0; attempt < 10000
+            && !(snapshot.status == ngc::SimulationStatus::Running
+                 && snapshot.trajectoryBackendVelocity > 1e-4); ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(snapshot.status == ngc::SimulationStatus::Running
+                && snapshot.trajectoryBackendVelocity > 1e-4,
+                std::format("resumed probe approach should return to moving Running state: {}",
+                            snapshot.error));
+        require(snapshot.machinePosition.x >= heldPosition && snapshot.machinePosition.x < 10.0,
+                "resumed probe should continue toward its original target");
+        worker.stop();
+        worker.join();
+    }
+
+    void testSimulationWorkerProbeContactSupersedesFeedHold() {
+        const auto configuration = ngc::loadMachineConfiguration("machine.toml");
+        require(configuration.has_value(), configuration ? "" : configuration.error());
+        SimulationWorker worker(*configuration);
+        ngc::ToolTable tools;
+        const std::vector<std::tuple<std::string, std::string>> program {
+            { "G38.3 F200 X13\n", "feed-hold-probe-contact-worker.ngc" },
+        };
+        require(worker.start(program, tools, true),
+                "probe-contact feed-hold worker regression should start");
+
+        auto snapshot = worker.snapshot();
+        for(int attempt = 0; attempt < 10000
+            && !(snapshot.status == ngc::SimulationStatus::Running
+                 && snapshot.machinePosition.x >= 12.85
+                 && snapshot.trajectoryBackendVelocity > 1.0); ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(snapshot.status == ngc::SimulationStatus::Running
+                && snapshot.machinePosition.x >= 12.85
+                && snapshot.machinePosition.x < 13.0,
+                std::format("probe should approach contact before the late feed hold: {}",
+                            snapshot.error));
+        require(worker.feedHold(), "late probe feed hold should be accepted");
+
+        bool sawPaused = false;
+        for(int attempt = 0; attempt < 10000
+            && snapshot.status != ngc::SimulationStatus::Completed
+            && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+            sawPaused = sawPaused || snapshot.status == ngc::SimulationStatus::Paused;
+        }
+        require(snapshot.status == ngc::SimulationStatus::Completed,
+                std::format("probe contact during feed-hold braking should complete normally: {}",
+                            snapshot.error));
+        require(!sawPaused,
+                "probe contact during feed-hold braking should supersede Paused/Resume state");
         worker.join();
     }
 
@@ -4005,7 +4359,12 @@ int main() {
         testIncrementalGeometryDefersAndDoesNotRebuildAnchorSection();
         testSimulationDriverFailureAppearsInGuiStatusStream();
         testMockBackendFeedHoldBrakesAlongActiveTrajectory();
+        testMockBackendFeedHoldStopBranchIsFatal();
+        testMockBackendFeedHoldPausesAndResumesProbeApproach();
+        testMockBackendProbeContactDuringFeedHoldStopIsDetected();
         testSimulationWorkerFeedHoldReachesPausedAtRest();
+        testSimulationWorkerFeedHoldResumesProbeApproach();
+        testSimulationWorkerProbeContactSupersedesFeedHold();
         test1001PreviewCompletesBoundedly();
         testSingleShortEntityClusterRetainsMidpointControl();
         test1002PreparedSliceBoundaries();

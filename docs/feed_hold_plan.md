@@ -7,8 +7,6 @@ This branch implements the first experimental feed-hold path for
 which froze executor ticks at a potentially nonzero velocity and acceleration,
 with backend-owned braking that starts on the next servo tick.
 
-The implementation is intentionally one-way for its first hardware-style trial:
-
 ```text
 SimulationStatus::Running / BackendState::Running
     -> Feed Hold request accepted by the backend
@@ -16,11 +14,10 @@ SimulationStatus::Running / BackendState::Running
     -> execution rate and rate acceleration reach zero
     -> BackendHeld(BackendHoldReason::FeedHold)
     -> SimulationStatus::Paused / BackendState::Held
+    -> Resume request accepted by the backend
+    -> SimulationStatus::Running / BackendState::Running
+    -> execution rate ramps from zero to one on the retained normal cursor
 ```
-
-Resume is not implemented. After reaching `Paused`, use Stop to end the run.
-This is deliberate so feed-hold braking can be validated before adding a proved
-resume path.
 
 Read `AGENTS.md` before extending this work. Its backend, streaming, stop-tail,
 terminology, and safety constraints remain authoritative. The implementation is
@@ -41,13 +38,23 @@ mock-only and is not yet a production real-time safety guarantee.
 - The backend reports `BackendHeld` with reason `FeedHold` only after execution
   rate and execution-rate acceleration are zero. The worker then reports
   `SimulationStatus::Paused`.
+- The GUI exposes `Resume` while Paused. Resume retains the current normal span
+  and progress and ramps execution rate back to one under the same configured
+  tangential acceleration and jerk request limits.
+- During an axis-space probe approach, Feed Hold generates an executor-owned
+  constrained stop without completing the probe, selecting its branch, or
+  removing its input transition. Resume generates a new approach from the held
+  state toward the original target and continues trigger sampling.
+- Probe input sampling continues during feed-hold braking. Contact latches the
+  first servo-sampled state crossing the transition, supersedes the feed hold,
+  and completes the probe normally instead of entering Paused.
 - Stop remains available during Running, Holding, and Paused.
 - Existing exact-stop holds use `BackendHoldReason::StopBranch`, keeping them
   distinct from an operator feed hold. The trajectory driver does not apply its
   exact-stop auto-resume or rolling-stop error logic to a feed-hold event.
-- If normal motion reaches a validated packet branch before braking completes,
-  the existing branch machinery may select the packet's precomputed stop tail.
-  A stop tail is never entered from an arbitrary point in a normal span.
+- If feed-hold braking or resume reaches a packet branch without a valid normal
+  continuation, the backend reports the STOP selection and a fatal fault. It
+  does not enter the stop tail.
 
 ## Retiming model
 
@@ -61,10 +68,10 @@ rate_jerk         = d(rate_acceleration) / dt
 ```
 
 Normal execution uses rate 1, rate acceleration 0, and rate jerk 0. During feed
-hold, the backend integrates a scalar S-curve-like braking command and advances
-reference time by the integrated rate instead of by the full servo period.
-Rate is constrained to the interval from zero to one and cannot reverse the
-reference trajectory.
+hold and resume, the backend integrates a scalar S-curve-like rate command and
+advances reference time by the integrated rate instead of by the full servo
+period. Rate is constrained to the interval from zero to one and cannot reverse
+the reference trajectory.
 
 For a reference execution-span polynomial `x(tau)`, the executed derivatives
 are calculated analytically per XYZABC component:
@@ -128,16 +135,11 @@ precomputed stop tail. The branch gate proves position, velocity, and
 acceleration continuity between normal motion and the tail, and proves that the
 tail ends stationary.
 
-Feed-hold retiming carries the same scalar rate state across that branch. If a
-normal continuation is available, normal motion continues while its reference
-clock slows. If the normal queue runs out at a branch while rate remains
-nonzero, existing branch selection enters the stop tail and continues braking.
-If the tail reaches its stationary end, the resulting hold is reported as a
-feed hold. Resume after entering a stop tail remains unsupported because the
-old moving continuation is no longer a proved continuation.
-
-The stop tail is a bounded fallback, not permission to jump to tail geometry,
-discard an unpublished moving suffix, or resume an invalidated continuation.
+Feed-hold retiming carries the same scalar rate state across a branch when a
+valid normal continuation is available. If normal continuation is unavailable
+while hold or resume retiming remains active, the backend reports a fatal
+condition. The stop tail is not used as a feed-hold fallback, and an invalidated
+moving continuation is never resumed.
 
 ## Mock telemetry
 
@@ -165,9 +167,17 @@ Focused framework-free tests in `src/test.cpp` cover:
 - aggregate and per-axis acceleration limits for recorded samples;
 - reaching rest before the programmed branch without entering a stop tail;
 - a single `BackendHeld` event with `BackendHoldReason::FeedHold` and stationary
-  velocity and acceleration; and
+  velocity and acceleration;
+- resuming from the retained normal cursor through intermediate execution rates
+  until normal rate is restored;
+- treating stop-branch exhaustion during feed hold as fatal without executing
+  the stop tail; and
+- holding and resuming a triggered probe approach without reporting probe
+  completion or losing its target; and
+- detecting probe contact during feed-hold braking at the first crossing servo
+  sample and completing without a transient Paused state; and
 - the end-to-end `SimulationWorker` transition from Running through Holding to
-  Paused, stopping before the programmed endpoint.
+  Paused and back to moving Running state.
 
 The configuration-loader regression also verifies positive feed-hold values.
 The branch builds both `ngc_tests` and `imgui_main`. The focused spline CTest
@@ -184,7 +194,8 @@ from this branch's commit.
    after the displayed backend velocity and acceleration reach zero.
 4. Confirm position remains before the programmed endpoint and does not drift
    after Paused.
-5. Use Stop to end the held run. Resume is intentionally absent.
+5. Click `Resume` and confirm motion accelerates forward from the held position.
+6. Use Stop to end the run.
 
 ## Deferred work
 
@@ -195,10 +206,6 @@ from this branch's commit.
 - Check exact or conservative acceleration extrema throughout every servo tick.
 - Add explicit diagnostic excess fields for aggregate/per-axis acceleration and
   jerk limits.
-- Implement and prove resume from a held normal-motion cursor without resetting
-  span progress, replaying events, or violating activation ownership.
-- Reject resume after stop-tail entry with a specific diagnostic until
-  replanning or a proved rejoin exists.
 - Add a bounded per-axis jerk feasibility solver and full coupled path-jerk
   enforcement.
 - Add optional operator graphs or sample export.

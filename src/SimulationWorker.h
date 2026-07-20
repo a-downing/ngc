@@ -98,7 +98,10 @@ class SimulationWorker {
     bool m_feedHoldRequested = false;
     bool m_feedHoldInProgress = false;
     bool m_feedHoldHeld = false;
+    bool m_feedResumeRequested = false;
+    bool m_feedResumeInProgress = false;
     std::optional<ngc::RequestId> m_pendingFeedHoldRequest;
+    std::optional<ngc::RequestId> m_pendingFeedResumeRequest;
     bool m_preserveState = false;
     bool m_home = false;
     std::deque<ngc::ControlRequest> m_jogControls;
@@ -166,7 +169,10 @@ public:
         m_feedHoldRequested = false;
         m_feedHoldInProgress = false;
         m_feedHoldHeld = false;
+        m_feedResumeRequested = false;
+        m_feedResumeInProgress = false;
         m_pendingFeedHoldRequest.reset();
+        m_pendingFeedResumeRequest.reset();
         m_snapshot.status = ngc::SimulationStatus::Running;
         m_cv.notify_all();
         return true;
@@ -250,10 +256,21 @@ public:
     bool feedHold() {
         std::scoped_lock lock(m_mutex);
         if(!m_running || !m_programRunning || m_paused || m_feedHoldRequested
-           || m_feedHoldInProgress || m_feedHoldHeld) return false;
+           || m_feedHoldInProgress || m_feedHoldHeld || m_feedResumeInProgress) return false;
         m_feedHoldRequested = true;
         m_feedHoldInProgress = true;
         m_snapshot.status = ngc::SimulationStatus::Holding;
+        m_cv.notify_all();
+        return true;
+    }
+    bool resume() {
+        std::scoped_lock lock(m_mutex);
+        if(!m_running || !m_programRunning || !m_paused || !m_feedHoldHeld
+           || m_feedResumeRequested || m_feedResumeInProgress) return false;
+        m_feedResumeRequested = true;
+        m_feedResumeInProgress = true;
+        m_paused = false;
+        m_snapshot.status = ngc::SimulationStatus::Running;
         m_cv.notify_all();
         return true;
     }
@@ -267,7 +284,10 @@ public:
             m_feedHoldRequested = false;
             m_feedHoldInProgress = false;
             m_feedHoldHeld = false;
+            m_feedResumeRequested = false;
+            m_feedResumeInProgress = false;
             m_pendingFeedHoldRequest.reset();
+            m_pendingFeedResumeRequest.reset();
             m_cv.notify_all();
         }
     }
@@ -427,6 +447,14 @@ private:
                 const auto found=m_spanPresentations.find({accepted->epoch,first->second});
                 if(found!=m_spanPresentations.end()) applyPresentation(found->second);
             }
+        } else if(std::holds_alternative<ngc::TriggeredMoveCompleted>(event)) {
+            if(m_feedHoldInProgress) {
+                m_pendingFeedHoldRequest.reset();
+                m_feedHoldInProgress = false;
+                m_feedHoldHeld = false;
+                m_paused = false;
+                m_snapshot.status = ngc::SimulationStatus::Running;
+            }
         } else if(const auto *retired = std::get_if<ngc::ChunkRetired>(&event)) {
             const ChunkKey key { retired->epoch, retired->chunk };
             const auto found = m_chunks.find(key);
@@ -445,8 +473,20 @@ private:
                && !completed->succeeded) {
                 m_pendingFeedHoldRequest.reset();
                 m_feedHoldInProgress = false;
-                m_snapshot.status = ngc::SimulationStatus::Error;
-                m_snapshot.error = "motion backend rejected the feed-hold request";
+                m_snapshot.status = ngc::SimulationStatus::Running;
+            } else if(m_pendingFeedResumeRequest
+                      && completed->request == *m_pendingFeedResumeRequest) {
+                m_pendingFeedResumeRequest.reset();
+                if(completed->succeeded) {
+                    m_feedHoldHeld = false;
+                    m_snapshot.status = ngc::SimulationStatus::Running;
+                } else {
+                    m_feedResumeInProgress = false;
+                    m_snapshot.status = ngc::SimulationStatus::Error;
+                    m_snapshot.error = "motion backend rejected the feed-resume request";
+                    m_running = false;
+                    m_programRunning = false;
+                }
             }
         }
     }
@@ -491,6 +531,10 @@ private:
         m_snapshot.trajectoryBackendExecutionRate = backend.executionRate;
         m_snapshot.trajectoryBackendExecutionRateAcceleration =
             backend.executionRateAcceleration;
+        if(m_feedResumeInProgress && backend.state == ngc::BackendState::Running
+           && backend.executionRate >= 1.0 - 1e-10
+           && std::abs(backend.executionRateAcceleration) <= 1e-10)
+            m_feedResumeInProgress = false;
         if(const auto span=m_executionSpans.find({backend.epoch,backend.activeSpan});
            span!=m_executionSpans.end()) {
             const auto &detail=span->second;
@@ -1150,6 +1194,17 @@ private:
                         m_running = false;
                         m_programRunning = false;
                     } else m_pendingFeedHoldRequest = request;
+                }
+                if(m_feedResumeRequested) {
+                    m_feedResumeRequested = false;
+                    const auto request = m_nextFeedHoldRequest++;
+                    if(m_backend.trySubmit(ngc::ResumeRequest { request, epoch })
+                            != ngc::SubmitResult::Submitted) {
+                        m_snapshot.status = ngc::SimulationStatus::Error;
+                        m_snapshot.error = "motion backend control channel is full while resuming feed";
+                        m_running = false;
+                        m_programRunning = false;
+                    } else m_pendingFeedResumeRequest = request;
                 }
                 if(m_paused) {
                     m_snapshot.status = ngc::SimulationStatus::Paused;

@@ -105,6 +105,8 @@ namespace ngc {
         FeedHoldConfiguration m_feedHoldLimits;
         TrajectoryLimits m_trajectoryLimits;
         bool m_feedHolding = false;
+        bool m_feedHeld = false;
+        bool m_feedResuming = false;
         double m_executionRate = 1.0;
         double m_executionRateAcceleration = 0.0;
         double m_executionRateJerk = 0.0;
@@ -117,7 +119,9 @@ namespace ngc {
             double length = 0.0;
             double elapsed = 0.0;
             bool stopping = false;
+            bool feedHoldStopping = false;
             TriggeredMoveStatus completionStatus = TriggeredMoveStatus::ReachedTarget;
+            MotionState stopOrigin{};
             MotionState triggerState{};
             ruckig::Trajectory<1> trajectory;
         } m_triggered;
@@ -282,19 +286,23 @@ namespace ngc {
                 return;
             }
             if(!m_active) activateNext();
-            if(m_feedHolding && !m_active) {
-                finishFeedHold();
+            if((m_feedHolding || m_feedResuming) && !m_active) {
+                if(m_feedHolding) finishFeedHold();
+                else faultFeedRetimingAtStopBranch();
                 if(shouldPublishSnapshot) publishSnapshot();
                 return;
             }
             const auto executedActiveMotion = m_active.has_value();
-            if(m_feedHolding && m_active
+            if((m_feedHolding || m_feedResuming) && m_active
                && std::holds_alternative<PlanChunk>(activeItem()))
-                seconds = feedHoldReferenceAdvance(physicalSeconds);
+                seconds = feedRetimingReferenceAdvance(physicalSeconds);
             const auto availableProgramSeconds = seconds;
             while(m_active && seconds > 0.0) {
                 if(std::holds_alternative<TriggeredMove>(activeItem())) {
                     advanceTriggered(seconds);
+                    if(m_snapshot.state != BackendState::Running
+                       && m_snapshot.state != BackendState::Holding)
+                        seconds = 0.0;
                     continue;
                 }
                 if(std::holds_alternative<TriggeredJointMove>(activeItem())) {
@@ -317,6 +325,7 @@ namespace ngc {
                 recordCalculatedPosition();
                 if(m_spanElapsed + 1e-12 < span.duration) break;
                 completeSpan();
+                if(m_snapshot.state == BackendState::Faulted) break;
             }
             if(!m_active)
                 m_currentProgramJerkMagnitude.store(0.0,std::memory_order_relaxed);
@@ -388,9 +397,9 @@ namespace ngc {
             return m_stopping ? chunk.stopTail[m_span] : chunk.normalMotion[m_span];
         }
 
-        bool feedHoldAccelerationInterval(const position_t &referenceVelocity,
-                                          const position_t &referenceAcceleration,
-                                          double &lower, double &upper) const {
+        bool feedRetimingAccelerationInterval(const position_t &referenceVelocity,
+                                              const position_t &referenceAcceleration,
+                                              double &lower, double &upper) const {
             lower = -std::numeric_limits<double>::infinity();
             upper = std::numeric_limits<double>::infinity();
             const auto rateSquared = m_executionRate * m_executionRate;
@@ -433,7 +442,7 @@ namespace ngc {
             return lower <= upper + 1e-12;
         }
 
-        double feedHoldReferenceAdvance(const double physicalSeconds) {
+        double feedRetimingReferenceAdvance(const double physicalSeconds) {
             const auto &span = currentSpan();
             const auto u = span.duration > 0.0
                 ? std::clamp(m_spanElapsed * span.inverseDuration, 0.0, 1.0) : 1.0;
@@ -443,16 +452,17 @@ namespace ngc {
             if(referenceSpeed <= 1e-10
                && magnitude(scaled(referenceAcceleration,
                                    m_executionRate * m_executionRate)) <= 1e-9) {
-                m_executionRate = 0.0;
+                m_executionRate = m_feedResuming ? 1.0 : 0.0;
                 m_executionRateAcceleration = 0.0;
                 m_executionRateJerk = 0.0;
-                return 0.0;
+                m_feedResuming = false;
+                return m_executionRate * physicalSeconds;
             }
 
             double feasibleLower = 0.0;
             double feasibleUpper = 0.0;
-            if(!feedHoldAccelerationInterval(referenceVelocity, referenceAcceleration,
-                                             feasibleLower, feasibleUpper)) {
+            if(!feedRetimingAccelerationInterval(referenceVelocity, referenceAcceleration,
+                                                 feasibleLower, feasibleUpper)) {
                 m_snapshot.state = BackendState::Faulted;
                 m_snapshot.faultCode = 4;
                 emit(BackendFault { 4 });
@@ -460,31 +470,50 @@ namespace ngc {
             }
 
             const auto safeReferenceSpeed = std::max(referenceSpeed, 1e-9);
-            const auto requestedLower = -m_feedHoldLimits.tangentialAcceleration
-                / safeReferenceSpeed;
-            const auto brakingAcceleration = std::clamp(
-                requestedLower, feasibleLower, feasibleUpper);
             const auto rateJerkLimit = m_feedHoldLimits.tangentialJerk / safeReferenceSpeed;
-            const auto release = m_executionRateAcceleration < 0.0
-                && m_executionRate <= m_executionRateAcceleration * m_executionRateAcceleration
-                    / (2.0 * std::max(rateJerkLimit, 1e-12)) + 1e-12;
-            auto requestedJerk = release ? rateJerkLimit : -rateJerkLimit;
+            const auto accelerationMagnitude = m_feedHoldLimits.tangentialAcceleration
+                / safeReferenceSpeed;
+            const auto release = m_feedResuming
+                ? m_executionRateAcceleration > 0.0
+                    && 1.0 - m_executionRate
+                        <= m_executionRateAcceleration * m_executionRateAcceleration
+                            / (2.0 * std::max(rateJerkLimit, 1e-12)) + 1e-12
+                : m_executionRateAcceleration < 0.0
+                    && m_executionRate
+                        <= m_executionRateAcceleration * m_executionRateAcceleration
+                            / (2.0 * std::max(rateJerkLimit, 1e-12)) + 1e-12;
+            const auto targetAcceleration = std::clamp(
+                m_feedResuming ? accelerationMagnitude : -accelerationMagnitude,
+                feasibleLower, feasibleUpper);
+            const auto requestedJerk = m_feedResuming
+                ? (release ? -rateJerkLimit : rateJerkLimit)
+                : (release ? rateJerkLimit : -rateJerkLimit);
             auto nextAcceleration = m_executionRateAcceleration
                 + requestedJerk * physicalSeconds;
-            if(release && nextAcceleration > 0.0) nextAcceleration = 0.0;
-            if(!release && nextAcceleration < brakingAcceleration)
-                nextAcceleration = brakingAcceleration;
+            if(m_feedResuming) {
+                if(release && nextAcceleration < 0.0) nextAcceleration = 0.0;
+                if(!release && nextAcceleration > targetAcceleration)
+                    nextAcceleration = targetAcceleration;
+            } else {
+                if(release && nextAcceleration > 0.0) nextAcceleration = 0.0;
+                if(!release && nextAcceleration < targetAcceleration)
+                    nextAcceleration = targetAcceleration;
+            }
             nextAcceleration = std::clamp(nextAcceleration, feasibleLower, feasibleUpper);
-            m_executionRateJerk = physicalSeconds > 0.0
-                ? (nextAcceleration - m_executionRateAcceleration) / physicalSeconds : 0.0;
 
             auto nextRate = m_executionRate
                 + 0.5 * (m_executionRateAcceleration + nextAcceleration) * physicalSeconds;
-            if(nextRate <= 1e-10) {
+            if(!m_feedResuming && nextRate <= 1e-10) {
                 nextRate = 0.0;
                 nextAcceleration = 0.0;
+            } else if(m_feedResuming && nextRate >= 1.0 - 1e-10) {
+                nextRate = 1.0;
+                nextAcceleration = 0.0;
+                m_feedResuming = false;
             }
             nextRate = std::clamp(nextRate, 0.0, 1.0);
+            m_executionRateJerk = physicalSeconds > 0.0
+                ? (nextAcceleration - m_executionRateAcceleration) / physicalSeconds : 0.0;
             const auto referenceAdvance = 0.5 * (m_executionRate + nextRate) * physicalSeconds;
             m_executionRate = nextRate;
             m_executionRateAcceleration = nextAcceleration;
@@ -514,6 +543,10 @@ namespace ngc {
 
         void finishFeedHold() {
             m_feedHolding = false;
+            m_feedHeld = true;
+            m_executionRate = 0.0;
+            m_executionRateAcceleration = 0.0;
+            m_executionRateJerk = 0.0;
             m_snapshot.state = BackendState::Held;
             m_snapshot.commanded.velocity = {};
             m_snapshot.commanded.acceleration = {};
@@ -523,6 +556,17 @@ namespace ngc {
             emit(BackendHeld {
                 m_snapshot.epoch, m_snapshot.commanded, BackendHoldReason::FeedHold,
             });
+        }
+
+        void faultFeedRetimingAtStopBranch() {
+            m_feedHolding = false;
+            m_feedHeld = false;
+            m_feedResuming = false;
+            m_snapshot.state = BackendState::Faulted;
+            m_snapshot.faultCode = 5;
+            emit(BackendFault { 5 });
+            if(m_active) release(*m_active);
+            m_active.reset();
         }
         void release(const std::uint8_t index) { m_planSlots[index].occupied.store(false, std::memory_order_release); }
 
@@ -856,11 +900,14 @@ namespace ngc {
             }
         }
 
-        bool beginTriggeredStop(const TriggeredMoveStatus status) {
+        bool beginTriggeredStop(const TriggeredMoveStatus status,
+                                const bool feedHold = false) {
             const auto &move = std::get<TriggeredMove>(activeItem());
-            m_triggered.triggerState = m_snapshot.commanded;
+            m_triggered.stopOrigin = m_snapshot.commanded;
+            if(!feedHold) m_triggered.triggerState = m_snapshot.commanded;
             m_triggered.completionStatus = status;
             m_triggered.stopping = true;
+            m_triggered.feedHoldStopping = feedHold;
             m_triggered.elapsed = 0.0;
             const auto scalarVelocity = dot(m_snapshot.commanded.velocity, m_triggered.direction);
             const auto scalarAcceleration = dot(m_snapshot.commanded.acceleration, m_triggered.direction);
@@ -894,6 +941,20 @@ namespace ngc {
             removeSyntheticInput(move.moveId);
             release(*m_active);
             m_active.reset();
+        }
+
+        void finishTriggeredFeedHold() {
+            m_triggered.stopping = false;
+            m_triggered.feedHoldStopping = false;
+            m_feedHolding = false;
+            m_feedHeld = true;
+            m_snapshot.state = BackendState::Held;
+            m_snapshot.commanded.velocity = {};
+            m_snapshot.commanded.acceleration = {};
+            m_snapshot.feedback = m_snapshot.commanded;
+            emit(BackendHeld {
+                m_snapshot.epoch, m_snapshot.commanded, BackendHoldReason::FeedHold,
+            });
         }
 
         void faultTriggered() {
@@ -932,12 +993,12 @@ namespace ngc {
             const auto consumed = std::min(seconds, std::max(duration - m_triggered.elapsed, 0.0));
             m_triggered.elapsed += consumed;
             const auto origin = m_triggered.stopping
-                ? m_triggered.triggerState.position : m_triggered.start;
+                ? m_triggered.stopOrigin.position : m_triggered.start;
             m_snapshot.commanded = triggeredStateAt(m_triggered.elapsed, origin);
             m_snapshot.feedback = m_snapshot.commanded;
             m_snapshot.spanProgress = duration > 0.0
                 ? std::clamp(m_triggered.elapsed / duration, 0.0, 1.0) : 1.0;
-            recordTriggeredPosition(m_triggered.stopping);
+            recordTriggeredPosition(m_triggered.stopping && !m_triggered.feedHoldStopping);
             seconds -= consumed;
             if(!m_triggered.stopping) {
                 const auto transition = syntheticTransitionDistance(move.moveId);
@@ -956,11 +1017,24 @@ namespace ngc {
                     m_snapshot.feedback = m_snapshot.commanded;
                     completeTriggered(TriggeredMoveStatus::ReachedTarget);
                 }
-            } else if(m_triggered.elapsed + 1e-12 >= duration) {
-                m_snapshot.commanded.velocity = {};
-                m_snapshot.commanded.acceleration = {};
-                m_snapshot.feedback = m_snapshot.commanded;
-                completeTriggered(m_triggered.completionStatus);
+            } else {
+                if(m_triggered.feedHoldStopping) {
+                    const auto transition = syntheticTransitionDistance(move.moveId);
+                    const auto progress = dot(m_snapshot.commanded.position - m_triggered.start,
+                                              m_triggered.direction);
+                    if(transition && progress + 1e-12 >= *transition) {
+                        m_triggered.triggerState = m_snapshot.commanded;
+                        m_triggered.completionStatus = TriggeredMoveStatus::Triggered;
+                        m_triggered.feedHoldStopping = false;
+                    }
+                }
+                if(m_triggered.elapsed + 1e-12 >= duration) {
+                    m_snapshot.commanded.velocity = {};
+                    m_snapshot.commanded.acceleration = {};
+                    m_snapshot.feedback = m_snapshot.commanded;
+                    if(m_triggered.feedHoldStopping) finishTriggeredFeedHold();
+                    else completeTriggered(m_triggered.completionStatus);
+                }
             }
         }
 
@@ -1153,24 +1227,69 @@ namespace ngc {
                         if(m_active) release(*m_active);
                         m_active.reset(); m_snapshot.state = BackendState::Disabled;
                         m_feedHolding = false;
-                    } else if constexpr(std::same_as<T, StartRequest> || std::same_as<T, ResumeRequest>) {
+                        m_feedHeld = false;
+                        m_feedResuming = false;
+                    } else if constexpr(std::same_as<T, StartRequest>) {
                         success = !m_jog;
                         if(success) {
                             m_snapshot.epoch = value.epoch;
                             m_snapshot.state = BackendState::Running;
                             m_feedHolding = false;
+                            m_feedHeld = false;
+                            m_feedResuming = false;
+                            m_executionRate = 1.0;
+                            m_executionRateAcceleration = 0.0;
+                            m_executionRateJerk = 0.0;
+                        }
+                    } else if constexpr(std::same_as<T, ResumeRequest>) {
+                        success = !m_jog && m_snapshot.state == BackendState::Held
+                            && value.epoch == m_snapshot.epoch;
+                        if(success && m_feedHeld) {
+                            if(m_active && !m_stopping
+                               && std::holds_alternative<PlanChunk>(activeItem())) {
+                                m_snapshot.state = BackendState::Running;
+                                m_feedHeld = false;
+                                m_feedResuming = true;
+                                m_executionRateAcceleration = 0.0;
+                                m_executionRateJerk = 0.0;
+                            } else if(m_active
+                                      && std::holds_alternative<TriggeredMove>(activeItem())) {
+                                success = initializeTriggered();
+                                if(success) {
+                                    m_snapshot.state = BackendState::Running;
+                                    m_feedHeld = false;
+                                    m_feedResuming = false;
+                                    m_executionRate = 1.0;
+                                    m_executionRateAcceleration = 0.0;
+                                    m_executionRateJerk = 0.0;
+                                }
+                            } else success = false;
+                        } else if(success) {
+                            m_snapshot.state = BackendState::Running;
+                            m_feedHolding = false;
+                            m_feedResuming = false;
                             m_executionRate = 1.0;
                             m_executionRateAcceleration = 0.0;
                             m_executionRateJerk = 0.0;
                         }
                     } else if constexpr(std::same_as<T, FeedHoldRequest>) {
                         success = !m_jog
-                            && (m_snapshot.state == BackendState::Running
-                                || m_snapshot.state == BackendState::Holding)
-                            && (!m_active || std::holds_alternative<PlanChunk>(activeItem()));
+                            && m_snapshot.state == BackendState::Running
+                            && !m_feedResuming
+                            && m_active.has_value();
                         if(success) {
-                            m_feedHolding = true;
-                            m_snapshot.state = BackendState::Holding;
+                            if(std::holds_alternative<PlanChunk>(activeItem()))
+                                success = !m_stopping;
+                            else if(std::holds_alternative<TriggeredMove>(activeItem()))
+                                success = !m_triggered.stopping
+                                    && beginTriggeredStop(
+                                        TriggeredMoveStatus::ReachedTarget, true);
+                            else success = false;
+                            if(success) {
+                                m_feedHolding = true;
+                                m_feedHeld = false;
+                                m_snapshot.state = BackendState::Holding;
+                            }
                         }
                     } else if constexpr(std::same_as<T, AbortRequest>) {
                         if(m_jog) success = beginJogStop(JogStopReason::Aborted);
@@ -1178,6 +1297,8 @@ namespace ngc {
                             if(m_active) release(*m_active);
                             m_active.reset(); m_snapshot.state = BackendState::Held;
                             m_feedHolding = false;
+                            m_feedHeld = false;
+                            m_feedResuming = false;
                         }
                     } else if constexpr(std::same_as<T, ResetRequest>) {
                         if(m_jog) {
@@ -1198,6 +1319,8 @@ namespace ngc {
                         }
                         m_stopping = false; m_span = 0; m_nextEvent = 0; m_spanElapsed = 0.0;
                         m_feedHolding = false;
+                        m_feedHeld = false;
+                        m_feedResuming = false;
                         m_executionRate = 1.0;
                         m_executionRateAcceleration = 0.0;
                         m_executionRateJerk = 0.0;
@@ -1311,6 +1434,10 @@ namespace ngc {
                     release(continuationIndex);
                 }
                 emit(BranchSelected { current.epoch, current.branch, BranchChoice::Stop, 0 });
+                if(m_feedHolding || m_feedResuming) {
+                    faultFeedRetimingAtStopBranch();
+                    return;
+                }
                 m_stopping = true;
                 m_span = 0;
             }
