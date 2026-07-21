@@ -21,7 +21,7 @@
 #include <unordered_map>
 #include <vector>
 
-#include <highs/Highs.h>
+#include <path_tempo/LinearOptimization.h>
 #include <path_tempo/Planner.h>
 #include <ruckig/ruckig.hpp>
 
@@ -39,39 +39,6 @@ namespace ngc {
         position_t midpoint(const position_t &a, const position_t &b) {
             return scaled(add(a, b), 0.5);
         }
-
-        struct SparseLpBuilder {
-            HighsLp model;
-
-            explicit SparseLpBuilder(const std::size_t variables) {
-                model.num_col_=static_cast<HighsInt>(variables);
-                model.num_row_=0;
-                model.sense_=ObjSense::kMinimize;
-                model.offset_=0.0;
-                model.col_cost_.assign(variables,0.0);
-                model.col_lower_.assign(variables,-kHighsInf);
-                model.col_upper_.assign(variables,kHighsInf);
-                model.a_matrix_.format_=MatrixFormat::kRowwise;
-                model.a_matrix_.start_.assign(1,0);
-            }
-
-            void addRow(const double lower,const double upper,
-                        const std::initializer_list<std::pair<std::size_t,double>> entries) {
-                for(const auto &[column,value]:entries) {
-                    if(!std::isfinite(value)) PANIC("SCP LP row contains a non-finite coefficient");
-                    if(!trajectory_detail::scpRetainsMatrixCoefficient(value)) continue;
-                    if(column>=static_cast<std::size_t>(model.num_col_))
-                        PANIC("SCP LP row references an invalid column");
-                    model.a_matrix_.index_.push_back(static_cast<HighsInt>(column));
-                    model.a_matrix_.value_.push_back(value);
-                }
-                model.a_matrix_.start_.push_back(
-                    static_cast<HighsInt>(model.a_matrix_.index_.size()));
-                model.row_lower_.push_back(lower);
-                model.row_upper_.push_back(upper);
-                ++model.num_row_;
-            }
-        };
 
         template<typename T>
         std::pair<std::array<T, 4>, std::array<T, 4>> splitBezier(const std::array<T, 4> &control) {
@@ -762,36 +729,6 @@ namespace ngc {
             return timeLawBetween(workspace,instrumentation,TimeLawPurpose::ExactStop,false,
                                   length,0.0,0.0,0.0,0.0,
                                   requestedVelocity,acceleration,jerk);
-        }
-
-        double velocityTransitionDistance(const double fromVelocity,const double toVelocity,
-                                          const double acceleration,const double jerk) {
-            const auto change=std::abs(toVelocity-fromVelocity);
-            if(change<=1e-15) return 0.0;
-            const auto threshold=acceleration*acceleration/jerk;
-            const auto duration=change<=threshold
-                ? 2.0*std::sqrt(change/jerk)
-                : change/acceleration+acceleration/jerk;
-            return std::midpoint(fromVelocity,toVelocity)*duration;
-        }
-
-        double reachableVelocity(const double fixedVelocity,const double cap,const double length,
-                                 const double acceleration,const double jerk) {
-            if(cap<=fixedVelocity) return cap;
-            // Leave a small positive cruise-distance reserve. Asking Ruckig for
-            // a transition at the exact minimum-distance boundary is numerically
-            // ambiguous and can select a much longer reversing profile.
-            const auto available=std::max(0.0,length-std::max(1e-12,length*1e-6));
-            if(velocityTransitionDistance(fixedVelocity,cap,acceleration,jerk)<=available) return cap;
-            auto low=fixedVelocity;
-            auto high=cap;
-            for(unsigned iteration=0;iteration<52;++iteration) {
-                const auto middle=std::midpoint(low,high);
-                if(velocityTransitionDistance(fixedVelocity,middle,acceleration,jerk)<=available)
-                    low=middle;
-                else high=middle;
-            }
-            return low;
         }
 
         double positionDot(const position_t &left, const position_t &right) {
@@ -1644,21 +1581,14 @@ namespace ngc {
             }
             return true;
         };
-        std::optional<HighsBasis> reusableScpBasis;
-        // Correction passes retain the same LP shape in the common case. Keep one
-        // configured solver so structure-stable passes can update bounds and
-        // coefficients without rebuilding HiGHS' model ownership each time.
-        Highs persistentScpSolver;
-        if(persistentScpSolver.setOptionValue("output_flag",false)!=HighsStatus::kOk
-           ||persistentScpSolver.setOptionValue("threads",HighsInt {1})!=HighsStatus::kOk
-           ||persistentScpSolver.setOptionValue("solver",std::string {"simplex"})
-                !=HighsStatus::kOk
-           ||persistentScpSolver.setOptionValue("small_matrix_value",
-                trajectory_detail::SCP_SMALL_MATRIX_VALUE)!=HighsStatus::kOk
-           ||persistentScpSolver.setOptionValue("time_limit",
-                m_continuousPlanningEffort.scpSolveTimeLimit)!=HighsStatus::kOk)
-            return std::unexpected("continuous SCP could not configure HiGHS");
-        std::optional<HighsLp> persistentScpModel;
+        // Correction passes retain the same LP shape in the common case. PathTempo
+        // owns the persistent HiGHS model and basis behind its solver-neutral API.
+        path_tempo::PersistentLinearSolver persistentScpSolver;
+        if(auto configured=persistentScpSolver.configure(
+                m_continuousPlanningEffort.scpSolveTimeLimit); !configured)
+            return std::unexpected(std::format(
+                "continuous SCP could not configure its linear solver: {}",
+                configured.error()));
         for(unsigned correctionPass=0;correctionPass<maximumLocalCorrectionPasses;
                 ++correctionPass) {
             reportProgress();
@@ -1679,7 +1609,7 @@ namespace ngc {
             for(unsigned reachabilityPass=0;reachabilityPass<8;++reachabilityPass) {
                 auto maximumChange=0.0;
                 for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
-                    const auto reachable=reachableVelocity(stationVelocity[pieceIndex],
+                    const auto reachable=path_tempo::reachableVelocity(stationVelocity[pieceIndex],
                         std::min(stationCaps[pieceIndex+1],localLimits[pieceIndex].velocity),
                         pieces[pieceIndex].length,localLimits[pieceIndex].acceleration,
                         localLimits[pieceIndex].jerk);
@@ -1695,7 +1625,7 @@ namespace ngc {
                     stationVelocity[pieceIndex+1]=reduced;
                 }
                 for(std::size_t pieceIndex=pieces.size();pieceIndex-->0;) {
-                    const auto reachable=reachableVelocity(stationVelocity[pieceIndex+1],
+                    const auto reachable=path_tempo::reachableVelocity(stationVelocity[pieceIndex+1],
                         std::min(stationCaps[pieceIndex],localLimits[pieceIndex].velocity),
                         pieces[pieceIndex].length,localLimits[pieceIndex].acceleration,
                         localLimits[pieceIndex].jerk);
@@ -1869,7 +1799,7 @@ namespace ngc {
             for(unsigned scpIteration=0;
                     scpIteration<m_continuousPlanningEffort.scpIterations;++scpIteration) {
                 reportProgress();
-                SparseLpBuilder lp(variableCount);
+                path_tempo::SparseLinearProgram lp(variableCount);
                 const auto &referenceVelocity=stationVelocity;
                 const auto &referenceAcceleration=stationAcceleration;
 
@@ -1905,14 +1835,14 @@ namespace ngc {
                         velocityLower=velocityUpper=scalarEnd->first;
                         accelerationLower=accelerationUpper=scalarEnd->second;
                     }
-                    lp.model.col_lower_[vColumn]=velocityLower;
-                    lp.model.col_upper_[vColumn]=velocityUpper;
-                    lp.model.col_lower_[aColumn]=accelerationLower;
-                    lp.model.col_upper_[aColumn]=accelerationUpper;
+                    lp.columnLower(vColumn)=velocityLower;
+                    lp.columnUpper(vColumn)=velocityUpper;
+                    lp.columnLower(aColumn)=accelerationLower;
+                    lp.columnUpper(aColumn)=accelerationUpper;
                     const auto deviationColumn=accelerationDeviationColumn(station);
-                    lp.model.col_lower_[deviationColumn]=0.0;
-                    lp.model.col_upper_[deviationColumn]=kHighsInf;
-                    lp.model.col_cost_[deviationColumn]=1e-6;
+                    lp.columnLower(deviationColumn)=0.0;
+                    lp.columnUpper(deviationColumn)=path_tempo::linearProgramInfinity();
+                    lp.columnCost(deviationColumn)=1e-6;
 
                     auto targetAcceleration=referenceAcceleration[station];
                     if(station>0&&station<pieces.size()) {
@@ -1930,26 +1860,26 @@ namespace ngc {
                         targetAcceleration=std::clamp(targetAcceleration,
                             accelerationLower,accelerationUpper);
                     }
-                    stationDeviationRowOffsets[station]=lp.model.num_row_;
-                    lp.addRow(-targetAcceleration,kHighsInf,{
+                    stationDeviationRowOffsets[station]=lp.rowCount();
+                    lp.addRow(-targetAcceleration,path_tempo::linearProgramInfinity(),{
                         {aColumn,-1.0},{deviationColumn,1.0},
                     });
-                    lp.addRow(targetAcceleration,kHighsInf,{
+                    lp.addRow(targetAcceleration,path_tempo::linearProgramInfinity(),{
                         {aColumn,1.0},{deviationColumn,1.0},
                     });
                 }
                 for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
                     for(const auto end:{false,true}) {
                         const auto column=jerkColumn(pieceIndex,end);
-                        lp.model.col_lower_[column]=-localLimits[pieceIndex].jerk;
-                        lp.model.col_upper_[column]=localLimits[pieceIndex].jerk;
+                        lp.columnLower(column)=-localLimits[pieceIndex].jerk;
+                        lp.columnUpper(column)=localLimits[pieceIndex].jerk;
                     }
                     const auto speedSum=std::max(1e-6,
                         referenceVelocity[pieceIndex]+referenceVelocity[pieceIndex+1]);
                     const auto objectiveDerivative=
                         -2.0*pieces[pieceIndex].length/(speedSum*speedSum);
-                    lp.model.col_cost_[velocityColumn(pieceIndex)]+=objectiveDerivative;
-                    lp.model.col_cost_[velocityColumn(pieceIndex+1)]+=objectiveDerivative;
+                    lp.columnCost(velocityColumn(pieceIndex))+=objectiveDerivative;
+                    lp.columnCost(velocityColumn(pieceIndex+1))+=objectiveDerivative;
                 }
 
                 const auto addAccelerationConstraints=[&](
@@ -1983,7 +1913,7 @@ namespace ngc {
                             positionDot(direction,geometry.tangent);
                         const auto constant=-positionDot(direction,geometry.curvature)
                             *referenceV*referenceV;
-                        lp.addRow(-kHighsInf,m_limits.pathAcceleration-constant,{
+                        lp.addRow(-path_tempo::linearProgramInfinity(),m_limits.pathAcceleration-constant,{
                             {vColumn,velocityCoefficient},
                             {aColumn,accelerationCoefficient},
                         });
@@ -2030,7 +1960,7 @@ namespace ngc {
                     const auto referenceNorm=referenceVector.length();
                     if(referenceNorm>1e-12) {
                         const auto direction=scaled(referenceVector,1.0/referenceNorm);
-                        lp.addRow(-kHighsInf,m_limits.pathJerk-positionDot(direction,constant),{
+                        lp.addRow(-path_tempo::linearProgramInfinity(),m_limits.pathJerk-positionDot(direction,constant),{
                             {vColumn,positionDot(direction,velocityDerivative)},
                             {aColumn,positionDot(direction,accelerationDerivative)},
                             {jColumn,positionDot(direction,geometry.tangent)},
@@ -2044,37 +1974,37 @@ namespace ngc {
                     const auto to=pieceIndex+1;
                     const auto referenceFrom=referenceVelocity[from];
                     const auto referenceTo=referenceVelocity[to];
-                    scpPieceRowOffsets[pieceIndex][0]=lp.model.num_row_;
+                    scpPieceRowOffsets[pieceIndex][0]=lp.rowCount();
                     if(m_continuousPlanningEffort.addScpAdjacentReachabilityRows) {
                         const auto referenceSquaredDifference=
                             referenceTo*referenceTo-referenceFrom*referenceFrom;
                         const auto accelerationEnergyLimit=2.0
                             *localLimits[pieceIndex].acceleration
                             *pieces[pieceIndex].length;
-                        lp.addRow(-kHighsInf,
+                        lp.addRow(-path_tempo::linearProgramInfinity(),
                             accelerationEnergyLimit+referenceSquaredDifference,{
                                 {velocityColumn(to),2.0*referenceTo},
                                 {velocityColumn(from),-2.0*referenceFrom},
                             });
-                        lp.addRow(-kHighsInf,
+                        lp.addRow(-path_tempo::linearProgramInfinity(),
                             accelerationEnergyLimit-referenceSquaredDifference,{
                                 {velocityColumn(from),2.0*referenceFrom},
                                 {velocityColumn(to),-2.0*referenceTo},
                             });
                         result->scpAdjacentReachabilityRows+=2;
                     }
-                    scpPieceRowOffsets[pieceIndex][1]=lp.model.num_row_;
+                    scpPieceRowOffsets[pieceIndex][1]=lp.rowCount();
                     addAccelerationConstraints(pieceStartGeometry[pieceIndex],from,
                         referenceFrom);
-                    scpPieceRowOffsets[pieceIndex][2]=lp.model.num_row_;
+                    scpPieceRowOffsets[pieceIndex][2]=lp.rowCount();
                     addAccelerationConstraints(pieceEndGeometry[pieceIndex],to,referenceTo);
-                    scpPieceRowOffsets[pieceIndex][3]=lp.model.num_row_;
+                    scpPieceRowOffsets[pieceIndex][3]=lp.rowCount();
                     addJerkConstraints(pieceStartGeometry[pieceIndex],from,pieceIndex,
                         false,0.0);
-                    scpPieceRowOffsets[pieceIndex][4]=lp.model.num_row_;
+                    scpPieceRowOffsets[pieceIndex][4]=lp.rowCount();
                     addJerkConstraints(pieceEndGeometry[pieceIndex],to,pieceIndex,
                         true,0.0);
-                    scpPieceRowOffsets[pieceIndex][5]=lp.model.num_row_;
+                    scpPieceRowOffsets[pieceIndex][5]=lp.rowCount();
                 }
 
                 // Every sequential linearization must contain its reference
@@ -2085,7 +2015,7 @@ namespace ngc {
                     referenceValues[velocityColumn(station)]=referenceVelocity[station];
                     referenceValues[accelerationColumn(station)]=referenceAcceleration[station];
                     const auto firstDeviationRow=stationDeviationRowOffsets[station];
-                    const auto targetFromFirstRow=-lp.model.row_lower_[firstDeviationRow];
+                    const auto targetFromFirstRow=-lp.rowLower(firstDeviationRow);
                     referenceValues[accelerationDeviationColumn(station)]=
                         std::abs(referenceAcceleration[station]-targetFromFirstRow);
                 }
@@ -2104,15 +2034,15 @@ namespace ngc {
                 auto referenceViolation=0.0;
                 auto referenceViolationRow=std::size_t {0};
                 auto referenceViolationValue=0.0;
-                for(std::size_t row=0;row<static_cast<std::size_t>(lp.model.num_row_);++row) {
+                for(std::size_t row=0;row<lp.rowCount();++row) {
                     auto value=0.0;
-                    const auto begin=lp.model.a_matrix_.start_[row];
-                    const auto end=lp.model.a_matrix_.start_[row+1];
+                    const auto begin=lp.rowBegin(row);
+                    const auto end=lp.rowEnd(row);
                     for(auto entry=begin;entry<end;++entry)
-                        value+=lp.model.a_matrix_.value_[entry]
-                            *referenceValues[lp.model.a_matrix_.index_[entry]];
-                    const auto violation=std::max({0.0,lp.model.row_lower_[row]-value,
-                        value-lp.model.row_upper_[row]});
+                        value+=lp.entryValue(entry)
+                            *referenceValues[lp.entryColumn(entry)];
+                    const auto violation=std::max({0.0,lp.rowLower(row)-value,
+                        value-lp.rowUpper(row)});
                     if(violation>referenceViolation) {
                         referenceViolation=violation;
                         referenceViolationRow=row;
@@ -2135,8 +2065,8 @@ namespace ngc {
                             referenceViolationRow
                                 -stationDeviationRowOffsets[violationStation],
                             referenceViolation,referenceViolationValue,
-                            lp.model.row_lower_[referenceViolationRow],
-                            lp.model.row_upper_[referenceViolationRow],
+                            lp.rowLower(referenceViolationRow),
+                            lp.rowUpper(referenceViolationRow),
                             referenceVelocity[violationStation],
                             referenceAcceleration[violationStation],
                             correctionPass,scpIteration));
@@ -2153,10 +2083,8 @@ namespace ngc {
                           &&referenceViolationRow
                               >=scpPieceRowOffsets[violationPiece][violationGroup+1])
                         ++violationGroup;
-                    const auto violationBegin=
-                        lp.model.a_matrix_.start_[referenceViolationRow];
-                    const auto violationEnd=
-                        lp.model.a_matrix_.start_[referenceViolationRow+1];
+                    const auto violationBegin=lp.rowBegin(referenceViolationRow);
+                    const auto violationEnd=lp.rowEnd(referenceViolationRow);
                     const auto firstEntry=violationBegin<violationEnd?violationBegin:0;
                     const auto secondEntry=violationBegin+1<violationEnd
                         ?violationBegin+1:firstEntry;
@@ -2173,127 +2101,53 @@ namespace ngc {
                         referenceViolationRow
                             -scpPieceRowOffsets[violationPiece][violationGroup],
                         referenceViolation,referenceViolationValue,
-                        lp.model.row_lower_[referenceViolationRow],
-                        lp.model.row_upper_[referenceViolationRow],
+                        lp.rowLower(referenceViolationRow),
+                        lp.rowUpper(referenceViolationRow),
                         referenceVelocity[violationPiece],
                         referenceAcceleration[violationPiece],
                         pieceStartGeometry[violationPiece].curvature.x,
                         pieceStartGeometry[violationPiece].tangent.x,
                         pieces.size(),violationEnd-violationBegin,
-                        lp.model.a_matrix_.index_[firstEntry],
-                        lp.model.a_matrix_.value_[firstEntry],
-                        referenceValues[lp.model.a_matrix_.index_[firstEntry]],
-                        lp.model.a_matrix_.index_[secondEntry],
-                        lp.model.a_matrix_.value_[secondEntry],
-                        referenceValues[lp.model.a_matrix_.index_[secondEntry]],
-                        lp.model.a_matrix_.index_[thirdEntry],
-                        lp.model.a_matrix_.value_[thirdEntry],
-                        referenceValues[lp.model.a_matrix_.index_[thirdEntry]],
+                        lp.entryColumn(firstEntry),
+                        lp.entryValue(firstEntry),
+                        referenceValues[lp.entryColumn(firstEntry)],
+                        lp.entryColumn(secondEntry),
+                        lp.entryValue(secondEntry),
+                        referenceValues[lp.entryColumn(secondEntry)],
+                        lp.entryColumn(thirdEntry),
+                        lp.entryValue(thirdEntry),
+                        referenceValues[lp.entryColumn(thirdEntry)],
                         correctionPass,scpIteration));
                 }
 
-                auto &highs=persistentScpSolver;
-                if(highs.setOptionValue("simplex_iteration_limit",
-                        static_cast<HighsInt>(m_continuousPlanningEffort
-                            .scpSimplexIterationLimitMultiplier*variableCount))
-                                !=HighsStatus::kOk)
-                    return std::unexpected("continuous SCP could not configure HiGHS");
-                const auto sameStructure=m_continuousPlanningEffort.reuseScpBasis
-                    &&persistentScpModel
-                    &&persistentScpModel->num_col_==lp.model.num_col_
-                    &&persistentScpModel->num_row_==lp.model.num_row_
-                    &&persistentScpModel->a_matrix_.format_==lp.model.a_matrix_.format_
-                    &&persistentScpModel->a_matrix_.start_==lp.model.a_matrix_.start_
-                    &&persistentScpModel->a_matrix_.index_==lp.model.a_matrix_.index_;
-                if(m_continuousPlanningEffort.reuseScpBasis&&persistentScpModel) {
-                    ++result->scpModelUpdateAttempts;
-                    if(sameStructure) ++result->scpModelUpdatesApplied;
-                    else ++result->scpModelStructureMismatches;
-                }
-                if(!sameStructure) {
-                    const auto passStatus=highs.passModel(lp.model);
-                    if(passStatus!=HighsStatus::kOk) {
-                        return std::unexpected(std::format(
-                            "continuous SCP model pass was not exact: status={} columns={} rows={} "
-                            "nonzeros={}",static_cast<int>(passStatus),lp.model.num_col_,
-                            lp.model.num_row_,lp.model.a_matrix_.index_.size()));
-                    }
-                } else {
-                    auto updateStatus=HighsStatus::kOk;
-                    if(persistentScpModel->col_cost_!=lp.model.col_cost_)
-                        updateStatus=highs.changeColsCost(0,lp.model.num_col_-1,
-                            lp.model.col_cost_.data());
-                    if(updateStatus==HighsStatus::kOk
-                       &&(persistentScpModel->col_lower_!=lp.model.col_lower_
-                          ||persistentScpModel->col_upper_!=lp.model.col_upper_))
-                        updateStatus=highs.changeColsBounds(0,lp.model.num_col_-1,
-                            lp.model.col_lower_.data(),lp.model.col_upper_.data());
-                    if(updateStatus==HighsStatus::kOk
-                       &&(persistentScpModel->row_lower_!=lp.model.row_lower_
-                          ||persistentScpModel->row_upper_!=lp.model.row_upper_))
-                        updateStatus=highs.changeRowsBounds(0,lp.model.num_row_-1,
-                            lp.model.row_lower_.data(),lp.model.row_upper_.data());
-                    for(HighsInt row=0;updateStatus==HighsStatus::kOk
-                            &&row<lp.model.num_row_;++row) {
-                        for(auto entry=lp.model.a_matrix_.start_[row];
-                                entry<lp.model.a_matrix_.start_[row+1];++entry) {
-                            if(persistentScpModel->a_matrix_.value_[entry]
-                                    ==lp.model.a_matrix_.value_[entry]) continue;
-                            updateStatus=highs.changeCoeff(row,
-                                lp.model.a_matrix_.index_[entry],
-                                lp.model.a_matrix_.value_[entry]);
-                            if(updateStatus!=HighsStatus::kOk) break;
-                        }
-                    }
-                    if(updateStatus!=HighsStatus::kOk)
-                        return std::unexpected(std::format(
-                            "continuous SCP could not update a structure-stable HiGHS model on "
-                            "correction pass {} iteration {}",correctionPass,scpIteration));
-                }
-                persistentScpModel=lp.model;
-                if(m_continuousPlanningEffort.reuseScpBasis&&reusableScpBasis) {
-                    ++result->scpBasisReuseAttempts;
-                    if(reusableScpBasis->valid
-                       &&reusableScpBasis->col_status.size()
-                            ==static_cast<std::size_t>(lp.model.num_col_)
-                       &&reusableScpBasis->row_status.size()
-                            ==static_cast<std::size_t>(lp.model.num_row_)) {
-                        if(highs.setBasis(*reusableScpBasis,"NGC SCP reuse")
-                                !=HighsStatus::kOk)
-                            return std::unexpected(std::format(
-                                "continuous SCP could not apply a dimension-checked HiGHS "
-                                "basis on correction pass {} iteration {}: columns={} rows={}",
-                                correctionPass,scpIteration,lp.model.num_col_,lp.model.num_row_));
-                        ++result->scpBasisReuseApplied;
-                    } else {
-                        ++result->scpBasisDimensionMismatches;
-                        reusableScpBasis.reset();
-                    }
-                }
                 ++result->scpSolves;
-                const auto solveStatus=highs.run();
-                const auto &solveInfo=highs.getInfo();
-                if(solveInfo.simplex_iteration_count>0)
-                    result->scpSimplexIterations+=
-                        static_cast<std::size_t>(solveInfo.simplex_iteration_count);
-                const auto modelStatus=highs.getModelStatus();
-                auto solveClassification=trajectory_detail::ScpSolveClassification::Failure;
-                if(solveStatus!=HighsStatus::kError) {
-                    if(modelStatus==HighsModelStatus::kOptimal
-                       &&solveStatus==HighsStatus::kOk)
-                        solveClassification=trajectory_detail::ScpSolveClassification::Optimal;
-                    else if(modelStatus==HighsModelStatus::kTimeLimit)
-                        solveClassification=trajectory_detail::ScpSolveClassification::TimeLimit;
-                    else if(modelStatus==HighsModelStatus::kIterationLimit)
-                        solveClassification=
-                            trajectory_detail::ScpSolveClassification::IterationLimit;
-                }
-                const auto solveAction=trajectory_detail::scpSolveAction(solveClassification);
-                if(solveAction==trajectory_detail::ScpSolveAction::RetainReference) {
+                auto solution=persistentScpSolver.solve(lp,{
+                    .simplexIterationLimit=m_continuousPlanningEffort
+                        .scpSimplexIterationLimitMultiplier*variableCount,
+                    .reuseBasis=m_continuousPlanningEffort.reuseScpBasis,
+                });
+                if(!solution)
+                    return std::unexpected(std::format(
+                        "continuous SCP linear solve failed on correction pass {} iteration {}: {} "
+                        "pieces={} start=[v={} a={}] end=[v={} a={}]",
+                        correctionPass,scpIteration,solution.error(),pieces.size(),
+                        scalarStart->first,scalarStart->second,
+                        scalarEnd->first,scalarEnd->second));
+                const auto &solveDiagnostics=solution->diagnostics;
+                result->scpSimplexIterations+=solveDiagnostics.simplexIterations;
+                result->scpBasisReuseAttempts+=solveDiagnostics.basisReuseAttempted;
+                result->scpBasisReuseApplied+=solveDiagnostics.basisReuseApplied;
+                result->scpBasisDimensionMismatches+=
+                    solveDiagnostics.basisDimensionMismatch;
+                result->scpModelUpdateAttempts+=solveDiagnostics.modelUpdateAttempted;
+                result->scpModelUpdatesApplied+=solveDiagnostics.modelUpdateApplied;
+                result->scpModelStructureMismatches+=
+                    solveDiagnostics.modelStructureMismatch;
+                if(solution->status!=path_tempo::LinearSolveStatus::Optimal) {
                     auto &fallback=result->scpResourceFallback;
                     if(fallback.occurrences==0) {
-                        fallback.reason=solveClassification
-                                ==trajectory_detail::ScpSolveClassification::TimeLimit
+                        fallback.reason=solution->status
+                                ==path_tempo::LinearSolveStatus::TimeLimit
                             ?ScpResourceFallbackReason::TimeLimit
                             :ScpResourceFallbackReason::IterationLimit;
                         fallback.correctionPass=correctionPass;
@@ -2302,36 +2156,14 @@ namespace ngc {
                     ++fallback.occurrences;
                     break;
                 }
-                if(solveAction==trajectory_detail::ScpSolveAction::Fail) {
-                    return std::unexpected(std::format(
-                        "continuous SCP HiGHS solve failed on correction pass {} iteration {}: {} "
-                        "pieces={} start=[v={} a={}] end=[v={} a={}]",
-                        correctionPass,scpIteration,
-                        highs.modelStatusToString(modelStatus),pieces.size(),
-                        scalarStart->first,scalarStart->second,
-                        scalarEnd->first,scalarEnd->second));
-                }
-                const auto &solution=highs.getSolution();
-                if(!solution.value_valid
-                   ||solution.col_value.size()!=static_cast<std::size_t>(variableCount))
-                    return std::unexpected("continuous SCP HiGHS solution has no primal values");
-                if(m_continuousPlanningEffort.reuseScpBasis) {
-                    const auto &basis=highs.getBasis();
-                    if(basis.valid
-                       &&basis.col_status.size()==static_cast<std::size_t>(lp.model.num_col_)
-                       &&basis.row_status.size()==static_cast<std::size_t>(lp.model.num_row_))
-                        reusableScpBasis=basis;
-                    else
-                        reusableScpBasis.reset();
-                }
 
                 std::vector<double> proposedVelocity(referenceVelocity.size());
                 std::vector<double> proposedAcceleration(referenceAcceleration.size());
                 for(std::size_t station=0;station<referenceVelocity.size();++station) {
                     proposedVelocity[station]=std::clamp(
-                        solution.col_value[velocityColumn(station)],0.0,stationCaps[station]);
+                        solution->values[velocityColumn(station)],0.0,stationCaps[station]);
                     proposedAcceleration[station]=
-                        solution.col_value[accelerationColumn(station)];
+                        solution->values[accelerationColumn(station)];
                 }
                 // A whole-horizon line search is overly brittle here: each
                 // materialized piece contains several jerk phases, so one bad

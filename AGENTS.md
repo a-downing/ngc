@@ -64,7 +64,7 @@ The VistaCNC P2-S LCD is two eight-character rows and requires periodic output r
 
 ## Build and test
 
-The supported development environment is Windows with Clang, Ninja, CMake, and vcpkg. GLM comes from vcpkg; GLFW, ImGui, toml++, and PathTempo are submodules. PathTempo provides the pinned unmodified upstream Ruckig dependency used by both trajectory timing and NGC's other NRT motion generation.
+The supported development environment is Windows with Clang, Ninja, CMake, and vcpkg. GLM comes from vcpkg; GLFW, ImGui, toml++, and PathTempo are submodules. PathTempo privately provides the pinned unmodified upstream HiGHS and Ruckig dependencies used by trajectory timing, while NGC's other NRT motion generation shares PathTempo's Ruckig target.
 
 Configure a fresh Release build with:
 
