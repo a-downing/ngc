@@ -430,7 +430,8 @@ class ApplicationImpl final {
 public:
     ApplicationImpl() = delete;
     ApplicationImpl(GLFWwindow *window, const ngc::MachineConfiguration &configuration,
-                    const ngc::spline_detail::SplineFitSolver splineFitSolver)
+                    const ngc::spline_detail::SplineFitSolver splineFitSolver,
+                    const ngc::ContinuousConstraintCheckMode continuousCheckMode)
         : m_window(window), m_simulationTiming(configuration.simulation),
           m_joggingConfiguration(configuration.jogging),
           m_pendantConfiguration(configuration.pendant), m_machineUnit(configuration.unit),
@@ -441,8 +442,15 @@ public:
           m_pendantTouchOffController(configuration),
           m_simulatedRapidSpeed(configuration.trajectory.rapidSpeed),
           m_pathJerk(configuration.trajectory.pathJerk) {
-        if(!m_simulation.setSplineFitSolver(splineFitSolver))
+        if (!m_simulation.setSplineFitSolver(splineFitSolver)) {
             PANIC("new simulation worker rejected its spline smoothing mode");
+        }
+
+        auto planningEffort = ngc::ContinuousPlanningEffort{};
+        planningEffort.constraintCheckMode = continuousCheckMode;
+        if (!m_simulation.setContinuousPlanningEffort(planningEffort)) {
+            PANIC("new simulation worker rejected its continuous constraint-check mode");
+        }
     }
 
     void init() {
@@ -2727,8 +2735,10 @@ public:
 };
 
 Application::Application(GLFWwindow *window, const ngc::MachineConfiguration &configuration,
-                         const ngc::spline_detail::SplineFitSolver splineFitSolver)
-    : m_impl(std::make_unique<ApplicationImpl>(window,configuration,splineFitSolver)) { }
+                         const ngc::spline_detail::SplineFitSolver splineFitSolver,
+                         const ngc::ContinuousConstraintCheckMode continuousCheckMode)
+    : m_impl(std::make_unique<ApplicationImpl>(window, configuration, splineFitSolver,
+          continuousCheckMode)) {}
 Application::~Application() = default;
 
 void Application::init() { m_impl->init(); }

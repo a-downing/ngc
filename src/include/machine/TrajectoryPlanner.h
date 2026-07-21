@@ -544,6 +544,9 @@ namespace ngc {
             if(chunk.normalMotion.size==0)
                 return std::unexpected("continuous plan has no normal motion");
             const auto &limits=m_compiler.limits();
+            const auto verifyMaterializedConstraints =
+                m_compiler.continuousPlanningEffort().constraintCheckMode
+                == ContinuousConstraintCheckMode::Materialized;
             std::optional<MotionState> previous;
             SpanId previousSpan=0;
             std::size_t spanIndex=0;
@@ -574,21 +577,25 @@ namespace ngc {
                             formatPosition(start.velocity),formatPosition(start.acceleration)));
                     }
                 }
-                for(const auto component:AXIS_COMPONENTS) {
-                    if(exceeds(trajectory_detail::maximumAxisVelocity(span,component),
-                               limits.axisVelocity.*component)
-                       ||exceeds(trajectory_detail::maximumAxisAcceleration(span,component),
-                                 limits.axisAcceleration.*component)
-                       ||exceeds(trajectory_detail::maximumAxisJerk(span,component),
-                                 limits.axisJerk.*component))
-                        return std::unexpected("continuous plan exceeds a configured axis limit");
+                if (verifyMaterializedConstraints) {
+                    for (const auto component : AXIS_COMPONENTS) {
+                        if (exceeds(trajectory_detail::maximumAxisVelocity(span, component),
+                                    limits.axisVelocity.*component)
+                            || exceeds(trajectory_detail::maximumAxisAcceleration(span, component),
+                                       limits.axisAcceleration.*component)
+                            || exceeds(trajectory_detail::maximumAxisJerk(span, component),
+                                       limits.axisJerk.*component)) {
+                            return std::unexpected("continuous plan exceeds a configured axis limit");
+                        }
+                    }
+                    const auto acceleration0 = start.acceleration.length();
+                    const auto acceleration1 = span.end.acceleration.length();
+                    const auto jerk = scalePosition(span.a, 6.0*span.inverseDurationCubed).length();
+                    if (exceeds(std::max(acceleration0, acceleration1), limits.pathAcceleration)
+                        || exceeds(jerk, limits.pathJerk)) {
+                        return std::unexpected("continuous plan exceeds a configured path limit");
+                    }
                 }
-                const auto acceleration0=start.acceleration.length();
-                const auto acceleration1=span.end.acceleration.length();
-                const auto jerk=scalePosition(span.a,6.0*span.inverseDurationCubed).length();
-                if(exceeds(std::max(acceleration0,acceleration1),limits.pathAcceleration)
-                   ||exceeds(jerk,limits.pathJerk))
-                    return std::unexpected("continuous plan exceeds a configured path limit");
                 previous=span.end;
                 previousSpan=span.id;
                 ++spanIndex;
@@ -982,36 +989,20 @@ namespace ngc {
                     const auto nominal=slowest->programmedVelocityLimit>0.0
                         ?slowest->length/slowest->programmedVelocityLimit:0.0;
                     m_lastContinuousPlanSummary=std::format(
-                        "pieces={} actual={:.3f}s seed={:.3f}s slowest_input={} "
+                        "pieces={} constraint_check={} actual={:.3f}s seed={:.3f}s slowest_input={} "
                         "length={:.6g} nominal={:.6g}s actual={:.6g}s ratio={:.3f} "
                         "programmed_v={:.6g} local_v={:.6g} entry_v={:.6g} exit_v={:.6g} "
-                        "local_a={:.6g} local_j={:.6g} scp_solves={} scp_iterations={} "
-                        "scp_trials={} scp_basis_applied={} scp_accepted={} "
-                        "transition_requests={} transition_solves={} cache_hits={} "
-                        "cache_failure_hits={} cache_materializations={} "
-                        "correction_passes={} "
-                        "scp_fallback={} fallback_count={} fallback_pass={} "
-                        "fallback_iteration={}",
-                        continuous->pieceTiming.size(),actualDuration,
+                        "local_a={:.6g} local_j={:.6g} correction_passes={}",
+                        continuous->pieceTiming.size(),
+                        name(m_compiler.continuousPlanningEffort().constraintCheckMode),
+                        actualDuration,
                         continuous->velocityOnlySeedDuration,slowest->input,
                         slowest->length,nominal,slowest->duration,
                         nominal>0.0?slowest->duration/nominal:0.0,
                         slowest->programmedVelocityLimit,slowest->velocityLimit,
                         slowest->entryVelocity,slowest->exitVelocity,
                         slowest->accelerationLimit,slowest->jerkLimit,
-                        continuous->scpSolves,continuous->scpSimplexIterations,
-                        continuous->scpLineSearchTrials,
-                        continuous->scpBasisReuseApplied,continuous->scpAcceptedSteps,
-                        continuous->scalarTransitionRequests,
-                        continuous->scalarTransitionSolverCalls,
-                        continuous->scalarTransitionCacheHits,
-                        continuous->scalarTransitionCacheFailureHits,
-                        continuous->scalarTransitionCacheMaterializations,
-                        continuous->correctionPasses,
-                        name(continuous->scpResourceFallback.reason),
-                        continuous->scpResourceFallback.occurrences,
-                        continuous->scpResourceFallback.correctionPass,
-                        continuous->scpResourceFallback.scpIteration);
+                        continuous->correctionPasses);
                 } else {
                     m_lastContinuousPlanSummary="continuous plan has no piece timing diagnostics";
                 }

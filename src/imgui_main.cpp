@@ -42,35 +42,62 @@ static void save_window_maximized(GLFWwindow *window) {
     state << "maximized=" << (glfwGetWindowAttrib(window, GLFW_MAXIMIZED) == GLFW_TRUE ? 1 : 0) << '\n';
 }
 
-static std::expected<ngc::spline_detail::SplineFitSolver,std::string> parseSmoother(
-        const int argc,char **argv) {
-    auto result=ngc::spline_detail::continuousSplineFitSolver();
-    for(auto argument=1;argument<argc;++argument) {
-        auto option=std::string_view{argv[argument]};
-        constexpr std::string_view prefix="--smoother=";
-        if(!option.starts_with(prefix))
-            return std::unexpected("unknown option '"+std::string{option}+"'");
-        option.remove_prefix(prefix.size());
-        using ngc::spline_detail::SplineFitSolver;
-        if(option=="none") result=SplineFitSolver::None;
-        else if(option=="coordinate") result=SplineFitSolver::CoordinateSearch;
-        else if(option=="uniform") result=SplineFitSolver::UniformBandedFairness;
-        else if(option=="peak-targeted") result=SplineFitSolver::PeakTargetedBandedFairness;
-        else if(option=="velocity-targeted")
-            result=SplineFitSolver::VelocityTargetedBandedFairness;
-        else return std::unexpected(
-            "unknown smoother; expected none, coordinate, uniform, peak-targeted, or "
-            "velocity-targeted");
+struct CommandLineOptions {
+    ngc::spline_detail::SplineFitSolver smoother =
+        ngc::spline_detail::continuousSplineFitSolver();
+    ngc::ContinuousConstraintCheckMode continuousCheck =
+        ngc::ContinuousConstraintCheckMode::Materialized;
+};
+
+static std::expected<CommandLineOptions, std::string> parseOptions(const int argc, char **argv) {
+    CommandLineOptions result;
+    for (auto argument = 1; argument < argc; ++argument) {
+        auto option = std::string_view{argv[argument]};
+        constexpr std::string_view smootherPrefix = "--smoother=";
+        constexpr std::string_view checkPrefix = "--continuous-check=";
+        if (option.starts_with(smootherPrefix)) {
+            option.remove_prefix(smootherPrefix.size());
+            using ngc::spline_detail::SplineFitSolver;
+            if (option == "none") {
+                result.smoother = SplineFitSolver::None;
+            } else if (option == "coordinate") {
+                result.smoother = SplineFitSolver::CoordinateSearch;
+            } else if (option == "uniform") {
+                result.smoother = SplineFitSolver::UniformBandedFairness;
+            } else if (option == "peak-targeted") {
+                result.smoother = SplineFitSolver::PeakTargetedBandedFairness;
+            } else if (option == "velocity-targeted") {
+                result.smoother = SplineFitSolver::VelocityTargetedBandedFairness;
+            } else {
+                return std::unexpected(
+                    "unknown smoother; expected none, coordinate, uniform, peak-targeted, or "
+                    "velocity-targeted");
+            }
+        } else if (option.starts_with(checkPrefix)) {
+            option.remove_prefix(checkPrefix.size());
+            if (option == "materialized") {
+                result.continuousCheck = ngc::ContinuousConstraintCheckMode::Materialized;
+            } else if (option == "sampled") {
+                result.continuousCheck = ngc::ContinuousConstraintCheckMode::Sampled;
+            } else {
+                return std::unexpected(
+                    "unknown continuous check; expected materialized or sampled");
+            }
+        } else {
+            return std::unexpected("unknown option '" + std::string{option} + "'");
+        }
     }
+
     return result;
 }
 
-int main(const int argc,char **argv) {
-    const auto smoother=parseSmoother(argc,argv);
-    if(!smoother) {
-        std::println(stderr,"{}",smoother.error());
-        std::println(stderr,"usage: imgui_main [--smoother=none|coordinate|uniform|"
-            "peak-targeted|velocity-targeted]");
+int main(const int argc, char **argv) {
+    const auto options = parseOptions(argc, argv);
+    if (!options) {
+        std::println(stderr, "{}", options.error());
+        std::println(stderr, "usage: imgui_main [--smoother=none|coordinate|uniform|"
+            "peak-targeted|velocity-targeted] "
+            "[--continuous-check=materialized|sampled]");
         return 2;
     }
     const auto configuration = ngc::loadMachineConfiguration("machine.toml");
@@ -134,7 +161,7 @@ int main(const int argc,char **argv) {
 
     ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
 
-    Application app(window,*configuration,*smoother);
+    Application app(window, *configuration, options->smoother, options->continuousCheck);
     app.init();
 
     while (!glfwWindowShouldClose(window)) {

@@ -1025,23 +1025,13 @@ namespace ngc {
            ||m_continuousPlanningEffort.maximumLocalCorrectionPasses>128
            ||m_continuousPlanningEffort.geometryVerificationBudgetMultiplier<36
            ||m_continuousPlanningEffort.geometryVerificationBudgetMultiplier>256
-           ||m_continuousPlanningEffort.scpIterations>32
-           ||m_continuousPlanningEffort.scpLineSearchSteps==0
-           ||m_continuousPlanningEffort.scpLineSearchSteps>24
-           ||m_continuousPlanningEffort.scpSimplexIterationLimitMultiplier==0
-           ||m_continuousPlanningEffort.scpSimplexIterationLimitMultiplier>4096
-           ||!std::isfinite(m_continuousPlanningEffort.scpVelocityTrustFraction)
-           ||m_continuousPlanningEffort.scpVelocityTrustFraction<=0.0
-           ||m_continuousPlanningEffort.scpVelocityTrustFraction>1.0
-           ||!std::isfinite(m_continuousPlanningEffort.scpAccelerationTrustFraction)
-           ||m_continuousPlanningEffort.scpAccelerationTrustFraction<=0.0
-           ||m_continuousPlanningEffort.scpAccelerationTrustFraction>2.0
-           ||!std::isfinite(m_continuousPlanningEffort.scpSolveTimeLimit)
-           ||m_continuousPlanningEffort.scpSolveTimeLimit<=0.0
-           ||m_continuousPlanningEffort.scpSolveTimeLimit>60.0
            ||!std::isfinite(m_continuousPlanningEffort
                 .curvatureDerivativeVelocityCapMultiplier)
-           ||m_continuousPlanningEffort.curvatureDerivativeVelocityCapMultiplier<=0.0)
+           ||m_continuousPlanningEffort.curvatureDerivativeVelocityCapMultiplier<=0.0
+           ||(m_continuousPlanningEffort.constraintCheckMode
+                  != ContinuousConstraintCheckMode::Materialized
+              && m_continuousPlanningEffort.constraintCheckMode
+                  != ContinuousConstraintCheckMode::Sampled))
             return std::unexpected("continuous planning effort is outside its bounded range");
         reportProgress();
 
@@ -1508,17 +1498,9 @@ namespace ngc {
                 .coordinateJerk = pathTempoVector(m_limits.axisJerk),
             },
             .settings = {
-                .linearSolveTimeLimit = m_continuousPlanningEffort.scpSolveTimeLimit,
-                .simplexIterationLimit =
-                    m_continuousPlanningEffort.scpSimplexIterationLimitMultiplier
-                        * (5 * pieces.size() + 3),
                 .maximumCorrectionPasses = maximumLocalCorrectionPasses,
-                .sequentialIterations = m_continuousPlanningEffort.scpIterations,
-                .lineSearchSteps = m_continuousPlanningEffort.scpLineSearchSteps,
-                .velocityTrustFraction = m_continuousPlanningEffort.scpVelocityTrustFraction,
-                .accelerationTrustFraction =
-                    m_continuousPlanningEffort.scpAccelerationTrustFraction,
-                .applySampledCorrections = false,
+                .applySampledCorrections = m_continuousPlanningEffort.constraintCheckMode
+                    == ContinuousConstraintCheckMode::Sampled,
             },
         };
         auto materializationPass = 0U;
@@ -1555,38 +1537,10 @@ namespace ngc {
                 localLimits[pieceIndex].jerk=planned->pieceLimits[pieceIndex].jerk;
             }
             result->velocityOnlySeedDuration=planned->diagnostics.velocitySeedDuration;
-            result->scpSolves+=planned->diagnostics.sequentialSolves;
-            result->scpSimplexIterations+=planned->diagnostics.linearSolverIterations;
-            result->scpLineSearchTrials+=planned->diagnostics.lineSearchTrials;
-            result->scpAcceptedSteps+=planned->diagnostics.acceptedRefinements;
-            result->scalarTransitionRequests+=planned->diagnostics.transitionRequests;
-            result->scalarTransitionSolverCalls+=
-                planned->diagnostics.transitionSolverCalls;
-            result->scalarTransitionCacheHits+=
-                planned->diagnostics.transitionCacheHits;
-            result->scalarTransitionCacheFailureHits+=
-                planned->diagnostics.transitionCacheFailureHits;
-            result->scalarTransitionCacheMaterializations+=
-                planned->diagnostics.transitionCacheMaterializations;
-            result->scpBasisReuseApplied+=
-                planned->diagnostics.linearSolverBasisReused?1U:0U;
-            if (planned->diagnostics.resourceLimitOccurrences>0) {
-                auto &fallback=result->scpResourceFallback;
-                if (fallback.occurrences==0) {
-                    fallback.reason=planned->diagnostics.resourceLimit
-                            ==path_tempo::PlanningResourceLimit::Time
-                        ?ScpResourceFallbackReason::TimeLimit
-                        :ScpResourceFallbackReason::IterationLimit;
-                    fallback.correctionPass=correctionPass;
-                    fallback.scpIteration=static_cast<unsigned>(planned->diagnostics
-                        .firstResourceLimitedSequentialIteration);
-                }
-                fallback.occurrences+=planned->diagnostics.resourceLimitOccurrences;
-            }
             result->correctionPasses =
                 static_cast<unsigned>(planned->diagnostics.correctionPasses);
 
-            const auto optimizedDuration=std::accumulate(pieceTiming.begin(),pieceTiming.end(),0.0,
+            const auto candidateDuration=std::accumulate(pieceTiming.begin(),pieceTiming.end(),0.0,
                 [](const double total,const auto &timing) { return total+timing.back().time; });
             result->ruckigBrakePhases=std::accumulate(
                 pieceTiming.begin(),pieceTiming.end(),std::size_t {0},
@@ -1922,6 +1876,13 @@ namespace ngc {
             if(normalSpans.empty())
                 return std::unexpected("continuous locally timed trajectory emitted no motion spans");
 
+            if (m_continuousPlanningEffort.constraintCheckMode
+                    == ContinuousConstraintCheckMode::Sampled) {
+                constraintsVerified = true;
+
+                return std::vector<path_tempo::PieceCorrection>{};
+            }
+
             struct ConstraintViolationDiagnostic {
                 double factor=1.0;
                 std::size_t stagedSpan=0;
@@ -1975,8 +1936,7 @@ namespace ngc {
             correctionHistory+=std::format(
                 "{}pass {}: factor={} piece={} input={} geometry={} piece_length={} "
                 "span_id={} staged_span={} span_duration={} constraint={} axis={} measured={} "
-                "limit={} measured_over_limit={} timing_candidate={} optimized_duration={} "
-                "scp_iterations={} scp_accepted_steps={} "
+                "limit={} measured_over_limit={} timing_candidate={} candidate_duration={} "
                 "max_station_acceleration={} station_state=[v={} a={} -> v={} a={}] "
                 "local_limits=[v={} a={} j={}]",
                 correctionHistory.empty()?"":"; ",correctionPass,worst,worstPiece,
@@ -1984,9 +1944,7 @@ namespace ngc {
                 pieces[worstPiece].length,worstViolation.spanId,worstViolation.stagedSpan,
                 worstViolation.duration,worstViolation.constraint,worstViolation.axis,
                 worstViolation.measured,worstViolation.limit,worstViolation.ratio,
-                m_continuousPlanningEffort.scpIterations==0
-                    ?"velocity-seed":"sparse-scp",optimizedDuration,
-                m_continuousPlanningEffort.scpIterations,result->scpAcceptedSteps,
+                "velocity-seed",candidateDuration,
                 maximumStationAcceleration,
                 stationVelocity[worstPiece],stationAcceleration[worstPiece],
                 stationVelocity[worstPiece+1],stationAcceleration[worstPiece+1],

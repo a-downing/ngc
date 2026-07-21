@@ -4,6 +4,7 @@
 
 #include "machine/MachineConfiguration.h"
 #include "machine/SplineReconstruction.h"
+#include "machine/TrajectoryCompiler.h"
 
 struct GLFWwindow;
 
@@ -15,7 +16,8 @@ class Application final {
 public:
     Application() = delete;
     Application(GLFWwindow *window, const ngc::MachineConfiguration &configuration,
-                ngc::spline_detail::SplineFitSolver splineFitSolver);
+                ngc::spline_detail::SplineFitSolver splineFitSolver,
+                ngc::ContinuousConstraintCheckMode continuousCheckMode);
     ~Application();
 
     Application(const Application &) = delete;

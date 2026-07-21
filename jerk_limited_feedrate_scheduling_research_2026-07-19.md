@@ -1,5 +1,7 @@
 # Research: Alternatives to NGC's Verifier-Guided Jerk-Limited Feedrate Scheduling
 
+Status: the HiGHS-backed sequential-refinement experiment proposed here was implemented and then removed from production. On the measured NGC workloads, the reachability/Ruckig candidate was faster and slightly more time-optimal without that refinement. References to HiGHS and SCP below are retained as research alternatives, not descriptions of the current planner or build dependencies.
+
 ## Executive conclusion
 
 NGC's strict scheduler is best described as a hybrid of:

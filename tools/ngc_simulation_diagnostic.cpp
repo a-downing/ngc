@@ -74,36 +74,39 @@ namespace {
             "velocity-targeted");
     }
 
-    std::expected<bool, std::string> parseScp(std::string_view argument) {
-        constexpr std::string_view prefix = "--scp=";
+    std::expected<ngc::ContinuousConstraintCheckMode, std::string> parseContinuousCheck(
+            std::string_view argument) {
+        constexpr std::string_view prefix = "--continuous-check=";
         if (!argument.starts_with(prefix)) {
-            return std::unexpected("SCP option must use --scp=on|off");
+            return std::unexpected(
+                "continuous-check option must use --continuous-check=materialized|sampled");
         }
         argument.remove_prefix(prefix.size());
-        if (argument == "on") {
-            return true;
+        if (argument == "materialized") {
+            return ngc::ContinuousConstraintCheckMode::Materialized;
         }
-        if (argument == "off") {
-            return false;
+        if (argument == "sampled") {
+            return ngc::ContinuousConstraintCheckMode::Sampled;
         }
 
-        return std::unexpected("unknown SCP mode; expected on or off");
+        return std::unexpected(
+            "unknown continuous check; expected materialized or sampled");
     }
 }
 
 int main(const int argc,char **argv) {
-    if (argc>6) {
+    if (argc > 6) {
         std::println(stderr,"usage: ngc_simulation_diagnostic [program.ngc] "
             "[maximum-program-seconds] [tick-multiplier] "
             "[--smoother=none|coordinate|uniform|peak-targeted|velocity-targeted] "
-            "[--scp=on|off]");
+            "[--continuous-check=materialized|sampled]");
         return 2;
     }
     const std::filesystem::path program=argc>1?argv[1]:"adaptive_pockets.ngc";
     const auto maximumProgramSeconds=argc>2?std::strtod(argv[2],nullptr):60.0;
     const auto multiplier=argc>3?std::atoi(argv[3]):10;
     auto smoother=ngc::spline_detail::continuousSplineFitSolver();
-    auto useScp = true;
+    auto continuousCheck = ngc::ContinuousConstraintCheckMode::Materialized;
     for (auto argument=4;argument<argc;++argument) {
         const auto option=std::string_view{argv[argument]};
         if (option.starts_with("--smoother=")) {
@@ -113,13 +116,13 @@ int main(const int argc,char **argv) {
                 return 2;
             }
             smoother=*parsed;
-        } else if (option.starts_with("--scp=")) {
-            const auto parsed=parseScp(option);
+        } else if (option.starts_with("--continuous-check=")) {
+            const auto parsed = parseContinuousCheck(option);
             if (!parsed) {
-                std::println(stderr,"{}",parsed.error());
+                std::println(stderr, "{}", parsed.error());
                 return 2;
             }
-            useScp = *parsed;
+            continuousCheck = *parsed;
         } else {
             std::println(stderr,"unknown diagnostic option: {}",option);
             return 2;
@@ -156,12 +159,10 @@ int main(const int argc,char **argv) {
         std::println(stderr,"simulation worker rejected the smoother selection");
         return 1;
     }
-    ngc::ContinuousPlanningEffort planningEffort;
-    if (!useScp) {
-        planningEffort.scpIterations = 0;
-    }
-    if(!worker.setContinuousPlanningEffort(planningEffort)) {
-        std::println(stderr,"simulation worker rejected the planning-effort selection");
+    auto planningEffort = ngc::ContinuousPlanningEffort{};
+    planningEffort.constraintCheckMode = continuousCheck;
+    if (!worker.setContinuousPlanningEffort(planningEffort)) {
+        std::println(stderr, "simulation worker rejected the continuous-check selection");
         return 1;
     }
     if(!worker.start(programs,tools,true)) {
@@ -169,9 +170,9 @@ int main(const int argc,char **argv) {
         return 1;
     }
 
-    std::println("program={} multiplier={} stop_after={:.3f}s smoother={} scp={}",
+    std::println("program={} multiplier={} stop_after={:.3f}s smoother={} continuous_check={}",
         program.string(),multiplier,maximumProgramSeconds,smootherName(smoother),
-        useScp ? "on" : "off");
+        name(continuousCheck));
     ngc::EpochId lastEpoch=0;
     ngc::ChunkId lastChunk=0;
     ngc::SpanId lastSpan=0;

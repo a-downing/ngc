@@ -19,55 +19,21 @@
 #include "machine/PreparedGeometry.h"
 
 namespace ngc {
-    enum class ScpResourceFallbackReason : std::uint8_t {
-        None,
-        TimeLimit,
-        IterationLimit,
+    enum class ContinuousConstraintCheckMode : std::uint8_t {
+        Materialized,
+        Sampled,
     };
 
-    inline std::string_view name(const ScpResourceFallbackReason reason) {
-        switch(reason) {
-            case ScpResourceFallbackReason::None: return "none";
-            case ScpResourceFallbackReason::TimeLimit: return "time-limit";
-            case ScpResourceFallbackReason::IterationLimit: return "iteration-limit";
+    inline std::string_view name(const ContinuousConstraintCheckMode mode) {
+        switch (mode) {
+            case ContinuousConstraintCheckMode::Materialized: return "materialized";
+            case ContinuousConstraintCheckMode::Sampled: return "sampled";
         }
+
         return "unknown";
     }
 
     namespace trajectory_detail {
-        // HiGHS removes entries whose magnitude is less than or equal to its
-        // small_matrix_value. The builder and configured solver share this one
-        // cutoff so passModel cannot silently loosen the SCP model.
-        inline constexpr double SCP_SMALL_MATRIX_VALUE=1e-12;
-
-        constexpr bool scpRetainsMatrixCoefficient(const double value) {
-            return value>SCP_SMALL_MATRIX_VALUE||value<-SCP_SMALL_MATRIX_VALUE;
-        }
-
-        enum class ScpSolveClassification : std::uint8_t {
-            Optimal,
-            TimeLimit,
-            IterationLimit,
-            Failure,
-        };
-
-        enum class ScpSolveAction : std::uint8_t {
-            AcceptOptimal,
-            RetainReference,
-            Fail,
-        };
-
-        constexpr ScpSolveAction scpSolveAction(const ScpSolveClassification classification) {
-            switch(classification) {
-                case ScpSolveClassification::Optimal: return ScpSolveAction::AcceptOptimal;
-                case ScpSolveClassification::TimeLimit:
-                case ScpSolveClassification::IterationLimit:
-                    return ScpSolveAction::RetainReference;
-                case ScpSolveClassification::Failure: return ScpSolveAction::Fail;
-            }
-            return ScpSolveAction::Fail;
-        }
-
         inline double maximumAxisVelocity(const AxisPolynomialSpan &span,
                                           const double position_t::*component) {
             const auto at = [&](const double u) {
@@ -113,14 +79,8 @@ namespace ngc {
         double curvatureDerivativeVelocityCapMultiplier = 1.0;
         bool applyCurvatureDerivativeVelocityCap = true;
         bool measureCurvatureDerivativeNumerics = false;
-        // PathTempo's HiGHS-backed sequential-linearization bounds. These are
-        // NRT planning limits, not RT execution data.
-        unsigned scpIterations = 1;
-        unsigned scpLineSearchSteps = 8;
-        std::size_t scpSimplexIterationLimitMultiplier = 64;
-        double scpVelocityTrustFraction = 0.35;
-        double scpAccelerationTrustFraction = 0.75;
-        double scpSolveTimeLimit = 0.5;
+        ContinuousConstraintCheckMode constraintCheckMode =
+            ContinuousConstraintCheckMode::Materialized;
     };
 
     struct ContinuousPieceTimingDiagnostic {
@@ -279,25 +239,7 @@ namespace ngc {
         std::size_t ruckigBrakePhases = 0;
         std::size_t geometryVerificationAttempts = 0;
         std::size_t geometryVerificationHighWater = 0;
-        std::size_t scpSolves = 0;
-        std::size_t scpSimplexIterations = 0;
-        std::size_t scpBasisReuseApplied = 0;
-        std::size_t scpLineSearchTrials = 0;
-        std::size_t scpAcceptedSteps = 0;
-        std::size_t scalarTransitionRequests = 0;
-        std::size_t scalarTransitionSolverCalls = 0;
-        std::size_t scalarTransitionCacheHits = 0;
-        std::size_t scalarTransitionCacheFailureHits = 0;
-        std::size_t scalarTransitionCacheMaterializations = 0;
         unsigned correctionPasses = 0;
-        // Bounded NRT evidence for the first expected solver-resource fallback
-        // in this plan. occurrences includes later correction-pass fallbacks.
-        struct ResourceFallbackDiagnostic {
-            ScpResourceFallbackReason reason = ScpResourceFallbackReason::None;
-            unsigned correctionPass = 0;
-            unsigned scpIteration = 0;
-            std::size_t occurrences = 0;
-        } scpResourceFallback;
         TimeLawDiagnostics timeLaw;
     };
 

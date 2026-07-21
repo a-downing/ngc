@@ -3098,32 +3098,6 @@ final_move_together = true
     void testClusterSplinePreparesKnotIntervalSamplesAndFeeds() {
         static_assert(ngc::spline_detail::continuousSplineFitSolver()
             ==ngc::spline_detail::SplineFitSolver::VelocityTargetedBandedFairness);
-        using ngc::trajectory_detail::ScpSolveAction;
-        using ngc::trajectory_detail::ScpSolveClassification;
-        static_assert(!ngc::trajectory_detail::scpRetainsMatrixCoefficient(0.0));
-        static_assert(!ngc::trajectory_detail::scpRetainsMatrixCoefficient(
-            ngc::trajectory_detail::SCP_SMALL_MATRIX_VALUE));
-        static_assert(!ngc::trajectory_detail::scpRetainsMatrixCoefficient(
-            -ngc::trajectory_detail::SCP_SMALL_MATRIX_VALUE));
-        static_assert(ngc::trajectory_detail::scpRetainsMatrixCoefficient(
-            2.0*ngc::trajectory_detail::SCP_SMALL_MATRIX_VALUE));
-        const auto matrixThreshold=ngc::trajectory_detail::SCP_SMALL_MATRIX_VALUE;
-        require(ngc::trajectory_detail::scpRetainsMatrixCoefficient(
-                    std::nextafter(matrixThreshold,std::numeric_limits<double>::infinity()))
-                    &&ngc::trajectory_detail::scpRetainsMatrixCoefficient(
-                        std::nextafter(-matrixThreshold,
-                            -std::numeric_limits<double>::infinity()))
-                    &&!ngc::trajectory_detail::scpRetainsMatrixCoefficient(
-                        std::nextafter(matrixThreshold,0.0)),
-                "SCP and HiGHS must share the exact inclusive small-matrix cutoff");
-        static_assert(ngc::trajectory_detail::scpSolveAction(ScpSolveClassification::Optimal)
-            ==ScpSolveAction::AcceptOptimal);
-        static_assert(ngc::trajectory_detail::scpSolveAction(ScpSolveClassification::TimeLimit)
-            ==ScpSolveAction::RetainReference);
-        static_assert(ngc::trajectory_detail::scpSolveAction(
-            ScpSolveClassification::IterationLimit)==ScpSolveAction::RetainReference);
-        static_assert(ngc::trajectory_detail::scpSolveAction(ScpSolveClassification::Failure)
-            ==ScpSolveAction::Fail);
         const auto lineRecord=[](const ngc::PreparedCommandId id,
                                  const ngc::position_t &from,
                                  const ngc::position_t &to,const double feed) {
@@ -3292,7 +3266,6 @@ final_move_together = true
         };
         ngc::TrajectoryCompiler compiler(trajectoryLimits);
         auto planningEffort = compiler.continuousPlanningEffort();
-        planningEffort.scpSolveTimeLimit = 0.5;
         compiler.setContinuousPlanningEffort(planningEffort);
         compiler.reset(94,points.front());
         const auto planned=compiler.compileContinuous(*prepared,0.05);
@@ -3336,7 +3309,22 @@ final_move_together = true
                 "in response to a nanosecond cubic");
         require((*planned)->correctionPasses > 1
                     && (*planned)->correctionHistory.contains("pass 1:"),
-                "the focused SCP fixture should re-solve through PathTempo's materialization callback");
+                "the focused continuous-path fixture should re-solve through PathTempo's materialization callback");
+
+        ngc::TrajectoryCompiler sampledCompiler(trajectoryLimits);
+        auto sampledEffort = planningEffort;
+        sampledEffort.constraintCheckMode = ngc::ContinuousConstraintCheckMode::Sampled;
+        sampledCompiler.setContinuousPlanningEffort(sampledEffort);
+        sampledCompiler.reset(94, points.front());
+        const auto sampledPlan = sampledCompiler.compileContinuous(*prepared, 0.05);
+        require(sampledPlan && *sampledPlan, sampledPlan ? "" : sampledPlan.error());
+        require((*sampledPlan)->correctionHistory.empty()
+                    && !(*sampledPlan)->chunks.empty()
+                    && std::ranges::all_of((*sampledPlan)->chunks, [](const auto &chunk) {
+                        return chunk.normalMotion.size > 0 && chunk.stopTail.size > 0;
+                    }),
+                "sampled checking should retain materialization, geometry proof, and stop tails "
+                "without running exact execution-span constraint correction");
 
         const auto planFingerprint=[](const ngc::ContinuousTrajectoryPlan &plan) {
             std::vector<std::uint64_t> result;
@@ -3420,7 +3408,7 @@ final_move_together = true
                 for(const auto &span:chunk.stopTail) appendSpan(span);
                 appendInteger(chunk.events.size);
                 require(chunk.events.size==0,
-                    "focused SCP plan should not contain scheduled events");
+                    "focused continuous-path plan should not contain scheduled events");
                 appendState(chunk.branchState);
                 appendState(chunk.stopState);
             }
@@ -3440,10 +3428,6 @@ final_move_together = true
                 "PathTempo production planning must preserve exact timing, emitted spans, "
                 "and verification outcomes across repeated compilations");
 
-        require((*planned)->scpSolves>0,
-                "continuous timing should solve at least one HiGHS SCP subproblem");
-        require((*planned)->scpAcceptedSteps>0,
-                "continuous timing should accept at least one locally feasible SCP station update");
         require((*planned)->pieceTiming.size()==expectedTimingIntervals.size(),
                 "continuous timing should create one timing interval per cluster knot interval");
         for(std::size_t interval=0;interval<expectedTimingIntervals.size();++interval) {
@@ -3504,50 +3488,6 @@ final_move_together = true
                     found->splineKnotIntervals.size(),clusterPlanner.preparedPieceCount(),
                     clusterPlanner.windowSize(),
                     clusterPlanner.preparedNominalDuration(),clusterNominalDuration));
-
-        ngc::TrajectoryCompiler limitedCompiler(trajectoryLimits);
-        auto limitedEffort=planningEffort;
-        // This fixture performs enough model setup before HiGHS checks its clock
-        // that the minimum practical positive limit reliably selects kTimeLimit.
-        limitedEffort.scpSolveTimeLimit=1e-12;
-        limitedCompiler.setContinuousPlanningEffort(limitedEffort);
-        limitedCompiler.reset(96,points.front());
-        const auto limitedPlan=limitedCompiler.compileContinuous(*prepared,0.05);
-        require(limitedPlan&&*limitedPlan,limitedPlan?"":limitedPlan.error());
-        const auto &fallback=(*limitedPlan)->scpResourceFallback;
-        require(fallback.reason==ngc::ScpResourceFallbackReason::TimeLimit
-                    &&fallback.occurrences>0&&fallback.correctionPass==0
-                    &&fallback.scpIteration==0,
-                "a bounded HiGHS time limit should retain the feasible SCP reference");
-        require((*limitedPlan)->scpAcceptedSteps==0,
-                "resource fallback must not consume a partial HiGHS primal solution");
-        require((*limitedPlan)->geometryVerificationAttempts>0
-                    &&!(*limitedPlan)->chunks.empty()
-                    &&std::ranges::all_of((*limitedPlan)->chunks,[](const auto &chunk) {
-                        return chunk.normalMotion.size>0&&chunk.stopTail.size>0;
-                    }),
-                "the retained SCP reference must pass normal verification and stop-tail gates");
-
-        ngc::TrajectoryCompiler noScpCompiler(trajectoryLimits);
-        auto noScpEffort=planningEffort;
-        noScpEffort.scpIterations = 0;
-        noScpCompiler.setContinuousPlanningEffort(noScpEffort);
-        noScpCompiler.reset(97,points.front());
-        const auto noScpPlan=noScpCompiler.compileContinuous(*prepared,0.05);
-        require(noScpPlan&&*noScpPlan,noScpPlan?"":noScpPlan.error());
-        require((*noScpPlan)->scpSolves == 0 && (*noScpPlan)->scpAcceptedSteps == 0,
-                "zero SCP iterations must skip every HiGHS refinement solve");
-
-        ngc::TrajectoryCompiler invalidEffortCompiler(trajectoryLimits);
-        auto invalidEffort=limitedEffort;
-        invalidEffort.scpSolveTimeLimit=0.0;
-        invalidEffortCompiler.setContinuousPlanningEffort(invalidEffort);
-        invalidEffortCompiler.reset(98,points.front());
-        const auto invalidEffortPlan=invalidEffortCompiler.compileContinuous(*prepared,0.05);
-        require(!invalidEffortPlan
-                    &&invalidEffortPlan.error().contains(
-                        "continuous planning effort is outside its bounded range"),
-                "SCP configuration errors must remain fatal rather than selecting fallback");
 
         auto missingSamples=*prepared;
         const auto missingCluster=std::ranges::find_if(
