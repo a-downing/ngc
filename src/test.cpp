@@ -3332,7 +3332,8 @@ final_move_together = true
             },
             .settings={
                 .linearSolveTimeLimit=uncachedEffort.scpSolveTimeLimit,
-                .simplexIterationLimit=4096,
+                .simplexIterationLimit=uncachedEffort.scpSimplexIterationLimitMultiplier
+                    *(5*pathTempoPieces.size()+3),
                 .maximumCorrectionPasses=uncachedEffort.maximumLocalCorrectionPasses,
                 .sequentialIterations=uncachedEffort.scpIterations,
                 .lineSearchSteps=uncachedEffort.scpLineSearchSteps,
@@ -3379,6 +3380,138 @@ final_move_together = true
             "PathTempo and NGC should require the same correction-pass count on the parity fixture");
         require(pathTempoPlan->diagnostics.acceptedRefinements>0,
             "PathTempo parity planning should accept at least one coupled station refinement");
+
+        auto suppliedMaterializationCorrection=false;
+        const path_tempo::MaterializationCorrection correction=[&](const auto &)
+                ->std::expected<std::vector<path_tempo::PieceCorrection>,std::string> {
+            std::vector<path_tempo::PieceCorrection> result;
+            if(suppliedMaterializationCorrection) return result;
+            suppliedMaterializationCorrection=true;
+            result.reserve((*planned)->pieceTiming.size());
+            for(std::size_t pieceIndex=0;pieceIndex<(*planned)->pieceTiming.size();
+                    ++pieceIndex) {
+                const auto &timing=(*planned)->pieceTiming[pieceIndex];
+                const auto timeScale=std::max({
+                    timing.initialVelocityLimit/timing.velocityLimit,
+                    std::sqrt(timing.initialAccelerationLimit/timing.accelerationLimit),
+                    std::cbrt(timing.initialJerkLimit/timing.jerkLimit),
+                });
+                if(timeScale>1.0+1e-12) result.push_back({
+                    .piece=pathTempoStorage[pieceIndex].id,
+                    .requiredTimeScale=timeScale,
+                });
+            }
+            return result;
+        };
+        path_tempo::PathPlanner alignedPathTempoPlanner;
+        const auto alignedPathTempoPlan=alignedPathTempoPlanner.solve(
+            path_tempo::PathPlanningRequest<6>{
+                .pieces=pathTempoPieces,
+                .beginning={},
+                .ending={},
+                .limits={
+                    .pathAcceleration=trajectoryLimits.pathAcceleration,
+                    .pathJerk=trajectoryLimits.pathJerk,
+                    .axisVelocity=toPathTempoVector(trajectoryLimits.axisVelocity),
+                    .axisAcceleration=toPathTempoVector(trajectoryLimits.axisAcceleration),
+                    .axisJerk=toPathTempoVector(trajectoryLimits.axisJerk),
+                },
+                .settings={
+                    .linearSolveTimeLimit=uncachedEffort.scpSolveTimeLimit,
+                    .simplexIterationLimit=uncachedEffort.scpSimplexIterationLimitMultiplier
+                        *(5*pathTempoPieces.size()+3),
+                    .maximumCorrectionPasses=uncachedEffort.maximumLocalCorrectionPasses,
+                    .sequentialIterations=uncachedEffort.scpIterations,
+                    .lineSearchSteps=uncachedEffort.scpLineSearchSteps,
+                    .velocityTrustFraction=uncachedEffort.scpVelocityTrustFraction,
+                    .accelerationTrustFraction=uncachedEffort.scpAccelerationTrustFraction,
+                },
+            },correction);
+        require(alignedPathTempoPlan.has_value(),
+            alignedPathTempoPlan?"":alignedPathTempoPlan.error().message);
+        require(std::abs(alignedPathTempoPlan->diagnostics.velocitySeedDuration-ngcDuration)
+                    <=1e-4*ngcDuration,
+            std::format("PathTempo materialization correction replay should reproduce NGC "
+                "duration within numerical correction-composition tolerance: ngc={} "
+                "path_tempo={}",ngcDuration,
+                alignedPathTempoPlan->diagnostics.velocitySeedDuration));
+        require(alignedPathTempoPlan->pieceBoundaries.size()
+                    ==(*planned)->pieceTiming.size()+1,
+            "aligned scalar parity should preserve every NGC timing boundary");
+        for(std::size_t station=0;
+                station<alignedPathTempoPlan->pieceBoundaries.size();++station) {
+            const auto ngcVelocity=station==(*planned)->pieceTiming.size()
+                ?(*planned)->pieceTiming.back().exitVelocity
+                :(*planned)->pieceTiming[station].entryVelocity;
+            const auto ngcAcceleration=station==(*planned)->pieceTiming.size()
+                ?(*planned)->pieceTiming.back().exitAcceleration
+                :(*planned)->pieceTiming[station].entryAcceleration;
+            require(std::abs(alignedPathTempoPlan->pieceBoundaries[station].velocity
+                        -ngcVelocity)<=2.5e-4*trajectoryLimits.axisVelocity.x
+                    &&std::abs(alignedPathTempoPlan->pieceBoundaries[station].acceleration
+                        -ngcAcceleration)<=1e-4*trajectoryLimits.pathAcceleration,
+                std::format("PathTempo corrected scalar boundary {} should closely match NGC: "
+                    "velocity={}/{} acceleration={}/{}",station,
+                    alignedPathTempoPlan->pieceBoundaries[station].velocity,ngcVelocity,
+                    alignedPathTempoPlan->pieceBoundaries[station].acceleration,
+                    ngcAcceleration));
+        }
+
+        auto provedLimitStorage=pathTempoStorage;
+        for(std::size_t pieceIndex=0;pieceIndex<provedLimitStorage.size();++pieceIndex) {
+            auto &limits=provedLimitStorage[pieceIndex].initialLimits;
+            const auto &timing=(*planned)->pieceTiming[pieceIndex];
+            limits.velocity=std::min(limits.velocity,timing.velocityLimit);
+            limits.acceleration=timing.accelerationLimit;
+            limits.jerk=timing.jerkLimit;
+        }
+        std::vector<path_tempo::PathPiece<6>> provedLimitPieces;
+        provedLimitPieces.reserve(provedLimitStorage.size());
+        for(const auto &piece:provedLimitStorage) provedLimitPieces.push_back(piece.view());
+        path_tempo::PathPlanner provedLimitPlanner;
+        const auto provedLimitPlan=provedLimitPlanner.solve(
+            path_tempo::PathPlanningRequest<6>{
+                .pieces=provedLimitPieces,
+                .beginning={},
+                .ending={},
+                .limits={
+                    .pathAcceleration=trajectoryLimits.pathAcceleration,
+                    .pathJerk=trajectoryLimits.pathJerk,
+                    .axisVelocity=toPathTempoVector(trajectoryLimits.axisVelocity),
+                    .axisAcceleration=toPathTempoVector(trajectoryLimits.axisAcceleration),
+                    .axisJerk=toPathTempoVector(trajectoryLimits.axisJerk),
+                },
+                .settings={
+                    .linearSolveTimeLimit=uncachedEffort.scpSolveTimeLimit,
+                    .simplexIterationLimit=uncachedEffort.scpSimplexIterationLimitMultiplier
+                        *(5*pathTempoPieces.size()+3),
+                    .maximumCorrectionPasses=uncachedEffort.maximumLocalCorrectionPasses,
+                    .sequentialIterations=uncachedEffort.scpIterations,
+                    .lineSearchSteps=uncachedEffort.scpLineSearchSteps,
+                    .velocityTrustFraction=uncachedEffort.scpVelocityTrustFraction,
+                    .accelerationTrustFraction=uncachedEffort.scpAccelerationTrustFraction,
+                },
+            });
+        require(provedLimitPlan.has_value(),provedLimitPlan?"":provedLimitPlan.error().message);
+        require(std::bit_cast<std::uint64_t>(provedLimitPlan->diagnostics
+                    .velocitySeedDuration)==std::bit_cast<std::uint64_t>(ngcDuration),
+            "PathTempo and NGC scalar durations should be bit-identical with the same proved limits");
+        for(std::size_t station=0;station<provedLimitPlan->pieceBoundaries.size();++station) {
+            const auto ngcVelocity=station==(*planned)->pieceTiming.size()
+                ?(*planned)->pieceTiming.back().exitVelocity
+                :(*planned)->pieceTiming[station].entryVelocity;
+            const auto ngcAcceleration=station==(*planned)->pieceTiming.size()
+                ?(*planned)->pieceTiming.back().exitAcceleration
+                :(*planned)->pieceTiming[station].entryAcceleration;
+            require(std::bit_cast<std::uint64_t>(
+                        provedLimitPlan->pieceBoundaries[station].velocity)
+                        ==std::bit_cast<std::uint64_t>(ngcVelocity)
+                    &&std::bit_cast<std::uint64_t>(
+                        provedLimitPlan->pieceBoundaries[station].acceleration)
+                        ==std::bit_cast<std::uint64_t>(ngcAcceleration),
+                std::format("PathTempo and NGC scalar boundary {} should be bit-identical "
+                    "with the same proved limits",station));
+        }
         require((*planned)->activations.size()==records.size(),
                 "continuous timing should resolve every prepared command activation");
         std::vector<ngc::SpanId> commandActivationSpans(records.size());
