@@ -32,6 +32,8 @@
 #include "machine/ToolTable.h"
 #include "memory/Memory.h"
 #include "parser/Program.h"
+#include "path_tempo/Planner.h"
+#include "path_tempo/Types.h"
 #include "SimulationWorker.h"
 #include "Worker.h"
 
@@ -3272,6 +3274,111 @@ final_move_together = true
         compiler.reset(94,points.front());
         const auto planned=compiler.compileContinuous(*prepared,0.05);
         require(planned&&*planned,planned?"":planned.error());
+
+        const auto toPathTempoVector=[](const ngc::position_t &value) {
+            return path_tempo::Vector<6>{value.x,value.y,value.z,value.a,value.b,value.c};
+        };
+        std::vector<path_tempo::SampledPathPiece<6>> pathTempoStorage;
+        pathTempoStorage.reserve(expectedTimingIntervals.size());
+        const auto appendPathTempoPiece=[&](const double length,const double programmedVelocity,
+                const double geometricVelocityLimit,
+                const std::span<const ngc::PreparedGeometricSample> samples) {
+            path_tempo::SampledPathPiece<6> piece{
+                .id=pathTempoStorage.size()+1,
+                .length=length,
+                .programmedVelocity=programmedVelocity,
+                .initialLimits={.velocity=geometricVelocityLimit},
+                .stations={},
+            };
+            piece.stations.reserve(samples.size());
+            const auto sampleOffset=samples.front().distance;
+            for(const auto &sample:samples) piece.stations.push_back({
+                .distance=sample.distance-sampleOffset,
+                .tangent=toPathTempoVector(sample.tangent),
+                .curvature=toPathTempoVector(sample.curvature),
+                .thirdDerivative=toPathTempoVector(sample.curvatureDerivative),
+            });
+            requireNear(piece.length,piece.stations.back().distance,
+                "PathTempo parity conversion should preserve timing-piece length");
+            pathTempoStorage.push_back(std::move(piece));
+        };
+        for(const auto &piece:prepared->pieces) {
+            if(piece.kind!=ngc::PreparedPieceKind::ClusterSpline) {
+                appendPathTempoPiece(piece.length(),piece.programmedFeed,
+                    std::numeric_limits<double>::infinity(),piece.geometricSamples);
+                continue;
+            }
+            for(const auto &interval:piece.clusterKnotIntervals) {
+                const auto samples=std::span{piece.geometricSamples}.subspan(
+                    interval.firstGeometricSample,interval.geometricSampleCount);
+                appendPathTempoPiece(interval.curveTo-interval.curveFrom,
+                    interval.programmedFeed,interval.geometricVelocityLimit,samples);
+            }
+        }
+        std::vector<path_tempo::PathPiece<6>> pathTempoPieces;
+        pathTempoPieces.reserve(pathTempoStorage.size());
+        for(const auto &piece:pathTempoStorage) pathTempoPieces.push_back(piece.view());
+        path_tempo::PathPlanner pathTempoPlanner;
+        const auto pathTempoPlan=pathTempoPlanner.solve(path_tempo::PathPlanningRequest<6>{
+            .pieces=pathTempoPieces,
+            .beginning={},
+            .ending={},
+            .limits={
+                .pathAcceleration=trajectoryLimits.pathAcceleration,
+                .pathJerk=trajectoryLimits.pathJerk,
+                .axisVelocity=toPathTempoVector(trajectoryLimits.axisVelocity),
+                .axisAcceleration=toPathTempoVector(trajectoryLimits.axisAcceleration),
+                .axisJerk=toPathTempoVector(trajectoryLimits.axisJerk),
+            },
+            .settings={
+                .linearSolveTimeLimit=uncachedEffort.scpSolveTimeLimit,
+                .simplexIterationLimit=4096,
+                .maximumCorrectionPasses=uncachedEffort.maximumLocalCorrectionPasses,
+                .sequentialIterations=uncachedEffort.scpIterations,
+                .lineSearchSteps=uncachedEffort.scpLineSearchSteps,
+                .velocityTrustFraction=uncachedEffort.scpVelocityTrustFraction,
+                .accelerationTrustFraction=uncachedEffort.scpAccelerationTrustFraction,
+            },
+        });
+        require(pathTempoPlan.has_value(),pathTempoPlan?"":pathTempoPlan.error().message);
+        require(pathTempoPlan->pieceBoundaries.size()==(*planned)->pieceTiming.size()+1,
+            "NGC and PathTempo should produce the same number of timing boundaries");
+        const auto ngcDuration=std::accumulate((*planned)->pieceTiming.begin(),
+            (*planned)->pieceTiming.end(),0.0,[](const double total,const auto &piece) {
+                return total+piece.duration;
+            });
+        const auto pathTempoDuration=pathTempoPlan->diagnostics.velocitySeedDuration;
+        auto maximumVelocityDifference=0.0;
+        auto maximumAccelerationDifference=0.0;
+        for(std::size_t station=0;station<pathTempoPlan->pieceBoundaries.size();++station) {
+            const auto ngcVelocity=station==(*planned)->pieceTiming.size()
+                ?(*planned)->pieceTiming.back().exitVelocity
+                :(*planned)->pieceTiming[station].entryVelocity;
+            const auto ngcAcceleration=station==(*planned)->pieceTiming.size()
+                ?(*planned)->pieceTiming.back().exitAcceleration
+                :(*planned)->pieceTiming[station].entryAcceleration;
+            maximumVelocityDifference=std::max(maximumVelocityDifference,
+                std::abs(pathTempoPlan->pieceBoundaries[station].velocity-ngcVelocity));
+            maximumAccelerationDifference=std::max(maximumAccelerationDifference,
+                std::abs(pathTempoPlan->pieceBoundaries[station].acceleration-ngcAcceleration));
+        }
+        const auto durationRatio=pathTempoDuration/ngcDuration;
+        require(durationRatio>=0.98&&durationRatio<=1.02,
+            std::format("PathTempo duration should remain within 2% of NGC on the mixed-feed "
+                "quintic cluster: ngc={} path_tempo={} ratio={}",ngcDuration,
+                pathTempoDuration,durationRatio));
+        require(maximumVelocityDifference<=0.05*trajectoryLimits.axisVelocity.x,
+            std::format("PathTempo and NGC internal boundary velocities should remain within "
+                "5% of the axis limit: difference={} limit={}",maximumVelocityDifference,
+                trajectoryLimits.axisVelocity.x));
+        require(maximumAccelerationDifference<=0.1*trajectoryLimits.pathAcceleration,
+            std::format("PathTempo and NGC internal boundary accelerations should remain within "
+                "10% of the path limit: difference={} limit={}",maximumAccelerationDifference,
+                trajectoryLimits.pathAcceleration));
+        require(pathTempoPlan->diagnostics.correctionPasses==(*planned)->correctionPasses,
+            "PathTempo and NGC should require the same correction-pass count on the parity fixture");
+        require(pathTempoPlan->diagnostics.acceptedRefinements>0,
+            "PathTempo parity planning should accept at least one coupled station refinement");
         require((*planned)->activations.size()==records.size(),
                 "continuous timing should resolve every prepared command activation");
         std::vector<ngc::SpanId> commandActivationSpans(records.size());
