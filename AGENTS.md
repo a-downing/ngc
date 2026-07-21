@@ -85,7 +85,7 @@ cmake --build build
 ctest --test-dir build -E "^ngc_tests$" --output-on-failure
 ```
 
-Tests are framework-free executables, with the core suite in `src/test.cpp`. The core suite loads `machine.toml` and `tool_table.txt` relative to its working directory, so run `build\ngc_tests.exe` from the source directory and exclude its build-directory CTest registration as shown above. Project warning and debug-symbol flags are target-scoped; dependency targets must not inherit them. Optimization is also applied target-by-target: every locally compiled C/C++ project and dependency target uses `-O2` in both Debug and Release builds.
+Tests are framework-free executables, with the core suite in `src/test.cpp`. The core suite loads `machine.toml` and `tool_table.txt` relative to its working directory, so run `build\ngc_tests.exe` from the source directory and exclude its build-directory CTest registration as shown above. Project warning flags are target-scoped; dependency targets must not inherit them. Do not override CMake's configuration-specific optimization flags: Debug retains the toolchain's standard unoptimized behavior, runtime checks, assertions, and symbols; Release, RelWithDebInfo, and MinSizeRel retain their toolchain defaults.
 
 ## Configuration and interpreter semantics
 
