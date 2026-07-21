@@ -1049,8 +1049,8 @@ namespace ngc {
         std::vector<GeometryPiece> pieces;
         auto timingPieceCount=std::size_t{0};
         for(const auto &prepared:geometry.pieces)
-            timingPieceCount+=prepared.kind==PreparedPieceKind::ClusterSpline
-                ?prepared.clusterKnotIntervals.size():1;
+            timingPieceCount+=prepared.splineKnotIntervals.empty()
+                ?std::size_t{1}:prepared.splineKnotIntervals.size();
         pieces.reserve(timingPieceCount);
         auto workspace=std::make_shared<CurveEvaluationWorkspace>();
         std::unordered_map<PreparedCommandId,std::size_t> inputById;
@@ -1166,7 +1166,7 @@ namespace ngc {
                 return {};
             };
 
-            if(prepared.kind!=PreparedPieceKind::ClusterSpline) {
+            if(prepared.splineKnotIntervals.empty()) {
                 if(auto appended=appendTimingPiece(prepared.curveFrom,prepared.curveTo,
                         prepared.programmedFeed,prepared.geometricSamples); !appended)
                     return std::unexpected(appended.error());
@@ -1176,30 +1176,29 @@ namespace ngc {
                         prepared.id));
                 continue;
             }
-            if(prepared.clusterKnotIntervals.empty())
-                return std::unexpected(std::format(
-                    "prepared cluster spline {} has no knot intervals",prepared.id));
-            const auto expectedSampleCount=16*prepared.clusterKnotIntervals.size()+1;
+            const auto expectedSampleCount=PREPARED_CURVE_SAMPLE_INTERVALS
+                *prepared.splineKnotIntervals.size()+1;
             if(prepared.geometricSamples.size()!=expectedSampleCount)
                 return std::unexpected(std::format(
-                    "prepared cluster spline {} has {} geometric samples; expected {}",
+                    "prepared spline {} has {} geometric samples; expected {}",
                     prepared.id,prepared.geometricSamples.size(),expectedSampleCount));
             auto expectedFrom=prepared.curveFrom;
             for(std::size_t intervalIndex=0;
-                    intervalIndex<prepared.clusterKnotIntervals.size();++intervalIndex) {
-                const auto &interval=prepared.clusterKnotIntervals[intervalIndex];
+                    intervalIndex<prepared.splineKnotIntervals.size();++intervalIndex) {
+                const auto &interval=prepared.splineKnotIntervals[intervalIndex];
                 if(std::abs(interval.curveFrom-expectedFrom)>1e-10
                    ||interval.curveTo<=interval.curveFrom)
                     return std::unexpected(std::format(
-                        "prepared cluster spline {} knot interval {} is not contiguous",
+                        "prepared spline {} knot interval {} is not contiguous",
                         prepared.id,intervalIndex));
-                if(interval.geometricSampleCount!=17
+                if(interval.geometricSampleCount!=PREPARED_CURVE_SAMPLE_INTERVALS+1
                    ||interval.firstGeometricSample>prepared.geometricSamples.size()
                    ||interval.geometricSampleCount
                         >prepared.geometricSamples.size()-interval.firstGeometricSample)
                     return std::unexpected(std::format(
-                        "prepared cluster spline {} knot interval {} does not provide 17 samples",
-                        prepared.id,intervalIndex));
+                        "prepared spline {} knot interval {} does not provide {} samples",
+                        prepared.id,intervalIndex,
+                        PREPARED_CURVE_SAMPLE_INTERVALS+1));
                 const auto samples=std::span{prepared.geometricSamples}.subspan(
                     interval.firstGeometricSample,interval.geometricSampleCount);
                 if(auto appended=appendTimingPiece(interval.curveFrom,interval.curveTo,
@@ -1209,11 +1208,11 @@ namespace ngc {
             }
             if(std::abs(expectedFrom-prepared.curveTo)>1e-10)
                 return std::unexpected(std::format(
-                    "prepared cluster spline {} knot intervals do not cover the curve",
+                    "prepared spline {} knot intervals do not cover the curve",
                     prepared.id));
             if(nextActivation!=prepared.activationStations.size())
                 return std::unexpected(std::format(
-                    "prepared cluster spline {} has activation stations outside its intervals",
+                    "prepared spline {} has activation stations outside its intervals",
                     prepared.id));
         }
         if(pieces.empty()) return std::unexpected("continuous path produced no geometry");

@@ -9,6 +9,8 @@
 #include <stdexcept>
 #include <tuple>
 
+#include "path_tempo/Sampling.h"
+
 #include "machine/SplineHandleOptimization.h"
 #include "machine/SplineReconstruction.h"
 
@@ -358,61 +360,68 @@ namespace ngc {
             return scaled(parameterDerivative, 1.0 / speed);
         }
 
-        PreparedGeometryBoundary splineBoundaryAtParameter(
-                const PreparedSplineCurve &spline, const double parameter,
-                const std::size_t parameterSpan) {
-            PreparedGeometryBoundary result;
-            result.position = derivativeAt(spline, parameter, 0, parameterSpan);
-            const auto first = derivativeAt(spline, parameter, 1, parameterSpan);
-            const auto second = derivativeAt(spline, parameter, 2, parameterSpan);
-            const auto third = derivativeAt(spline, parameter, 3, parameterSpan);
-            const auto speed = first.length();
-            if(speed <= 1e-15) return result;
+        path_tempo::Vector<6> pathTempoVector(const position_t &value) {
+            return {value.x,value.y,value.z,value.a,value.b,value.c};
+        }
 
-            result.tangent = scaled(first, 1.0 / speed);
-            result.curvature = scaled(
-                second - scaled(result.tangent, dot(second, result.tangent)),
-                1.0 / (speed * speed));
+        std::string samplingErrorText(const path_tempo::SamplingError error) {
+            switch(error) {
+                case path_tempo::SamplingError::InvalidLength: return "invalid length";
+                case path_tempo::SamplingError::InvalidMaxVelocity: return "invalid maximum velocity";
+                case path_tempo::SamplingError::InvalidSampleCount: return "invalid sample count";
+                case path_tempo::SamplingError::InvalidKnots: return "invalid knots";
+                case path_tempo::SamplingError::InvalidWeights: return "invalid weights";
+                case path_tempo::SamplingError::InvalidPieceIds: return "invalid piece IDs";
+                case path_tempo::SamplingError::NonFiniteGeometry: return "non-finite geometry";
+                case path_tempo::SamplingError::IrregularCurve: return "irregular curve";
+            }
+            return "unknown sampling error";
+        }
 
-            result.curvatureDerivative = curvatureDerivativeFromParameterDerivatives(
-                first, second, third, speed);
+        std::expected<std::vector<PreparedGeometricSample>,std::string>
+        samplePreparedInterval(const PreparedPathPiece &piece,
+                               CurveEvaluationWorkspace &workspace,
+                               const double curveFrom,const double curveTo,
+                               const std::size_t sampleIntervals) {
+            const auto length=curveTo-curveFrom;
+            const auto sampled=path_tempo::sampleArcLengthCurve<6>(length,1,1.0,
+                sampleIntervals,[&](const double distance) {
+                    const auto source=curveFrom+distance;
+                    return path_tempo::DifferentialState<6>{
+                        .tangent=pathTempoVector(tangentAtDistance(
+                            *piece.curve,source,workspace)),
+                        .curvature=pathTempoVector(curvatureAtDistance(
+                            *piece.curve,source,workspace)),
+                        .thirdDerivative=pathTempoVector(curvatureDerivativeAtDistance(
+                            *piece.curve,source,workspace)),
+                    };
+                });
+            if(!sampled)
+                return std::unexpected(std::format("PathTempo geometry sampling failed: {}",
+                    samplingErrorText(sampled.error())));
+            std::vector<PreparedGeometricSample> result;
+            result.reserve(sampled->stations.size());
+            for(const auto &station:sampled->stations)
+                result.push_back({station.distance,
+                    {station.tangent[0],station.tangent[1],station.tangent[2],
+                     station.tangent[3],station.tangent[4],station.tangent[5]},
+                    {station.curvature[0],station.curvature[1],station.curvature[2],
+                     station.curvature[3],station.curvature[4],station.curvature[5]},
+                    {station.thirdDerivative[0],station.thirdDerivative[1],
+                     station.thirdDerivative[2],station.thirdDerivative[3],
+                     station.thirdDerivative[4],station.thirdDerivative[5]}});
             return result;
         }
 
-        PreparedGeometryBoundary boundaryAt(const PreparedPathPiece &piece,
-                                             CurveEvaluationWorkspace &workspace,
-                                             const double distance) {
-            return {
-                positionAtDistance(*piece.curve, piece.curveFrom + distance, workspace),
-                tangentAtDistance(*piece.curve, piece.curveFrom + distance, workspace),
-                curvatureAtDistance(*piece.curve, piece.curveFrom + distance, workspace),
-                curvatureDerivativeAtDistance(*piece.curve, piece.curveFrom + distance, workspace),
-            };
-        }
-
-        void appendGeometricSample(PreparedPathPiece &piece, const double distance,
-                                   const PreparedGeometryBoundary &boundary) {
-            piece.geometricSamples.push_back({distance, boundary.tangent,
-                boundary.curvature, boundary.curvatureDerivative});
-        }
-
-        void samplePiece(PreparedPathPiece &piece, CurveEvaluationWorkspace &workspace) {
-            constexpr unsigned SAMPLES = 64;
-            piece.geometricSamples.reserve(SAMPLES + 1);
-            OrderedSplineInverseState orderedSpline;
-            const auto *spline = std::get_if<PreparedSplineCurve>(&piece.curve->value);
-            for(unsigned index = 0; index <= SAMPLES; ++index) {
-                const auto distance = piece.length() * index / static_cast<double>(SAMPLES);
-                PreparedGeometryBoundary boundary;
-                if(spline) {
-                    const auto parameter = splineParameterAtDistance(
-                        *piece.curve, *spline, piece.curveFrom + distance,
-                        workspace, &orderedSpline);
-                    boundary = splineBoundaryAtParameter(
-                        *spline, parameter, orderedSpline.parameterSpan);
-                } else boundary = boundaryAt(piece, workspace, distance);
-                appendGeometricSample(piece, distance, boundary);
-            }
+        std::expected<void,std::string> samplePiece(
+                PreparedPathPiece &piece,CurveEvaluationWorkspace &workspace) {
+            const auto sampleIntervals=std::holds_alternative<PreparedLineCurve>(
+                piece.curve->value)?std::size_t{1}:PREPARED_CURVE_SAMPLE_INTERVALS;
+            auto samples=samplePreparedInterval(piece,workspace,piece.curveFrom,
+                piece.curveTo,sampleIntervals);
+            if(!samples) return std::unexpected(samples.error());
+            piece.geometricSamples=std::move(*samples);
+            return {};
         }
 
         struct ClusterSourceFeedRange {
@@ -444,20 +453,21 @@ namespace ngc {
                                  nullptr, parameterSpan);
         }
 
-        std::expected<void, std::string> prepareClusterKnotIntervals(
+        std::expected<void, std::string> prepareSplineKnotIntervals(
                 PreparedPathPiece &piece,
                 const std::span<const ClusterSourceFeedRange> sourceFeeds,
                 CurveEvaluationWorkspace &workspace,
-                const GeometryPreparationEffort &effort) {
+                const GeometryPreparationEffort &effort,
+                const bool computeGeometricVelocityLimit) {
             const auto *spline = std::get_if<PreparedSplineCurve>(&piece.curve->value);
             if(!spline || spline->degree == 0 || spline->controls.size() <= spline->degree)
-                return std::unexpected("cluster spline has no knot intervals");
+                return std::unexpected("spline has no knot intervals");
             if(sourceFeeds.empty())
-                return std::unexpected("cluster spline has no source feed ranges");
+                return std::unexpected("spline has no source feed ranges");
             const auto intervalCount = spline->controls.size() - spline->degree;
             const auto sourceLength = sourceFeeds.back().to;
             if(!std::isfinite(sourceLength) || sourceLength <= 1e-12)
-                return std::unexpected("cluster spline has an invalid source length");
+                return std::unexpected("spline has an invalid source length");
 
             std::vector<double> curveBoundaries(intervalCount + 1);
             curveBoundaries.front() = piece.curveFrom;
@@ -468,13 +478,12 @@ namespace ngc {
             for(std::size_t interval = 0; interval < intervalCount; ++interval)
                 if(!std::isfinite(curveBoundaries[interval])
                    || curveBoundaries[interval + 1] <= curveBoundaries[interval])
-                    return std::unexpected("cluster spline knot intervals are not ordered by distance");
+                    return std::unexpected("spline knot intervals are not ordered by distance");
 
-            constexpr std::size_t SAMPLE_INTERVALS = 16;
             if(effort.generateSamples)
-                piece.geometricSamples.reserve(SAMPLE_INTERVALS * intervalCount + 1);
-            piece.clusterKnotIntervals.reserve(intervalCount);
-            OrderedSplineInverseState orderedSpline;
+                piece.geometricSamples.reserve(
+                    PREPARED_CURVE_SAMPLE_INTERVALS*intervalCount+1);
+            piece.splineKnotIntervals.reserve(intervalCount);
             auto sourceIndex = std::size_t{0};
             for(std::size_t interval = 0; interval < intervalCount; ++interval) {
                 // Reconstruction maps composite source distance linearly onto
@@ -499,9 +508,9 @@ namespace ngc {
                             programmedFeed, sourceFeeds[candidate].programmedFeed);
                 }
                 if(!std::isfinite(programmedFeed) || programmedFeed <= 0.0)
-                    return std::unexpected("cluster spline knot interval has no positive source feed");
+                    return std::unexpected("spline knot interval has no positive source feed");
 
-                PreparedClusterKnotInterval prepared{
+                PreparedSplineKnotInterval prepared{
                     .curveFrom = curveBoundaries[interval],
                     .curveTo = curveBoundaries[interval + 1],
                     .programmedFeed = programmedFeed,
@@ -509,32 +518,21 @@ namespace ngc {
                 if(effort.generateSamples) {
                     prepared.firstGeometricSample = piece.geometricSamples.size();
                     if(interval > 0) --prepared.firstGeometricSample;
-                    prepared.geometricSampleCount = SAMPLE_INTERVALS + 1;
+                    prepared.geometricSampleCount=PREPARED_CURVE_SAMPLE_INTERVALS+1;
+                    auto intervalSamples=samplePreparedInterval(piece,workspace,
+                        prepared.curveFrom,prepared.curveTo,
+                        PREPARED_CURVE_SAMPLE_INTERVALS);
+                    if(!intervalSamples) return std::unexpected(intervalSamples.error());
                     const auto firstSample = interval == 0 ? std::size_t{0} : std::size_t{1};
-                    for(std::size_t sample = firstSample; sample <= SAMPLE_INTERVALS; ++sample) {
-                        const auto fraction = static_cast<double>(sample)
-                            / static_cast<double>(SAMPLE_INTERVALS);
-                        auto curveDistance = std::lerp(
-                            prepared.curveFrom, prepared.curveTo, fraction);
-                        auto parameter = 0.0;
-                        auto parameterSpan = interval;
-                        if(piece.curve->geometricallyLinear) {
-                            parameter = static_cast<double>(interval) + fraction;
-                            curveDistance = piece.curveFrom + splineDistanceAtParameter(
-                                *piece.curve, *spline, parameter, parameterSpan);
-                        } else {
-                            parameter = splineParameterAtDistance(
-                                *piece.curve, *spline, curveDistance, workspace, &orderedSpline);
-                            parameterSpan = orderedSpline.parameterSpan;
-                        }
-                        const auto localDistance = curveDistance - piece.curveFrom;
-                        appendGeometricSample(piece, localDistance,
-                            splineBoundaryAtParameter(
-                                *spline, parameter, parameterSpan));
+                    for(std::size_t sample=firstSample;
+                            sample<intervalSamples->size();++sample) {
+                        auto geometric=(*intervalSamples)[sample];
+                        geometric.distance+=prepared.curveFrom-piece.curveFrom;
+                        piece.geometricSamples.push_back(geometric);
                     }
                 }
                 auto velocityLimit=std::numeric_limits<double>::infinity();
-                if(effort.generateSamples) {
+                if(effort.generateSamples&&computeGeometricVelocityLimit) {
                     constexpr std::array components{
                         &position_t::x,&position_t::y,&position_t::z,
                         &position_t::a,&position_t::b,&position_t::c,
@@ -570,9 +568,9 @@ namespace ngc {
                 }
                 if(std::isnan(velocityLimit)||velocityLimit<=0.0)
                     return std::unexpected(
-                        "cluster spline knot interval has no positive geometric velocity cap");
+                        "spline knot interval has no positive geometric velocity cap");
                 prepared.geometricVelocityLimit=velocityLimit;
-                piece.clusterKnotIntervals.push_back(prepared);
+                piece.splineKnotIntervals.push_back(prepared);
             }
             return {};
         }
@@ -840,7 +838,9 @@ namespace ngc {
                 prepared.primaryCommand = record.id;
                 prepared.activationStations = {{record.id,prepared.curveFrom}};
                 prepared.sourceCommands = {record.id};
-                if(effort.generateSamples) samplePiece(prepared, workspace);
+                if(effort.generateSamples)
+                    if(auto sampled=samplePiece(prepared,workspace);!sampled)
+                        return std::unexpected(sampled.error());
                 expected = end;
                 return prepared;
             }, record.command);
@@ -936,11 +936,18 @@ namespace ngc {
             piece.activationStations = std::move(activations);
             piece.sourceCommands = std::move(sources);
             piece.replacedSourceIntervals = std::move(replacedSourceIntervals);
-            if(kind == PreparedPieceKind::ClusterSpline) {
-                    if(auto prepared = prepareClusterKnotIntervals(
-                            piece, clusterSourceFeeds, workspace, effort); !prepared)
+            if(std::holds_alternative<PreparedSplineCurve>(curve->value)) {
+                const std::array ordinaryFeed{
+                    ClusterSourceFeedRange{0.0,piece.length(),feed}};
+                const auto sourceFeeds=kind==PreparedPieceKind::ClusterSpline
+                    ?clusterSourceFeeds:std::span<const ClusterSourceFeedRange>{ordinaryFeed};
+                if(auto prepared=prepareSplineKnotIntervals(piece,sourceFeeds,
+                        workspace,effort,kind==PreparedPieceKind::ClusterSpline);!prepared)
                     return std::unexpected(prepared.error());
-            } else if(effort.generateSamples) samplePiece(piece, workspace);
+            } else if(effort.generateSamples) {
+                if(auto sampled=samplePiece(piece,workspace);!sampled)
+                    return std::unexpected(sampled.error());
+            }
             if(feed > 0.0) result.diagnostics.nominalDuration += piece.length() / feed;
             result.pieces.push_back(std::move(piece));
             return {};

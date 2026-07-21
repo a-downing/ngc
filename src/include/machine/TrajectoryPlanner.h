@@ -236,12 +236,11 @@ namespace ngc {
         }
 
         static void resamplePreparedPiece(PreparedPathPiece &piece) {
-            constexpr unsigned SAMPLE_INTERVALS=64;
             CurveEvaluationWorkspace workspace;
             piece.geometricSamples.clear();
-            piece.geometricSamples.reserve(SAMPLE_INTERVALS+1);
-            for(unsigned index=0;index<=SAMPLE_INTERVALS;++index) {
-                const auto local=piece.length()*index/static_cast<double>(SAMPLE_INTERVALS);
+            piece.geometricSamples.reserve(2);
+            for(unsigned index=0;index<=1;++index) {
+                const auto local=piece.length()*index;
                 const auto distance=piece.curveFrom+local;
                 const auto tangent=tangentAtDistance(*piece.curve,distance,workspace);
                 const auto curvature=curvatureAtDistance(*piece.curve,distance,workspace);
@@ -252,11 +251,10 @@ namespace ngc {
         }
 
         static double preparedNominalDuration(const PreparedPathPiece &piece) {
-            if(piece.kind==PreparedPieceKind::ClusterSpline
-               &&!piece.clusterKnotIntervals.empty())
-                return std::accumulate(piece.clusterKnotIntervals.begin(),
-                    piece.clusterKnotIntervals.end(),0.0,
-                    [](const double total,const PreparedClusterKnotInterval &interval) {
+            if(!piece.splineKnotIntervals.empty())
+                return std::accumulate(piece.splineKnotIntervals.begin(),
+                    piece.splineKnotIntervals.end(),0.0,
+                    [](const double total,const PreparedSplineKnotInterval &interval) {
                         return interval.programmedFeed>0.0
                             ?total+(interval.curveTo-interval.curveFrom)
                                 /interval.programmedFeed
@@ -267,7 +265,7 @@ namespace ngc {
         }
 
         static double preparedPredictedDuration(
-                const PreparedClusterKnotInterval &interval) {
+                const PreparedSplineKnotInterval &interval) {
             const auto velocity=std::min(
                 interval.programmedFeed,interval.geometricVelocityLimit);
             return velocity>0.0
@@ -275,11 +273,10 @@ namespace ngc {
         }
 
         static double preparedPredictedDuration(const PreparedPathPiece &piece) {
-            if(piece.kind==PreparedPieceKind::ClusterSpline
-               &&!piece.clusterKnotIntervals.empty())
-                return std::accumulate(piece.clusterKnotIntervals.begin(),
-                    piece.clusterKnotIntervals.end(),0.0,
-                    [](const double total,const PreparedClusterKnotInterval &interval) {
+            if(!piece.splineKnotIntervals.empty())
+                return std::accumulate(piece.splineKnotIntervals.begin(),
+                    piece.splineKnotIntervals.end(),0.0,
+                    [](const double total,const PreparedSplineKnotInterval &interval) {
                         return total+preparedPredictedDuration(interval);
                     });
             return preparedNominalDuration(piece);
@@ -290,8 +287,8 @@ namespace ngc {
             return std::accumulate(geometry.pieces.begin(),geometry.pieces.end(),
                 std::size_t{0},[](const std::size_t total,
                                   const PreparedPathPiece &piece) {
-                    return total+(piece.kind==PreparedPieceKind::ClusterSpline
-                        ?piece.clusterKnotIntervals.size():std::size_t{1});
+                    return total+(piece.splineKnotIntervals.empty()
+                        ?std::size_t{1}:piece.splineKnotIntervals.size());
                 });
         }
 
@@ -363,28 +360,28 @@ namespace ngc {
             } else {
                 const auto absoluteDistance=piece.curveFrom+localDistance;
                 const auto tolerance=std::max(1e-10,piece.length()*1e-10);
-                auto suffixInterval=piece.clusterKnotIntervals.size();
+                auto suffixInterval=piece.splineKnotIntervals.size();
                 for(std::size_t interval=1;
-                        interval<piece.clusterKnotIntervals.size();++interval)
-                    if(std::abs(piece.clusterKnotIntervals[interval].curveFrom
+                        interval<piece.splineKnotIntervals.size();++interval)
+                    if(std::abs(piece.splineKnotIntervals[interval].curveFrom
                                 -absoluteDistance)<=tolerance
-                       &&std::abs(piece.clusterKnotIntervals[interval-1].curveTo
+                       &&std::abs(piece.splineKnotIntervals[interval-1].curveTo
                                    -absoluteDistance)<=tolerance) {
                         suffixInterval=interval;
                         break;
                     }
-                if(suffixInterval==piece.clusterKnotIntervals.size())
+                if(suffixInterval==piece.splineKnotIntervals.size())
                     return std::nullopt;
                 const auto firstSuffixSample=
-                    piece.clusterKnotIntervals[suffixInterval].firstGeometricSample;
+                    piece.splineKnotIntervals[suffixInterval].firstGeometricSample;
                 if(firstSuffixSample==0
                    ||firstSuffixSample>=piece.geometricSamples.size())
                     return std::nullopt;
 
-                prefixPiece.clusterKnotIntervals.resize(suffixInterval);
-                suffixPiece.clusterKnotIntervals.erase(
-                    suffixPiece.clusterKnotIntervals.begin(),
-                    suffixPiece.clusterKnotIntervals.begin()
+                prefixPiece.splineKnotIntervals.resize(suffixInterval);
+                suffixPiece.splineKnotIntervals.erase(
+                    suffixPiece.splineKnotIntervals.begin(),
+                    suffixPiece.splineKnotIntervals.begin()
                         +static_cast<std::ptrdiff_t>(suffixInterval));
                 prefixPiece.geometricSamples.resize(firstSuffixSample+1);
                 suffixPiece.geometricSamples.assign(
@@ -393,11 +390,11 @@ namespace ngc {
                     piece.geometricSamples.end());
                 for(auto &sample:suffixPiece.geometricSamples)
                     sample.distance-=localDistance;
-                for(auto &interval:suffixPiece.clusterKnotIntervals)
+                for(auto &interval:suffixPiece.splineKnotIntervals)
                     interval.firstGeometricSample-=firstSuffixSample;
                 velocityLimit=std::min(
-                    prefixPiece.clusterKnotIntervals.back().programmedFeed,
-                    suffixPiece.clusterKnotIntervals.front().programmedFeed);
+                    prefixPiece.splineKnotIntervals.back().programmedFeed,
+                    suffixPiece.splineKnotIntervals.front().programmedFeed);
             }
 
             std::vector<PreparedPathPiece> prefixPieces;
@@ -445,8 +442,8 @@ namespace ngc {
                 } else if(piece.kind==PreparedPieceKind::ClusterSpline) {
                     auto intervalDuration=0.0;
                     for(std::size_t interval=0;
-                            interval+1<piece.clusterKnotIntervals.size();++interval) {
-                        const auto &knot=piece.clusterKnotIntervals[interval];
+                            interval+1<piece.splineKnotIntervals.size();++interval) {
+                        const auto &knot=piece.splineKnotIntervals[interval];
                         if(knot.programmedFeed<=0.0) break;
                         intervalDuration+=preparedPredictedDuration(knot);
                         if(precedingDuration+intervalDuration<target) continue;
@@ -1069,8 +1066,8 @@ namespace ngc {
                     } else if(piece.kind==PreparedPieceKind::ClusterSpline) {
                         auto clusterDuration=0.0;
                         for(std::size_t interval=0;
-                                interval+1<piece.clusterKnotIntervals.size();++interval) {
-                            const auto &knot=piece.clusterKnotIntervals[interval];
+                                interval+1<piece.splineKnotIntervals.size();++interval) {
+                            const auto &knot=piece.splineKnotIntervals[interval];
                             if(knot.programmedFeed<=0.0) break;
                             clusterDuration+=preparedPredictedDuration(knot);
                             const auto prefixDuration=precedingDuration+clusterDuration;

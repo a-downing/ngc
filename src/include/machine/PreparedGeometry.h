@@ -159,7 +159,11 @@ namespace ngc {
         position_t curvatureDerivative{};
     };
 
-    struct PreparedClusterKnotInterval {
+    // Sixteen subintervals balance curved-path constraint coverage with the
+    // cost of PathTempo's sampled coupled-limit refinement.
+    inline constexpr std::size_t PREPARED_CURVE_SAMPLE_INTERVALS=16;
+
+    struct PreparedSplineKnotInterval {
         double curveFrom = 0.0;
         double curveTo = 0.0;
         double programmedFeed = 0.0;
@@ -205,10 +209,10 @@ namespace ngc {
         // the replaced geometry without reconstructing it independently.
         std::vector<PreparedSourceInterval> replacedSourceIntervals;
         std::vector<PreparedGeometricSample> geometricSamples;
-        // Continuous timing treats each cluster-spline knot interval as one
-        // timing interval and requires its prepared samples and feed. The
-        // cluster-wide programmedFeed remains presentation/slice metadata.
-        std::vector<PreparedClusterKnotInterval> clusterKnotIntervals;
+        // Continuous timing treats every spline knot interval as one timing
+        // interval and requires its prepared samples and feed. For cluster
+        // splines the piece-wide programmedFeed remains presentation metadata.
+        std::vector<PreparedSplineKnotInterval> splineKnotIntervals;
 
         double length() const { return std::max(0.0, curveTo - curveFrom); }
     };

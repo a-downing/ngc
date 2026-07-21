@@ -2969,6 +2969,21 @@ final_move_together = true
         const auto &incoming=prepared->pieces[0];
         const auto &blend=prepared->pieces[1];
         const auto &outgoing=prepared->pieces[2];
+        const auto *blendSpline=std::get_if<ngc::PreparedSplineCurve>(&blend.curve->value);
+        require(blendSpline&&blendSpline->degree==3,
+                "a junction blend should retain its cubic B-spline representation");
+        require(blend.splineKnotIntervals.size()
+                    ==blendSpline->controls.size()-blendSpline->degree,
+                "a cubic junction blend should prepare one timing piece per knot interval");
+        require(blend.geometricSamples.size()
+                    ==ngc::PREPARED_CURVE_SAMPLE_INTERVALS
+                        *blend.splineKnotIntervals.size()+1,
+                "each cubic junction interval should retain 17 shared-boundary samples");
+        require(incoming.geometricSamples.size()
+                    ==ngc::PREPARED_CURVE_SAMPLE_INTERVALS+1
+                    &&outgoing.geometricSamples.size()
+                        ==ngc::PREPARED_CURVE_SAMPLE_INTERVALS+1,
+                "arcs and spline knot intervals should use the same sampling density");
         const auto incomingCurvature=ngc::curvatureAtDistance(
             *incoming.curve,incoming.curveTo,workspace);
         const auto blendStartCurvature=ngc::curvatureAtDistance(
@@ -3213,18 +3228,21 @@ final_move_together = true
         require(unsmoothedSpline&&unsmoothedSpline->degree==3,
             "none smoothing must preserve the cluster's unsmoothed cubic construction");
         const auto intervalCount=spline->controls.size()-spline->degree;
-        require(found->clusterKnotIntervals.size()==intervalCount,
+        require(found->splineKnotIntervals.size()==intervalCount,
                 "cluster preparation should retain one metadata record per knot interval");
-        require(found->geometricSamples.size()==16*intervalCount+1,
+        require(found->geometricSamples.size()
+                    ==ngc::PREPARED_CURVE_SAMPLE_INTERVALS*intervalCount+1,
                 "cluster preparation should retain 17 shared-boundary samples per knot interval");
         requireNear(found->programmedFeed,2.0,
                     "cluster-wide programmed feed must remain unchanged");
         auto minimumIntervalFeed=std::numeric_limits<double>::infinity();
         for(std::size_t interval=0;interval<intervalCount;++interval) {
-            const auto &metadata=found->clusterKnotIntervals[interval];
-            require(metadata.firstGeometricSample==16*interval
-                    &&metadata.geometricSampleCount==17,
-                    "cluster knot interval should address its 17 samples without a search");
+            const auto &metadata=found->splineKnotIntervals[interval];
+            require(metadata.firstGeometricSample
+                        ==ngc::PREPARED_CURVE_SAMPLE_INTERVALS*interval
+                    &&metadata.geometricSampleCount
+                        ==ngc::PREPARED_CURVE_SAMPLE_INTERVALS+1,
+                    "cluster knot interval should address its configured samples without a search");
             require(metadata.curveTo>metadata.curveFrom,
                     "cluster knot interval distances should be strictly ordered");
             require(metadata.geometricVelocityLimit>0.0
@@ -3233,7 +3251,7 @@ final_move_together = true
                     "each cluster knot interval");
             if(interval>0)
                 requireNear(metadata.curveFrom,
-                    found->clusterKnotIntervals[interval-1].curveTo,
+                    found->splineKnotIntervals[interval-1].curveTo,
                     "adjacent cluster knot intervals should share one curve boundary");
             requireNear(found->geometricSamples[metadata.firstGeometricSample].distance,
                         metadata.curveFrom-found->curveFrom,
@@ -3250,7 +3268,7 @@ final_move_together = true
         std::vector<std::pair<double,double>> expectedTimingIntervals;
         for(const auto &piece:prepared->pieces) {
             if(piece.kind==ngc::PreparedPieceKind::ClusterSpline) {
-                for(const auto &interval:piece.clusterKnotIntervals)
+                for(const auto &interval:piece.splineKnotIntervals)
                     expectedTimingIntervals.emplace_back(
                         interval.curveTo-interval.curveFrom,interval.programmedFeed);
             } else {
@@ -3278,9 +3296,9 @@ final_move_together = true
                 return piece.kind==ngc::PreparedPieceKind::ClusterSpline;
             });
         require(roundedCluster!=roundedEndpointGeometry.pieces.end()
-                    &&roundedCluster->clusterKnotIntervals.size()>1,
+                    &&roundedCluster->splineKnotIntervals.size()>1,
             "endpoint-rounding regression requires a multi-interval cluster spline");
-        const auto &roundedInterval=roundedCluster->clusterKnotIntervals[1];
+        const auto &roundedInterval=roundedCluster->splineKnotIntervals[1];
         const auto roundedSample=roundedInterval.firstGeometricSample
             +roundedInterval.geometricSampleCount-1;
         roundedCluster->geometricSamples[roundedSample].distance+=5e-11;
@@ -3434,8 +3452,8 @@ final_move_together = true
             record.metadata.pathTolerance=0.05;
         }
         const auto clusterNominalDuration=std::accumulate(
-            found->clusterKnotIntervals.begin(),found->clusterKnotIntervals.end(),0.0,
-            [](const double total,const ngc::PreparedClusterKnotInterval &interval) {
+            found->splineKnotIntervals.begin(),found->splineKnotIntervals.end(),0.0,
+            [](const double total,const ngc::PreparedSplineKnotInterval &interval) {
                 return total+(interval.curveTo-interval.curveFrom)/interval.programmedFeed;
             });
         auto rollingLimits=trajectoryLimits;
@@ -3465,7 +3483,7 @@ final_move_together = true
         require(clusterPlanner.diagnostics().rollingBoundaryCandidates>0
                     &&clusterPlanner.diagnostics().maximumRollingSuffixProbePieces>0
                     &&clusterPlanner.diagnostics().maximumRollingSuffixProbePieces
-                        <found->clusterKnotIntervals.size()
+                        <found->splineKnotIntervals.size()
                     &&clusterPlanner.preparedPieceCount()==1
                     &&clusterPlanner.preparedNominalDuration()<clusterNominalDuration,
                 std::format("an ended cluster spline should roll at a prepared knot boundary "
@@ -3474,7 +3492,7 @@ final_move_together = true
                     "duration={}/{}",
                     clusterPlanner.diagnostics().rollingBoundaryCandidates,
                     clusterPlanner.diagnostics().maximumRollingSuffixProbePieces,
-                    found->clusterKnotIntervals.size(),clusterPlanner.preparedPieceCount(),
+                    found->splineKnotIntervals.size(),clusterPlanner.preparedPieceCount(),
                     clusterPlanner.windowSize(),
                     clusterPlanner.preparedNominalDuration(),clusterNominalDuration));
 
@@ -3562,6 +3580,14 @@ final_move_together = true
         compiler.reset(93,first);
         const auto planned=compiler.compileContinuous(*prepared,0.005);
         require(planned&&*planned,planned?"":planned.error());
+        const auto expectedTimingPieces=std::accumulate(prepared->pieces.begin(),
+            prepared->pieces.end(),std::size_t{0},[](const std::size_t total,
+                                                     const auto &piece) {
+                return total+(piece.splineKnotIntervals.empty()
+                    ?std::size_t{1}:piece.splineKnotIntervals.size());
+            });
+        require((*planned)->pieceTiming.size()==expectedTimingPieces,
+                "continuous timing should emit one piece per cubic knot interval");
         const auto duration=std::accumulate((*planned)->pieceTiming.begin(),
             (*planned)->pieceTiming.end(),0.0,[](const double total,const auto &piece) {
                 return total+piece.duration;
