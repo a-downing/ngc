@@ -21,7 +21,6 @@
 #include <unordered_map>
 #include <vector>
 
-#include <path_tempo/LinearOptimization.h>
 #include <path_tempo/Planner.h>
 #include <ruckig/ruckig.hpp>
 
@@ -123,83 +122,14 @@ namespace ngc {
 
         enum class TimeLawPurpose {
             ExactStop,
-            ContinuousSeed,
         };
-
-        using TimeLawInputKey=std::array<std::uint64_t,8>;
-
-        struct TimeLawInputHash {
-            std::size_t operator()(const TimeLawInputKey &values) const {
-                auto result=std::size_t {0xcbf29ce484222325ULL};
-                for(const auto value:values) {
-                    result^=static_cast<std::size_t>(value);
-                    result*=std::size_t {0x100000001b3ULL};
-                    if constexpr(sizeof(std::size_t)<sizeof(value))
-                        result^=static_cast<std::size_t>(value>>32U);
-                }
-                return result;
-            }
-        };
-
-        TimeLawInputKey timeLawInputKey(const double length,const double fromVelocity,
-                const double fromAcceleration,const double toVelocity,
-                const double toAcceleration,const double requestedVelocity,
-                const double acceleration,const double jerk) {
-            return {
-                std::bit_cast<std::uint64_t>(length),
-                std::bit_cast<std::uint64_t>(fromVelocity),
-                std::bit_cast<std::uint64_t>(fromAcceleration),
-                std::bit_cast<std::uint64_t>(toVelocity),
-                std::bit_cast<std::uint64_t>(toAcceleration),
-                std::bit_cast<std::uint64_t>(requestedVelocity),
-                std::bit_cast<std::uint64_t>(acceleration),
-                std::bit_cast<std::uint64_t>(jerk),
-            };
-        }
-
-        struct TimeLawCacheEntry {
-            TimeLawInputKey key {};
-            double duration=0.0;
-            bool successful=false;
-            bool valid=false;
-        };
-
-        constexpr std::size_t SMALL_TIME_LAW_CACHE_SIZE=32768;
-        // A 128K direct-mapped table is about 11 MiB and was the measured knee
-        // for large horizons. A 256K table removed more solver calls but did not
-        // improve wall time. Smaller rolling probes avoid initializing it.
-        constexpr std::size_t LARGE_TIME_LAW_CACHE_SIZE=131072;
-
-        TimeLawCacheEntry *threadTimeLawCache() {
-            thread_local auto cache=
-                std::make_unique<TimeLawCacheEntry[]>(LARGE_TIME_LAW_CACHE_SIZE);
-            return cache.get();
-        }
 
         struct TimeLawInstrumentation {
             TimeLawDiagnostics diagnostics;
-            std::unique_ptr<TimeLawCacheEntry[]> cache;
-            std::size_t cacheSize=SMALL_TIME_LAW_CACHE_SIZE;
-            bool shareAcrossCompilations=false;
-
-            void configureCache(const std::size_t requestedSize,const bool share) {
-                if(cache) PANIC("time-law cache configured after first use");
-                if(requestedSize==0||(requestedSize&(requestedSize-1))!=0)
-                    PANIC("time-law cache size must be a power of two");
-                cacheSize=requestedSize;
-                shareAcrossCompilations=share;
-            }
-
-            TimeLawCacheEntry *entries() {
-                if(shareAcrossCompilations) return threadTimeLawCache();
-                if(!cache) cache=std::make_unique<TimeLawCacheEntry[]>(cacheSize);
-                return cache.get();
-            }
 
             TimeLawCallDiagnostics &forPurpose(const TimeLawPurpose purpose) {
                 switch(purpose) {
                     case TimeLawPurpose::ExactStop: return diagnostics.exactStop;
-                    case TimeLawPurpose::ContinuousSeed: return diagnostics.continuousSeed;
                 }
                 PANIC("invalid time-law instrumentation purpose");
             }
@@ -210,26 +140,6 @@ namespace ngc {
                 ++result.calls;
                 if(correctionPass) ++result.correctionPassCalls;
                 return result;
-            }
-
-            TimeLawCacheEntry *find(const TimeLawInputKey &key,
-                                    TimeLawCallDiagnostics &diagnosticsForPurpose) {
-                auto &entry=entries()[TimeLawInputHash{}(key)&(cacheSize-1)];
-                if(entry.valid&&entry.key==key) {
-                    ++diagnosticsForPurpose.cacheHits;
-                    if(entry.successful) ++diagnosticsForPurpose.cacheSuccessfulHits;
-                    else ++diagnosticsForPurpose.cacheFailureHits;
-                    return &entry;
-                }
-                ++diagnosticsForPurpose.cacheMisses;
-                if(entry.valid) ++diagnosticsForPurpose.cacheCollisions;
-                return nullptr;
-            }
-
-            void store(const TimeLawInputKey &key,const bool successful,
-                       const double duration) {
-                auto &entry=entries()[TimeLawInputHash{}(key)&(cacheSize-1)];
-                entry={key,duration,successful,true};
             }
         };
 
@@ -647,78 +557,6 @@ namespace ngc {
             return result;
         }
 
-        struct CandidateTimeLaw {
-            std::optional<TimeLaw> timing;
-            TimeLawInputKey key {};
-            double duration=0.0;
-            bool successful=false;
-            bool cacheHit=false;
-        };
-
-        CandidateTimeLaw candidateTimeLawBetween(TimeLawWorkspace &workspace,
-                TimeLawInstrumentation &instrumentation,const bool useCache,
-                const TimeLawPurpose purpose,
-                const bool correctionPass,
-                const double length,const double fromVelocity,const double fromAcceleration,
-                const double toVelocity,const double toAcceleration,
-                const double requestedVelocity,const double acceleration,const double jerk) {
-            auto &diagnostics=instrumentation.begin(purpose,correctionPass);
-            TimeLawCallTimer timer {diagnostics};
-            const auto key=timeLawInputKey(length,fromVelocity,fromAcceleration,toVelocity,
-                toAcceleration,requestedVelocity,acceleration,jerk);
-            if(useCache) {
-                if(const auto *cached=instrumentation.find(key,diagnostics)) {
-                    timer.succeeded=cached->successful;
-                    return {.timing=std::nullopt,.key=key,.duration=cached->duration,
-                        .successful=cached->successful,.cacheHit=true};
-                }
-            }
-            ++diagnostics.solverCalls;
-            auto result=solveTimeLawBetween(workspace,length,fromVelocity,fromAcceleration,
-                toVelocity,toAcceleration,requestedVelocity,acceleration,jerk);
-            if(!result) {
-                if(useCache) instrumentation.store(key,false,0.0);
-                return {.timing=std::nullopt,.key=key,.duration=0.0,
-                    .successful=false,.cacheHit=false};
-            }
-            const auto duration=result->back().time;
-            if(useCache) instrumentation.store(key,true,duration);
-            timer.succeeded=true;
-            return {.timing=*result,.key=key,.duration=duration,
-                .successful=true,.cacheHit=false};
-        }
-
-        std::expected<TimeLaw,std::string> materializeCandidateTimeLaw(
-                TimeLawWorkspace &workspace,
-                TimeLawInstrumentation &instrumentation,const TimeLawPurpose purpose,
-                const CandidateTimeLaw &candidate,
-                const double length,const double fromVelocity,const double fromAcceleration,
-                const double toVelocity,const double toAcceleration,
-                const double requestedVelocity,const double acceleration,const double jerk) {
-            const auto key=timeLawInputKey(length,fromVelocity,fromAcceleration,toVelocity,
-                toAcceleration,requestedVelocity,acceleration,jerk);
-            if(!candidate.successful)
-                return std::unexpected("cannot materialize an unsuccessful cached time law");
-            if(candidate.key!=key)
-                return std::unexpected("cached time-law winner does not match its materialization key");
-            auto &diagnostics=instrumentation.forPurpose(purpose);
-            ++diagnostics.cacheMaterializations;
-            ++diagnostics.solverCalls;
-            const auto started=std::chrono::steady_clock::now();
-            auto result=solveTimeLawBetween(workspace,length,fromVelocity,fromAcceleration,
-                toVelocity,toAcceleration,requestedVelocity,acceleration,jerk);
-            diagnostics.seconds+=std::chrono::duration<double>(
-                std::chrono::steady_clock::now()-started).count();
-            if(!result)
-                return std::unexpected(
-                    "cached successful time-law winner failed exact materialization");
-            if(std::bit_cast<std::uint64_t>(result->back().time)
-                    !=std::bit_cast<std::uint64_t>(candidate.duration))
-                return std::unexpected(
-                    "cached time-law winner duration changed during exact materialization");
-            return *result;
-        }
-
         std::expected<TimeLaw, std::string> timeLaw(TimeLawWorkspace &workspace,
                 TimeLawInstrumentation &instrumentation,
                 const double length, const double requestedVelocity, const double acceleration, const double jerk) {
@@ -735,14 +573,6 @@ namespace ngc {
             return left.x*right.x + left.y*right.y + left.z*right.z
                 + left.a*right.a + left.b*right.b + left.c*right.c;
         }
-
-        struct CoupledEndpointGeometry {
-            position_t tangent;
-            position_t curvature;
-            position_t curvatureDerivative;
-        };
-
-        enum class CoupledEndpointResult { Feasible, Acceleration, Jerk };
 
         struct GeometryActivation {
             std::size_t input=0;
@@ -764,6 +594,80 @@ namespace ngc {
             std::function<position_t(double)> positionAt;
             std::function<double(double,double)> chordErrorBound;
         };
+
+        path_tempo::Vector<6> pathTempoVector(const position_t &value) {
+            return {value.x,value.y,value.z,value.a,value.b,value.c};
+        }
+
+        std::expected<std::vector<TimeLaw>,std::string> localTimeLaws(
+                const path_tempo::PlannedPath &planned,
+                const std::span<const GeometryPiece> pieces) {
+            std::vector<TimeLaw> result(pieces.size());
+            std::vector<double> elapsed(pieces.size(),0.0);
+            std::vector<double> offsets(pieces.size(),0.0);
+            for (std::size_t piece=1;piece<pieces.size();++piece) {
+                offsets[piece]=offsets[piece-1]+pieces[piece-1].length;
+            }
+
+            auto previousPiece=std::size_t {0};
+            for (const auto &segment:planned.timeLaw.segments) {
+                if (segment.piece==0||segment.piece>pieces.size()) {
+                    return std::unexpected(std::format(
+                        "PathTempo emitted unknown piece ID {}",segment.piece));
+                }
+                const auto piece=static_cast<std::size_t>(segment.piece-1);
+                if (!result[piece].size()) {
+                    if (piece<previousPiece) {
+                        return std::unexpected(
+                            "PathTempo emitted time-law pieces out of order");
+                    }
+                    previousPiece=piece;
+                }
+                const auto localDistance=segment.c0-offsets[piece];
+                const auto tolerance=std::max(1e-10,pieces[piece].length*1e-10);
+                auto &timing=result[piece];
+                if (timing.size()==0) {
+                    if (std::abs(localDistance)>tolerance) {
+                        return std::unexpected(std::format(
+                            "PathTempo piece {} starts at local distance {}",piece,
+                            localDistance));
+                    }
+                    timing.push_back({
+                        .time=0.0,
+                        .distance=0.0,
+                        .velocity=segment.velocity(0.0),
+                        .acceleration=segment.acceleration(0.0),
+                        .jerk=segment.jerk(),
+                        .ruckigBrakePhase=segment.initialStateCorrection,
+                    });
+                } else {
+                    if (std::abs(timing.back().distance-localDistance)>tolerance) {
+                        return std::unexpected(std::format(
+                            "PathTempo piece {} has a discontinuous scalar phase",piece));
+                    }
+                    timing.back().jerk=segment.jerk();
+                    timing.back().ruckigBrakePhase=segment.initialStateCorrection;
+                }
+                elapsed[piece]+=segment.duration;
+                timing.push_back({
+                    .time=elapsed[piece],
+                    .distance=segment.position(segment.duration)-offsets[piece],
+                    .velocity=segment.velocity(segment.duration),
+                    .acceleration=segment.acceleration(segment.duration),
+                });
+            }
+            for (std::size_t piece=0;piece<pieces.size();++piece) {
+                const auto tolerance=std::max(1e-10,pieces[piece].length*1e-10);
+                if (result[piece].size()<2
+                   ||std::abs(result[piece].back().distance-pieces[piece].length)>tolerance) {
+                    return std::unexpected(std::format(
+                        "PathTempo did not cover continuous piece {}",piece));
+                }
+                result[piece].back().distance=pieces[piece].length;
+            }
+
+            return result;
+        }
     }
 
     TrajectoryCompiler::TrajectoryCompiler(TrajectoryLimits limits) : m_limits(limits) { }
@@ -1125,11 +1029,6 @@ namespace ngc {
            ||m_continuousPlanningEffort.scpIterations>32
            ||m_continuousPlanningEffort.scpLineSearchSteps==0
            ||m_continuousPlanningEffort.scpLineSearchSteps>24
-           ||(m_continuousPlanningEffort.timeLawCacheEntries!=0
-                &&((m_continuousPlanningEffort.timeLawCacheEntries
-                        &(m_continuousPlanningEffort.timeLawCacheEntries-1))!=0
-                   ||m_continuousPlanningEffort.timeLawCacheEntries
-                        >LARGE_TIME_LAW_CACHE_SIZE))
            ||m_continuousPlanningEffort.scpSimplexIterationLimitMultiplier==0
            ||m_continuousPlanningEffort.scpSimplexIterationLimitMultiplier>4096
            ||!std::isfinite(m_continuousPlanningEffort.scpVelocityTrustFraction)
@@ -1318,13 +1217,6 @@ namespace ngc {
                     prepared.id));
         }
         if(pieces.empty()) return std::unexpected("continuous path produced no geometry");
-        const auto automaticTimeLawCacheSize=
-            pieces.size()>1024?LARGE_TIME_LAW_CACHE_SIZE:SMALL_TIME_LAW_CACHE_SIZE;
-        timeLawRecorder.instrumentation.configureCache(
-            m_continuousPlanningEffort.timeLawCacheEntries==0
-                ?automaticTimeLawCacheSize
-                :m_continuousPlanningEffort.timeLawCacheEntries,
-            m_continuousPlanningEffort.shareTimeLawCacheAcrossCompilations);
 
         CurveEvaluationWorkspace endpointWorkspace;
         const auto &last=geometry.pieces.back();
@@ -1519,25 +1411,6 @@ namespace ngc {
         }
         const auto initialLocalLimits=localLimits;
 
-        // These one-sided endpoint values are geometry-only and remain valid
-        // through every local-limit correction pass. Candidate evaluation used
-        // to repeat the exact inverse/sample path for both sides of every
-        // station even though only scalar velocity and acceleration changed.
-        std::vector<CoupledEndpointGeometry> pieceStartGeometry;
-        std::vector<CoupledEndpointGeometry> pieceEndGeometry;
-        pieceStartGeometry.reserve(pieces.size());
-        pieceEndGeometry.reserve(pieces.size());
-        for(const auto &piece:pieces) {
-            const auto &start=piece.geometricSamples.front();
-            const auto &end=piece.geometricSamples.back();
-            pieceStartGeometry.push_back({start.tangent,start.curvature,
-                start.curvatureDerivative});
-            pieceEndGeometry.push_back({end.tangent,end.curvature,
-                end.curvatureDerivative});
-        }
-        timeLawRecorder.instrumentation.diagnostics.endpointFeasibility
-            .cachedGeometryEndpoints+=2*pieces.size();
-
         const auto kinematicAt=[&](const std::size_t pieceIndex,const TimeBoundary &boundary) {
             const auto &piece=pieces[pieceIndex];
             auto local=std::clamp(boundary.distance,0.0,piece.length);
@@ -1558,7 +1431,6 @@ namespace ngc {
         bool constraintsVerified=false;
         std::string correctionHistory;
         std::size_t totalGeometryVerificationAttempts=0;
-        TimeLawWorkspace timeLawWorkspace;
         std::vector<double> previousStationVelocity;
         std::vector<double> previousStationAcceleration;
         std::vector<TimeLaw> previousPieceTiming;
@@ -1581,696 +1453,141 @@ namespace ngc {
             }
             return true;
         };
-        // Correction passes retain the same LP shape in the common case. PathTempo
-        // owns the persistent HiGHS model and basis behind its solver-neutral API.
-        path_tempo::PersistentLinearSolver persistentScpSolver;
-        if(auto configured=persistentScpSolver.configure(
-                m_continuousPlanningEffort.scpSolveTimeLimit); !configured)
-            return std::unexpected(std::format(
-                "continuous SCP could not configure its linear solver: {}",
-                configured.error()));
-        for(unsigned correctionPass=0;correctionPass<maximumLocalCorrectionPasses;
+        std::vector<path_tempo::SampledPathPiece<6>> pathTempoStorage;
+        pathTempoStorage.reserve(pieces.size());
+        for (std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
+            const auto &piece=pieces[pieceIndex];
+            path_tempo::SampledPathPiece<6> timingPiece {
+                .id=pieceIndex+1,
+                .length=piece.length,
+                .maxVelocity=piece.speed,
+                .initialLimits={},
+                .stations={},
+            };
+            timingPiece.stations.reserve(piece.geometricSamples.size());
+            for (std::size_t sampleIndex=0;sampleIndex<piece.geometricSamples.size();
+                    ++sampleIndex) {
+                const auto &sample=piece.geometricSamples[sampleIndex];
+                const auto distance=sampleIndex==0?0.0
+                    :sampleIndex+1==piece.geometricSamples.size()?piece.length
+                    :sample.distance-piece.geometricSampleDistanceOffset;
+                timingPiece.stations.push_back({
+                    .distance=distance,
+                    .tangent=pathTempoVector(sample.tangent),
+                    .curvature=pathTempoVector(sample.curvature),
+                    .thirdDerivative=pathTempoVector(sample.curvatureDerivative),
+                });
+            }
+            pathTempoStorage.push_back(std::move(timingPiece));
+        }
+
+        path_tempo::PathPlanner pathPlanner;
+        for (unsigned correctionPass=0;correctionPass<maximumLocalCorrectionPasses;
                 ++correctionPass) {
             reportProgress();
-            result->correctionPasses=correctionPass+1;
-            std::vector<double> stationCaps(pieces.size()+1,std::numeric_limits<double>::infinity());
-            stationCaps.front()=scalarStart->first;
-            stationCaps.back()=scalarEnd->first;
-            for(std::size_t station=1;station<pieces.size();++station)
-                stationCaps[station]=std::min(localLimits[station-1].velocity,
-                                              localLimits[station].velocity);
-            if(stationCaps.front()>localLimits.front().velocity*(1.0+1e-10)
-               ||stationCaps.back()>localLimits.back().velocity*(1.0+1e-10))
-                return std::unexpected(std::format(
-                    "continuous boundary velocity exceeds a local path cap: start={}/{} end={}/{}",
-                    stationCaps.front(),localLimits.front().velocity,
-                    stationCaps.back(),localLimits.back().velocity));
-            std::vector<double> stationVelocity=stationCaps;
-            for(unsigned reachabilityPass=0;reachabilityPass<8;++reachabilityPass) {
-                auto maximumChange=0.0;
-                for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
-                    const auto reachable=path_tempo::reachableVelocity(stationVelocity[pieceIndex],
-                        std::min(stationCaps[pieceIndex+1],localLimits[pieceIndex].velocity),
-                        pieces[pieceIndex].length,localLimits[pieceIndex].acceleration,
-                        localLimits[pieceIndex].jerk);
-                    if(pieceIndex+1==pieces.size()) {
-                        if(reachable+1e-10<stationVelocity.back())
-                            return std::unexpected(std::format(
-                                "continuous fixed end velocity is not forward reachable: "
-                                "requested={} reachable={}",stationVelocity.back(),reachable));
-                        continue;
-                    }
-                    const auto reduced=std::min(stationVelocity[pieceIndex+1],reachable);
-                    maximumChange=std::max(maximumChange,stationVelocity[pieceIndex+1]-reduced);
-                    stationVelocity[pieceIndex+1]=reduced;
-                }
-                for(std::size_t pieceIndex=pieces.size();pieceIndex-->0;) {
-                    const auto reachable=path_tempo::reachableVelocity(stationVelocity[pieceIndex+1],
-                        std::min(stationCaps[pieceIndex],localLimits[pieceIndex].velocity),
-                        pieces[pieceIndex].length,localLimits[pieceIndex].acceleration,
-                        localLimits[pieceIndex].jerk);
-                    if(pieceIndex==0) {
-                        if(reachable+1e-10<stationVelocity.front())
-                            return std::unexpected(std::format(
-                                "continuous fixed start velocity cannot reach the remaining path: "
-                                "requested={} backward reachable={}",stationVelocity.front(),reachable));
-                        continue;
-                    }
-                    const auto reduced=std::min(stationVelocity[pieceIndex],reachable);
-                    maximumChange=std::max(maximumChange,stationVelocity[pieceIndex]-reduced);
-                    stationVelocity[pieceIndex]=reduced;
-                }
-                if(maximumChange<=1e-11) break;
-            }
-
-            std::vector<double> stationAcceleration(pieces.size()+1,0.0);
-            stationAcceleration.front()=scalarStart->second;
-            stationAcceleration.back()=scalarEnd->second;
-            std::vector<TimeLaw> pieceTiming(pieces.size());
-            for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
-                if((pieceIndex&31U)==0) reportProgress();
-                auto timing=timeLawBetween(timeLawWorkspace,timeLawRecorder.instrumentation,
-                    TimeLawPurpose::ContinuousSeed,correctionPass>0,
-                    pieces[pieceIndex].length,
-                    stationVelocity[pieceIndex],0.0,stationVelocity[pieceIndex+1],0.0,
-                    localLimits[pieceIndex].velocity,localLimits[pieceIndex].acceleration,
-                    localLimits[pieceIndex].jerk);
-                if(!timing) return std::unexpected(std::format(
-                    "continuous reachability seed timing failed at piece {} input {}: {}",
-                    pieceIndex,pieces[pieceIndex].input,timing.error()));
-                pieceTiming[pieceIndex]=*timing;
-            }
-            result->velocityOnlySeedDuration=std::accumulate(
-                pieceTiming.begin(),pieceTiming.end(),0.0,
-                [](const double total,const auto &timing) { return total+timing.back().time; });
-
-            const auto stateWithinCoupledLimits=[&](const CoupledEndpointGeometry &geometry,
-                    const std::size_t pieceIndex,const double velocity,
-                    const double acceleration) {
-                const auto axisAcceleration=add(scaled(geometry.tangent,acceleration),
-                    scaled(geometry.curvature,velocity*velocity));
-                if(axisAcceleration.length()>m_limits.pathAcceleration*(1.0+1e-10))
-                    return CoupledEndpointResult::Acceleration;
-                for(const auto component:AXIS_COMPONENTS)
-                    if(std::abs(axisAcceleration.*component)
-                       >m_limits.axisAcceleration.*component*(1.0+1e-10))
-                        return CoupledEndpointResult::Acceleration;
-
-                const auto geometricJerk=add(
-                    scaled(geometry.curvature,3.0*velocity*acceleration),
-                    scaled(geometry.curvatureDerivative,velocity*velocity*velocity));
-                auto minimumScalarJerk=-localLimits[pieceIndex].jerk;
-                auto maximumScalarJerk=localLimits[pieceIndex].jerk;
-                for(const auto component:AXIS_COMPONENTS) {
-                    const auto tangent=geometry.tangent.*component;
-                    const auto geometric=geometricJerk.*component;
-                    const auto limit=m_limits.axisJerk.*component;
-                    if(std::abs(tangent)<=1e-15) {
-                        if(std::abs(geometric)>limit*(1.0+1e-10))
-                            return CoupledEndpointResult::Jerk;
-                        continue;
-                    }
-                    auto lower=(-limit-geometric)/tangent;
-                    auto upper=(limit-geometric)/tangent;
-                    if(lower>upper) std::swap(lower,upper);
-                    minimumScalarJerk=std::max(minimumScalarJerk,lower);
-                    maximumScalarJerk=std::min(maximumScalarJerk,upper);
-                }
-                if(minimumScalarJerk>maximumScalarJerk)
-                    return CoupledEndpointResult::Jerk;
-                const auto scalarJerk=std::clamp(-positionDot(geometry.tangent,geometricJerk),
-                    minimumScalarJerk,maximumScalarJerk);
-                return add(scaled(geometry.tangent,scalarJerk),geometricJerk).length()
-                    <=m_limits.pathJerk*(1.0+1e-10)
-                    ?CoupledEndpointResult::Feasible:CoupledEndpointResult::Jerk;
-            };
-
-            const auto feasibleEndpointScalarJerk=[&](
-                    const CoupledEndpointGeometry &geometry,const std::size_t pieceIndex,
-                    const double velocity,const double acceleration)
-                    ->std::optional<double> {
-                const auto geometricJerk=add(
-                    scaled(geometry.curvature,3.0*velocity*acceleration),
-                    scaled(geometry.curvatureDerivative,velocity*velocity*velocity));
-                auto lower=-localLimits[pieceIndex].jerk;
-                auto upper=localLimits[pieceIndex].jerk;
-                for(const auto component:AXIS_COMPONENTS) {
-                    const auto tangent=geometry.tangent.*component;
-                    const auto geometric=geometricJerk.*component;
-                    const auto limit=m_limits.axisJerk.*component;
-                    if(!std::isfinite(limit)) continue;
-                    if(std::abs(tangent)<=1e-15) {
-                        if(std::abs(geometric)>limit*(1.0+1e-10)) return std::nullopt;
-                        continue;
-                    }
-                    auto componentLower=(-limit-geometric)/tangent;
-                    auto componentUpper=(limit-geometric)/tangent;
-                    if(componentLower>componentUpper)
-                        std::swap(componentLower,componentUpper);
-                    lower=std::max(lower,componentLower);
-                    upper=std::min(upper,componentUpper);
-                }
-                if(lower>upper) return std::nullopt;
-                const auto result=std::clamp(-positionDot(geometry.tangent,geometricJerk),
-                    lower,upper);
-                if(add(scaled(geometry.tangent,result),geometricJerk).length()
-                    >m_limits.pathJerk*(1.0+1e-10)) return std::nullopt;
-                return result;
-            };
-
-            const auto materializeScpCandidate=[&](const std::vector<double> &velocity,
-                    const std::vector<double> &acceleration,std::vector<TimeLaw> &timing,
-                    double &duration) {
-                if(velocity.size()!=pieces.size()+1||acceleration.size()!=velocity.size())
-                    PANIC("SCP candidate station count does not match continuous geometry");
-                for(std::size_t station=0;station<velocity.size();++station) {
-                    if(station>0&&stateWithinCoupledLimits(pieceEndGeometry[station-1],
-                            station-1,velocity[station],acceleration[station])
-                                !=CoupledEndpointResult::Feasible) return false;
-                    if(station<pieces.size()&&stateWithinCoupledLimits(
-                            pieceStartGeometry[station],station,velocity[station],
-                            acceleration[station])!=CoupledEndpointResult::Feasible) return false;
-                }
-                std::vector<TimeLaw> candidateTiming(pieces.size());
-                auto candidateDuration=0.0;
-                for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
-                    ++result->scpMaterializationAttempts;
-                    auto candidate=timeLawBetween(timeLawWorkspace,
-                        timeLawRecorder.instrumentation,TimeLawPurpose::ContinuousSeed,
-                        correctionPass>0,pieces[pieceIndex].length,
-                        velocity[pieceIndex],acceleration[pieceIndex],
-                        velocity[pieceIndex+1],acceleration[pieceIndex+1],
-                        localLimits[pieceIndex].velocity,
-                        localLimits[pieceIndex].acceleration,
-                        localLimits[pieceIndex].jerk);
-                    if(!candidate) return false;
-                    candidateDuration+=candidate->back().time;
-                    candidateTiming[pieceIndex]=*candidate;
-                }
-                timing=std::move(candidateTiming);
-                duration=candidateDuration;
-                return true;
-            };
-
-            // The velocity-only reachability envelope is a cheap feasible
-            // reference for the sequential LP. Materialize its actual boundary
-            // accelerations before asking HiGHS for an improving step.
-            auto scpDuration=0.0;
-            if(!materializeScpCandidate(stationVelocity,stationAcceleration,
-                    pieceTiming,scpDuration))
-                return std::unexpected(std::format(
-                    "continuous SCP could not materialize its initial fixed-boundary "
-                    "reference on correction pass {}",correctionPass));
-
-            const auto velocityColumn=[](const std::size_t station) { return station; };
-            const auto accelerationColumn=[stationCount=stationVelocity.size()](
-                    const std::size_t station) { return stationCount+station; };
-            const auto jerkColumn=[stationCount=stationVelocity.size()](
-                    const std::size_t pieceIndex,const bool end) {
-                return 2*stationCount+2*pieceIndex+(end?1U:0U);
-            };
-            const auto accelerationDeviationColumn=[stationCount=stationVelocity.size(),
-                    pieceCount=pieces.size()](const std::size_t station) {
-                return 2*stationCount+2*pieceCount+station;
-            };
-            const auto variableCount=3*stationVelocity.size()+2*pieces.size();
-            const auto scpStarted=std::chrono::steady_clock::now();
-
-            for(unsigned scpIteration=0;
-                    scpIteration<m_continuousPlanningEffort.scpIterations;++scpIteration) {
-                reportProgress();
-                path_tempo::SparseLinearProgram lp(variableCount);
-                const auto &referenceVelocity=stationVelocity;
-                const auto &referenceAcceleration=stationAcceleration;
-
-                std::vector<std::size_t> stationDeviationRowOffsets(
-                    referenceVelocity.size());
-                for(std::size_t station=0;station<referenceVelocity.size();++station) {
-                    const auto vColumn=velocityColumn(station);
-                    const auto aColumn=accelerationColumn(station);
-                    auto velocityLower=std::max(0.0,referenceVelocity[station]
-                        -m_continuousPlanningEffort.scpVelocityTrustFraction
-                            *std::max(1e-6,stationCaps[station]));
-                    auto velocityUpper=std::min(stationCaps[station],referenceVelocity[station]
-                        +m_continuousPlanningEffort.scpVelocityTrustFraction
-                            *std::max(1e-6,stationCaps[station]));
-                    auto accelerationLimit=std::numeric_limits<double>::infinity();
-                    if(station>0) accelerationLimit=std::min(accelerationLimit,
-                        localLimits[station-1].acceleration);
-                    if(station<pieces.size()) accelerationLimit=std::min(accelerationLimit,
-                        localLimits[station].acceleration);
-                    accelerationLimit*=0.95;
-                    auto accelerationLower=std::max(-accelerationLimit,
-                        referenceAcceleration[station]
-                            -m_continuousPlanningEffort.scpAccelerationTrustFraction
-                                *accelerationLimit);
-                    auto accelerationUpper=std::min(accelerationLimit,
-                        referenceAcceleration[station]
-                            +m_continuousPlanningEffort.scpAccelerationTrustFraction
-                                *accelerationLimit);
-                    if(station==0) {
-                        velocityLower=velocityUpper=scalarStart->first;
-                        accelerationLower=accelerationUpper=scalarStart->second;
-                    } else if(station+1==referenceVelocity.size()) {
-                        velocityLower=velocityUpper=scalarEnd->first;
-                        accelerationLower=accelerationUpper=scalarEnd->second;
-                    }
-                    lp.columnLower(vColumn)=velocityLower;
-                    lp.columnUpper(vColumn)=velocityUpper;
-                    lp.columnLower(aColumn)=accelerationLower;
-                    lp.columnUpper(aColumn)=accelerationUpper;
-                    const auto deviationColumn=accelerationDeviationColumn(station);
-                    lp.columnLower(deviationColumn)=0.0;
-                    lp.columnUpper(deviationColumn)=path_tempo::linearProgramInfinity();
-                    lp.columnCost(deviationColumn)=1e-6;
-
-                    auto targetAcceleration=referenceAcceleration[station];
-                    if(station>0&&station<pieces.size()) {
-                        const auto leftSlope=(referenceVelocity[station]
-                            *referenceVelocity[station]-referenceVelocity[station-1]
-                                *referenceVelocity[station-1])
-                            /(2.0*pieces[station-1].length);
-                        const auto rightSlope=(referenceVelocity[station+1]
-                            *referenceVelocity[station+1]-referenceVelocity[station]
-                                *referenceVelocity[station])
-                            /(2.0*pieces[station].length);
-                        targetAcceleration=leftSlope*rightSlope>0.0
-                            ?std::copysign(std::min(std::abs(leftSlope),
-                                std::abs(rightSlope)),leftSlope):0.0;
-                        targetAcceleration=std::clamp(targetAcceleration,
-                            accelerationLower,accelerationUpper);
-                    }
-                    stationDeviationRowOffsets[station]=lp.rowCount();
-                    lp.addRow(-targetAcceleration,path_tempo::linearProgramInfinity(),{
-                        {aColumn,-1.0},{deviationColumn,1.0},
-                    });
-                    lp.addRow(targetAcceleration,path_tempo::linearProgramInfinity(),{
-                        {aColumn,1.0},{deviationColumn,1.0},
-                    });
-                }
-                for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
-                    for(const auto end:{false,true}) {
-                        const auto column=jerkColumn(pieceIndex,end);
-                        lp.columnLower(column)=-localLimits[pieceIndex].jerk;
-                        lp.columnUpper(column)=localLimits[pieceIndex].jerk;
-                    }
-                    const auto speedSum=std::max(1e-6,
-                        referenceVelocity[pieceIndex]+referenceVelocity[pieceIndex+1]);
-                    const auto objectiveDerivative=
-                        -2.0*pieces[pieceIndex].length/(speedSum*speedSum);
-                    lp.columnCost(velocityColumn(pieceIndex))+=objectiveDerivative;
-                    lp.columnCost(velocityColumn(pieceIndex+1))+=objectiveDerivative;
-                }
-
-                const auto addAccelerationConstraints=[&](
-                        const CoupledEndpointGeometry &geometry,const std::size_t station,
-                        const double referenceV) {
-                    const auto vColumn=velocityColumn(station);
-                    const auto aColumn=accelerationColumn(station);
-                    for(std::size_t axis=0;axis<AXIS_COMPONENTS.size();++axis) {
-                        const auto component=AXIS_COMPONENTS[axis];
-                        const auto velocityCoefficient=
-                            2.0*geometry.curvature.*component*referenceV;
-                        const auto accelerationCoefficient=geometry.tangent.*component;
-                        const auto constant=-(geometry.curvature.*component)
-                            *referenceV*referenceV;
-                        const auto limit=m_limits.axisAcceleration.*component;
-                        if(!std::isfinite(limit)) continue;
-                        lp.addRow(-limit-constant,limit-constant,{
-                            {vColumn,velocityCoefficient},
-                            {aColumn,accelerationCoefficient},
-                        });
-                    }
-                    const auto referenceVector=add(
-                        scaled(geometry.tangent,referenceAcceleration[station]),
-                        scaled(geometry.curvature,referenceV*referenceV));
-                    const auto referenceNorm=referenceVector.length();
-                    if(referenceNorm>1e-12) {
-                        const auto direction=scaled(referenceVector,1.0/referenceNorm);
-                        const auto velocityCoefficient=
-                            2.0*positionDot(direction,geometry.curvature)*referenceV;
-                        const auto accelerationCoefficient=
-                            positionDot(direction,geometry.tangent);
-                        const auto constant=-positionDot(direction,geometry.curvature)
-                            *referenceV*referenceV;
-                        lp.addRow(-path_tempo::linearProgramInfinity(),m_limits.pathAcceleration-constant,{
-                            {vColumn,velocityCoefficient},
-                            {aColumn,accelerationCoefficient},
-                        });
-                    }
+            std::vector<path_tempo::PathPiece<6>> pathTempoPieces;
+            pathTempoPieces.reserve(pathTempoStorage.size());
+            for (std::size_t pieceIndex=0;pieceIndex<pathTempoStorage.size();++pieceIndex) {
+                pathTempoStorage[pieceIndex].initialLimits={
+                    .velocity=localLimits[pieceIndex].velocity,
+                    .acceleration=localLimits[pieceIndex].acceleration,
+                    .jerk=localLimits[pieceIndex].jerk,
                 };
-
-                const auto addJerkConstraints=[&](const CoupledEndpointGeometry &geometry,
-                        const std::size_t station,const std::size_t pieceIndex,
-                        const bool end,const double referenceJerk) {
-                    const auto referenceV=referenceVelocity[station];
-                    const auto referenceA=referenceAcceleration[station];
-                    const auto vColumn=velocityColumn(station);
-                    const auto aColumn=accelerationColumn(station);
-                    const auto jColumn=jerkColumn(pieceIndex,end);
-                    position_t velocityDerivative{};
-                    position_t accelerationDerivative{};
-                    position_t geometricReference{};
-                    for(const auto component:AXIS_COMPONENTS) {
-                        velocityDerivative.*component=
-                            3.0*geometry.curvature.*component*referenceA
-                            +3.0*geometry.curvatureDerivative.*component
-                                *referenceV*referenceV;
-                        accelerationDerivative.*component=
-                            3.0*geometry.curvature.*component*referenceV;
-                        geometricReference.*component=
-                            3.0*geometry.curvature.*component*referenceV*referenceA
-                            +geometry.curvatureDerivative.*component
-                                *referenceV*referenceV*referenceV;
-                    }
-                    const auto constant=subtract(geometricReference,
-                        add(scaled(velocityDerivative,referenceV),
-                            scaled(accelerationDerivative,referenceA)));
-                    for(const auto component:AXIS_COMPONENTS) {
-                        const auto limit=m_limits.axisJerk.*component;
-                        if(!std::isfinite(limit)) continue;
-                        lp.addRow(-limit-constant.*component,limit-constant.*component,{
-                            {vColumn,velocityDerivative.*component},
-                            {aColumn,accelerationDerivative.*component},
-                            {jColumn,geometry.tangent.*component},
-                        });
-                    }
-                    const auto referenceVector=add(
-                        scaled(geometry.tangent,referenceJerk),geometricReference);
-                    const auto referenceNorm=referenceVector.length();
-                    if(referenceNorm>1e-12) {
-                        const auto direction=scaled(referenceVector,1.0/referenceNorm);
-                        lp.addRow(-path_tempo::linearProgramInfinity(),m_limits.pathJerk-positionDot(direction,constant),{
-                            {vColumn,positionDot(direction,velocityDerivative)},
-                            {aColumn,positionDot(direction,accelerationDerivative)},
-                            {jColumn,positionDot(direction,geometry.tangent)},
-                        });
-                    }
-                };
-
-                std::vector<std::array<std::size_t,6>> scpPieceRowOffsets(pieces.size());
-                for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
-                    const auto from=pieceIndex;
-                    const auto to=pieceIndex+1;
-                    const auto referenceFrom=referenceVelocity[from];
-                    const auto referenceTo=referenceVelocity[to];
-                    scpPieceRowOffsets[pieceIndex][0]=lp.rowCount();
-                    if(m_continuousPlanningEffort.addScpAdjacentReachabilityRows) {
-                        const auto referenceSquaredDifference=
-                            referenceTo*referenceTo-referenceFrom*referenceFrom;
-                        const auto accelerationEnergyLimit=2.0
-                            *localLimits[pieceIndex].acceleration
-                            *pieces[pieceIndex].length;
-                        lp.addRow(-path_tempo::linearProgramInfinity(),
-                            accelerationEnergyLimit+referenceSquaredDifference,{
-                                {velocityColumn(to),2.0*referenceTo},
-                                {velocityColumn(from),-2.0*referenceFrom},
-                            });
-                        lp.addRow(-path_tempo::linearProgramInfinity(),
-                            accelerationEnergyLimit-referenceSquaredDifference,{
-                                {velocityColumn(from),2.0*referenceFrom},
-                                {velocityColumn(to),-2.0*referenceTo},
-                            });
-                        result->scpAdjacentReachabilityRows+=2;
-                    }
-                    scpPieceRowOffsets[pieceIndex][1]=lp.rowCount();
-                    addAccelerationConstraints(pieceStartGeometry[pieceIndex],from,
-                        referenceFrom);
-                    scpPieceRowOffsets[pieceIndex][2]=lp.rowCount();
-                    addAccelerationConstraints(pieceEndGeometry[pieceIndex],to,referenceTo);
-                    scpPieceRowOffsets[pieceIndex][3]=lp.rowCount();
-                    addJerkConstraints(pieceStartGeometry[pieceIndex],from,pieceIndex,
-                        false,0.0);
-                    scpPieceRowOffsets[pieceIndex][4]=lp.rowCount();
-                    addJerkConstraints(pieceEndGeometry[pieceIndex],to,pieceIndex,
-                        true,0.0);
-                    scpPieceRowOffsets[pieceIndex][5]=lp.rowCount();
-                }
-
-                // Every sequential linearization must contain its reference
-                // point. Check that invariant before attributing an
-                // infeasibility to the LP solver.
-                std::vector<double> referenceValues(variableCount,0.0);
-                for(std::size_t station=0;station<referenceVelocity.size();++station) {
-                    referenceValues[velocityColumn(station)]=referenceVelocity[station];
-                    referenceValues[accelerationColumn(station)]=referenceAcceleration[station];
-                    const auto firstDeviationRow=stationDeviationRowOffsets[station];
-                    const auto targetFromFirstRow=-lp.rowLower(firstDeviationRow);
-                    referenceValues[accelerationDeviationColumn(station)]=
-                        std::abs(referenceAcceleration[station]-targetFromFirstRow);
-                }
-                for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
-                    const auto startJerk=feasibleEndpointScalarJerk(
-                        pieceStartGeometry[pieceIndex],pieceIndex,
-                        referenceVelocity[pieceIndex],referenceAcceleration[pieceIndex]);
-                    const auto endJerk=feasibleEndpointScalarJerk(
-                        pieceEndGeometry[pieceIndex],pieceIndex,
-                        referenceVelocity[pieceIndex+1],referenceAcceleration[pieceIndex+1]);
-                    if(!startJerk||!endJerk)
-                        PANIC("verified SCP reference has no feasible endpoint scalar jerk");
-                    referenceValues[jerkColumn(pieceIndex,false)]=*startJerk;
-                    referenceValues[jerkColumn(pieceIndex,true)]=*endJerk;
-                }
-                auto referenceViolation=0.0;
-                auto referenceViolationRow=std::size_t {0};
-                auto referenceViolationValue=0.0;
-                for(std::size_t row=0;row<lp.rowCount();++row) {
-                    auto value=0.0;
-                    const auto begin=lp.rowBegin(row);
-                    const auto end=lp.rowEnd(row);
-                    for(auto entry=begin;entry<end;++entry)
-                        value+=lp.entryValue(entry)
-                            *referenceValues[lp.entryColumn(entry)];
-                    const auto violation=std::max({0.0,lp.rowLower(row)-value,
-                        value-lp.rowUpper(row)});
-                    if(violation>referenceViolation) {
-                        referenceViolation=violation;
-                        referenceViolationRow=row;
-                        referenceViolationValue=value;
-                    }
-                }
-                if(referenceViolation>1e-7) {
-                    if(referenceViolationRow<scpPieceRowOffsets.front()[0]) {
-                        auto violationStation=std::size_t {0};
-                        while(violationStation+1<stationDeviationRowOffsets.size()
-                              &&referenceViolationRow
-                                    >=stationDeviationRowOffsets[violationStation+1])
-                            ++violationStation;
-                        return std::unexpected(std::format(
-                            "continuous SCP linearization excludes its reference: row={} "
-                            "station={} group=acceleration_deviation group_row={} "
-                            "violation={} value={} bounds=[{},{}] reference=[v={} a={}] "
-                            "correction_pass={} iteration={}",
-                            referenceViolationRow,violationStation,
-                            referenceViolationRow
-                                -stationDeviationRowOffsets[violationStation],
-                            referenceViolation,referenceViolationValue,
-                            lp.rowLower(referenceViolationRow),
-                            lp.rowUpper(referenceViolationRow),
-                            referenceVelocity[violationStation],
-                            referenceAcceleration[violationStation],
-                            correctionPass,scpIteration));
-                    }
-                    auto violationPiece=std::size_t {0};
-                    while(violationPiece+1<scpPieceRowOffsets.size()
-                          &&referenceViolationRow>=scpPieceRowOffsets[violationPiece][5])
-                        ++violationPiece;
-                    static constexpr std::array rowGroups{
-                        "adjacent_reachability","start_acceleration","end_acceleration",
-                        "start_jerk","end_jerk"};
-                    auto violationGroup=std::size_t {0};
-                    while(violationGroup+1<rowGroups.size()
-                          &&referenceViolationRow
-                              >=scpPieceRowOffsets[violationPiece][violationGroup+1])
-                        ++violationGroup;
-                    const auto violationBegin=lp.rowBegin(referenceViolationRow);
-                    const auto violationEnd=lp.rowEnd(referenceViolationRow);
-                    const auto firstEntry=violationBegin<violationEnd?violationBegin:0;
-                    const auto secondEntry=violationBegin+1<violationEnd
-                        ?violationBegin+1:firstEntry;
-                    const auto thirdEntry=violationBegin+2<violationEnd
-                        ?violationBegin+2:secondEntry;
-                    return std::unexpected(std::format(
-                        "continuous SCP linearization excludes its reference: row={} piece={} "
-                        "group={} group_row={} violation={} value={} bounds=[{},{}] "
-                        "reference=[v={} a={}] curvature={} tangent={} pieces={} "
-                        "entries={} first=[column={} coefficient={} reference={}] "
-                        "second=[column={} coefficient={} reference={}] "
-                        "third=[column={} coefficient={} reference={}] correction_pass={} iteration={}",
-                        referenceViolationRow,violationPiece,rowGroups[violationGroup],
-                        referenceViolationRow
-                            -scpPieceRowOffsets[violationPiece][violationGroup],
-                        referenceViolation,referenceViolationValue,
-                        lp.rowLower(referenceViolationRow),
-                        lp.rowUpper(referenceViolationRow),
-                        referenceVelocity[violationPiece],
-                        referenceAcceleration[violationPiece],
-                        pieceStartGeometry[violationPiece].curvature.x,
-                        pieceStartGeometry[violationPiece].tangent.x,
-                        pieces.size(),violationEnd-violationBegin,
-                        lp.entryColumn(firstEntry),
-                        lp.entryValue(firstEntry),
-                        referenceValues[lp.entryColumn(firstEntry)],
-                        lp.entryColumn(secondEntry),
-                        lp.entryValue(secondEntry),
-                        referenceValues[lp.entryColumn(secondEntry)],
-                        lp.entryColumn(thirdEntry),
-                        lp.entryValue(thirdEntry),
-                        referenceValues[lp.entryColumn(thirdEntry)],
-                        correctionPass,scpIteration));
-                }
-
-                ++result->scpSolves;
-                auto solution=persistentScpSolver.solve(lp,{
-                    .simplexIterationLimit=m_continuousPlanningEffort
-                        .scpSimplexIterationLimitMultiplier*variableCount,
-                    .reuseBasis=m_continuousPlanningEffort.reuseScpBasis,
-                });
-                if(!solution)
-                    return std::unexpected(std::format(
-                        "continuous SCP linear solve failed on correction pass {} iteration {}: {} "
-                        "pieces={} start=[v={} a={}] end=[v={} a={}]",
-                        correctionPass,scpIteration,solution.error(),pieces.size(),
-                        scalarStart->first,scalarStart->second,
-                        scalarEnd->first,scalarEnd->second));
-                const auto &solveDiagnostics=solution->diagnostics;
-                result->scpSimplexIterations+=solveDiagnostics.simplexIterations;
-                result->scpBasisReuseAttempts+=solveDiagnostics.basisReuseAttempted;
-                result->scpBasisReuseApplied+=solveDiagnostics.basisReuseApplied;
-                result->scpBasisDimensionMismatches+=
-                    solveDiagnostics.basisDimensionMismatch;
-                result->scpModelUpdateAttempts+=solveDiagnostics.modelUpdateAttempted;
-                result->scpModelUpdatesApplied+=solveDiagnostics.modelUpdateApplied;
-                result->scpModelStructureMismatches+=
-                    solveDiagnostics.modelStructureMismatch;
-                if(solution->status!=path_tempo::LinearSolveStatus::Optimal) {
-                    auto &fallback=result->scpResourceFallback;
-                    if(fallback.occurrences==0) {
-                        fallback.reason=solution->status
-                                ==path_tempo::LinearSolveStatus::TimeLimit
-                            ?ScpResourceFallbackReason::TimeLimit
-                            :ScpResourceFallbackReason::IterationLimit;
-                        fallback.correctionPass=correctionPass;
-                        fallback.scpIteration=scpIteration;
-                    }
-                    ++fallback.occurrences;
-                    break;
-                }
-
-                std::vector<double> proposedVelocity(referenceVelocity.size());
-                std::vector<double> proposedAcceleration(referenceAcceleration.size());
-                for(std::size_t station=0;station<referenceVelocity.size();++station) {
-                    proposedVelocity[station]=std::clamp(
-                        solution->values[velocityColumn(station)],0.0,stationCaps[station]);
-                    proposedAcceleration[station]=
-                        solution->values[accelerationColumn(station)];
-                }
-                // A whole-horizon line search is overly brittle here: each
-                // materialized piece contains several jerk phases, so one bad
-                // station can reject an otherwise useful LP direction. Treat
-                // internal stations as a working set instead. A station is
-                // committed only when both adjacent exact scalar transitions
-                // remain feasible and their combined duration does not grow.
-                auto acceptedAny=false;
-                for(std::size_t station=1;station+1<stationVelocity.size();++station) {
-                    ++result->scpStationProposals;
-                    const auto leftPiece=station-1;
-                    const auto rightPiece=station;
-                    const auto oldDuration=pieceTiming[leftPiece].back().time
-                        +pieceTiming[rightPiece].back().time;
-                    for(unsigned lineSearch=0;
-                            lineSearch<m_continuousPlanningEffort.scpLineSearchSteps;
-                            ++lineSearch) {
-                        ++result->scpLineSearchTrials;
-                        const auto fraction=std::ldexp(1.0,-static_cast<int>(lineSearch));
-                        const auto trialVelocity=std::lerp(stationVelocity[station],
-                            proposedVelocity[station],fraction);
-                        const auto trialAcceleration=std::lerp(stationAcceleration[station],
-                            proposedAcceleration[station],fraction);
-                        if(stateWithinCoupledLimits(pieceEndGeometry[leftPiece],leftPiece,
-                                trialVelocity,trialAcceleration)
-                                    !=CoupledEndpointResult::Feasible
-                           ||stateWithinCoupledLimits(pieceStartGeometry[rightPiece],rightPiece,
-                                trialVelocity,trialAcceleration)
-                                    !=CoupledEndpointResult::Feasible)
-                            continue;
-
-                        auto left=candidateTimeLawBetween(timeLawWorkspace,
-                            timeLawRecorder.instrumentation,
-                            m_continuousPlanningEffort.cacheScpLineSearchTrials,
-                            TimeLawPurpose::ContinuousSeed,
-                            correctionPass>0,pieces[leftPiece].length,
-                            stationVelocity[leftPiece],stationAcceleration[leftPiece],
-                            trialVelocity,trialAcceleration,
-                            localLimits[leftPiece].velocity,
-                            localLimits[leftPiece].acceleration,
-                            localLimits[leftPiece].jerk);
-                        if(!left.cacheHit) ++result->scpMaterializationAttempts;
-                        if(!left.successful) continue;
-                        auto right=candidateTimeLawBetween(timeLawWorkspace,
-                            timeLawRecorder.instrumentation,
-                            m_continuousPlanningEffort.cacheScpLineSearchTrials,
-                            TimeLawPurpose::ContinuousSeed,
-                            correctionPass>0,pieces[rightPiece].length,
-                            trialVelocity,trialAcceleration,
-                            stationVelocity[rightPiece+1],stationAcceleration[rightPiece+1],
-                            localLimits[rightPiece].velocity,
-                            localLimits[rightPiece].acceleration,
-                            localLimits[rightPiece].jerk);
-                        if(!right.cacheHit) ++result->scpMaterializationAttempts;
-                        if(!right.successful) continue;
-                        const auto newDuration=left.duration+right.duration;
-                        if(newDuration>oldDuration*(1.0+1e-10)) continue;
-
-                        if(!left.timing) {
-                            ++result->scpMaterializationAttempts;
-                            auto materialized=materializeCandidateTimeLaw(timeLawWorkspace,
-                                timeLawRecorder.instrumentation,
-                                TimeLawPurpose::ContinuousSeed,left,
-                                pieces[leftPiece].length,stationVelocity[leftPiece],
-                                stationAcceleration[leftPiece],trialVelocity,trialAcceleration,
-                                localLimits[leftPiece].velocity,
-                                localLimits[leftPiece].acceleration,
-                                localLimits[leftPiece].jerk);
-                            if(!materialized)
-                                return std::unexpected(std::format(
-                                    "continuous SCP left trial cache materialization failed "
-                                    "on correction pass {} iteration {} station {}: {}",
-                                    correctionPass,scpIteration,station,materialized.error()));
-                            left.timing=std::move(*materialized);
-                        }
-                        if(!right.timing) {
-                            ++result->scpMaterializationAttempts;
-                            auto materialized=materializeCandidateTimeLaw(timeLawWorkspace,
-                                timeLawRecorder.instrumentation,
-                                TimeLawPurpose::ContinuousSeed,right,
-                                pieces[rightPiece].length,trialVelocity,trialAcceleration,
-                                stationVelocity[rightPiece+1],stationAcceleration[rightPiece+1],
-                                localLimits[rightPiece].velocity,
-                                localLimits[rightPiece].acceleration,
-                                localLimits[rightPiece].jerk);
-                            if(!materialized)
-                                return std::unexpected(std::format(
-                                    "continuous SCP right trial cache materialization failed "
-                                    "on correction pass {} iteration {} station {}: {}",
-                                    correctionPass,scpIteration,station,materialized.error()));
-                            right.timing=std::move(*materialized);
-                        }
-
-                        stationVelocity[station]=trialVelocity;
-                        stationAcceleration[station]=trialAcceleration;
-                        pieceTiming[leftPiece]=std::move(*left.timing);
-                        pieceTiming[rightPiece]=std::move(*right.timing);
-                        scpDuration+=newDuration-oldDuration;
-                        ++result->scpAcceptedSteps;
-                        acceptedAny=true;
-                        break;
-                    }
-                }
-                if(!acceptedAny) break;
+                pathTempoPieces.push_back(pathTempoStorage[pieceIndex].view());
             }
-            result->scpSeconds+=std::chrono::duration<double>(
-                std::chrono::steady_clock::now()-scpStarted).count();
+            const auto planned=pathPlanner.solve(path_tempo::PathPlanningRequest<6>{
+                .pieces=pathTempoPieces,
+                .beginning={
+                    .velocity=scalarStart->first,
+                    .acceleration=scalarStart->second,
+                },
+                .ending={
+                    .velocity=scalarEnd->first,
+                    .acceleration=scalarEnd->second,
+                },
+                .limits={
+                    .pathAcceleration=m_limits.pathAcceleration,
+                    .pathJerk=m_limits.pathJerk,
+                    .coordinateVelocity=pathTempoVector(m_limits.axisVelocity),
+                    .coordinateAcceleration=pathTempoVector(m_limits.axisAcceleration),
+                    .coordinateJerk=pathTempoVector(m_limits.axisJerk),
+                },
+                .settings={
+                    .linearSolveTimeLimit=m_continuousPlanningEffort.scpSolveTimeLimit,
+                    .simplexIterationLimit=
+                        m_continuousPlanningEffort.scpSimplexIterationLimitMultiplier
+                            *(5*pieces.size()+3),
+                    .maximumCorrectionPasses=maximumLocalCorrectionPasses,
+                    .sequentialIterations=m_continuousPlanningEffort.scpIterations,
+                    .lineSearchSteps=m_continuousPlanningEffort.scpLineSearchSteps,
+                    .velocityTrustFraction=
+                        m_continuousPlanningEffort.scpVelocityTrustFraction,
+                    .accelerationTrustFraction=
+                        m_continuousPlanningEffort.scpAccelerationTrustFraction,
+                    .applySampledCorrections=false,
+                },
+            });
+            if (!planned) {
+                return std::unexpected(std::format(
+                    "PathTempo continuous timing failed: {}",planned.error().message));
+            }
+            if (planned->pieceBoundaries.size()!=pieces.size()+1
+               ||planned->pieceLimits.size()!=pieces.size()) {
+                return std::unexpected(
+                    "PathTempo continuous timing returned inconsistent piece data");
+            }
+
+            std::vector<double> stationVelocity;
+            std::vector<double> stationAcceleration;
+            stationVelocity.reserve(planned->pieceBoundaries.size());
+            stationAcceleration.reserve(planned->pieceBoundaries.size());
+            for (const auto &boundary:planned->pieceBoundaries) {
+                stationVelocity.push_back(boundary.velocity);
+                stationAcceleration.push_back(boundary.acceleration);
+            }
+            auto convertedTiming=localTimeLaws(*planned,pieces);
+            if (!convertedTiming) {
+                return std::unexpected(convertedTiming.error());
+            }
+            auto pieceTiming=std::move(*convertedTiming);
+
+            for (std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
+                localLimits[pieceIndex].velocity=planned->pieceLimits[pieceIndex].velocity;
+                localLimits[pieceIndex].acceleration=
+                    planned->pieceLimits[pieceIndex].acceleration;
+                localLimits[pieceIndex].jerk=planned->pieceLimits[pieceIndex].jerk;
+            }
+            result->velocityOnlySeedDuration=planned->diagnostics.velocitySeedDuration;
+            result->scpSolves+=planned->diagnostics.sequentialSolves;
+            result->scpSimplexIterations+=planned->diagnostics.linearSolverIterations;
+            result->scpLineSearchTrials+=planned->diagnostics.lineSearchTrials;
+            result->scpAcceptedSteps+=planned->diagnostics.acceptedRefinements;
+            result->scalarTransitionRequests+=planned->diagnostics.transitionRequests;
+            result->scalarTransitionSolverCalls+=
+                planned->diagnostics.transitionSolverCalls;
+            result->scalarTransitionCacheHits+=
+                planned->diagnostics.transitionCacheHits;
+            result->scalarTransitionCacheFailureHits+=
+                planned->diagnostics.transitionCacheFailureHits;
+            result->scalarTransitionCacheMaterializations+=
+                planned->diagnostics.transitionCacheMaterializations;
+            result->scpBasisReuseApplied+=
+                planned->diagnostics.linearSolverBasisReused?1U:0U;
+            if (planned->diagnostics.resourceLimitOccurrences>0) {
+                auto &fallback=result->scpResourceFallback;
+                if (fallback.occurrences==0) {
+                    fallback.reason=planned->diagnostics.resourceLimit
+                            ==path_tempo::PlanningResourceLimit::Time
+                        ?ScpResourceFallbackReason::TimeLimit
+                        :ScpResourceFallbackReason::IterationLimit;
+                    fallback.correctionPass=correctionPass;
+                    fallback.scpIteration=static_cast<unsigned>(planned->diagnostics
+                        .firstResourceLimitedSequentialIteration);
+                }
+                fallback.occurrences+=planned->diagnostics.resourceLimitOccurrences;
+            }
+            result->correctionPasses=correctionPass
+                +static_cast<unsigned>(planned->diagnostics.correctionPasses);
 
             const auto optimizedDuration=std::accumulate(pieceTiming.begin(),pieceTiming.end(),0.0,
                 [](const double total,const auto &timing) { return total+timing.back().time; });

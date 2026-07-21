@@ -3266,252 +3266,32 @@ final_move_together = true
             .axisJerk={501,501,501,501,501,501},
         };
         ngc::TrajectoryCompiler compiler(trajectoryLimits);
-        auto uncachedEffort=compiler.continuousPlanningEffort();
-        uncachedEffort.shareTimeLawCacheAcrossCompilations=false;
-        uncachedEffort.cacheScpLineSearchTrials=false;
-        uncachedEffort.reuseScpBasis=false;
-        compiler.setContinuousPlanningEffort(uncachedEffort);
+        const auto planningEffort=compiler.continuousPlanningEffort();
+        compiler.setContinuousPlanningEffort(planningEffort);
         compiler.reset(94,points.front());
         const auto planned=compiler.compileContinuous(*prepared,0.05);
         require(planned&&*planned,planned?"":planned.error());
 
-        const auto toPathTempoVector=[](const ngc::position_t &value) {
-            return path_tempo::Vector<6>{value.x,value.y,value.z,value.a,value.b,value.c};
-        };
-        std::vector<path_tempo::SampledPathPiece<6>> pathTempoStorage;
-        pathTempoStorage.reserve(expectedTimingIntervals.size());
-        const auto appendPathTempoPiece=[&](const double length,const double programmedVelocity,
-                const double geometricVelocityLimit,
-                const std::span<const ngc::PreparedGeometricSample> samples) {
-            path_tempo::SampledPathPiece<6> piece{
-                .id=pathTempoStorage.size()+1,
-                .length=length,
-                .programmedVelocity=programmedVelocity,
-                .initialLimits={.velocity=geometricVelocityLimit},
-                .stations={},
-            };
-            piece.stations.reserve(samples.size());
-            const auto sampleOffset=samples.front().distance;
-            for(const auto &sample:samples) piece.stations.push_back({
-                .distance=sample.distance-sampleOffset,
-                .tangent=toPathTempoVector(sample.tangent),
-                .curvature=toPathTempoVector(sample.curvature),
-                .thirdDerivative=toPathTempoVector(sample.curvatureDerivative),
+        auto roundedEndpointGeometry=*prepared;
+        auto roundedCluster=std::ranges::find_if(
+            roundedEndpointGeometry.pieces,[](const auto &piece) {
+                return piece.kind==ngc::PreparedPieceKind::ClusterSpline;
             });
-            requireNear(piece.length,piece.stations.back().distance,
-                "PathTempo parity conversion should preserve timing-piece length");
-            pathTempoStorage.push_back(std::move(piece));
-        };
-        for(const auto &piece:prepared->pieces) {
-            if(piece.kind!=ngc::PreparedPieceKind::ClusterSpline) {
-                appendPathTempoPiece(piece.length(),piece.programmedFeed,
-                    std::numeric_limits<double>::infinity(),piece.geometricSamples);
-                continue;
-            }
-            for(const auto &interval:piece.clusterKnotIntervals) {
-                const auto samples=std::span{piece.geometricSamples}.subspan(
-                    interval.firstGeometricSample,interval.geometricSampleCount);
-                appendPathTempoPiece(interval.curveTo-interval.curveFrom,
-                    interval.programmedFeed,interval.geometricVelocityLimit,samples);
-            }
-        }
-        std::vector<path_tempo::PathPiece<6>> pathTempoPieces;
-        pathTempoPieces.reserve(pathTempoStorage.size());
-        for(const auto &piece:pathTempoStorage) pathTempoPieces.push_back(piece.view());
-        path_tempo::PathPlanner pathTempoPlanner;
-        const auto pathTempoPlan=pathTempoPlanner.solve(path_tempo::PathPlanningRequest<6>{
-            .pieces=pathTempoPieces,
-            .beginning={},
-            .ending={},
-            .limits={
-                .pathAcceleration=trajectoryLimits.pathAcceleration,
-                .pathJerk=trajectoryLimits.pathJerk,
-                .axisVelocity=toPathTempoVector(trajectoryLimits.axisVelocity),
-                .axisAcceleration=toPathTempoVector(trajectoryLimits.axisAcceleration),
-                .axisJerk=toPathTempoVector(trajectoryLimits.axisJerk),
-            },
-            .settings={
-                .linearSolveTimeLimit=uncachedEffort.scpSolveTimeLimit,
-                .simplexIterationLimit=uncachedEffort.scpSimplexIterationLimitMultiplier
-                    *(5*pathTempoPieces.size()+3),
-                .maximumCorrectionPasses=uncachedEffort.maximumLocalCorrectionPasses,
-                .sequentialIterations=uncachedEffort.scpIterations,
-                .lineSearchSteps=uncachedEffort.scpLineSearchSteps,
-                .velocityTrustFraction=uncachedEffort.scpVelocityTrustFraction,
-                .accelerationTrustFraction=uncachedEffort.scpAccelerationTrustFraction,
-            },
-        });
-        require(pathTempoPlan.has_value(),pathTempoPlan?"":pathTempoPlan.error().message);
-        require(pathTempoPlan->pieceBoundaries.size()==(*planned)->pieceTiming.size()+1,
-            "NGC and PathTempo should produce the same number of timing boundaries");
-        const auto ngcDuration=std::accumulate((*planned)->pieceTiming.begin(),
-            (*planned)->pieceTiming.end(),0.0,[](const double total,const auto &piece) {
-                return total+piece.duration;
-            });
-        const auto pathTempoDuration=pathTempoPlan->diagnostics.velocitySeedDuration;
-        auto maximumVelocityDifference=0.0;
-        auto maximumAccelerationDifference=0.0;
-        for(std::size_t station=0;station<pathTempoPlan->pieceBoundaries.size();++station) {
-            const auto ngcVelocity=station==(*planned)->pieceTiming.size()
-                ?(*planned)->pieceTiming.back().exitVelocity
-                :(*planned)->pieceTiming[station].entryVelocity;
-            const auto ngcAcceleration=station==(*planned)->pieceTiming.size()
-                ?(*planned)->pieceTiming.back().exitAcceleration
-                :(*planned)->pieceTiming[station].entryAcceleration;
-            maximumVelocityDifference=std::max(maximumVelocityDifference,
-                std::abs(pathTempoPlan->pieceBoundaries[station].velocity-ngcVelocity));
-            maximumAccelerationDifference=std::max(maximumAccelerationDifference,
-                std::abs(pathTempoPlan->pieceBoundaries[station].acceleration-ngcAcceleration));
-        }
-        const auto durationRatio=pathTempoDuration/ngcDuration;
-        require(durationRatio>=0.98&&durationRatio<=1.02,
-            std::format("PathTempo duration should remain within 2% of NGC on the mixed-feed "
-                "quintic cluster: ngc={} path_tempo={} ratio={}",ngcDuration,
-                pathTempoDuration,durationRatio));
-        require(maximumVelocityDifference<=0.05*trajectoryLimits.axisVelocity.x,
-            std::format("PathTempo and NGC internal boundary velocities should remain within "
-                "5% of the axis limit: difference={} limit={}",maximumVelocityDifference,
-                trajectoryLimits.axisVelocity.x));
-        require(maximumAccelerationDifference<=0.1*trajectoryLimits.pathAcceleration,
-            std::format("PathTempo and NGC internal boundary accelerations should remain within "
-                "10% of the path limit: difference={} limit={}",maximumAccelerationDifference,
-                trajectoryLimits.pathAcceleration));
-        require(pathTempoPlan->diagnostics.correctionPasses==(*planned)->correctionPasses,
-            "PathTempo and NGC should require the same correction-pass count on the parity fixture");
-        require(pathTempoPlan->diagnostics.acceptedRefinements>0,
-            "PathTempo parity planning should accept at least one coupled station refinement");
+        require(roundedCluster!=roundedEndpointGeometry.pieces.end()
+                    &&roundedCluster->clusterKnotIntervals.size()>1,
+            "endpoint-rounding regression requires a multi-interval cluster spline");
+        const auto &roundedInterval=roundedCluster->clusterKnotIntervals[1];
+        const auto roundedSample=roundedInterval.firstGeometricSample
+            +roundedInterval.geometricSampleCount-1;
+        roundedCluster->geometricSamples[roundedSample].distance+=5e-11;
+        ngc::TrajectoryCompiler roundedEndpointCompiler(trajectoryLimits);
+        roundedEndpointCompiler.setContinuousPlanningEffort(planningEffort);
+        roundedEndpointCompiler.reset(94,points.front());
+        const auto roundedEndpointPlan=roundedEndpointCompiler.compileContinuous(
+            roundedEndpointGeometry,0.05);
+        require(roundedEndpointPlan&&*roundedEndpointPlan,
+            roundedEndpointPlan?"":roundedEndpointPlan.error());
 
-        auto suppliedMaterializationCorrection=false;
-        const path_tempo::MaterializationCorrection correction=[&](const auto &)
-                ->std::expected<std::vector<path_tempo::PieceCorrection>,std::string> {
-            std::vector<path_tempo::PieceCorrection> result;
-            if(suppliedMaterializationCorrection) return result;
-            suppliedMaterializationCorrection=true;
-            result.reserve((*planned)->pieceTiming.size());
-            for(std::size_t pieceIndex=0;pieceIndex<(*planned)->pieceTiming.size();
-                    ++pieceIndex) {
-                const auto &timing=(*planned)->pieceTiming[pieceIndex];
-                const auto timeScale=std::max({
-                    timing.initialVelocityLimit/timing.velocityLimit,
-                    std::sqrt(timing.initialAccelerationLimit/timing.accelerationLimit),
-                    std::cbrt(timing.initialJerkLimit/timing.jerkLimit),
-                });
-                if(timeScale>1.0+1e-12) result.push_back({
-                    .piece=pathTempoStorage[pieceIndex].id,
-                    .requiredTimeScale=timeScale,
-                });
-            }
-            return result;
-        };
-        path_tempo::PathPlanner alignedPathTempoPlanner;
-        const auto alignedPathTempoPlan=alignedPathTempoPlanner.solve(
-            path_tempo::PathPlanningRequest<6>{
-                .pieces=pathTempoPieces,
-                .beginning={},
-                .ending={},
-                .limits={
-                    .pathAcceleration=trajectoryLimits.pathAcceleration,
-                    .pathJerk=trajectoryLimits.pathJerk,
-                    .axisVelocity=toPathTempoVector(trajectoryLimits.axisVelocity),
-                    .axisAcceleration=toPathTempoVector(trajectoryLimits.axisAcceleration),
-                    .axisJerk=toPathTempoVector(trajectoryLimits.axisJerk),
-                },
-                .settings={
-                    .linearSolveTimeLimit=uncachedEffort.scpSolveTimeLimit,
-                    .simplexIterationLimit=uncachedEffort.scpSimplexIterationLimitMultiplier
-                        *(5*pathTempoPieces.size()+3),
-                    .maximumCorrectionPasses=uncachedEffort.maximumLocalCorrectionPasses,
-                    .sequentialIterations=uncachedEffort.scpIterations,
-                    .lineSearchSteps=uncachedEffort.scpLineSearchSteps,
-                    .velocityTrustFraction=uncachedEffort.scpVelocityTrustFraction,
-                    .accelerationTrustFraction=uncachedEffort.scpAccelerationTrustFraction,
-                },
-            },correction);
-        require(alignedPathTempoPlan.has_value(),
-            alignedPathTempoPlan?"":alignedPathTempoPlan.error().message);
-        require(std::abs(alignedPathTempoPlan->diagnostics.velocitySeedDuration-ngcDuration)
-                    <=1e-4*ngcDuration,
-            std::format("PathTempo materialization correction replay should reproduce NGC "
-                "duration within numerical correction-composition tolerance: ngc={} "
-                "path_tempo={}",ngcDuration,
-                alignedPathTempoPlan->diagnostics.velocitySeedDuration));
-        require(alignedPathTempoPlan->pieceBoundaries.size()
-                    ==(*planned)->pieceTiming.size()+1,
-            "aligned scalar parity should preserve every NGC timing boundary");
-        for(std::size_t station=0;
-                station<alignedPathTempoPlan->pieceBoundaries.size();++station) {
-            const auto ngcVelocity=station==(*planned)->pieceTiming.size()
-                ?(*planned)->pieceTiming.back().exitVelocity
-                :(*planned)->pieceTiming[station].entryVelocity;
-            const auto ngcAcceleration=station==(*planned)->pieceTiming.size()
-                ?(*planned)->pieceTiming.back().exitAcceleration
-                :(*planned)->pieceTiming[station].entryAcceleration;
-            require(std::abs(alignedPathTempoPlan->pieceBoundaries[station].velocity
-                        -ngcVelocity)<=2.5e-4*trajectoryLimits.axisVelocity.x
-                    &&std::abs(alignedPathTempoPlan->pieceBoundaries[station].acceleration
-                        -ngcAcceleration)<=1e-4*trajectoryLimits.pathAcceleration,
-                std::format("PathTempo corrected scalar boundary {} should closely match NGC: "
-                    "velocity={}/{} acceleration={}/{}",station,
-                    alignedPathTempoPlan->pieceBoundaries[station].velocity,ngcVelocity,
-                    alignedPathTempoPlan->pieceBoundaries[station].acceleration,
-                    ngcAcceleration));
-        }
-
-        auto provedLimitStorage=pathTempoStorage;
-        for(std::size_t pieceIndex=0;pieceIndex<provedLimitStorage.size();++pieceIndex) {
-            auto &limits=provedLimitStorage[pieceIndex].initialLimits;
-            const auto &timing=(*planned)->pieceTiming[pieceIndex];
-            limits.velocity=std::min(limits.velocity,timing.velocityLimit);
-            limits.acceleration=timing.accelerationLimit;
-            limits.jerk=timing.jerkLimit;
-        }
-        std::vector<path_tempo::PathPiece<6>> provedLimitPieces;
-        provedLimitPieces.reserve(provedLimitStorage.size());
-        for(const auto &piece:provedLimitStorage) provedLimitPieces.push_back(piece.view());
-        path_tempo::PathPlanner provedLimitPlanner;
-        const auto provedLimitPlan=provedLimitPlanner.solve(
-            path_tempo::PathPlanningRequest<6>{
-                .pieces=provedLimitPieces,
-                .beginning={},
-                .ending={},
-                .limits={
-                    .pathAcceleration=trajectoryLimits.pathAcceleration,
-                    .pathJerk=trajectoryLimits.pathJerk,
-                    .axisVelocity=toPathTempoVector(trajectoryLimits.axisVelocity),
-                    .axisAcceleration=toPathTempoVector(trajectoryLimits.axisAcceleration),
-                    .axisJerk=toPathTempoVector(trajectoryLimits.axisJerk),
-                },
-                .settings={
-                    .linearSolveTimeLimit=uncachedEffort.scpSolveTimeLimit,
-                    .simplexIterationLimit=uncachedEffort.scpSimplexIterationLimitMultiplier
-                        *(5*pathTempoPieces.size()+3),
-                    .maximumCorrectionPasses=uncachedEffort.maximumLocalCorrectionPasses,
-                    .sequentialIterations=uncachedEffort.scpIterations,
-                    .lineSearchSteps=uncachedEffort.scpLineSearchSteps,
-                    .velocityTrustFraction=uncachedEffort.scpVelocityTrustFraction,
-                    .accelerationTrustFraction=uncachedEffort.scpAccelerationTrustFraction,
-                },
-            });
-        require(provedLimitPlan.has_value(),provedLimitPlan?"":provedLimitPlan.error().message);
-        require(std::bit_cast<std::uint64_t>(provedLimitPlan->diagnostics
-                    .velocitySeedDuration)==std::bit_cast<std::uint64_t>(ngcDuration),
-            "PathTempo and NGC scalar durations should be bit-identical with the same proved limits");
-        for(std::size_t station=0;station<provedLimitPlan->pieceBoundaries.size();++station) {
-            const auto ngcVelocity=station==(*planned)->pieceTiming.size()
-                ?(*planned)->pieceTiming.back().exitVelocity
-                :(*planned)->pieceTiming[station].entryVelocity;
-            const auto ngcAcceleration=station==(*planned)->pieceTiming.size()
-                ?(*planned)->pieceTiming.back().exitAcceleration
-                :(*planned)->pieceTiming[station].entryAcceleration;
-            require(std::bit_cast<std::uint64_t>(
-                        provedLimitPlan->pieceBoundaries[station].velocity)
-                        ==std::bit_cast<std::uint64_t>(ngcVelocity)
-                    &&std::bit_cast<std::uint64_t>(
-                        provedLimitPlan->pieceBoundaries[station].acceleration)
-                        ==std::bit_cast<std::uint64_t>(ngcAcceleration),
-                std::format("PathTempo and NGC scalar boundary {} should be bit-identical "
-                    "with the same proved limits",station));
-        }
         require((*planned)->activations.size()==records.size(),
                 "continuous timing should resolve every prepared command activation");
         std::vector<ngc::SpanId> commandActivationSpans(records.size());
@@ -3522,7 +3302,6 @@ final_move_together = true
                 })&&std::ranges::is_sorted(commandActivationSpans)
                 &&commandActivationSpans[1]!=commandActivationSpans.back(),
                 "cluster source commands should activate progressively through emitted spans");
-        const auto uncachedCalls=ngc::totalTimeLawCalls((*planned)->timeLaw);
         require(std::ranges::all_of((*planned)->pieceTiming,[](const auto &piece) {
                     return piece.velocityLimit>=piece.initialVelocityLimit*0.02
                         &&piece.jerkLimit>=piece.initialJerkLimit*0.001;
@@ -3620,113 +3399,20 @@ final_move_together = true
             }
             return result;
         };
-        ngc::TrajectoryCompiler cachedScpCompiler(trajectoryLimits);
-        auto cachedScpEffort=uncachedEffort;
-        cachedScpEffort.cacheScpLineSearchTrials=true;
-        cachedScpCompiler.setContinuousPlanningEffort(cachedScpEffort);
-        cachedScpCompiler.reset(94,points.front());
-        const auto cachedScpPlan=cachedScpCompiler.compileContinuous(*prepared,0.05);
-        require(cachedScpPlan&&*cachedScpPlan,
-            cachedScpPlan?"":cachedScpPlan.error());
-        const auto cachedScpCalls=ngc::totalTimeLawCalls((*cachedScpPlan)->timeLaw);
-        require(planFingerprint(**cachedScpPlan)==planFingerprint(**planned)
-                    &&(*cachedScpPlan)->correctionHistory
-                        ==(*planned)->correctionHistory
-                    &&(*cachedScpPlan)->geometryVerificationAttempts
+        ngc::TrajectoryCompiler repeatedCompiler(trajectoryLimits);
+        repeatedCompiler.setContinuousPlanningEffort(planningEffort);
+        repeatedCompiler.reset(94,points.front());
+        const auto repeatedPlan=repeatedCompiler.compileContinuous(*prepared,0.05);
+        require(repeatedPlan&&*repeatedPlan,repeatedPlan?"":repeatedPlan.error());
+        require(planFingerprint(**repeatedPlan)==planFingerprint(**planned)
+                    &&(*repeatedPlan)->correctionHistory==(*planned)->correctionHistory
+                    &&(*repeatedPlan)->geometryVerificationAttempts
                         ==(*planned)->geometryVerificationAttempts
-                    &&(*cachedScpPlan)->geometryVerificationHighWater
+                    &&(*repeatedPlan)->geometryVerificationHighWater
                         ==(*planned)->geometryVerificationHighWater,
-                "cached SCP trials must preserve accepted station states, exact timing, "
-                "emitted spans, and verification outcomes");
-        require(cachedScpCalls.solverCalls<uncachedCalls.solverCalls
-                    &&(*cachedScpPlan)->scpMaterializationAttempts
-                        <(*planned)->scpMaterializationAttempts,
-                std::format("cached SCP trials should reduce scalar solves and full "
-                    "materializations: solvers {} >= {} materializations {} >= {}",
-                    cachedScpCalls.solverCalls,uncachedCalls.solverCalls,
-                    (*cachedScpPlan)->scpMaterializationAttempts,
-                    (*planned)->scpMaterializationAttempts));
-        require(cachedScpCalls.cacheFailureHits>0,
-                "a repeated cached scalar failure must remain a failed SCP trial");
+                "PathTempo production planning must preserve exact timing, emitted spans, "
+                "and verification outcomes across repeated compilations");
 
-        ngc::TrajectoryCompiler basisReuseCompiler(trajectoryLimits);
-        auto basisReuseEffort=cachedScpEffort;
-        basisReuseEffort.reuseScpBasis=true;
-        basisReuseCompiler.setContinuousPlanningEffort(basisReuseEffort);
-        basisReuseCompiler.reset(94,points.front());
-        const auto basisReusePlan=basisReuseCompiler.compileContinuous(*prepared,0.05);
-        require(basisReusePlan&&*basisReusePlan,
-            basisReusePlan?"":basisReusePlan.error());
-        require((*basisReusePlan)->scpBasisReuseAttempts>0
-                    &&(*basisReusePlan)->scpBasisReuseApplied
-                        ==(*basisReusePlan)->scpBasisReuseAttempts
-                    &&(*basisReusePlan)->scpBasisDimensionMismatches==0,
-                "same-dimension correction passes should apply every retained HiGHS basis");
-        require((*basisReusePlan)->scpModelUpdateAttempts>0
-                    &&(*basisReusePlan)->scpModelUpdatesApplied
-                        ==(*basisReusePlan)->scpModelUpdateAttempts
-                    &&(*basisReusePlan)->scpModelStructureMismatches==0,
-                "same-structure correction passes should update the retained HiGHS model");
-        require((*basisReusePlan)->scpSimplexIterations
-                    <(*cachedScpPlan)->scpSimplexIterations,
-                "basis reuse should reduce simplex iterations on the focused correction fixture");
-        require(planFingerprint(**basisReusePlan)==planFingerprint(**cachedScpPlan)
-                    &&(*basisReusePlan)->correctionHistory
-                        ==(*cachedScpPlan)->correctionHistory
-                    &&(*basisReusePlan)->geometryVerificationAttempts
-                        ==(*cachedScpPlan)->geometryVerificationAttempts
-                    &&(*basisReusePlan)->geometryVerificationHighWater
-                        ==(*cachedScpPlan)->geometryVerificationHighWater
-                    &&(*basisReusePlan)->scpAcceptedSteps
-                        ==(*cachedScpPlan)->scpAcceptedSteps
-                    &&(*basisReusePlan)->scpMaterializationAttempts
-                        ==(*cachedScpPlan)->scpMaterializationAttempts,
-                "basis reuse must preserve the focused exact plan and verification outcome");
-
-        ngc::TrajectoryCompiler reachabilityRowCompiler(trajectoryLimits);
-        auto reachabilityRowEffort=cachedScpEffort;
-        reachabilityRowEffort.addScpAdjacentReachabilityRows=true;
-        reachabilityRowCompiler.setContinuousPlanningEffort(reachabilityRowEffort);
-        reachabilityRowCompiler.reset(94,points.front());
-        const auto reachabilityRowPlan=
-            reachabilityRowCompiler.compileContinuous(*prepared,0.05);
-        require(reachabilityRowPlan&&*reachabilityRowPlan,
-            reachabilityRowPlan?"":reachabilityRowPlan.error());
-        const auto planDuration=[](const ngc::ContinuousTrajectoryPlan &plan) {
-            return std::accumulate(plan.pieceTiming.begin(),plan.pieceTiming.end(),0.0,
-                [](const double total,const auto &piece) {
-                    return total+piece.duration;
-                });
-        };
-        require((*reachabilityRowPlan)->scpAdjacentReachabilityRows
-                    ==2*expectedTimingIntervals.size()*(*reachabilityRowPlan)->scpSolves,
-                "enabled adjacent-station reachability must add two tracked LP rows per piece");
-        require(planFingerprint(**reachabilityRowPlan)==planFingerprint(**cachedScpPlan)
-                    &&planDuration(**reachabilityRowPlan)==planDuration(**cachedScpPlan)
-                    &&(*reachabilityRowPlan)->scpAcceptedSteps
-                        ==(*cachedScpPlan)->scpAcceptedSteps
-                    &&(*reachabilityRowPlan)->scpStationProposals
-                        ==(*cachedScpPlan)->scpStationProposals
-                    &&(*reachabilityRowPlan)->correctionPasses
-                        ==(*cachedScpPlan)->correctionPasses,
-                "adjacent-station reachability rows should remain a default-off experiment "
-                "when they do not improve the focused SCP plan");
-
-        ngc::TrajectoryCompiler collisionCompiler(trajectoryLimits);
-        auto collisionEffort=cachedScpEffort;
-        collisionEffort.timeLawCacheEntries=1;
-        collisionCompiler.setContinuousPlanningEffort(collisionEffort);
-        collisionCompiler.reset(94,points.front());
-        const auto collisionPlan=collisionCompiler.compileContinuous(*prepared,0.05);
-        require(collisionPlan&&*collisionPlan,
-            collisionPlan?"":collisionPlan.error());
-        const auto collisionCalls=ngc::totalTimeLawCalls((*collisionPlan)->timeLaw);
-        require(collisionCalls.cacheCollisions>0,
-                "a one-entry time-law cache should exercise exact-key collisions");
-        require(planFingerprint(**collisionPlan)==planFingerprint(**planned)
-                    &&(*collisionPlan)->correctionHistory
-                        ==(*planned)->correctionHistory,
-                "a colliding cache entry must not supply a nonmatching scalar result");
         require((*planned)->scpSolves>0,
                 "continuous timing should solve at least one HiGHS SCP subproblem");
         require((*planned)->scpAcceptedSteps>0,
@@ -3755,7 +3441,7 @@ final_move_together = true
         auto rollingLimits=trajectoryLimits;
         rollingLimits.lookaheadDuration=0.2*clusterNominalDuration;
         ngc::TrajectoryPlanner clusterPlanner(rollingLimits);
-        clusterPlanner.setContinuousPlanningEffort(cachedScpEffort);
+        clusterPlanner.setContinuousPlanningEffort(planningEffort);
         ngc::CurveEvaluationWorkspace clusterWorkspace;
         const auto clusterStart=ngc::positionAtDistance(
             *found->curve,found->curveFrom,clusterWorkspace);
@@ -3793,7 +3479,7 @@ final_move_together = true
                     clusterPlanner.preparedNominalDuration(),clusterNominalDuration));
 
         ngc::TrajectoryCompiler limitedCompiler(trajectoryLimits);
-        auto limitedEffort=uncachedEffort;
+        auto limitedEffort=planningEffort;
         // This fixture performs enough model setup before HiGHS checks its clock
         // that the minimum practical positive limit reliably selects kTimeLimit.
         limitedEffort.scpSolveTimeLimit=1e-12;

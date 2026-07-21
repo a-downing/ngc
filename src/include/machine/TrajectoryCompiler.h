@@ -113,17 +113,8 @@ namespace ngc {
         double curvatureDerivativeVelocityCapMultiplier = 1.0;
         bool applyCurvatureDerivativeVelocityCap = true;
         bool measureCurvatureDerivativeNumerics = false;
-        bool shareTimeLawCacheAcrossCompilations = true;
-        // Measurement controls for the compile-local scalar time-law cache.
-        // Production uses cached duration-only SCP line-search trials and the
-        // automatic horizon-sized cache. Tests and offline benchmarks may
-        // disable the trial cache or force a smaller power-of-two table.
-        bool cacheScpLineSearchTrials = true;
-        std::size_t timeLawCacheEntries = 0;
-        // Experimental HiGHS-backed sequential linearization. These bounds
-        // are NRT planning limits, not RT execution data.
-        bool addScpAdjacentReachabilityRows = false;
-        bool reuseScpBasis = true;
+        // PathTempo's HiGHS-backed sequential-linearization bounds. These are
+        // NRT planning limits, not RT execution data.
         unsigned scpIterations = 1;
         unsigned scpLineSearchSteps = 8;
         std::size_t scpSimplexIterationLimitMultiplier = 64;
@@ -165,11 +156,8 @@ namespace ngc {
         double curvatureDerivativeFiniteDifferenceFineStep = 0.0;
     };
 
-    // NRT-only cost evidence for calls into the scalar Ruckig position solver.
-    // Candidate calls use a compile-local bit-exact result cache. A cached
-    // successful duration is materialized again only if it becomes the new
-    // selected timing, so retained phase data still comes from Ruckig and the
-    // complete validation path.
+    // NRT-only cost evidence for exact-stop calls into PathTempo's scalar
+    // transition solver.
     struct TimeLawCallDiagnostics {
         std::size_t calls = 0;
         std::size_t successes = 0;
@@ -293,18 +281,14 @@ namespace ngc {
         std::size_t geometryVerificationHighWater = 0;
         std::size_t scpSolves = 0;
         std::size_t scpSimplexIterations = 0;
-        std::size_t scpAdjacentReachabilityRows = 0;
-        std::size_t scpBasisReuseAttempts = 0;
         std::size_t scpBasisReuseApplied = 0;
-        std::size_t scpBasisDimensionMismatches = 0;
-        std::size_t scpModelUpdateAttempts = 0;
-        std::size_t scpModelUpdatesApplied = 0;
-        std::size_t scpModelStructureMismatches = 0;
-        std::size_t scpStationProposals = 0;
         std::size_t scpLineSearchTrials = 0;
         std::size_t scpAcceptedSteps = 0;
-        std::size_t scpMaterializationAttempts = 0;
-        double scpSeconds = 0.0;
+        std::size_t scalarTransitionRequests = 0;
+        std::size_t scalarTransitionSolverCalls = 0;
+        std::size_t scalarTransitionCacheHits = 0;
+        std::size_t scalarTransitionCacheFailureHits = 0;
+        std::size_t scalarTransitionCacheMaterializations = 0;
         unsigned correctionPasses = 0;
         // Bounded NRT evidence for the first expected solver-resource fallback
         // in this plan. occurrences includes later correction-pass fallbacks.

@@ -989,11 +989,9 @@ namespace ngc {
                         "length={:.6g} nominal={:.6g}s actual={:.6g}s ratio={:.3f} "
                         "programmed_v={:.6g} local_v={:.6g} entry_v={:.6g} exit_v={:.6g} "
                         "local_a={:.6g} local_j={:.6g} scp_solves={} scp_iterations={} "
-                        "scp_reachability_rows={} scp_proposals={} scp_trials={} "
-                        "scp_basis_attempts={} scp_basis_applied={} scp_basis_mismatches={} "
-                        "scp_model_attempts={} scp_model_applied={} "
-                        "scp_model_mismatches={} "
-                        "scp_accepted={} scp_materializations={} scp_seconds={:.6f} "
+                        "scp_trials={} scp_basis_applied={} scp_accepted={} "
+                        "transition_requests={} transition_solves={} cache_hits={} "
+                        "cache_failure_hits={} cache_materializations={} "
                         "correction_passes={} "
                         "scp_fallback={} fallback_count={} fallback_pass={} "
                         "fallback_iteration={}",
@@ -1005,15 +1003,14 @@ namespace ngc {
                         slowest->entryVelocity,slowest->exitVelocity,
                         slowest->accelerationLimit,slowest->jerkLimit,
                         continuous->scpSolves,continuous->scpSimplexIterations,
-                        continuous->scpAdjacentReachabilityRows,
-                        continuous->scpStationProposals,continuous->scpLineSearchTrials,
-                        continuous->scpBasisReuseAttempts,continuous->scpBasisReuseApplied,
-                        continuous->scpBasisDimensionMismatches,
-                        continuous->scpModelUpdateAttempts,
-                        continuous->scpModelUpdatesApplied,
-                        continuous->scpModelStructureMismatches,
-                        continuous->scpAcceptedSteps,continuous->scpMaterializationAttempts,
-                        continuous->scpSeconds,continuous->correctionPasses,
+                        continuous->scpLineSearchTrials,
+                        continuous->scpBasisReuseApplied,continuous->scpAcceptedSteps,
+                        continuous->scalarTransitionRequests,
+                        continuous->scalarTransitionSolverCalls,
+                        continuous->scalarTransitionCacheHits,
+                        continuous->scalarTransitionCacheFailureHits,
+                        continuous->scalarTransitionCacheMaterializations,
+                        continuous->correctionPasses,
                         name(continuous->scpResourceFallback.reason),
                         continuous->scpResourceFallback.occurrences,
                         continuous->scpResourceFallback.correctionPass,
