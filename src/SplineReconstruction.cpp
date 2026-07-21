@@ -115,12 +115,17 @@ namespace ngc {
                                       const position_t &desired,const bool end) {
             const auto coefficients=endpointDerivativeCoefficients(spline,order,end);
             const auto unknown=end?spline.controls.size()-1-order:order;
+            const auto &origin=end?spline.controls.back():spline.controls.front();
+            const auto coefficientSum=std::accumulate(
+                coefficients.begin(),coefficients.end(),0.0);
             for(const auto component:AXIS_COMPONENTS) {
-                auto residual=desired.*component;
+                auto residual=desired.*component-origin.*component*coefficientSum;
                 for(std::size_t index=0;index<spline.controls.size();++index)
                     if(index!=unknown)
-                        residual-=coefficients[index]*(spline.controls[index].*component);
-                spline.controls[unknown].*component=residual/coefficients[unknown];
+                        residual-=coefficients[index]
+                            *(spline.controls[index].*component-origin.*component);
+                spline.controls[unknown].*component=origin.*component
+                    +residual/coefficients[unknown];
             }
         }
 

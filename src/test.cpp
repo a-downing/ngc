@@ -3132,7 +3132,7 @@ final_move_together = true
             record.command=ngc::MoveLine{from,to,feed};
             return record;
         };
-        const std::array points{
+        std::array points{
             ngc::position_t{0,0,0,0,0,0},
             ngc::position_t{1,0,0,0,0,0},
             ngc::position_t{1.04,0.03,0,0,0,0},
@@ -3144,6 +3144,10 @@ final_move_together = true
             ngc::position_t{1.28,0.03,0,0,0,0},
             ngc::position_t{2.28,0.03,0,0,0,0},
         };
+        const ngc::position_t translation{2.3,9.1,1.1,0,0,0};
+        for (auto &point : points) {
+            point = point + translation;
+        }
         constexpr std::array feeds{60.0,120.0,120.0,30.0,120.0,
                                    120.0,120.0,120.0,180.0};
         std::vector<ngc::PreparedCommandRecord> records;
@@ -3214,6 +3218,9 @@ final_move_together = true
         const auto *spline=std::get_if<ngc::PreparedSplineCurve>(&found->curve->value);
         require(spline&&spline->degree==5,
                 "the focused cluster sampling case should use quintic reconstruction");
+        require(found->geometricSamples.front().curvature.length()<1e-9
+                    &&found->geometricSamples.back().curvature.length()<1e-9,
+                "translated cluster endpoint curvature must match its straight anchors");
         auto noneEffort=effort;
         noneEffort.splineFitSolver=ngc::spline_detail::SplineFitSolver::None;
         const auto unsmoothed=ngc::prepareContinuousGeometry(
@@ -3284,7 +3291,8 @@ final_move_together = true
             .axisJerk={501,501,501,501,501,501},
         };
         ngc::TrajectoryCompiler compiler(trajectoryLimits);
-        const auto planningEffort=compiler.continuousPlanningEffort();
+        auto planningEffort = compiler.continuousPlanningEffort();
+        planningEffort.scpSolveTimeLimit = 0.5;
         compiler.setContinuousPlanningEffort(planningEffort);
         compiler.reset(94,points.front());
         const auto planned=compiler.compileContinuous(*prepared,0.05);
@@ -3326,8 +3334,9 @@ final_move_together = true
                 }),
                 "numerically conditioned curved subdivision must not collapse local limits "
                 "in response to a nanosecond cubic");
-        require((*planned)->correctionPasses>1,
-                "the focused SCP fixture should still exercise exact local-limit correction");
+        require((*planned)->correctionPasses > 1
+                    && (*planned)->correctionHistory.contains("pass 1:"),
+                "the focused SCP fixture should re-solve through PathTempo's materialization callback");
 
         const auto planFingerprint=[](const ngc::ContinuousTrajectoryPlan &plan) {
             std::vector<std::uint64_t> result;
@@ -3519,11 +3528,21 @@ final_move_together = true
                     }),
                 "the retained SCP reference must pass normal verification and stop-tail gates");
 
+        ngc::TrajectoryCompiler noScpCompiler(trajectoryLimits);
+        auto noScpEffort=planningEffort;
+        noScpEffort.scpIterations = 0;
+        noScpCompiler.setContinuousPlanningEffort(noScpEffort);
+        noScpCompiler.reset(97,points.front());
+        const auto noScpPlan=noScpCompiler.compileContinuous(*prepared,0.05);
+        require(noScpPlan&&*noScpPlan,noScpPlan?"":noScpPlan.error());
+        require((*noScpPlan)->scpSolves == 0 && (*noScpPlan)->scpAcceptedSteps == 0,
+                "zero SCP iterations must skip every HiGHS refinement solve");
+
         ngc::TrajectoryCompiler invalidEffortCompiler(trajectoryLimits);
         auto invalidEffort=limitedEffort;
         invalidEffort.scpSolveTimeLimit=0.0;
         invalidEffortCompiler.setContinuousPlanningEffort(invalidEffort);
-        invalidEffortCompiler.reset(97,points.front());
+        invalidEffortCompiler.reset(98,points.front());
         const auto invalidEffortPlan=invalidEffortCompiler.compileContinuous(*prepared,0.05);
         require(!invalidEffortPlan
                     &&invalidEffortPlan.error().contains(

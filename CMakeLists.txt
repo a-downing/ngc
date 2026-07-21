@@ -11,6 +11,34 @@ set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 function(ngc_target_defaults target)
     target_compile_options(${target} PRIVATE -g -O2 -Wall -Wextra)
     target_link_options(${target} PRIVATE -g)
+    set_property(TARGET ${target} PROPERTY EFFECTIVE_O2_ENABLED TRUE)
+endfunction()
+
+function(ngc_force_o2_in_directory directory)
+    get_property(targets DIRECTORY "${directory}" PROPERTY BUILDSYSTEM_TARGETS)
+    foreach(target IN LISTS targets)
+        get_target_property(imported ${target} IMPORTED)
+        get_target_property(type ${target} TYPE)
+        get_target_property(o2_enabled ${target} EFFECTIVE_O2_ENABLED)
+        if(NOT imported AND NOT o2_enabled
+           AND (type STREQUAL "EXECUTABLE" OR type STREQUAL "STATIC_LIBRARY"
+                OR type STREQUAL "SHARED_LIBRARY" OR type STREQUAL "MODULE_LIBRARY"
+                OR type STREQUAL "OBJECT_LIBRARY"))
+            if(MSVC)
+                target_compile_options(${target} PRIVATE
+                    "$<$<COMPILE_LANGUAGE:C,CXX>:/O2>")
+            else()
+                target_compile_options(${target} PRIVATE
+                    "$<$<COMPILE_LANGUAGE:C,CXX>:-O2>")
+            endif()
+            set_property(TARGET ${target} PROPERTY EFFECTIVE_O2_ENABLED TRUE)
+        endif()
+    endforeach()
+
+    get_property(subdirectories DIRECTORY "${directory}" PROPERTY SUBDIRECTORIES)
+    foreach(subdirectory IN LISTS subdirectories)
+        ngc_force_o2_in_directory("${subdirectory}")
+    endforeach()
 endfunction()
 
 add_subdirectory(src/pendant)
@@ -105,6 +133,11 @@ target_include_directories(ngc_simulation_diagnostic PRIVATE src)
 target_link_libraries(ngc_simulation_diagnostic PRIVATE ngc_core)
 ngc_target_defaults(ngc_simulation_diagnostic)
 
+add_executable(ngc_g64_geometry_export tools/ngc_g64_geometry_export.cpp)
+target_include_directories(ngc_g64_geometry_export PRIVATE src)
+target_link_libraries(ngc_g64_geometry_export PRIVATE ngc_core)
+ngc_target_defaults(ngc_g64_geometry_export)
+
 add_executable(vistacnc_p2s_probe tools/vistacnc_p2s_probe.cpp)
 ngc_target_defaults(vistacnc_p2s_probe)
 target_link_libraries(vistacnc_p2s_probe PRIVATE ngc_pendant)
@@ -131,3 +164,8 @@ set_tests_properties(ngc_spline_half_entity_controls_test PROPERTIES
 
 add_executable(ngc_quintic_spline_analyzer tools/ngc_quintic_spline_analyzer.cpp)
 ngc_target_defaults(ngc_quintic_spline_analyzer)
+
+# Apply optimization target-by-target after every local dependency has defined
+# its targets. This makes Debug and Release execute project and dependency code
+# at -O2 without leaking warning, debug-symbol, or optimization flags globally.
+ngc_force_o2_in_directory("${CMAKE_CURRENT_SOURCE_DIR}")

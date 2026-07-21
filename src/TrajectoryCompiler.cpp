@@ -1025,7 +1025,6 @@ namespace ngc {
            ||m_continuousPlanningEffort.maximumLocalCorrectionPasses>128
            ||m_continuousPlanningEffort.geometryVerificationBudgetMultiplier<36
            ||m_continuousPlanningEffort.geometryVerificationBudgetMultiplier>256
-           ||m_continuousPlanningEffort.scpIterations==0
            ||m_continuousPlanningEffort.scpIterations>32
            ||m_continuousPlanningEffort.scpLineSearchSteps==0
            ||m_continuousPlanningEffort.scpLineSearchSteps>24
@@ -1480,56 +1479,55 @@ namespace ngc {
             pathTempoStorage.push_back(std::move(timingPiece));
         }
 
-        path_tempo::PathPlanner pathPlanner;
-        for (unsigned correctionPass=0;correctionPass<maximumLocalCorrectionPasses;
-                ++correctionPass) {
+        std::vector<path_tempo::PathPiece<6>> pathTempoPieces;
+        pathTempoPieces.reserve(pathTempoStorage.size());
+        for (std::size_t pieceIndex = 0; pieceIndex < pathTempoStorage.size(); ++pieceIndex) {
+            pathTempoStorage[pieceIndex].initialLimits = {
+                .velocity = localLimits[pieceIndex].velocity,
+                .acceleration = localLimits[pieceIndex].acceleration,
+                .jerk = localLimits[pieceIndex].jerk,
+            };
+            pathTempoPieces.push_back(pathTempoStorage[pieceIndex].view());
+        }
+
+        const path_tempo::PathPlanningRequest<6> pathTempoRequest {
+            .pieces = pathTempoPieces,
+            .beginning = {
+                .velocity = scalarStart->first,
+                .acceleration = scalarStart->second,
+            },
+            .ending = {
+                .velocity = scalarEnd->first,
+                .acceleration = scalarEnd->second,
+            },
+            .limits = {
+                .pathAcceleration = m_limits.pathAcceleration,
+                .pathJerk = m_limits.pathJerk,
+                .coordinateVelocity = pathTempoVector(m_limits.axisVelocity),
+                .coordinateAcceleration = pathTempoVector(m_limits.axisAcceleration),
+                .coordinateJerk = pathTempoVector(m_limits.axisJerk),
+            },
+            .settings = {
+                .linearSolveTimeLimit = m_continuousPlanningEffort.scpSolveTimeLimit,
+                .simplexIterationLimit =
+                    m_continuousPlanningEffort.scpSimplexIterationLimitMultiplier
+                        * (5 * pieces.size() + 3),
+                .maximumCorrectionPasses = maximumLocalCorrectionPasses,
+                .sequentialIterations = m_continuousPlanningEffort.scpIterations,
+                .lineSearchSteps = m_continuousPlanningEffort.scpLineSearchSteps,
+                .velocityTrustFraction = m_continuousPlanningEffort.scpVelocityTrustFraction,
+                .accelerationTrustFraction =
+                    m_continuousPlanningEffort.scpAccelerationTrustFraction,
+                .applySampledCorrections = false,
+            },
+        };
+        auto materializationPass = 0U;
+        const path_tempo::MaterializationCorrection materializationCorrection =
+            [&](const path_tempo::PlannedPath &candidate)
+                -> std::expected<std::vector<path_tempo::PieceCorrection>, std::string> {
+            const auto correctionPass = materializationPass++;
             reportProgress();
-            std::vector<path_tempo::PathPiece<6>> pathTempoPieces;
-            pathTempoPieces.reserve(pathTempoStorage.size());
-            for (std::size_t pieceIndex=0;pieceIndex<pathTempoStorage.size();++pieceIndex) {
-                pathTempoStorage[pieceIndex].initialLimits={
-                    .velocity=localLimits[pieceIndex].velocity,
-                    .acceleration=localLimits[pieceIndex].acceleration,
-                    .jerk=localLimits[pieceIndex].jerk,
-                };
-                pathTempoPieces.push_back(pathTempoStorage[pieceIndex].view());
-            }
-            const auto planned=pathPlanner.solve(path_tempo::PathPlanningRequest<6>{
-                .pieces=pathTempoPieces,
-                .beginning={
-                    .velocity=scalarStart->first,
-                    .acceleration=scalarStart->second,
-                },
-                .ending={
-                    .velocity=scalarEnd->first,
-                    .acceleration=scalarEnd->second,
-                },
-                .limits={
-                    .pathAcceleration=m_limits.pathAcceleration,
-                    .pathJerk=m_limits.pathJerk,
-                    .coordinateVelocity=pathTempoVector(m_limits.axisVelocity),
-                    .coordinateAcceleration=pathTempoVector(m_limits.axisAcceleration),
-                    .coordinateJerk=pathTempoVector(m_limits.axisJerk),
-                },
-                .settings={
-                    .linearSolveTimeLimit=m_continuousPlanningEffort.scpSolveTimeLimit,
-                    .simplexIterationLimit=
-                        m_continuousPlanningEffort.scpSimplexIterationLimitMultiplier
-                            *(5*pieces.size()+3),
-                    .maximumCorrectionPasses=maximumLocalCorrectionPasses,
-                    .sequentialIterations=m_continuousPlanningEffort.scpIterations,
-                    .lineSearchSteps=m_continuousPlanningEffort.scpLineSearchSteps,
-                    .velocityTrustFraction=
-                        m_continuousPlanningEffort.scpVelocityTrustFraction,
-                    .accelerationTrustFraction=
-                        m_continuousPlanningEffort.scpAccelerationTrustFraction,
-                    .applySampledCorrections=false,
-                },
-            });
-            if (!planned) {
-                return std::unexpected(std::format(
-                    "PathTempo continuous timing failed: {}",planned.error().message));
-            }
+            const auto *planned = &candidate;
             if (planned->pieceBoundaries.size()!=pieces.size()+1
                ||planned->pieceLimits.size()!=pieces.size()) {
                 return std::unexpected(
@@ -1585,8 +1583,8 @@ namespace ngc {
                 }
                 fallback.occurrences+=planned->diagnostics.resourceLimitOccurrences;
             }
-            result->correctionPasses=correctionPass
-                +static_cast<unsigned>(planned->diagnostics.correctionPasses);
+            result->correctionPasses =
+                static_cast<unsigned>(planned->diagnostics.correctionPasses);
 
             const auto optimizedDuration=std::accumulate(pieceTiming.begin(),pieceTiming.end(),0.0,
                 [](const double total,const auto &timing) { return total+timing.back().time; });
@@ -1986,35 +1984,61 @@ namespace ngc {
                 pieces[worstPiece].length,worstViolation.spanId,worstViolation.stagedSpan,
                 worstViolation.duration,worstViolation.constraint,worstViolation.axis,
                 worstViolation.measured,worstViolation.limit,worstViolation.ratio,
-                "sparse-scp",optimizedDuration,
+                m_continuousPlanningEffort.scpIterations==0
+                    ?"velocity-seed":"sparse-scp",optimizedDuration,
                 m_continuousPlanningEffort.scpIterations,result->scpAcceptedSteps,
                 maximumStationAcceleration,
                 stationVelocity[worstPiece],stationAcceleration[worstPiece],
                 stationVelocity[worstPiece+1],stationAcceleration[worstPiece+1],
                 localLimits[worstPiece].velocity,
                 localLimits[worstPiece].acceleration,localLimits[worstPiece].jerk);
-            if(worst<=1.0+1e-9) {
-                constraintsVerified=true;
-                break;
+            if (worst <= 1.0 + 1e-9) {
+                constraintsVerified = true;
+
+                return std::vector<path_tempo::PieceCorrection>{};
             }
-            previousStationVelocity=stationVelocity;
-            previousStationAcceleration=stationAcceleration;
-            previousPieceTiming=pieceTiming;
+
+            previousStationVelocity = stationVelocity;
+            previousStationAcceleration = stationAcceleration;
+            previousPieceTiming = pieceTiming;
             previouslyCorrectedPieces.clear();
-            for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
-                if(correction[pieceIndex]<=1.0+1e-9) continue;
+
+            std::vector<path_tempo::PieceCorrection> corrections;
+            corrections.reserve(pieces.size());
+            for (std::size_t pieceIndex = 0; pieceIndex < pieces.size(); ++pieceIndex) {
+                if (correction[pieceIndex] <= 1.0 + 1e-9) {
+                    continue;
+                }
+
                 previouslyCorrectedPieces.push_back(pieceIndex);
-                const auto factor=correction[pieceIndex]*1.01;
-                localLimits[pieceIndex].velocity/=factor;
-                localLimits[pieceIndex].acceleration/=factor*factor;
-                localLimits[pieceIndex].jerk/=factor*factor*factor;
+                corrections.push_back({
+                    .piece = pieceIndex + 1,
+                    .requiredTimeScale = correction[pieceIndex] * 1.01,
+                });
             }
+
+            return corrections;
+        };
+
+        path_tempo::PathPlanner pathPlanner;
+        const auto planned = pathPlanner.solve(pathTempoRequest, materializationCorrection);
+        if (!planned) {
+            return std::unexpected(std::format(
+                "PathTempo continuous timing failed: {}; materialization history: {}",
+                planned.error().message,correctionHistory));
         }
-        if(!constraintsVerified)
+
+        if (materializationPass != planned->diagnostics.correctionPasses) {
+            return std::unexpected("PathTempo materialization callback count does not match its correction-pass diagnostics");
+        }
+
+        if (!constraintsVerified) {
             return std::unexpected(std::format(
                 "continuous local constraint correction did not converge after {} passes: {}",
                 maximumLocalCorrectionPasses,correctionHistory));
-        result->correctionHistory=correctionHistory;
+        }
+
+        result->correctionHistory = correctionHistory;
 
         const MotionState emittedStart{
             normalSpans.front().d,
