@@ -80,7 +80,6 @@ namespace ngc {
             double velocity;
             double acceleration;
             double jerk=0.0;
-            bool ruckigBrakePhase=false;
         };
 
         class TimeLaw {
@@ -519,7 +518,6 @@ namespace ngc {
             for(const auto &segment:*transition) {
                 auto &from=result.back();
                 from.jerk=segment.jerk();
-                from.ruckigBrakePhase=segment.initialStateCorrection;
                 phaseTime+=segment.duration;
                 result.push_back({
                     phaseTime,
@@ -638,7 +636,6 @@ namespace ngc {
                         .velocity=segment.velocity(0.0),
                         .acceleration=segment.acceleration(0.0),
                         .jerk=segment.jerk(),
-                        .ruckigBrakePhase=segment.initialStateCorrection,
                     });
                 } else {
                     if (std::abs(timing.back().distance-localDistance)>tolerance) {
@@ -646,7 +643,6 @@ namespace ngc {
                             "PathTempo piece {} has a discontinuous scalar phase",piece));
                     }
                     timing.back().jerk=segment.jerk();
-                    timing.back().ruckigBrakePhase=segment.initialStateCorrection;
                 }
                 elapsed[piece]+=segment.duration;
                 timing.push_back({
@@ -1028,6 +1024,10 @@ namespace ngc {
            ||!std::isfinite(m_continuousPlanningEffort
                 .curvatureDerivativeVelocityCapMultiplier)
            ||m_continuousPlanningEffort.curvatureDerivativeVelocityCapMultiplier<=0.0
+           ||(m_continuousPlanningEffort.boundaryAccelerationMode
+                  != ContinuousBoundaryAccelerationMode::Zero
+              && m_continuousPlanningEffort.boundaryAccelerationMode
+                  != ContinuousBoundaryAccelerationMode::Optimized)
            ||(m_continuousPlanningEffort.constraintCheckMode
                   != ContinuousConstraintCheckMode::Materialized
               && m_continuousPlanningEffort.constraintCheckMode
@@ -1436,8 +1436,7 @@ namespace ngc {
                    ||!bitExactDouble(a.distance,b.distance)
                    ||!bitExactDouble(a.velocity,b.velocity)
                    ||!bitExactDouble(a.acceleration,b.acceleration)
-                   ||!bitExactDouble(a.jerk,b.jerk)
-                   ||a.ruckigBrakePhase!=b.ruckigBrakePhase) return false;
+                   ||!bitExactDouble(a.jerk,b.jerk)) return false;
             }
             return true;
         };
@@ -1501,6 +1500,11 @@ namespace ngc {
                 .maximumCorrectionPasses = maximumLocalCorrectionPasses,
                 .applySampledCorrections = m_continuousPlanningEffort.constraintCheckMode
                     == ContinuousConstraintCheckMode::Sampled,
+                .boundaryAccelerationMode =
+                    m_continuousPlanningEffort.boundaryAccelerationMode
+                            == ContinuousBoundaryAccelerationMode::Zero
+                        ? path_tempo::BoundaryAccelerationMode::Zero
+                        : path_tempo::BoundaryAccelerationMode::Optimized,
             },
         };
         auto materializationPass = 0U;
@@ -1536,19 +1540,11 @@ namespace ngc {
                     planned->pieceLimits[pieceIndex].acceleration;
                 localLimits[pieceIndex].jerk=planned->pieceLimits[pieceIndex].jerk;
             }
-            result->velocityOnlySeedDuration=planned->diagnostics.velocitySeedDuration;
             result->correctionPasses =
                 static_cast<unsigned>(planned->diagnostics.correctionPasses);
 
             const auto candidateDuration=std::accumulate(pieceTiming.begin(),pieceTiming.end(),0.0,
                 [](const double total,const auto &timing) { return total+timing.back().time; });
-            result->ruckigBrakePhases=std::accumulate(
-                pieceTiming.begin(),pieceTiming.end(),std::size_t {0},
-                [](const std::size_t total,const auto &timing) {
-                    return total+std::ranges::count_if(timing,[](const auto &boundary) {
-                        return boundary.ruckigBrakePhase;
-                    });
-                });
             if(correctionPass>0&&!previouslyCorrectedPieces.empty()) {
                 CorrectionPassLocalityDiagnostic locality {
                     .pass=correctionPass,
@@ -1986,8 +1982,13 @@ namespace ngc {
                 planned.error().message,correctionHistory));
         }
 
-        if (materializationPass != planned->diagnostics.correctionPasses) {
-            return std::unexpected("PathTempo materialization callback count does not match its correction-pass diagnostics");
+        const auto diagnosedCorrectionPasses = planned->diagnostics.correctionPasses;
+        if ((m_continuousPlanningEffort.constraintCheckMode
+                 == ContinuousConstraintCheckMode::Materialized
+             && materializationPass != diagnosedCorrectionPasses)
+            || materializationPass > diagnosedCorrectionPasses) {
+            return std::unexpected(
+                "PathTempo materialization callback count is inconsistent with its correction-pass diagnostics");
         }
 
         if (!constraintsVerified) {

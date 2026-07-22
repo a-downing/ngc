@@ -431,6 +431,7 @@ public:
     ApplicationImpl() = delete;
     ApplicationImpl(GLFWwindow *window, const ngc::MachineConfiguration &configuration,
                     const ngc::spline_detail::SplineFitSolver splineFitSolver,
+                    const ngc::ContinuousBoundaryAccelerationMode boundaryAccelerationMode,
                     const ngc::ContinuousConstraintCheckMode continuousCheckMode)
         : m_window(window), m_simulationTiming(configuration.simulation),
           m_joggingConfiguration(configuration.jogging),
@@ -447,9 +448,10 @@ public:
         }
 
         auto planningEffort = ngc::ContinuousPlanningEffort{};
+        planningEffort.boundaryAccelerationMode = boundaryAccelerationMode;
         planningEffort.constraintCheckMode = continuousCheckMode;
         if (!m_simulation.setContinuousPlanningEffort(planningEffort)) {
-            PANIC("new simulation worker rejected its continuous constraint-check mode");
+            PANIC("new simulation worker rejected its continuous planning mode");
         }
     }
 
@@ -2736,9 +2738,10 @@ public:
 
 Application::Application(GLFWwindow *window, const ngc::MachineConfiguration &configuration,
                          const ngc::spline_detail::SplineFitSolver splineFitSolver,
+                         const ngc::ContinuousBoundaryAccelerationMode boundaryAccelerationMode,
                          const ngc::ContinuousConstraintCheckMode continuousCheckMode)
     : m_impl(std::make_unique<ApplicationImpl>(window, configuration, splineFitSolver,
-          continuousCheckMode)) {}
+          boundaryAccelerationMode, continuousCheckMode)) {}
 Application::~Application() = default;
 
 void Application::init() { m_impl->init(); }

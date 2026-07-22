@@ -989,14 +989,14 @@ namespace ngc {
                     const auto nominal=slowest->programmedVelocityLimit>0.0
                         ?slowest->length/slowest->programmedVelocityLimit:0.0;
                     m_lastContinuousPlanSummary=std::format(
-                        "pieces={} constraint_check={} actual={:.3f}s seed={:.3f}s slowest_input={} "
+                        "pieces={} mode={} constraint_check={} actual={:.3f}s slowest_input={} "
                         "length={:.6g} nominal={:.6g}s actual={:.6g}s ratio={:.3f} "
                         "programmed_v={:.6g} local_v={:.6g} entry_v={:.6g} exit_v={:.6g} "
                         "local_a={:.6g} local_j={:.6g} correction_passes={}",
                         continuous->pieceTiming.size(),
+                        name(m_compiler.continuousPlanningEffort().boundaryAccelerationMode),
                         name(m_compiler.continuousPlanningEffort().constraintCheckMode),
-                        actualDuration,
-                        continuous->velocityOnlySeedDuration,slowest->input,
+                        actualDuration,slowest->input,
                         slowest->length,nominal,slowest->duration,
                         nominal>0.0?slowest->duration/nominal:0.0,
                         slowest->programmedVelocityLimit,slowest->velocityLimit,

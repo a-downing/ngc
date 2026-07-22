@@ -3266,10 +3266,30 @@ final_move_together = true
         };
         ngc::TrajectoryCompiler compiler(trajectoryLimits);
         auto planningEffort = compiler.continuousPlanningEffort();
+        require(planningEffort.boundaryAccelerationMode
+                    == ngc::ContinuousBoundaryAccelerationMode::Optimized
+                    && name(planningEffort.boundaryAccelerationMode) == "optimized"
+                    && name(ngc::ContinuousBoundaryAccelerationMode::Zero) == "zero",
+                "continuous planning should default to PathTempo's optimized boundary mode");
         compiler.setContinuousPlanningEffort(planningEffort);
         compiler.reset(94,points.front());
         const auto planned=compiler.compileContinuous(*prepared,0.05);
         require(planned&&*planned,planned?"":planned.error());
+
+        ngc::TrajectoryCompiler zeroBoundaryCompiler(trajectoryLimits);
+        auto zeroBoundaryEffort = planningEffort;
+        zeroBoundaryEffort.boundaryAccelerationMode =
+            ngc::ContinuousBoundaryAccelerationMode::Zero;
+        zeroBoundaryCompiler.setContinuousPlanningEffort(zeroBoundaryEffort);
+        zeroBoundaryCompiler.reset(94, points.front());
+        const auto zeroBoundaryPlan = zeroBoundaryCompiler.compileContinuous(*prepared, 0.05);
+        require(zeroBoundaryPlan && *zeroBoundaryPlan,
+                zeroBoundaryPlan ? "" : zeroBoundaryPlan.error());
+        require(std::ranges::all_of((*zeroBoundaryPlan)->pieceTiming, [](const auto &piece) {
+                    return std::abs(piece.entryAcceleration) < 1e-9
+                        && std::abs(piece.exitAcceleration) < 1e-9;
+                }),
+                "zero boundary mode should force zero acceleration at every PathPiece boundary");
 
         auto roundedEndpointGeometry=*prepared;
         auto roundedCluster=std::ranges::find_if(

@@ -19,6 +19,20 @@
 #include "machine/PreparedGeometry.h"
 
 namespace ngc {
+    enum class ContinuousBoundaryAccelerationMode : std::uint8_t {
+        Zero,
+        Optimized,
+    };
+
+    inline std::string_view name(const ContinuousBoundaryAccelerationMode mode) {
+        switch (mode) {
+            case ContinuousBoundaryAccelerationMode::Zero: return "zero";
+            case ContinuousBoundaryAccelerationMode::Optimized: return "optimized";
+        }
+
+        return "unknown";
+    }
+
     enum class ContinuousConstraintCheckMode : std::uint8_t {
         Materialized,
         Sampled,
@@ -79,6 +93,8 @@ namespace ngc {
         double curvatureDerivativeVelocityCapMultiplier = 1.0;
         bool applyCurvatureDerivativeVelocityCap = true;
         bool measureCurvatureDerivativeNumerics = false;
+        ContinuousBoundaryAccelerationMode boundaryAccelerationMode =
+            ContinuousBoundaryAccelerationMode::Optimized;
         ContinuousConstraintCheckMode constraintCheckMode =
             ContinuousConstraintCheckMode::Materialized;
     };
@@ -234,9 +250,7 @@ namespace ngc {
         std::vector<TimedCommandActivation> activations;
         // NRT-only development evidence; never crosses MotionBackend.
         std::vector<ContinuousPieceTimingDiagnostic> pieceTiming;
-        double velocityOnlySeedDuration = 0.0;
         std::string correctionHistory;
-        std::size_t ruckigBrakePhases = 0;
         std::size_t geometryVerificationAttempts = 0;
         std::size_t geometryVerificationHighWater = 0;
         unsigned correctionPasses = 0;

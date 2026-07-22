@@ -17,6 +17,7 @@ public:
     Application() = delete;
     Application(GLFWwindow *window, const ngc::MachineConfiguration &configuration,
                 ngc::spline_detail::SplineFitSolver splineFitSolver,
+                ngc::ContinuousBoundaryAccelerationMode boundaryAccelerationMode,
                 ngc::ContinuousConstraintCheckMode continuousCheckMode);
     ~Application();
 

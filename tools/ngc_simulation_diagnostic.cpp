@@ -92,30 +92,51 @@ namespace {
         return std::unexpected(
             "unknown continuous check; expected materialized or sampled");
     }
+
+    std::expected<ngc::ContinuousBoundaryAccelerationMode, std::string> parseMode(
+            std::string_view argument) {
+        constexpr std::string_view prefix = "--mode=";
+        if (argument.starts_with(prefix)) {
+            argument.remove_prefix(prefix.size());
+        }
+        if (argument == "zero") {
+            return ngc::ContinuousBoundaryAccelerationMode::Zero;
+        }
+        if (argument == "optimized") {
+            return ngc::ContinuousBoundaryAccelerationMode::Optimized;
+        }
+
+        return std::unexpected("unknown mode; expected zero or optimized");
+    }
 }
 
-int main(const int argc,char **argv) {
-    if (argc > 6) {
-        std::println(stderr,"usage: ngc_simulation_diagnostic [program.ngc] "
-            "[maximum-program-seconds] [tick-multiplier] "
-            "[--smoother=none|coordinate|uniform|peak-targeted|velocity-targeted] "
-            "[--continuous-check=materialized|sampled]");
-        return 2;
-    }
-    const std::filesystem::path program=argc>1?argv[1]:"adaptive_pockets.ngc";
-    const auto maximumProgramSeconds=argc>2?std::strtod(argv[2],nullptr):60.0;
-    const auto multiplier=argc>3?std::atoi(argv[3]):10;
-    auto smoother=ngc::spline_detail::continuousSplineFitSolver();
+int main(const int argc, char **argv) {
+    auto smoother = ngc::spline_detail::continuousSplineFitSolver();
+    auto mode = ngc::ContinuousBoundaryAccelerationMode::Optimized;
     auto continuousCheck = ngc::ContinuousConstraintCheckMode::Materialized;
-    for (auto argument=4;argument<argc;++argument) {
-        const auto option=std::string_view{argv[argument]};
+    std::vector<std::string_view> positionalArguments;
+
+    for (auto argument = 1; argument < argc; ++argument) {
+        const auto option = std::string_view{argv[argument]};
         if (option.starts_with("--smoother=")) {
-            const auto parsed=parseSmoother(option);
+            const auto parsed = parseSmoother(option);
             if (!parsed) {
-                std::println(stderr,"{}",parsed.error());
+                std::println(stderr, "{}", parsed.error());
                 return 2;
             }
-            smoother=*parsed;
+            smoother = *parsed;
+        } else if (option == "--mode" || option.starts_with("--mode=")) {
+            if (option == "--mode" && ++argument == argc) {
+                std::println(stderr, "mode option requires zero or optimized");
+                return 2;
+            }
+            const auto parsed = parseMode(
+                option == "--mode" ? std::string_view{argv[argument]} : option);
+            if (!parsed) {
+                std::println(stderr, "{}", parsed.error());
+                return 2;
+            }
+            mode = *parsed;
         } else if (option.starts_with("--continuous-check=")) {
             const auto parsed = parseContinuousCheck(option);
             if (!parsed) {
@@ -123,11 +144,30 @@ int main(const int argc,char **argv) {
                 return 2;
             }
             continuousCheck = *parsed;
-        } else {
-            std::println(stderr,"unknown diagnostic option: {}",option);
+        } else if (option.starts_with("--")) {
+            std::println(stderr, "unknown diagnostic option: {}", option);
             return 2;
+        } else {
+            positionalArguments.push_back(option);
         }
     }
+
+    if (positionalArguments.size() > 3) {
+        std::println(stderr, "usage: ngc_simulation_diagnostic [program.ngc] "
+            "[maximum-program-seconds] [tick-multiplier] "
+            "[--smoother=none|coordinate|uniform|peak-targeted|velocity-targeted] "
+            "[--mode=zero|optimized] "
+            "[--continuous-check=materialized|sampled]");
+        return 2;
+    }
+
+    const std::filesystem::path program = positionalArguments.empty()
+        ? std::filesystem::path{"adaptive_pockets.ngc"}
+        : std::filesystem::path{positionalArguments[0]};
+    const auto maximumProgramSeconds = positionalArguments.size() > 1
+        ? std::strtod(positionalArguments[1].data(), nullptr) : 60.0;
+    const auto multiplier = positionalArguments.size() > 2
+        ? std::atoi(positionalArguments[2].data()) : 10;
 
     auto configuration=ngc::loadMachineConfiguration("machine.toml");
     if(!configuration) {
@@ -160,9 +200,10 @@ int main(const int argc,char **argv) {
         return 1;
     }
     auto planningEffort = ngc::ContinuousPlanningEffort{};
+    planningEffort.boundaryAccelerationMode = mode;
     planningEffort.constraintCheckMode = continuousCheck;
     if (!worker.setContinuousPlanningEffort(planningEffort)) {
-        std::println(stderr, "simulation worker rejected the continuous-check selection");
+        std::println(stderr, "simulation worker rejected the continuous planning selection");
         return 1;
     }
     if(!worker.start(programs,tools,true)) {
@@ -170,9 +211,9 @@ int main(const int argc,char **argv) {
         return 1;
     }
 
-    std::println("program={} multiplier={} stop_after={:.3f}s smoother={} continuous_check={}",
+    std::println("program={} multiplier={} stop_after={:.3f}s smoother={} mode={} continuous_check={}",
         program.string(),multiplier,maximumProgramSeconds,smootherName(smoother),
-        name(continuousCheck));
+        name(mode),name(continuousCheck));
     ngc::EpochId lastEpoch=0;
     ngc::ChunkId lastChunk=0;
     ngc::SpanId lastSpan=0;

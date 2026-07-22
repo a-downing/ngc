@@ -45,6 +45,8 @@ static void save_window_maximized(GLFWwindow *window) {
 struct CommandLineOptions {
     ngc::spline_detail::SplineFitSolver smoother =
         ngc::spline_detail::continuousSplineFitSolver();
+    ngc::ContinuousBoundaryAccelerationMode mode =
+        ngc::ContinuousBoundaryAccelerationMode::Optimized;
     ngc::ContinuousConstraintCheckMode continuousCheck =
         ngc::ContinuousConstraintCheckMode::Materialized;
 };
@@ -54,6 +56,7 @@ static std::expected<CommandLineOptions, std::string> parseOptions(const int arg
     for (auto argument = 1; argument < argc; ++argument) {
         auto option = std::string_view{argv[argument]};
         constexpr std::string_view smootherPrefix = "--smoother=";
+        constexpr std::string_view modePrefix = "--mode=";
         constexpr std::string_view checkPrefix = "--continuous-check=";
         if (option.starts_with(smootherPrefix)) {
             option.remove_prefix(smootherPrefix.size());
@@ -72,6 +75,22 @@ static std::expected<CommandLineOptions, std::string> parseOptions(const int arg
                 return std::unexpected(
                     "unknown smoother; expected none, coordinate, uniform, peak-targeted, or "
                     "velocity-targeted");
+            }
+        } else if (option == "--mode" || option.starts_with(modePrefix)) {
+            if (option == "--mode") {
+                if (++argument == argc) {
+                    return std::unexpected("mode option requires zero or optimized");
+                }
+                option = argv[argument];
+            } else {
+                option.remove_prefix(modePrefix.size());
+            }
+            if (option == "zero") {
+                result.mode = ngc::ContinuousBoundaryAccelerationMode::Zero;
+            } else if (option == "optimized") {
+                result.mode = ngc::ContinuousBoundaryAccelerationMode::Optimized;
+            } else {
+                return std::unexpected("unknown mode; expected zero or optimized");
             }
         } else if (option.starts_with(checkPrefix)) {
             option.remove_prefix(checkPrefix.size());
@@ -97,6 +116,7 @@ int main(const int argc, char **argv) {
         std::println(stderr, "{}", options.error());
         std::println(stderr, "usage: imgui_main [--smoother=none|coordinate|uniform|"
             "peak-targeted|velocity-targeted] "
+            "[--mode=zero|optimized] "
             "[--continuous-check=materialized|sampled]");
         return 2;
     }
@@ -161,7 +181,8 @@ int main(const int argc, char **argv) {
 
     ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
 
-    Application app(window, *configuration, options->smoother, options->continuousCheck);
+    Application app(window, *configuration, options->smoother, options->mode,
+                    options->continuousCheck);
     app.init();
 
     while (!glfwWindowShouldClose(window)) {
