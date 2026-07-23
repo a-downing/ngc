@@ -431,9 +431,7 @@ public:
     ApplicationImpl() = delete;
     ApplicationImpl(GLFWwindow *window, const ngc::MachineConfiguration &configuration,
                     const ngc::spline_detail::SplineFitSolver splineFitSolver,
-                    const ngc::ContinuousBoundaryAccelerationMode boundaryAccelerationMode,
-                    const ngc::ContinuousConstraintCheckMode continuousCheckMode,
-                    const std::optional<bool> pathTempoSampledCorrections)
+                    const ngc::ContinuousBoundaryAccelerationMode boundaryAccelerationMode)
         : m_window(window), m_simulationTiming(configuration.simulation),
           m_joggingConfiguration(configuration.jogging),
           m_pendantConfiguration(configuration.pendant), m_machineUnit(configuration.unit),
@@ -450,8 +448,6 @@ public:
 
         auto planningEffort = ngc::ContinuousPlanningEffort{};
         planningEffort.boundaryAccelerationMode = boundaryAccelerationMode;
-        planningEffort.constraintCheckMode = continuousCheckMode;
-        planningEffort.pathTempoSampledCorrections=pathTempoSampledCorrections;
         if (!m_simulation.setContinuousPlanningEffort(planningEffort)) {
             PANIC("new simulation worker rejected its continuous planning mode");
         }
@@ -2740,11 +2736,9 @@ public:
 
 Application::Application(GLFWwindow *window, const ngc::MachineConfiguration &configuration,
                          const ngc::spline_detail::SplineFitSolver splineFitSolver,
-                         const ngc::ContinuousBoundaryAccelerationMode boundaryAccelerationMode,
-                         const ngc::ContinuousConstraintCheckMode continuousCheckMode,
-                         const std::optional<bool> pathTempoSampledCorrections)
+                         const ngc::ContinuousBoundaryAccelerationMode boundaryAccelerationMode)
     : m_impl(std::make_unique<ApplicationImpl>(window, configuration, splineFitSolver,
-          boundaryAccelerationMode,continuousCheckMode,pathTempoSampledCorrections)) {}
+          boundaryAccelerationMode)) {}
 Application::~Application() = default;
 
 void Application::init() { m_impl->init(); }

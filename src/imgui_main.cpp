@@ -2,7 +2,6 @@
 #include <cstdio>
 #include <expected>
 #include <fstream>
-#include <optional>
 #include <print>
 #include <string>
 #include <string_view>
@@ -48,9 +47,6 @@ struct CommandLineOptions {
         ngc::spline_detail::continuousSplineFitSolver();
     ngc::ContinuousBoundaryAccelerationMode mode =
         ngc::ContinuousBoundaryAccelerationMode::Optimized;
-    ngc::ContinuousConstraintCheckMode continuousCheck =
-        ngc::ContinuousConstraintCheckMode::Materialized;
-    std::optional<bool> sampledCorrections;
 };
 
 static std::expected<CommandLineOptions, std::string> parseOptions(const int argc, char **argv) {
@@ -59,8 +55,6 @@ static std::expected<CommandLineOptions, std::string> parseOptions(const int arg
         auto option = std::string_view{argv[argument]};
         constexpr std::string_view smootherPrefix = "--smoother=";
         constexpr std::string_view modePrefix = "--mode=";
-        constexpr std::string_view checkPrefix = "--continuous-check=";
-        constexpr std::string_view sampledCorrectionsPrefix = "--sampled-corrections=";
         if (option.starts_with(smootherPrefix)) {
             option.remove_prefix(smootherPrefix.size());
             using ngc::spline_detail::SplineFitSolver;
@@ -95,25 +89,6 @@ static std::expected<CommandLineOptions, std::string> parseOptions(const int arg
             } else {
                 return std::unexpected("unknown mode; expected zero or optimized");
             }
-        } else if (option.starts_with(checkPrefix)) {
-            option.remove_prefix(checkPrefix.size());
-            if (option == "materialized") {
-                result.continuousCheck = ngc::ContinuousConstraintCheckMode::Materialized;
-            } else if (option == "sampled") {
-                result.continuousCheck = ngc::ContinuousConstraintCheckMode::Sampled;
-            } else if(option=="geometry") {
-                result.continuousCheck=
-                    ngc::ContinuousConstraintCheckMode::GeometryDiagnostic;
-            } else {
-                return std::unexpected(
-                    "unknown continuous check; expected materialized, sampled, or geometry");
-            }
-        } else if(option.starts_with(sampledCorrectionsPrefix)) {
-            option.remove_prefix(sampledCorrectionsPrefix.size());
-            if(option=="on") result.sampledCorrections=true;
-            else if(option=="off") result.sampledCorrections=false;
-            else return std::unexpected(
-                "unknown sampled-corrections value; expected on or off");
         } else {
             return std::unexpected("unknown option '" + std::string{option} + "'");
         }
@@ -128,9 +103,7 @@ int main(const int argc, char **argv) {
         std::println(stderr, "{}", options.error());
         std::println(stderr, "usage: imgui_main [--smoother=none|coordinate|uniform|"
             "peak-targeted|velocity-targeted] "
-            "[--mode=zero|optimized] "
-            "[--continuous-check=materialized|sampled|geometry] "
-            "[--sampled-corrections=on|off]");
+            "[--mode=zero|optimized]");
         return 2;
     }
     const auto configuration = ngc::loadMachineConfiguration("machine.toml");
@@ -194,8 +167,7 @@ int main(const int argc, char **argv) {
 
     ImVec4 clear_color = ImVec4(0.45f, 0.55f, 0.60f, 1.00f);
 
-    Application app(window, *configuration, options->smoother, options->mode,
-                    options->continuousCheck,options->sampledCorrections);
+    Application app(window, *configuration, options->smoother, options->mode);
     app.init();
 
     while (!glfwWindowShouldClose(window)) {

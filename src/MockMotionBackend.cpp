@@ -17,11 +17,12 @@ namespace ngc {
     namespace {
         constexpr std::size_t PLAN_CAPACITY = 8;
         constexpr std::size_t CONTROL_CAPACITY = 16;
-        // One drain interval can retire the complete plan horizon. Each chunk can
-        // produce accepted, branch, retired, and probe/held records, in addition
-        // to control acknowledgements. Keep enough return capacity for that
-        // worst-case burst so the bounded forward horizon cannot deadlock itself.
-        constexpr std::size_t EVENT_CAPACITY = 64;
+        // One drain interval can retire the complete plan horizon. Preserve
+        // every execution marker plus accepted, branch, retired, held, and
+        // control records from that bounded horizon.
+        constexpr std::size_t EVENT_CAPACITY =
+            PLAN_CAPACITY * (MAX_EXECUTION_MARKERS_PER_CHUNK + 4)
+            + CONTROL_CAPACITY;
         constexpr std::size_t SNAPSHOT_CAPACITY = 4;
         constexpr std::size_t SYNTHETIC_INPUT_CAPACITY = 16;
 
@@ -48,32 +49,20 @@ namespace ngc {
         }
 
         position_t evaluate(const AxisPolynomialSpan &span, const double u) {
-            const auto component = [&](const double position_t::*member) {
-                return ((span.a.*member * u + span.b.*member) * u + span.c.*member) * u + span.d.*member;
-            };
-            return { component(&position_t::x), component(&position_t::y), component(&position_t::z),
-                     component(&position_t::a), component(&position_t::b), component(&position_t::c) };
+            return evaluateExecutionPolynomial(span, u).state.position;
         }
 
         position_t derivative(const AxisPolynomialSpan &span, const double u) {
-            const auto component = [&](const double position_t::*member) {
-                return (3.0 * span.a.*member * u * u + 2.0 * span.b.*member * u + span.c.*member)
-                    * span.inverseDuration;
-            };
-            return { component(&position_t::x), component(&position_t::y), component(&position_t::z),
-                     component(&position_t::a), component(&position_t::b), component(&position_t::c) };
+            return evaluateExecutionPolynomial(span, u).state.velocity;
         }
 
         position_t secondDerivative(const AxisPolynomialSpan &span, const double u) {
-            const auto component = [&](const double position_t::*member) {
-                return (6.0 * span.a.*member * u + 2.0 * span.b.*member) * span.inverseDurationSquared;
-            };
-            return { component(&position_t::x), component(&position_t::y), component(&position_t::z),
-                     component(&position_t::a), component(&position_t::b), component(&position_t::c) };
+            return evaluateExecutionPolynomial(span, u).state.acceleration;
         }
 
-        position_t thirdDerivative(const AxisPolynomialSpan &span) {
-            return scaled(span.a, 6.0 * span.inverseDurationCubed);
+        position_t thirdDerivative(
+                const AxisPolynomialSpan &span, const double u) {
+            return evaluateExecutionPolynomial(span, u).jerk;
         }
     }
 
@@ -96,7 +85,7 @@ namespace ngc {
         std::atomic<std::uint32_t> m_queuedExecutionItems{0};
         bool m_stopping = false;
         std::uint32_t m_span = 0;
-        std::uint32_t m_nextEvent = 0;
+        std::uint32_t m_nextMarker = 0;
         double m_spanElapsed = 0.0;
         double m_lastAdvanceProgramSeconds = 0.0;
         std::atomic<double> m_currentProgramJerkMagnitude{0.0};
@@ -249,9 +238,50 @@ namespace ngc {
         PublishResult publish(const ExecutionItem &item) noexcept {
             const auto valid = std::visit([](const auto &value) {
                 using T = std::decay_t<decltype(value)>;
-                if constexpr(std::same_as<T, PlanChunk>)
-                    return value.normalMotion.size != 0 && value.stopTail.size != 0
-                        && value.epoch != 0 && value.id != 0;
+                if constexpr(std::same_as<T, PlanChunk>) {
+                    if (value.normalMotion.size == 0 || value.stopTail.size == 0
+                       || value.epoch == 0 || value.id == 0) {
+                        return false;
+                    }
+                    const auto validSpan = [](const AxisPolynomialSpan &span) {
+                        if (span.id == 0
+                           || (span.degree
+                                    != ExecutionPolynomialDegree::Cubic
+                               && span.degree
+                                    != ExecutionPolynomialDegree::Quintic)
+                           || !std::isfinite(span.duration)
+                           || span.duration <= 0.0
+                           || !std::isfinite(span.inverseDuration)
+                           || span.inverseDuration <= 0.0) {
+                            return false;
+                        }
+                        return span.degree
+                                != ExecutionPolynomialDegree::Cubic
+                            || (span.coefficients[3].length() == 0.0
+                                && span.coefficients[4].length() == 0.0);
+                    };
+                    if (!std::ranges::all_of(
+                            value.normalMotion, validSpan)
+                       || !std::ranges::all_of(
+                            value.stopTail, validSpan)) {
+                        return false;
+                    }
+                    std::optional<std::pair<std::uint32_t, double>> previous;
+                    for (const auto &marker : value.markers) {
+                        const auto location =
+                            std::pair{marker.span, marker.parameter};
+                        if (marker.id == 0
+                           || marker.span >= value.normalMotion.size
+                           || !std::isfinite(marker.parameter)
+                           || marker.parameter < 0.0
+                           || marker.parameter > 1.0
+                           || (previous && location < *previous)) {
+                            return false;
+                        }
+                        previous = location;
+                    }
+                    return true;
+                }
                 else if constexpr(std::same_as<T, TriggeredMove>)
                     return value.epoch != 0 && value.id != 0 && value.moveId != 0
                         && magnitude(value.target) < std::numeric_limits<double>::infinity()
@@ -379,6 +409,7 @@ namespace ngc {
                 m_snapshot.spanProgress = u;
                 m_snapshot.commanded = retimedState(span, u);
                 m_snapshot.feedback = m_snapshot.commanded;
+                emitExecutionMarkersThrough(u);
                 const auto jerk = retimedJerk(span, u);
                 m_currentProgramJerkMagnitude.store(magnitude(jerk), std::memory_order_relaxed);
                 m_lastAdvanceProgramSeconds = availableProgramSeconds - seconds;
@@ -455,6 +486,40 @@ namespace ngc {
         const AxisPolynomialSpan &currentSpan() const {
             const auto &chunk = activeChunk();
             return m_stopping ? chunk.stopTail[m_span] : chunk.normalMotion[m_span];
+        }
+
+        void emitExecutionMarkersThrough(const double parameter) {
+            if (m_stopping || !m_active
+               || !std::holds_alternative<PlanChunk>(activeItem())) {
+                return;
+            }
+            const auto &chunk = activeChunk();
+            while (m_nextMarker < chunk.markers.size) {
+                const auto &marker = chunk.markers[m_nextMarker];
+                if (marker.span > m_span
+                   || (marker.span == m_span
+                       && marker.parameter > parameter)) {
+                    break;
+                }
+                if (marker.span < m_span || marker.id == 0
+                   || !std::isfinite(marker.parameter)
+                   || marker.parameter < 0.0 || marker.parameter > 1.0) {
+                    m_snapshot.state = BackendState::Faulted;
+                    m_snapshot.faultCode = 8;
+                    return;
+                }
+                emit(ExecutionMarkerReached{
+                    .epoch = chunk.epoch,
+                    .chunk = chunk.id,
+                    .marker = marker.id,
+                    .span = chunk.normalMotion[m_span].id,
+                    .parameter = marker.parameter,
+                });
+                ++m_nextMarker;
+                if (m_snapshot.state == BackendState::Faulted) {
+                    return;
+                }
+            }
         }
 
         bool feedRetimingAccelerationInterval(const position_t &referenceVelocity,
@@ -594,7 +659,7 @@ namespace ngc {
         position_t retimedJerk(const AxisPolynomialSpan &span, const double u) const {
             const auto referenceVelocity = derivative(span, u);
             const auto referenceAcceleration = secondDerivative(span, u);
-            return scaled(thirdDerivative(span),
+            return scaled(thirdDerivative(span, u),
                           m_executionRate * m_executionRate * m_executionRate)
                 + scaled(referenceAcceleration,
                          3.0 * m_executionRate * m_executionRateAcceleration)
@@ -1404,7 +1469,7 @@ namespace ngc {
                             accountForDequeued(discarded);
                             release(discarded);
                         }
-                        m_stopping = false; m_span = 0; m_nextEvent = 0; m_spanElapsed = 0.0;
+                        m_stopping = false; m_span = 0; m_nextMarker = 0; m_spanElapsed = 0.0;
                         m_feedHolding = false;
                         m_feedHeld = false;
                         m_feedResuming = false;
@@ -1459,11 +1524,14 @@ namespace ngc {
             m_active = index;
             m_stopping = false;
             m_span = 0;
-            m_nextEvent = 0;
+            m_nextMarker = 0;
             m_spanElapsed = 0.0;
             m_snapshot.activeChunk = itemId(item);
             m_snapshot.activeSpan = 0;
             emit(ChunkAccepted { itemEpoch(item), itemId(item) });
+            if (std::holds_alternative<PlanChunk>(item)) {
+                emitExecutionMarkersThrough(0.0);
+            }
             if(std::holds_alternative<TriggeredMove>(item) && !initializeTriggered()) faultTriggered();
             if(std::holds_alternative<TriggeredJointMove>(item) && !initializeTriggeredJoints()) faultTriggered();
         }
@@ -1472,7 +1540,10 @@ namespace ngc {
             m_spanElapsed = 0.0;
             ++m_span;
             const auto count = m_stopping ? activeChunk().stopTail.size : activeChunk().normalMotion.size;
-            if(m_span < count) return;
+            if (m_span < count) {
+                emitExecutionMarkersThrough(0.0);
+                return;
+            }
             if(m_stopping) {
                 auto &chunk = activeChunk();
                 emit(ChunkRetired { chunk.epoch, chunk.id });
@@ -1511,11 +1582,14 @@ namespace ngc {
                 m_active = continuationIndex;
                 release(oldIndex);
                 m_span = 0;
-                m_nextEvent = 0;
+                m_nextMarker = 0;
                 m_spanElapsed = 0.0;
                 m_snapshot.activeChunk = itemId(continuation);
                 m_snapshot.activeSpan = 0;
                 emit(ChunkAccepted { itemEpoch(continuation), itemId(continuation) });
+                if (std::holds_alternative<PlanChunk>(continuation)) {
+                    emitExecutionMarkersThrough(0.0);
+                }
                 if(std::holds_alternative<TriggeredMove>(continuation) && !initializeTriggered()) faultTriggered();
                 if(std::holds_alternative<TriggeredJointMove>(continuation)
                    && !initializeTriggeredJoints()) faultTriggered();

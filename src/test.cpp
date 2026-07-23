@@ -1972,10 +1972,8 @@ final_move_together = true
         span.inverseDuration = 1.0 / duration;
         span.inverseDurationSquared = span.inverseDuration * span.inverseDuration;
         span.inverseDurationCubed = span.inverseDurationSquared * span.inverseDuration;
-        span.c.x = to - from;
-        span.d.x = from;
-        span.end.position.x = to;
-        span.end.velocity.x = (to - from) / duration;
+        span.origin.x = from;
+        span.coefficients[0].x = to - from;
         return span;
     }
 
@@ -1992,8 +1990,6 @@ final_move_together = true
         require(chunk.normalMotion.push(linearSpan(100, 0.0, 1.0, 1.0)),
                 "test normal span should fit in a chunk");
         auto stop = linearSpan(101, 1.0, 1.0, 0.25);
-        stop.end = {};
-        stop.end.position.x = 1.0;
         require(chunk.stopTail.push(stop), "test stop tail should fit in a chunk");
         chunk.branchState.position.x = 1.0;
         chunk.stopState.position.x = 1.0;
@@ -2032,6 +2028,87 @@ final_move_together = true
                 "mock diagnostics should distinguish the executed stop tail");
     }
 
+    void testMockBackendEmitsOrderedInSpanExecutionMarkers() {
+        ngc::MockMotionBackend backend;
+        ngc::PlanChunk chunk;
+        chunk.epoch = 8;
+        chunk.id = 12;
+        chunk.branch = 22;
+        require(chunk.normalMotion.push(
+                    linearSpan(110, 0.0, 1.0, 1.0))
+                && chunk.normalMotion.push(
+                    linearSpan(111, 1.0, 2.0, 1.0)),
+                "execution-marker test normal spans should fit");
+        auto stop = linearSpan(112, 2.0, 2.0, 1e-6);
+        require(chunk.stopTail.push(stop),
+                "execution-marker test stop tail should fit");
+        chunk.branchState = ngc::executionSpanEnd(chunk.normalMotion[1]);
+        chunk.stopState.position.x = 2.0;
+        const std::array markers{
+            ngc::ExecutionMarker{1, 0, 0.0},
+            ngc::ExecutionMarker{2, 0, 0.25},
+            ngc::ExecutionMarker{3, 0, 0.25},
+            ngc::ExecutionMarker{4, 0, 1.0},
+            ngc::ExecutionMarker{5, 1, 0.0},
+            ngc::ExecutionMarker{6, 1, 0.75},
+        };
+        for (const auto &marker : markers) {
+            require(chunk.markers.push(marker),
+                    "execution marker should fit in its packet");
+        }
+
+        auto unordered = chunk;
+        std::swap(unordered.markers[1], unordered.markers[4]);
+        require(backend.tryPublish(unordered) == ngc::PublishResult::Invalid,
+                "backend should reject unordered execution markers");
+        require(backend.tryPublish(chunk) == ngc::PublishResult::Published,
+                "backend should accept ordered in-span execution markers");
+        require(backend.trySubmit(ngc::StartRequest{1, 8})
+                    == ngc::SubmitResult::Submitted,
+                "execution-marker test should submit start");
+
+        const auto takeMarkers = [&] {
+            std::vector<ngc::ExecutionMarkerReached> result;
+            ngc::ExecutionEvent event;
+            while (backend.tryTakeEvent(event)) {
+                if (const auto *marker =
+                        std::get_if<ngc::ExecutionMarkerReached>(&event)) {
+                    result.push_back(*marker);
+                }
+            }
+            return result;
+        };
+
+        backend.advanceTick(0.0, true);
+        auto reached = takeMarkers();
+        require(reached.size() == 1 && reached[0].marker == 1
+                && reached[0].span == 110
+                && reached[0].parameter == 0.0,
+                "a parameter-zero marker should fire when its packet starts");
+
+        backend.advanceTick(0.3, true);
+        reached = takeMarkers();
+        require(reached.size() == 2 && reached[0].marker == 2
+                && reached[1].marker == 3,
+                "coincident in-span markers should fire once in source order");
+
+        backend.advanceTick(0.8, true);
+        reached = takeMarkers();
+        require(reached.size() == 2 && reached[0].marker == 4
+                && reached[1].marker == 5
+                && reached[0].span == 110
+                && reached[1].span == 111,
+                "one servo advance should preserve markers on both sides "
+                "of a crossed span boundary");
+
+        backend.advanceTick(0.65, true);
+        reached = takeMarkers();
+        require(reached.size() == 1 && reached[0].marker == 6
+                && reached[0].span == 111,
+                "an interior marker in the next span should fire at its "
+                "normalized trajectory progress");
+    }
+
     void testMockBackendFeedHoldBrakesAlongActiveTrajectory() {
         ngc::TrajectoryLimits limits;
         limits.pathAcceleration = 4.0;
@@ -2046,10 +2123,11 @@ final_move_together = true
         require(chunk.normalMotion.push(linearSpan(201, 0.0, 10.0, 10.0)),
                 "feed-hold test normal span should fit");
         auto stop = linearSpan(202, 10.0, 10.0, 1e-6);
-        stop.end.position.x = 10.0;
         require(chunk.stopTail.push(stop), "feed-hold test stop tail should fit");
-        chunk.branchState = chunk.normalMotion[0].end;
+        chunk.branchState = ngc::executionSpanEnd(chunk.normalMotion[0]);
         chunk.stopState.position.x = 10.0;
+        require(chunk.markers.push({7, 0, 0.2}),
+                "feed-hold execution marker should fit");
 
         require(backend.tryPublish(chunk) == ngc::PublishResult::Published,
                 "feed-hold test chunk should publish");
@@ -2092,22 +2170,32 @@ final_move_together = true
 
         bool sawFeedHeld = false;
         bool selectedStopTail = false;
+        bool markerReachedBeforeResume = false;
         ngc::ExecutionEvent event;
         while(backend.tryTakeEvent(event)) {
             if(const auto *held = std::get_if<ngc::BackendHeld>(&event))
                 sawFeedHeld = held->reason == ngc::BackendHoldReason::FeedHold;
             if(const auto *branch = std::get_if<ngc::BranchSelected>(&event))
                 selectedStopTail = branch->choice == ngc::BranchChoice::Stop;
+            if (const auto *marker =
+                    std::get_if<ngc::ExecutionMarkerReached>(&event)) {
+                markerReachedBeforeResume =
+                    markerReachedBeforeResume || marker->marker == 7;
+            }
         }
         require(sawFeedHeld, "feed hold should identify its held-state reason");
         require(!selectedStopTail,
                 "a feed hold completed inside normal motion should not select the stop tail");
+        require(!markerReachedBeforeResume,
+                "feed hold should not emit a marker beyond its held "
+                "trajectory cursor");
 
         const auto heldPosition = snapshot.commanded.position.x;
         require(backend.trySubmit(ngc::ResumeRequest { 3, 17 }) == ngc::SubmitResult::Submitted,
                 "held normal motion should accept a resume request");
         bool sawResumeAcceleration = false;
         bool resumeAccepted = false;
+        auto markerReachCount = 0U;
         for(int tick = 0; tick < 5000
             && !(snapshot.state == ngc::BackendState::Running
                  && snapshot.executionRate >= 1.0 - 1e-10); ++tick) {
@@ -2125,6 +2213,12 @@ final_move_together = true
             while(backend.tryTakeEvent(event)) {
                 if(const auto *completed = std::get_if<ngc::RequestCompleted>(&event))
                     if(completed->request == 3) resumeAccepted = completed->succeeded;
+                if (const auto *marker =
+                        std::get_if<ngc::ExecutionMarkerReached>(&event)) {
+                    if (marker->marker == 7) {
+                        ++markerReachCount;
+                    }
+                }
             }
         }
         require(resumeAccepted, "backend should acknowledge feed resume");
@@ -2135,6 +2229,20 @@ final_move_together = true
                 "feed resume should restore the normal execution rate");
         require(snapshot.commanded.position.x > heldPosition,
                 "feed resume should advance along the retained normal branch");
+        for (auto tick = 0; tick < 5000 && markerReachCount == 0; ++tick) {
+            backend.advanceTick(0.001, true);
+            while (backend.tryTakeEvent(event)) {
+                if (const auto *marker =
+                        std::get_if<ngc::ExecutionMarkerReached>(&event)) {
+                    if (marker->marker == 7) {
+                        ++markerReachCount;
+                    }
+                }
+            }
+        }
+        require(markerReachCount == 1,
+                "feed resume should emit a retained in-span marker exactly "
+                "once when the trajectory cursor reaches it");
 
         const auto samples = backend.takeExecutedJerkSamples();
         require(std::ranges::any_of(samples, [](const auto &sample) {
@@ -2164,7 +2272,7 @@ final_move_together = true
                 "feed-hold branch-fault normal span should fit");
         require(chunk.stopTail.push(linearSpan(204, 0.1, 0.1, 1e-6)),
                 "feed-hold branch-fault stop tail should fit");
-        chunk.branchState = chunk.normalMotion[0].end;
+        chunk.branchState = ngc::executionSpanEnd(chunk.normalMotion[0]);
         chunk.stopState = chunk.branchState;
 
         require(backend.tryPublish(chunk) == ngc::PublishResult::Published,
@@ -2622,65 +2730,32 @@ final_move_together = true
     }
 
     ngc::position_t evaluateSpan(const ngc::AxisPolynomialSpan &span, const double u) {
-        const auto evaluate = [&](const double ngc::position_t::*member) {
-            return ((span.a.*member*u + span.b.*member)*u + span.c.*member)*u + span.d.*member;
-        };
-        return { evaluate(&ngc::position_t::x), evaluate(&ngc::position_t::y), evaluate(&ngc::position_t::z),
-                 evaluate(&ngc::position_t::a), evaluate(&ngc::position_t::b), evaluate(&ngc::position_t::c) };
+        return ngc::evaluateExecutionPolynomial(span, u).state.position;
     }
 
     double spanAcceleration(const ngc::AxisPolynomialSpan &span, const double u) {
-        const auto component = [&](const double ngc::position_t::*member) {
-            return (6.0*span.a.*member*u + 2.0*span.b.*member) * span.inverseDurationSquared;
-        };
-        const auto x = component(&ngc::position_t::x);
-        const auto y = component(&ngc::position_t::y);
-        const auto z = component(&ngc::position_t::z);
-        const auto a = component(&ngc::position_t::a);
-        const auto b = component(&ngc::position_t::b);
-        const auto c = component(&ngc::position_t::c);
-        return std::sqrt(x*x + y*y + z*z + a*a + b*b + c*c);
+        return ngc::evaluateExecutionPolynomial(
+            span, u).state.acceleration.length();
     }
 
     double spanJerk(const ngc::AxisPolynomialSpan &span) {
-        const auto component = [&](const double ngc::position_t::*member) {
-            return 6.0*span.a.*member * span.inverseDurationCubed;
-        };
-        const auto x = component(&ngc::position_t::x);
-        const auto y = component(&ngc::position_t::y);
-        const auto z = component(&ngc::position_t::z);
-        const auto a = component(&ngc::position_t::a);
-        const auto b = component(&ngc::position_t::b);
-        const auto c = component(&ngc::position_t::c);
-        return std::sqrt(x*x + y*y + z*z + a*a + b*b + c*c);
+        return ngc::trajectory_detail::maximumPathJerk(span);
     }
 
     double spanAxisVelocity(const ngc::AxisPolynomialSpan &span,
                             const double ngc::position_t::*component) {
-        const auto at = [&](const double u) {
-            return std::abs((3.0*span.a.*component*u*u + 2.0*span.b.*component*u
-                + span.c.*component) * span.inverseDuration);
-        };
-        auto result = std::max(at(0.0), at(1.0));
-        if(std::abs(span.a.*component) > 1e-15) {
-            const auto stationary = -(span.b.*component) / (3.0*(span.a.*component));
-            if(stationary > 0.0 && stationary < 1.0) result = std::max(result, at(stationary));
-        }
-        return result;
+        return ngc::trajectory_detail::maximumAxisVelocity(span, component);
     }
 
     double spanAxisAcceleration(const ngc::AxisPolynomialSpan &span,
                                 const double ngc::position_t::*component) {
-        const auto at = [&](const double u) {
-            return std::abs((6.0*span.a.*component*u + 2.0*span.b.*component)
-                * span.inverseDurationSquared);
-        };
-        return std::max(at(0.0), at(1.0));
+        return ngc::trajectory_detail::maximumAxisAcceleration(
+            span, component);
     }
 
     double spanAxisJerk(const ngc::AxisPolynomialSpan &span,
                         const double ngc::position_t::*component) {
-        return std::abs(6.0*span.a.*component * span.inverseDurationCubed);
+        return ngc::trajectory_detail::maximumAxisJerk(span, component);
     }
 
     void requireAxisLimits(const ngc::PlanChunk &chunk, const double ngc::position_t::*component,
@@ -2719,8 +2794,12 @@ final_move_together = true
                     "compiled line should begin at the canonical start");
         requireNear(evaluateSpan(line->normalMotion[line->normalMotion.size-1], 1.0).x, 2.0,
                     "compiled line should end at the canonical endpoint");
-        requireNear(line->normalMotion[0].c.x, 0.0, "exact-stop line should start at zero velocity");
-        requireNear(line->normalMotion[line->normalMotion.size-1].end.velocity.x, 0.0,
+        requireNear(line->normalMotion[0].coefficients[0].x, 0.0,
+                    "exact-stop line should start at zero velocity");
+        requireNear(ngc::executionSpanEnd(
+                        line->normalMotion[line->normalMotion.size - 1])
+                        .velocity.x,
+                    0.0,
                     "exact-stop line should finish at zero velocity");
         for(const auto &span : line->normalMotion) {
             require(spanAcceleration(span, 0.0) <= ACCELERATION + 1e-8,
@@ -2734,9 +2813,9 @@ final_move_together = true
             const auto &previous = line->normalMotion[i-1];
             const auto &current = line->normalMotion[i];
             const auto previousEndAcceleration =
-                (6.0*previous.a.x + 2.0*previous.b.x) * previous.inverseDurationSquared;
+                ngc::executionSpanEnd(previous).acceleration.x;
             const auto currentStartAcceleration =
-                2.0*current.b.x * current.inverseDurationSquared;
+                ngc::executionSpanStart(current).acceleration.x;
             requireNear(previousEndAcceleration, currentStartAcceleration,
                         "Ruckig phases should have continuous acceleration");
         }
@@ -2751,10 +2830,13 @@ final_move_together = true
         requireNear(arcStart.y, 0.0, "compiled arc should preserve its start Y");
         requireNear(arcEnd.x, 1.0, "compiled arc should preserve its endpoint X");
         requireNear(arcEnd.y, 1.0, "compiled arc should preserve its endpoint Y");
-        requireNear(arc->normalMotion[0].c.x, 0.0, "exact-stop arc should begin at zero velocity");
-        requireNear(arc->normalMotion[arc->normalMotion.size-1].end.velocity.x, 0.0,
+        requireNear(arc->normalMotion[0].coefficients[0].x, 0.0,
+                    "exact-stop arc should begin at zero velocity");
+        const auto arcTerminal = ngc::executionSpanEnd(
+            arc->normalMotion[arc->normalMotion.size - 1]);
+        requireNear(arcTerminal.velocity.x, 0.0,
                     "exact-stop arc should end with zero X velocity");
-        requireNear(arc->normalMotion[arc->normalMotion.size-1].end.velocity.y, 0.0,
+        requireNear(arcTerminal.velocity.y, 0.0,
                     "exact-stop arc should end with zero Y velocity");
         for(const auto &span : arc->normalMotion) {
             require(spanAcceleration(span, 0.0) <= ACCELERATION + 1e-8,
@@ -2776,9 +2858,9 @@ final_move_together = true
         require(constantSpeed.has_value(), constantSpeed ? "" : constantSpeed.error());
         require(constantSpeed->normalMotion.size == 1,
                 "infinite acceleration should compile a line into one constant-speed span");
-        requireNear(constantSpeed->normalMotion[0].a.x, 0.0,
+        requireNear(constantSpeed->normalMotion[0].coefficients[2].x, 0.0,
                     "constant-speed line should have no cubic position term");
-        requireNear(constantSpeed->normalMotion[0].b.x, 0.0,
+        requireNear(constantSpeed->normalMotion[0].coefficients[1].x, 0.0,
                     "constant-speed line should have no quadratic position term");
         requireNear(constantSpeed->normalMotion[0].duration, 2.0,
                     "constant-speed line duration should be distance divided by feed");
@@ -2898,15 +2980,12 @@ final_move_together = true
         cubic.inverseDuration=1.0;
         cubic.inverseDurationSquared=1.0;
         cubic.inverseDurationCubed=1.0;
-        cubic.a.x=1.0;
-        cubic.end.position.x=1.0;
-        cubic.end.velocity.x=3.0;
-        cubic.end.acceleration.x=6.0;
+        cubic.coefficients[2].x = 1.0;
         require(jerkChunk.normalMotion.push(cubic),
                 "jerk telemetry cubic should fit in its chunk");
         require(jerkChunk.stopTail.push(linearSpan(4,1.0,1.0,1e-6)),
                 "jerk telemetry stop tail should fit in its chunk");
-        jerkChunk.branchState=cubic.end;
+        jerkChunk.branchState = ngc::executionSpanEnd(cubic);
         jerkChunk.stopState.position.x=1.0;
         require(jerkBackend.tryPublish(jerkChunk)==ngc::PublishResult::Published,
                 "jerk telemetry chunk should publish");
@@ -3290,18 +3369,64 @@ final_move_together = true
             .axisAcceleration={20,20,20,20,20,20},
             .axisJerk={501,501,501,501,501,501},
         };
+        const std::array accelerationControls{
+            ngc::position_t{},
+            ngc::position_t{0.04,0,0,0,0,0},
+            ngc::position_t{0.02,0,0,0,0,0},
+            ngc::position_t{},
+        };
+        requireNear(
+            ngc::trajectory_detail::accelerationControlHullExcursionRatio(
+                accelerationControls, 0.001, 100.0,
+                ngc::position_t{50,50,50,50,50,50}),
+            0.8,
+            "the isolated quintic acceleration-control hull should use the "
+            "strictest path or axis servo-period jerk budget");
+        require(ngc::trajectory_detail::servoAwareJerkAccepted(
+                    0.0005, 1.5, 0.8, 0.001),
+                "a sub-servo jerk peak with a bounded acceleration excursion "
+                "should pass the production policy");
+        require(!ngc::trajectory_detail::servoAwareJerkAccepted(
+                    0.001, 1.5, 0.8, 0.001),
+                "a full-servo jerk violation should remain a strict failure");
+        require(!ngc::trajectory_detail::servoAwareJerkAccepted(
+                    0.0005, 1.5, 1.1, 0.001),
+                "a sub-servo jerk peak with excessive acceleration excursion "
+                "should fail the production policy");
+        require(ngc::trajectory_detail::servoAwareJerkAccepted(
+                    0.001, 1.01, 2.0, 0.001)
+                    && !ngc::trajectory_detail::servoAwareJerkAccepted(
+                        0.001, 1.0101, 0.0, 0.001),
+                "the production jerk policy should allow one percent but no more");
+        require(ngc::trajectory_detail::dynamicLimitRatioAccepted(1.01)
+                    && !ngc::trajectory_detail::dynamicLimitRatioAccepted(1.0101),
+                "the production acceleration policy should allow one percent "
+                "but no more");
         ngc::TrajectoryCompiler compiler(trajectoryLimits);
         auto planningEffort = compiler.continuousPlanningEffort();
         require(planningEffort.boundaryAccelerationMode
                     == ngc::ContinuousBoundaryAccelerationMode::Optimized
                     && name(planningEffort.boundaryAccelerationMode) == "optimized"
-                    && name(ngc::ContinuousBoundaryAccelerationMode::Zero) == "zero"
-                    &&!ngc::usesPathTempoSampledCorrections(planningEffort),
+                    && name(ngc::ContinuousBoundaryAccelerationMode::Zero) == "zero",
                 "continuous planning should default to PathTempo's optimized boundary mode");
         compiler.setContinuousPlanningEffort(planningEffort);
         compiler.reset(94,points.front());
         const auto planned=compiler.compileContinuous(*prepared,0.05);
         require(planned&&*planned,planned?"":planned.error());
+        require(std::ranges::all_of((*planned)->chunks, [](const auto &chunk) {
+                    return std::ranges::all_of(
+                               chunk.normalMotion, [](const auto &span) {
+                                   return span.degree
+                                       == ngc::ExecutionPolynomialDegree::Quintic;
+                               })
+                        && std::ranges::all_of(
+                               chunk.stopTail, [](const auto &span) {
+                                   return span.degree
+                                       == ngc::ExecutionPolynomialDegree::Cubic;
+                               });
+                }),
+                "materialized continuous planning should emit proved quintic "
+                "normal motion with cubic stop tails");
 
         ngc::TrajectoryCompiler zeroBoundaryCompiler(trajectoryLimits);
         auto zeroBoundaryEffort = planningEffort;
@@ -3341,13 +3466,46 @@ final_move_together = true
         require((*planned)->activations.size()==records.size(),
                 "continuous timing should resolve every prepared command activation");
         std::vector<ngc::SpanId> commandActivationSpans(records.size());
-        for(const auto &activation:(*planned)->activations)
+        auto interiorExecutionMarkers = 0U;
+        for (const auto &activation : (*planned)->activations) {
             commandActivationSpans[activation.input]=activation.span;
+            require(activation.marker != 0
+                        && activation.chunk < (*planned)->chunks.size()
+                        && activation.parameter >= 0.0
+                        && activation.parameter <= 1.0,
+                    "continuous command activation should retain a bounded "
+                    "backend execution marker");
+            const auto &markers =
+                (*planned)->chunks[activation.chunk].markers;
+            const auto marker = std::ranges::find(
+                markers, activation.marker, &ngc::ExecutionMarker::id);
+            require(marker != markers.end()
+                        && (*planned)->chunks[activation.chunk]
+                                .normalMotion[marker->span].id
+                            == activation.span
+                        && marker->parameter == activation.parameter,
+                    "continuous activation metadata should match its packet marker");
+            if (activation.parameter > 0.0
+               && activation.parameter < 1.0) {
+                ++interiorExecutionMarkers;
+            }
+        }
         require(std::ranges::all_of(commandActivationSpans,[](const auto span) {
                     return span!=0;
                 })&&std::ranges::is_sorted(commandActivationSpans)
                 &&commandActivationSpans[1]!=commandActivationSpans.back(),
                 "cluster source commands should activate progressively through emitted spans");
+        require(interiorExecutionMarkers > 0,
+                "cluster source commands should use exact in-span backend "
+                "markers instead of early span-start activation");
+        require((*planned)->executionMarkers == (*planned)->activations.size()
+                    && (*planned)->interiorExecutionMarkers
+                        == interiorExecutionMarkers
+                    && (*planned)->maximumExecutionMarkersPerChunk > 0
+                    && (*planned)->maximumExecutionMarkersPerChunk
+                        <= ngc::MAX_EXECUTION_MARKERS_PER_CHUNK,
+                "continuous marker diagnostics should account for the "
+                "bounded production packet representation");
         require(std::ranges::any_of((*planned)->pieceTiming,[](const auto &piece) {
                     return std::isfinite(piece.staticVelocityLimit);
                 })
@@ -3358,117 +3516,15 @@ final_move_together = true
                     }),
                 "PathTempo should retain prepared static velocity caps without caller-side "
                 "acceleration or jerk reduction");
-        require((*planned)->correctionPasses > 1
-                    && (*planned)->correctionHistory.contains("pass 1:"),
-                "the focused continuous-path fixture should re-solve through PathTempo's materialization callback");
-        require((*planned)->materialization.callbackPasses==(*planned)->correctionPasses
-                    &&(*planned)->materialization.reusedPieces>0
-                    &&(*planned)->materialization.materializedPieces
-                        <(*planned)->materialization.candidatePieces,
-                "materialized correction should reuse bit-exact timing pieces across callbacks");
-
-        ngc::TrajectoryCompiler sampledCompiler(trajectoryLimits);
-        auto sampledEffort = planningEffort;
-        sampledEffort.constraintCheckMode = ngc::ContinuousConstraintCheckMode::Sampled;
-        require(ngc::usesPathTempoSampledCorrections(sampledEffort),
-                "sampled checking should enable PathTempo sampled corrections by default");
-        sampledCompiler.setContinuousPlanningEffort(sampledEffort);
-        sampledCompiler.reset(94, points.front());
-        const auto sampledPlan = sampledCompiler.compileContinuous(*prepared, 0.05);
-        require(sampledPlan && *sampledPlan, sampledPlan ? "" : sampledPlan.error());
-        require((*sampledPlan)->correctionHistory.empty()
-                    && !(*sampledPlan)->chunks.empty()
-                    && std::ranges::all_of((*sampledPlan)->chunks, [](const auto &chunk) {
-                        return chunk.normalMotion.size > 0 && chunk.stopTail.size > 0;
-                    }),
-                "sampled checking should retain materialization, geometry proof, and stop tails "
-                "without running exact execution-span constraint correction");
-
-        ngc::TrajectoryCompiler preconditionedCompiler(trajectoryLimits);
-        auto preconditionedEffort=planningEffort;
-        preconditionedEffort.pathTempoSampledCorrections=true;
-        require(ngc::usesPathTempoSampledCorrections(preconditionedEffort),
-                "materialized checking should accept explicit sampled preconditioning");
-        preconditionedCompiler.setContinuousPlanningEffort(preconditionedEffort);
-        preconditionedCompiler.reset(94,points.front());
-        const auto preconditionedPlan=
-            preconditionedCompiler.compileContinuous(*prepared,0.05);
-        require(preconditionedPlan&&*preconditionedPlan,
-            preconditionedPlan?"":preconditionedPlan.error());
-        require((*preconditionedPlan)->materialization.callbackPasses>0
-                    &&(*preconditionedPlan)->materialization.callbackPasses
-                        <=(*preconditionedPlan)->correctionPasses
-                    &&(*preconditionedPlan)->materialization.exactConstraintSpanChecks>0,
-                "sampled preconditioning must retain the materialized exact-cubic gate");
-
-        ngc::TrajectoryCompiler geometryDiagnosticCompiler(trajectoryLimits);
-        auto geometryDiagnosticEffort=planningEffort;
-        geometryDiagnosticEffort.constraintCheckMode=
-            ngc::ContinuousConstraintCheckMode::GeometryDiagnostic;
-        geometryDiagnosticEffort.pathTempoSampledCorrections=false;
-        geometryDiagnosticCompiler.setContinuousPlanningEffort(geometryDiagnosticEffort);
-        geometryDiagnosticCompiler.reset(94,points.front());
-        const auto geometryDiagnosticPlan=
-            geometryDiagnosticCompiler.compileContinuous(*prepared,0.05);
-        require(geometryDiagnosticPlan&&*geometryDiagnosticPlan,
-            geometryDiagnosticPlan?"":geometryDiagnosticPlan.error());
-        require(name(geometryDiagnosticEffort.constraintCheckMode)=="geometry"
-                    &&(*geometryDiagnosticPlan)->correctionHistory.contains(
-                        "check=actual_geometry")
-                    &&(*geometryDiagnosticPlan)->materialization.geometryDifferentialChecks>0
-                    &&(*geometryDiagnosticPlan)->materialization.exactConstraintSpanChecks>0
-                    &&std::ranges::all_of((*geometryDiagnosticPlan)->pieceTiming,
-                        [&](const auto &piece) {
-                            return piece.accelerationLimit
-                                    <=trajectoryLimits.pathAcceleration*0.99+1e-12
-                                &&piece.jerkLimit
-                                    <=trajectoryLimits.pathJerk*0.99+1e-12;
-                        }),
-                "geometry diagnostic checking should apply 99 percent planning limits, "
-                "correct actual geometry, and retain axis-cubic detection");
-        const auto &cubicDiagnostics =
-            (*geometryDiagnosticPlan)->materialization.cubicViolations;
-        const auto histogramSpans = std::accumulate(
-            cubicDiagnostics.worstRatioHistogram.begin(),
-            cubicDiagnostics.worstRatioHistogram.end(),std::size_t{0});
-        const auto materiallyViolatingHistogramSpans = std::accumulate(
-            cubicDiagnostics.worstRatioHistogram.begin()+2,
-            cubicDiagnostics.worstRatioHistogram.end(),std::size_t{0});
-        require(cubicDiagnostics.spans>0
-                    &&histogramSpans==cubicDiagnostics.spans
-                    &&materiallyViolatingHistogramSpans
-                        ==cubicDiagnostics.violatingSpans
-                    &&cubicDiagnostics.violatingSpans>0
-                    &&cubicDiagnostics.violatingPieces
-                        ==(*geometryDiagnosticPlan)->materialization
-                            .axisCubicViolationPieces
-                    &&cubicDiagnostics.maximumRatio>1.0
-                    &&cubicDiagnostics.worstSpanDuration>0.0
-                    &&cubicDiagnostics.worstPreparedPiece!=0,
-                "geometry diagnostics should classify every final emitted cubic and retain "
-                "the worst material violation provenance");
-        const auto &quinticPrototype =
-            (*geometryDiagnosticPlan)->materialization.quinticPrototype;
-        const auto quinticInitialHistogramSpans = std::accumulate(
-            quinticPrototype.initialWorstRatioHistogram.begin(),
-            quinticPrototype.initialWorstRatioHistogram.end(), std::size_t{0});
-        require(quinticPrototype.ran && quinticPrototype.initialCurvedSpans > 0,
-                "the NRT quintic grouping prototype should run on curved timing pieces");
-        require(quinticInitialHistogramSpans == quinticPrototype.initialCurvedSpans,
-                "the NRT quintic grouping prototype should classify every initial candidate");
-        require(quinticPrototype.finalQuinticSpans > 0
-                    || (quinticPrototype.resourceExhausted
-                        && quinticPrototype.failedIntervals > 0),
-                "the bounded NRT quintic grouping prototype should either accept proved "
-                "candidates or explicitly report resource exhaustion");
-        require(quinticPrototype.geometryProofs
-                    >= quinticPrototype.finalQuinticSpans,
-                "the NRT quintic grouping prototype should geometry-prove accepted candidates");
-        require(quinticPrototype.constraintBoundNodes
-                    >= quinticPrototype.geometryProofs,
-                "the NRT quintic grouping prototype should certify derivative bounds");
-        require(quinticPrototype.maximumAcceptedRatio <= 1.0 + 1e-9,
-                "the NRT quintic grouping prototype must not accept a constraint violation");
+        require((*planned)->correctionPasses >= 1
+                    && (*planned)->correctionHistory.contains("pass 0:")
+                    && (*planned)->materialization.callbackPasses >= 1
+                    && (*planned)->correctionPasses
+                        >= (*planned)->materialization.callbackPasses
+                    && (*planned)->materialization.quintic
+                            .constraintBoundNodes > 0,
+                "PathTempo should run its sampled passes before production "
+                "materialization proves a candidate's quintics");
 
         const auto planFingerprint=[](const ngc::ContinuousTrajectoryPlan &plan) {
             std::vector<std::uint64_t> result;
@@ -3497,11 +3553,11 @@ final_move_together = true
                 appendDouble(span.inverseDuration);
                 appendDouble(span.inverseDurationSquared);
                 appendDouble(span.inverseDurationCubed);
-                appendPosition(span.a);
-                appendPosition(span.b);
-                appendPosition(span.c);
-                appendPosition(span.d);
-                appendState(span.end);
+                appendInteger(std::to_underlying(span.degree));
+                appendPosition(span.origin);
+                for (const auto &coefficient : span.coefficients) {
+                    appendPosition(coefficient);
+                }
             };
 
             appendInteger(plan.pieceTiming.size());
@@ -3527,6 +3583,8 @@ final_move_together = true
                 appendInteger(activation.input);
                 appendInteger(activation.span);
                 appendInteger(activation.chunk);
+                appendInteger(activation.marker);
+                appendDouble(activation.parameter);
             }
             appendInteger(plan.chunks.size());
             for(const auto &chunk:plan.chunks) {
@@ -3539,6 +3597,12 @@ final_move_together = true
                 appendInteger(chunk.stopTail.size);
                 for(const auto &span:chunk.stopTail) appendSpan(span);
                 appendInteger(chunk.events.size);
+                appendInteger(chunk.markers.size);
+                for (const auto &marker : chunk.markers) {
+                    appendInteger(marker.id);
+                    appendInteger(marker.span);
+                    appendDouble(marker.parameter);
+                }
                 require(chunk.events.size==0,
                     "focused continuous-path plan should not contain scheduled events");
                 appendState(chunk.branchState);
@@ -3546,24 +3610,6 @@ final_move_together = true
             }
             return result;
         };
-        ngc::TrajectoryCompiler uncachedCompiler(trajectoryLimits);
-        auto uncachedEffort=planningEffort;
-        uncachedEffort.reuseMaterializedPieces=false;
-        uncachedCompiler.setContinuousPlanningEffort(uncachedEffort);
-        uncachedCompiler.reset(94,points.front());
-        const auto uncachedPlan=uncachedCompiler.compileContinuous(*prepared,0.05);
-        require(uncachedPlan&&*uncachedPlan,uncachedPlan?"":uncachedPlan.error());
-        require(planFingerprint(**uncachedPlan)==planFingerprint(**planned)
-                    &&(*uncachedPlan)->correctionHistory==(*planned)->correctionHistory,
-                "cached materialization must emit the bit-exact uncached plan and corrections");
-        require((*uncachedPlan)->materialization.reusedPieces==0
-                    &&(*uncachedPlan)->materialization.materializedPieces
-                        ==(*uncachedPlan)->materialization.candidatePieces
-                    &&(*planned)->geometryVerificationAttempts
-                        <(*uncachedPlan)->geometryVerificationAttempts
-                    &&(*planned)->materialization.exactConstraintSpanChecks
-                        <(*uncachedPlan)->materialization.exactConstraintSpanChecks,
-                "cached materialization should skip unchanged geometry proofs and exact span checks");
         ngc::TrajectoryCompiler repeatedCompiler(trajectoryLimits);
         repeatedCompiler.setContinuousPlanningEffort(planningEffort);
         repeatedCompiler.reset(94,points.front());
@@ -3677,6 +3723,27 @@ final_move_together = true
         require(blend!=prepared->pieces.end()&&blend->curve->geometricallyLinear,
                 "a monotone collinear junction blend must retain its spline identity but use "
                 "the exact linear timing emitter");
+        ngc::CurveEvaluationWorkspace workspace;
+        const auto blendStart = ngc::positionAtDistance(
+            *blend->curve,blend->curveFrom,workspace);
+        const auto blendEnd = ngc::positionAtDistance(
+            *blend->curve,blend->curveTo,workspace);
+        for (const auto fraction : {0.1,0.25,0.5,0.75,0.9}) {
+            const auto actual = ngc::positionAtDistance(
+                *blend->curve,
+                std::lerp(blend->curveFrom,blend->curveTo,fraction),workspace);
+            const ngc::position_t expected{
+                std::lerp(blendStart.x,blendEnd.x,fraction),
+                std::lerp(blendStart.y,blendEnd.y,fraction),
+                std::lerp(blendStart.z,blendEnd.z,fraction),
+                std::lerp(blendStart.a,blendEnd.a,fraction),
+                std::lerp(blendStart.b,blendEnd.b,fraction),
+                std::lerp(blendStart.c,blendEnd.c,fraction),
+            };
+            require((actual-expected).length() < 1e-11,
+                    "a collinear multi-knot spline must invert chord distance "
+                    "within its owning knot interval");
+        }
 
         ngc::TrajectoryCompiler compiler({
             .pathAcceleration=20.0,.rapidSpeed=199.8,.arcChordTolerance=0.0001,
@@ -3703,6 +3770,55 @@ final_move_together = true
             });
         require(duration<5.0,std::format(
             "collinear feed-transition timing must remain bounded, got {:.6f} seconds",duration));
+
+    }
+
+    void testExecutionPolynomialEvaluation() {
+        ngc::AxisPolynomialSpan span;
+        span.degree = ngc::ExecutionPolynomialDegree::Quintic;
+        span.duration = 2.0;
+        span.inverseDuration = 0.5;
+        span.inverseDurationSquared = 0.25;
+        span.inverseDurationCubed = 0.125;
+        span.origin = {10.0, -4.0, 3.0, 0.0, 0.0, 0.0};
+        span.coefficients = {
+            ngc::position_t{1.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+            ngc::position_t{2.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+            ngc::position_t{3.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+            ngc::position_t{4.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+            ngc::position_t{5.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+        };
+        constexpr auto parameter = 0.4;
+        const auto evaluated =
+            ngc::evaluateExecutionPolynomial(span, parameter);
+        const auto position = 10.0 + parameter * (1.0 + parameter
+            * (2.0 + parameter * (3.0 + parameter * (4.0 + parameter * 5.0))));
+        const auto velocity = (1.0 + parameter * (4.0 + parameter
+            * (9.0 + parameter * (16.0 + parameter * 25.0)))) * 0.5;
+        const auto acceleration = (4.0 + parameter
+            * (18.0 + parameter * (48.0 + parameter * 100.0))) * 0.25;
+        const auto jerk =
+            (18.0 + parameter * (96.0 + parameter * 300.0)) * 0.125;
+        require(std::abs(evaluated.state.position.x - position) < 1e-12
+                    && std::abs(evaluated.state.velocity.x - velocity) < 1e-12
+                    && std::abs(evaluated.state.acceleration.x
+                        - acceleration) < 1e-12
+                    && std::abs(evaluated.jerk.x - jerk) < 1e-12
+                    && evaluated.state.position.y == -4.0
+                    && evaluated.state.position.z == 3.0,
+                "the production quintic span must evaluate PVA and jerk "
+                "from normalized local coefficients");
+        auto cubic = span;
+        cubic.degree = ngc::ExecutionPolynomialDegree::Cubic;
+        cubic.coefficients[3] = {};
+        cubic.coefficients[4] = {};
+        const auto cubicEvaluation =
+            ngc::evaluateExecutionPolynomial(cubic, parameter);
+        const auto cubicPosition = 10.0 + parameter
+            * (1.0 + parameter * (2.0 + parameter * 3.0));
+        require(std::abs(cubicEvaluation.state.position.x
+                        - cubicPosition) < 1e-12,
+                "the degree-aware evaluator should accept padded cubic spans");
     }
 
     void testShortLineMidpointCurvatureInference() {
@@ -3860,7 +3976,10 @@ final_move_together = true
         requireNear(firstEnd.y, junction.y, "rounded arc polynomial should end at canonical Y");
         requireNear(firstEnd.x, secondStart.x, "consecutive arcs should have continuous X");
         requireNear(firstEnd.y, secondStart.y, "consecutive arcs should have continuous Y");
-        requireNear(first->normalMotion[first->normalMotion.size-1].end.position.y, junction.y,
+        requireNear(ngc::executionSpanEnd(
+                        first->normalMotion[first->normalMotion.size - 1])
+                        .position.y,
+                    junction.y,
                     "cached arc terminal state should preserve the canonical endpoint");
 
         const ngc::position_t lineEnd { -2, 0, 0, 0, 0, 0 };
@@ -4486,6 +4605,7 @@ int main() {
         testSpscChannelIsBoundedAndOrdered();
         testOwningSpscChannelTransfersMoveOnlyValues();
         testMockMotionBackendUsesProductionTransportContract();
+        testMockBackendEmitsOrderedInSpanExecutionMarkers();
         testJogControlUsesBoundedBackendTransport();
         testMockBackendAdvancesOneFixedServoTick();
         testExactStopPlannerCompilesLinesAndArcs();
@@ -4494,6 +4614,7 @@ int main() {
         testPreparedArcJunctionMatchesSourceCurvature();
         testNoneSplineSmoothingPreservesCubicControls();
         testClusterSplinePreparesKnotIntervalSamplesAndFeeds();
+        testExecutionPolynomialEvaluation();
         testCollinearJunctionBlendUsesLinearTiming();
         testShortLineMidpointCurvatureInference();
         testVerifiedCubicArcSpanCounts();

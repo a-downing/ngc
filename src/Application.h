@@ -1,7 +1,6 @@
 #pragma once
 
 #include <memory>
-#include <optional>
 
 #include "machine/MachineConfiguration.h"
 #include "machine/SplineReconstruction.h"
@@ -18,9 +17,7 @@ public:
     Application() = delete;
     Application(GLFWwindow *window, const ngc::MachineConfiguration &configuration,
                 ngc::spline_detail::SplineFitSolver splineFitSolver,
-                ngc::ContinuousBoundaryAccelerationMode boundaryAccelerationMode,
-                ngc::ContinuousConstraintCheckMode continuousCheckMode,
-                std::optional<bool> pathTempoSampledCorrections);
+                ngc::ContinuousBoundaryAccelerationMode boundaryAccelerationMode);
     ~Application();
 
     Application(const Application &) = delete;

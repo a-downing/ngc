@@ -287,13 +287,21 @@ namespace ngc {
                 }
                 previousFraction = fraction;
             }
-            if(collinear) {
+            if (collinear) {
                 // Collinear junctions are geometrically exact lines. Retain
                 // the spline controls/knots for presentation identity, but
-                // use an exact chord-length bracket and avoid rebuilding a
-                // costly numerical table for every straight G64 junction.
-                spline.parameters = { 0.0, static_cast<double>(spans) };
-                spline.distances = { 0.0, displacement.length() };
+                // use exact chord-distance brackets at every knot. The inverse
+                // solver evaluates one spline span per bracket, so a single
+                // bracket across multiple knot intervals would select the
+                // wrong basis span for all but the middle interval.
+                spline.parameters.reserve(spans + 1);
+                spline.distances.reserve(spans + 1);
+                for (std::size_t span = 0; span <= spans; ++span) {
+                    const auto parameter = static_cast<double>(span);
+                    spline.parameters.push_back(parameter);
+                    spline.distances.push_back(
+                        (splineAt(spline, parameter) - spline.controls.front()).length());
+                }
                 return std::make_shared<const PreparedCurve>(PreparedCurve{
                     std::move(spline), displacement.length(), true});
             }

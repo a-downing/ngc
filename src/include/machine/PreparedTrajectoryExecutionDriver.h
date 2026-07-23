@@ -61,8 +61,10 @@ namespace ngc {
                 const auto &item = planned.items[itemIndex];
                 if constexpr(std::invocable<Observe, const MachineCommand &, const ExecutionItem &,
                                              const TrajectoryPlanningMetadata &,
-                                             const TrajectoryCommandPresentation &, SpanId>)
-                    observe(input.command,item,input.metadata,input.presentation,activation->span);
+                                             const TrajectoryCommandPresentation &,
+                                             ExecutionMarkerId>)
+                    observe(input.command, item, input.metadata,
+                        input.presentation, activation->marker);
                 else if constexpr(std::invocable<Observe, const MachineCommand &, const ExecutionItem &,
                                                   const TrajectoryPlanningMetadata &>)
                     observe(input.command, item, input.metadata);
@@ -228,6 +230,11 @@ namespace ngc {
         void setLimits(const TrajectoryLimits &limits) { m_planner.setLimits(limits); }
         void setContinuousPlanningEffort(const ContinuousPlanningEffort &effort) {
             m_planner.setContinuousPlanningEffort(effort);
+        }
+        void setContinuousDiagnosticCallback(std::function<void(
+                const ContinuousTrajectoryPlan &,
+                std::span<const TrajectoryPlannerInput>)> callback) {
+            m_planner.setContinuousDiagnosticCallback(std::move(callback));
         }
         void setPlanningProgressCallback(std::function<void()> callback) {
             m_planner.setProgressCallback(std::move(callback));

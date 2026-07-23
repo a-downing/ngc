@@ -69,6 +69,7 @@ class SimulationWorker {
     ngc::SimulationSnapshot m_snapshot;
     using ChunkKey = std::pair<ngc::EpochId, ngc::ChunkId>;
     using SpanKey = std::pair<ngc::EpochId, ngc::SpanId>;
+    using MarkerKey = std::pair<ngc::EpochId, ngc::ExecutionMarkerId>;
     struct ExecutionSpanDiagnostic {
         ngc::ChunkId chunk = 0;
         std::uint32_t ordinal = 0;
@@ -81,9 +82,9 @@ class SimulationWorker {
         double endAcceleration = 0.0;
     };
     std::map<ChunkKey, ChunkPresentation> m_chunks;
-    std::map<SpanKey, ChunkPresentation> m_spanPresentations;
+    std::map<MarkerKey, ChunkPresentation> m_markerPresentations;
     std::map<SpanKey, ExecutionSpanDiagnostic> m_executionSpans;
-    std::map<ChunkKey, ngc::SpanId> m_chunkFirstSpan;
+    std::set<ChunkKey> m_chunksWithMarkers;
     std::map<std::uint64_t, ChunkKey> m_blockChunks;
     std::map<std::uint64_t, ngc::BlockExecution> m_deferredCompletedBlocks;
     std::set<ChunkKey> m_retiredChunks;
@@ -367,7 +368,17 @@ public:
     bool setContinuousPlanningEffort(const ngc::ContinuousPlanningEffort &effort) {
         std::scoped_lock lock(m_mutex);
         if(m_running || m_start || m_home || m_activeJog) return false;
-        m_driver.setContinuousPlanningEffort(effort);
+        auto configuredEffort = effort;
+        configuredEffort.quinticServoPeriod = m_servoPeriod;
+        m_driver.setContinuousPlanningEffort(configuredEffort);
+        return true;
+    }
+    bool setContinuousDiagnosticCallback(std::function<void(
+            const ngc::ContinuousTrajectoryPlan &,
+            std::span<const ngc::TrajectoryPlannerInput>)> callback) {
+        std::scoped_lock lock(m_mutex);
+        if(m_running || m_start || m_home || m_activeJog) return false;
+        m_driver.setContinuousDiagnosticCallback(std::move(callback));
         return true;
     }
     void setRapidSpeed(const double speed) {
@@ -381,15 +392,8 @@ public:
         std::scoped_lock lock(m_mutex);
         for(auto &sample:samples) {
             const ChunkPresentation *presentation=nullptr;
-            auto span=m_spanPresentations.upper_bound({sample.epoch,sample.span});
-            if(span!=m_spanPresentations.begin()) {
-                --span;
-                if(span->first.first==sample.epoch) presentation=&span->second;
-            }
-            if(!presentation) {
-                const auto chunk=m_chunks.find({sample.epoch,sample.chunk});
-                if(chunk!=m_chunks.end()) presentation=&chunk->second;
-            }
+            const auto chunk=m_chunks.find({sample.epoch,sample.chunk});
+            if(chunk!=m_chunks.end()) presentation=&chunk->second;
             if(presentation) sample.position=sample.position-presentation->tool.offset;
         }
         return samples;
@@ -403,9 +407,9 @@ public:
 private:
     void clearPresentation() {
         m_chunks.clear();
-        m_spanPresentations.clear();
+        m_markerPresentations.clear();
         m_executionSpans.clear();
-        m_chunkFirstSpan.clear();
+        m_chunksWithMarkers.clear();
         m_blockChunks.clear();
         m_deferredCompletedBlocks.clear();
         m_retiredChunks.clear();
@@ -435,7 +439,7 @@ private:
 
     void observeCommand(const ngc::MachineCommand &command, const ngc::ExecutionItem &item,
                         const ngc::TrajectoryCommandPresentation &captured,
-                        const ngc::SpanId activationSpan) {
+                        const ngc::ExecutionMarkerId activationMarker) {
         ChunkPresentation presentation;
         presentation.tool = captured.tool;
         presentation.activeToolOffset = captured.activeToolOffset;
@@ -453,23 +457,17 @@ private:
            chunk&&!m_chunks.contains(key)) {
             const auto retainSpan=[&](const ngc::AxisPolynomialSpan &span,
                                       const std::uint32_t ordinal,const bool stopTail) {
-                const auto scaled=[](const ngc::position_t &value,const double factor) {
-                    return ngc::position_t{value.x*factor,value.y*factor,value.z*factor,
-                        value.a*factor,value.b*factor,value.c*factor};
-                };
-                const ngc::MotionState start{
-                    span.d,scaled(span.c,span.inverseDuration),
-                    scaled(span.b,2.0*span.inverseDurationSquared),
-                };
+                const auto start = ngc::executionSpanStart(span);
+                const auto end = ngc::executionSpanEnd(span);
                 m_executionSpans.try_emplace(SpanKey{chunk->epoch,span.id},
                     ExecutionSpanDiagnostic{
                         .chunk=chunk->id,.ordinal=ordinal,.stopTail=stopTail,
                         .duration=span.duration,
-                        .distance=(span.end.position-start.position).length(),
+                        .distance=(end.position-start.position).length(),
                         .startVelocity=start.velocity.length(),
-                        .endVelocity=span.end.velocity.length(),
+                        .endVelocity=end.velocity.length(),
                         .startAcceleration=start.acceleration.length(),
-                        .endAcceleration=span.end.acceleration.length(),
+                        .endAcceleration=end.acceleration.length(),
                     });
             };
             for(std::uint32_t index=0;index<chunk->normalMotion.size;++index)
@@ -490,9 +488,10 @@ private:
             const auto contact = move.target + presentation.tool.offset - presentation.activeToolOffset;
             (void)m_backend.configureSyntheticInput(move.moveId, contact);
         }
-        if(activationSpan!=0) {
-            m_spanPresentations.insert_or_assign({key.first,activationSpan},presentation);
-            m_chunkFirstSpan.try_emplace(key,activationSpan);
+        if (activationMarker != 0) {
+            m_markerPresentations.insert_or_assign(
+                {key.first, activationMarker}, presentation);
+            m_chunksWithMarkers.insert(key);
         }
         if(const auto existing=m_chunks.find(key);existing!=m_chunks.end())
             presentation.completedBlocks.insert(presentation.completedBlocks.end(),
@@ -504,9 +503,18 @@ private:
     void observeBackendEvent(const ngc::ExecutionEvent &event) {
         if(const auto *accepted = std::get_if<ngc::ChunkAccepted>(&event)) {
             const ChunkKey key{accepted->epoch,accepted->chunk};
-            if(const auto first=m_chunkFirstSpan.find(key);first!=m_chunkFirstSpan.end()) {
-                const auto found=m_spanPresentations.find({accepted->epoch,first->second});
-                if(found!=m_spanPresentations.end()) applyPresentation(found->second);
+            if (!m_chunksWithMarkers.contains(key)) {
+                const auto found = m_chunks.find(key);
+                if (found != m_chunks.end()) {
+                    applyPresentation(found->second);
+                }
+            }
+        } else if (const auto *marker =
+                       std::get_if<ngc::ExecutionMarkerReached>(&event)) {
+            const auto found = m_markerPresentations.find(
+                {marker->epoch, marker->marker});
+            if (found != m_markerPresentations.end()) {
+                applyPresentation(found->second);
             }
         } else if(std::holds_alternative<ngc::TriggeredMoveCompleted>(event)) {
             if(m_feedHoldInProgress) {
@@ -618,18 +626,6 @@ private:
         m_snapshot.hasActiveMotion = (backend.state == ngc::BackendState::Running
                                       || backend.state == ngc::BackendState::Holding)
             && backend.activeSpan != 0;
-        if(backend.activeSpan!=0) {
-            auto found=m_spanPresentations.upper_bound({backend.epoch,backend.activeSpan});
-            if(found!=m_spanPresentations.begin()) {
-                --found;
-                if(found->first.first==backend.epoch) {
-                    applyPresentation(found->second);
-                    return;
-                }
-            }
-        }
-        const auto found=m_chunks.find({backend.epoch,backend.activeChunk});
-        if(found!=m_chunks.end()) applyPresentation(found->second);
     }
 
     static double &axisComponent(ngc::position_t &position, const ngc::Machine::Axis axis) {
@@ -1372,9 +1368,11 @@ private:
                     lock.unlock();
                     const auto pumped=m_driver.pumpOne(
                         [&](const auto &command, const auto &chunk, const auto &,
-                            const auto &presentation, const ngc::SpanId activationSpan) {
+                            const auto &presentation,
+                            const ngc::ExecutionMarkerId activationMarker) {
                             std::scoped_lock presentationLock(m_mutex);
-                            observeCommand(command,chunk,presentation,activationSpan);
+                            observeCommand(command, chunk, presentation,
+                                activationMarker);
                         },
                         [&](const auto &lifecycle) {
                             std::scoped_lock presentationLock(m_mutex);

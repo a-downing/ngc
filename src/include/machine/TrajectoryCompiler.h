@@ -20,6 +20,8 @@
 #include "machine/PreparedGeometry.h"
 
 namespace ngc {
+    struct TrajectoryLimits;
+
     enum class ContinuousBoundaryAccelerationMode : std::uint8_t {
         Zero,
         Optimized,
@@ -34,77 +36,89 @@ namespace ngc {
         return "unknown";
     }
 
-    enum class ContinuousConstraintCheckMode : std::uint8_t {
-        Materialized,
-        Sampled,
-        GeometryDiagnostic,
-    };
-
-    inline std::string_view name(const ContinuousConstraintCheckMode mode) {
-        switch (mode) {
-            case ContinuousConstraintCheckMode::Materialized: return "materialized";
-            case ContinuousConstraintCheckMode::Sampled: return "sampled";
-            case ContinuousConstraintCheckMode::GeometryDiagnostic: return "geometry";
-        }
-
-        return "unknown";
-    }
-
     namespace trajectory_detail {
-        inline double maximumAxisVelocity(const AxisPolynomialSpan &span,
-                                          const double position_t::*component) {
-            const auto at = [&](const double u) {
-                return std::abs((3.0*span.a.*component*u*u + 2.0*span.b.*component*u
-                    + span.c.*component) * span.inverseDuration);
+        inline constexpr double POLYNOMIAL_RATIO_TOLERANCE = 1e-8;
+        inline constexpr double DYNAMIC_LIMIT_TOLERANCE = 0.01;
+        inline constexpr double DYNAMIC_LIMIT_RATIO =
+            1.0 + DYNAMIC_LIMIT_TOLERANCE;
+
+        inline bool dynamicLimitRatioAccepted(const double ratio) {
+            return ratio
+                <= DYNAMIC_LIMIT_RATIO + POLYNOMIAL_RATIO_TOLERANCE;
+        }
+
+        double maximumAxisVelocity(const AxisPolynomialSpan &span,
+            const double position_t::*component);
+        double maximumAxisAcceleration(const AxisPolynomialSpan &span,
+            const double position_t::*component);
+        double maximumAxisJerk(const AxisPolynomialSpan &span,
+            const double position_t::*component);
+        double maximumPathAcceleration(const AxisPolynomialSpan &span);
+        double maximumPathJerk(const AxisPolynomialSpan &span);
+        double accelerationExcursionRatio(const AxisPolynomialSpan &span,
+            double servoPeriod, const TrajectoryLimits &limits);
+
+        inline bool servoAwareJerkAccepted(const double duration,
+                const double maximumJerkRatio,
+                const double accelerationExcursionRatio,
+                const double servoPeriod) {
+            return maximumJerkRatio
+                    <= DYNAMIC_LIMIT_RATIO
+                        + POLYNOMIAL_RATIO_TOLERANCE
+                || (duration < servoPeriod
+                    && accelerationExcursionRatio
+                        <= DYNAMIC_LIMIT_RATIO
+                            + POLYNOMIAL_RATIO_TOLERANCE);
+        }
+
+        inline double accelerationControlHullExcursionRatio(
+                const std::span<const position_t> controls,
+                const double servoPeriod, const double pathJerk,
+                const position_t &axisJerk) {
+            constexpr std::array components {
+                &position_t::x, &position_t::y, &position_t::z,
+                &position_t::a, &position_t::b, &position_t::c,
             };
-            auto result = std::max(at(0.0), at(1.0));
-            if(std::abs(span.a.*component) > 1e-15) {
-                const auto stationary = -(span.b.*component) / (3.0*(span.a.*component));
-                if(stationary > 0.0 && stationary < 1.0)
-                    result = std::max(result, at(stationary));
+            auto result = 0.0;
+            for (std::size_t left = 0; left < controls.size(); ++left) {
+                for (std::size_t right = left + 1;
+                        right < controls.size(); ++right) {
+                    result = std::max(result,
+                        (controls[right] - controls[left]).length()
+                            / (pathJerk * servoPeriod));
+                }
             }
+            for (const auto component : components) {
+                const auto [minimum, maximum] =
+                    std::ranges::minmax(controls, {}, component);
+                result = std::max(result,
+                    ((maximum.*component) - (minimum.*component))
+                        / ((axisJerk.*component) * servoPeriod));
+            }
+
             return result;
-        }
-
-        inline double maximumAxisAcceleration(const AxisPolynomialSpan &span,
-                                              const double position_t::*component) {
-            const auto at = [&](const double u) {
-                return std::abs((6.0*span.a.*component*u + 2.0*span.b.*component)
-                    * span.inverseDurationSquared);
-            };
-            return std::max(at(0.0), at(1.0));
-        }
-
-        inline double maximumAxisJerk(const AxisPolynomialSpan &span,
-                                      const double position_t::*component) {
-            return std::abs(6.0*span.a.*component * span.inverseDurationCubed);
         }
     }
 
     struct ContinuousPlanningEffort {
         unsigned maximumLocalCorrectionPasses = 32;
-        std::size_t geometryVerificationBudgetMultiplier = 36;
-        // Diagnostic escape hatch for bit-exact cached-versus-uncached plan
-        // comparisons. Production keeps solve-local piece reuse enabled.
-        bool reuseMaterializedPieces = true;
-        // No value preserves the check-mode default: sampled checking enables
-        // PathTempo's differential-station corrections and materialized
-        // checking does not. A value explicitly overrides that choice.
-        std::optional<bool> pathTempoSampledCorrections;
+        // A sub-servo quintic may exceed the continuous pointwise jerk limit
+        // only when its complete acceleration-control hull fits within one
+        // configured servo-period jerk budget. SimulationWorker replaces this
+        // default with typed machine configuration.
+        double quinticServoPeriod = 0.001;
         ContinuousBoundaryAccelerationMode boundaryAccelerationMode =
             ContinuousBoundaryAccelerationMode::Optimized;
-        ContinuousConstraintCheckMode constraintCheckMode =
-            ContinuousConstraintCheckMode::Materialized;
     };
-
-    inline bool usesPathTempoSampledCorrections(const ContinuousPlanningEffort &effort) {
-        return effort.pathTempoSampledCorrections.value_or(
-            effort.constraintCheckMode==ContinuousConstraintCheckMode::Sampled);
-    }
 
     struct ContinuousPieceTimingDiagnostic {
         std::size_t input = 0;
+        PreparedPieceId preparedPiece = 0;
+        PreparedPieceKind preparedKind = PreparedPieceKind::RetainedLineSection;
+        std::size_t knotInterval = std::numeric_limits<std::size_t>::max();
         double length = 0.0;
+        double curveFrom = 0.0;
+        double curveTo = 0.0;
         bool linear = false;
         position_t startPosition{};
         position_t endPosition{};
@@ -228,6 +242,8 @@ namespace ngc {
         std::size_t input = 0;
         SpanId span = 0;
         std::size_t chunk = 0;
+        ExecutionMarkerId marker = 0;
+        double parameter = 0.0;
     };
 
     enum class ContinuousPolynomialConstraintKind : std::uint8_t {
@@ -252,54 +268,109 @@ namespace ngc {
         return "unknown";
     }
 
-    struct ContinuousCubicConstraintSeverity {
-        std::size_t violatingSpans = 0;
-        double violatingDuration = 0.0;
-        double maximumRatio = 1.0;
-        double worstSpanDuration = 0.0;
-        std::size_t worstTimingPiece = 0;
-        std::size_t worstLocalSpan = 0;
-    };
-
     inline constexpr std::size_t CONTINUOUS_POLYNOMIAL_SEVERITY_BIN_COUNT = 9;
 
-    struct ContinuousCubicViolationDiagnostics {
-        // Each final emitted cubic is placed in exactly one bin according to
-        // its worst raw measured/limit ratio across every path and axis check:
-        // compliant, numerical, <=0.1%, <=1%, <=5%, <=25%, <=50%, <=100%, >100%.
-        std::array<std::size_t, CONTINUOUS_POLYNOMIAL_SEVERITY_BIN_COUNT>
-            worstRatioHistogram{};
-        std::size_t spans = 0;
-        std::size_t violatingSpans = 0;
-        std::size_t violatingPieces = 0;
-        double violatingDuration = 0.0;
-        double maximumRatio = 1.0;
-        double worstSpanDuration = 0.0;
-        std::size_t worstTimingPiece = 0;
-        PreparedPieceId worstPreparedPiece = 0;
-        std::size_t worstInput = 0;
-        std::size_t worstLocalSpan = 0;
-        ContinuousPolynomialConstraintKind worstConstraint =
-            ContinuousPolynomialConstraintKind::PathAcceleration;
-        std::size_t worstAxis = std::numeric_limits<std::size_t>::max();
-        ContinuousCubicConstraintSeverity pathAcceleration;
-        ContinuousCubicConstraintSeverity pathJerk;
-        std::array<ContinuousCubicConstraintSeverity, 6> axisVelocity{};
-        std::array<ContinuousCubicConstraintSeverity, 6> axisAcceleration{};
-        std::array<ContinuousCubicConstraintSeverity, 6> axisJerk{};
-    };
+    struct ContinuousQuinticMaterializationDiagnostics {
+        struct ShadowSpan {
+            std::size_t timingPiece = 0;
+            PreparedPieceId preparedPiece = 0;
+            PreparedPieceKind preparedKind = PreparedPieceKind::RetainedLineSection;
+            std::size_t knotInterval = std::numeric_limits<std::size_t>::max();
+            std::size_t firstSourceInput = 0;
+            std::size_t lastSourceInput = 0;
+            std::size_t sourceInputCount = 0;
+            unsigned degree = 0;
+            double globalTimeFrom = 0.0;
+            double pieceTimeFrom = 0.0;
+            double pieceTimeTo = 0.0;
+            double localDistanceFrom = 0.0;
+            double localDistanceTo = 0.0;
+            double duration = 0.0;
+            double inverseDuration = 0.0;
+            position_t origin{};
+            // Local normalized-power coefficients. Coefficient zero is zero
+            // because origin is stored separately.
+            std::array<position_t, 6> coefficients{};
+            MotionState start{};
+            MotionState end{};
+            double pointwiseConstraintRatio = 0.0;
+            double acceptanceRatio = 0.0;
+            double accelerationExcursionRatio = 0.0;
+            bool subServoJerkAccepted = false;
+        };
 
-    struct ContinuousQuinticPrototypeDiagnostics {
+        struct ShadowActivation {
+            std::size_t input = 0;
+            std::size_t span = 0;
+            double globalTime = 0.0;
+            double localDistance = 0.0;
+            double parameter = 0.0;
+        };
+
+        struct CorrectionPass {
+            unsigned callbackPass = 0;
+            std::size_t failedIntervals = 0;
+            std::size_t correctedPieces = 0;
+            std::size_t candidateEvaluations = 0;
+            std::size_t geometryProofs = 0;
+            double maximumFailedRatio = 0.0;
+            double maximumRequiredTimeScale = 1.0;
+            double seconds = 0.0;
+        };
+
+        struct FailureSample {
+            double parameter = 0.0;
+            double time = 0.0;
+            double localDistance = 0.0;
+            position_t quinticPosition{};
+            position_t preparedPosition{};
+        };
+
+        struct Failure {
+            std::size_t timingPiece = 0;
+            PreparedPieceId preparedPiece = 0;
+            PreparedPieceKind preparedKind = PreparedPieceKind::RetainedLineSection;
+            std::size_t knotInterval = std::numeric_limits<std::size_t>::max();
+            std::size_t firstSourceInput = 0;
+            std::size_t lastSourceInput = 0;
+            std::size_t sourceInputCount = 0;
+            double pieceCurveFrom = 0.0;
+            double pieceCurveTo = 0.0;
+            double intervalFrom = 0.0;
+            double intervalTo = 0.0;
+            double localDistanceFrom = 0.0;
+            double localDistanceTo = 0.0;
+            double duration = 0.0;
+            double certifiedRatio = 0.0;
+            double sampledRatio = 0.0;
+            double maximumJerkParameter = 0.0;
+            double maximumJerkTime = 0.0;
+            double maximumJerkPieceTime = 0.0;
+            double maximumJerkRatio = 0.0;
+            position_t maximumJerk{};
+            double originalDistance = 0.0;
+            double originalVelocity = 0.0;
+            double originalAcceleration = 0.0;
+            double originalScalarJerk = 0.0;
+            double originalJerkRatio = 0.0;
+            position_t originalJerk{};
+            ContinuousPolynomialConstraintKind constraint =
+                ContinuousPolynomialConstraintKind::PathAcceleration;
+            std::size_t axis = std::numeric_limits<std::size_t>::max();
+            std::array<position_t, 6> bezierControls{};
+            std::array<position_t, 6> normalizedPowerCoefficients{};
+            std::vector<FailureSample> samples;
+        };
+
         bool ran = false;
         std::array<std::size_t, CONTINUOUS_POLYNOMIAL_SEVERITY_BIN_COUNT>
             initialWorstRatioHistogram{};
-        std::size_t initialCurvedSpans = 0;
+        std::size_t initialSpans = 0;
         std::size_t initialViolatingSpans = 0;
         std::size_t finalQuinticSpans = 0;
-        std::size_t retainedLinearCubicSpans = 0;
-        std::size_t groupCandidateEvaluations = 0;
-        std::size_t groupedPhaseBoundaries = 0;
-        std::size_t ungroupablePieces = 0;
+        std::size_t candidateEvaluations = 0;
+        std::size_t absorbedScalarPhaseBoundaries = 0;
+        std::size_t unresolvedPieces = 0;
         std::size_t beginningBoundaryFailures = 0;
         std::size_t endingBoundaryFailures = 0;
         std::size_t interiorFailures = 0;
@@ -309,10 +380,12 @@ namespace ngc {
         std::size_t failedConstraintChecks = 0;
         std::array<std::size_t, 6> failedConstraintKinds{};
         std::size_t failedNonzeroBoundaryAccelerations = 0;
+        std::size_t subServoJerkAcceptedSpans = 0;
+        std::size_t maximumShadowSpansPerServoPeriod = 0;
         std::size_t forwardProgressFailures = 0;
-        std::size_t maximumPhasesPerGroup = 0;
+        std::size_t maximumScalarPhasesPerQuintic = 0;
         std::size_t subdivisions = 0;
-        std::size_t phaseBoundarySplits = 0;
+        std::size_t quinticSplits = 0;
         std::size_t geometryRefinements = 0;
         std::size_t constraintRefinements = 0;
         std::size_t geometryProofs = 0;
@@ -323,6 +396,7 @@ namespace ngc {
         unsigned maximumDepth = 0;
         double maximumInitialRatio = 1.0;
         double maximumAcceptedRatio = 0.0;
+        double maximumAcceptedPointwiseRatio = 0.0;
         double worstInitialDuration = 0.0;
         double firstFailureDuration = 0.0;
         double firstFailureFrom = 0.0;
@@ -335,6 +409,15 @@ namespace ngc {
         double firstFailureEndRampDuration = 0.0;
         double maximumFailedCertifiedRatio = 0.0;
         double maximumFailedSampledRatio = 0.0;
+        double maximumSubServoAccelerationExcursionRatio = 0.0;
+        double shadowDuration = 0.0;
+        double maximumShadowTimeError = 0.0;
+        double maximumShadowPositionError = 0.0;
+        double maximumShadowVelocityError = 0.0;
+        double maximumShadowAccelerationError = 0.0;
+        double maximumShadowDistanceError = 0.0;
+        std::uint64_t shadowFingerprint = 0;
+        bool shadowSequenceVerified = false;
         std::size_t firstFailureTimingPiece = 0;
         PreparedPieceId firstFailurePreparedPiece = 0;
         std::size_t worstInitialTimingPiece = 0;
@@ -343,30 +426,20 @@ namespace ngc {
         ContinuousPolynomialConstraintKind worstInitialConstraint =
             ContinuousPolynomialConstraintKind::PathAcceleration;
         std::size_t worstInitialAxis = std::numeric_limits<std::size_t>::max();
+        std::vector<Failure> failures;
+        std::vector<CorrectionPass> correctionPasses;
+        std::vector<ShadowSpan> shadowSpans;
+        std::vector<ShadowActivation> shadowActivations;
         double seconds = 0.0;
     };
 
-    // NRT-only evidence for PathTempo materialization callback work. Cache
-    // entries live for one continuous compilation attempt and never cross the
-    // RT-facing backend boundary.
+    // NRT-only evidence for PathTempo materialization callback work.
     struct ContinuousMaterializationDiagnostics {
         std::size_t callbackPasses = 0;
         std::size_t candidatePieces = 0;
-        std::size_t materializedPieces = 0;
-        std::size_t reusedPieces = 0;
-        std::size_t exactConstraintSpanChecks = 0;
-        std::size_t geometryDifferentialChecks = 0;
-        std::size_t axisCubicViolationPieces = 0;
-        double maximumAxisCubicTimeScale = 1.0;
-        ContinuousCubicViolationDiagnostics cubicViolations;
-        ContinuousQuinticPrototypeDiagnostics quinticPrototype;
+        ContinuousQuinticMaterializationDiagnostics quintic;
         double candidateConversionSeconds = 0.0;
-        double cacheComparisonSeconds = 0.0;
-        double cubicConstructionSeconds = 0.0;
-        double geometryVerificationSeconds = 0.0;
-        double exactConstraintSeconds = 0.0;
         double correctionCollectionSeconds = 0.0;
-        double finalAssemblySeconds = 0.0;
     };
 
     struct ContinuousTrajectoryPlan {
@@ -375,6 +448,9 @@ namespace ngc {
         // curve-distance stations; continuous emission resolves their timed
         // execution ownership before the plan reaches TrajectoryPlanner.
         std::vector<TimedCommandActivation> activations;
+        std::size_t executionMarkers = 0;
+        std::size_t interiorExecutionMarkers = 0;
+        std::size_t maximumExecutionMarkersPerChunk = 0;
         // NRT-only development evidence; never crosses MotionBackend.
         std::vector<ContinuousPieceTimingDiagnostic> pieceTiming;
         std::string correctionHistory;
@@ -410,6 +486,7 @@ namespace ngc {
         EpochId m_epoch = 1;
         ChunkId m_nextChunk = 1;
         SpanId m_nextSpan = 1;
+        ExecutionMarkerId m_nextExecutionMarker = 1;
         BranchSequence m_previousBranch = 0;
         position_t m_position{};
         std::function<void()> m_progressCallback;

@@ -58,11 +58,19 @@ namespace ngc {
         template<typename Item>
         PlannedExecution(MachineCommand commandValue, TrajectoryPlanningMetadata metadataValue,
                          Item &&itemValue, std::vector<TrajectoryPlannerInput> inputValues,
-                         const SpanId activationSpan = 0)
+                         const SpanId activationSpan = 0,
+                         const ExecutionMarkerId activationMarker = 0,
+                         const double activationParameter = 0.0)
             : command(std::move(commandValue)), metadata(std::move(metadataValue)),
               items{ExecutionItem{std::forward<Item>(itemValue)}}, inputs(std::move(inputValues)) {
             if(!inputs.empty()&&inputs.front().presentationActivation)
-                activations.push_back({0,activationSpan,0});
+                activations.push_back({
+                    .input = 0,
+                    .span = activationSpan,
+                    .chunk = 0,
+                    .marker = activationMarker,
+                    .parameter = activationParameter,
+                });
         }
 
         PlannedExecution(MachineCommand commandValue,TrajectoryPlanningMetadata metadataValue,
@@ -484,13 +492,19 @@ namespace ngc {
             return value > limit*(1.0 + 1e-9) + 1e-9;
         }
 
+        static bool exceedsDynamicLimit(const double value, const double limit) {
+            return exceeds(value,
+                limit * trajectory_detail::DYNAMIC_LIMIT_RATIO);
+        }
+
         std::expected<void, std::string> verifyStopBranch(const PlanChunk &chunk) const {
             if(chunk.normalMotion.size == 0) return std::unexpected("planned chunk has no normal motion");
             if(chunk.stopTail.size == 0) return std::unexpected("planned chunk has no bounded stop branch");
             const auto discontinuity = [](const position_t &a, const position_t &b) {
                 return (a-b).length() > 1e-8;
             };
-            const auto &normalEnd=chunk.normalMotion[chunk.normalMotion.size-1].end;
+            const auto normalEnd =
+                executionSpanEnd(chunk.normalMotion[chunk.normalMotion.size - 1]);
             if(discontinuity(normalEnd.position,chunk.branchState.position)
                ||discontinuity(normalEnd.velocity,chunk.branchState.velocity)
                ||discontinuity(normalEnd.acceleration,chunk.branchState.acceleration))
@@ -503,13 +517,13 @@ namespace ngc {
             auto previous = chunk.branchState;
             const auto &limits = m_compiler.limits();
             for(const auto &span : chunk.stopTail) {
+                if (span.degree != ExecutionPolynomialDegree::Cubic) {
+                    return std::unexpected(
+                        "planned stop branch contains a non-cubic span");
+                }
                 if(!std::isfinite(span.duration) || span.duration <= 0.0)
                     return std::unexpected("planned stop branch contains an invalid span duration");
-                const MotionState start {
-                    span.d,
-                    scalePosition(span.c, span.inverseDuration),
-                    scalePosition(span.b, 2.0*span.inverseDurationSquared),
-                };
+                const auto start = executionSpanStart(span);
                 if(discontinuity(start.position, previous.position)
                    || discontinuity(start.velocity, previous.velocity)
                    || discontinuity(start.acceleration, previous.acceleration))
@@ -517,19 +531,22 @@ namespace ngc {
                 for(const auto component : AXIS_COMPONENTS) {
                     if(exceeds(trajectory_detail::maximumAxisVelocity(span, component),
                                limits.axisVelocity.*component)
-                       || exceeds(trajectory_detail::maximumAxisAcceleration(span, component),
+                       || exceedsDynamicLimit(
+                          trajectory_detail::maximumAxisAcceleration(span, component),
                                   limits.axisAcceleration.*component)
-                       || exceeds(trajectory_detail::maximumAxisJerk(span, component),
+                       || exceedsDynamicLimit(
+                          trajectory_detail::maximumAxisJerk(span, component),
                                   limits.axisJerk.*component))
                         return std::unexpected("planned stop branch exceeds a configured axis limit");
                 }
-                const auto acceleration0 = start.acceleration.length();
-                const auto acceleration1 = span.end.acceleration.length();
-                const auto jerk = scalePosition(span.a, 6.0*span.inverseDurationCubed).length();
-                if(exceeds(std::max(acceleration0, acceleration1), limits.pathAcceleration)
-                   || exceeds(jerk, limits.pathJerk))
+                if(exceedsDynamicLimit(
+                       trajectory_detail::maximumPathAcceleration(span),
+                           limits.pathAcceleration)
+                   || exceedsDynamicLimit(
+                      trajectory_detail::maximumPathJerk(span),
+                              limits.pathJerk))
                     return std::unexpected("planned stop branch exceeds a configured path limit");
-                previous = span.end;
+                previous = executionSpanEnd(span);
             }
             if(discontinuity(previous.position, chunk.stopState.position)
                || discontinuity(previous.velocity, chunk.stopState.velocity)
@@ -543,60 +560,93 @@ namespace ngc {
         std::expected<void,std::string> verifyContinuousNormalMotion(const PlanChunk &chunk) const {
             if(chunk.normalMotion.size==0)
                 return std::unexpected("continuous plan has no normal motion");
+            std::optional<std::tuple<std::uint32_t, double,
+                ExecutionMarkerId>> previousMarker;
+            for (const auto &marker : chunk.markers) {
+                const auto key =
+                    std::tuple{marker.span, marker.parameter, marker.id};
+                if (marker.id == 0 || marker.span >= chunk.normalMotion.size
+                   || !std::isfinite(marker.parameter)
+                   || marker.parameter < 0.0 || marker.parameter > 1.0) {
+                    return std::unexpected(
+                        "continuous plan has an invalid execution marker");
+                }
+                if (previousMarker && key < *previousMarker) {
+                    return std::unexpected(
+                        "continuous plan execution markers are unordered");
+                }
+                previousMarker = key;
+            }
             const auto &limits=m_compiler.limits();
-            const auto verifyMaterializedConstraints =
-                m_compiler.continuousPlanningEffort().constraintCheckMode
-                == ContinuousConstraintCheckMode::Materialized;
             std::optional<MotionState> previous;
             SpanId previousSpan=0;
             std::size_t spanIndex=0;
             for(const auto &span:chunk.normalMotion) {
+                if (span.degree != ExecutionPolynomialDegree::Quintic) {
+                    return std::unexpected(
+                        "continuous plan has an unexpected polynomial degree");
+                }
                 if(!std::isfinite(span.duration)||span.duration<=0.0)
                     return std::unexpected("continuous plan has an invalid span duration");
-                const MotionState start {
-                    span.d,
-                    scalePosition(span.c,span.inverseDuration),
-                    scalePosition(span.b,2.0*span.inverseDurationSquared),
-                };
+                const auto start = executionSpanStart(span);
                 if(previous) {
                     const auto positionJump=(previous->position-start.position).length();
                     const auto velocityJump=(previous->velocity-start.velocity).length();
                     const auto accelerationJump=(previous->acceleration-start.acceleration).length();
                     if(positionJump>1e-8||velocityJump>1e-7||accelerationJump>1e-7) {
-                        const auto boundaryType=spanIndex%3==0
-                            ? "between emitted three-span chains" : "inside one emitted three-span chain";
                         return std::unexpected(std::format(
-                            "continuous plan C2 verification failed {} at normal span index {} "
+                            "continuous plan C2 verification failed at normal span index {} "
                             "(span {} -> {}): position jump={} tolerance=1e-8; velocity jump={} "
                             "tolerance=1e-7; acceleration jump={} tolerance=1e-7; previous end "
                             "position={} velocity={} acceleration={}; current start position={} "
-                            "velocity={} acceleration={}",boundaryType,spanIndex,previousSpan,span.id,
+                            "velocity={} acceleration={}",spanIndex,previousSpan,span.id,
                             positionJump,velocityJump,accelerationJump,
                             formatPosition(previous->position),formatPosition(previous->velocity),
                             formatPosition(previous->acceleration),formatPosition(start.position),
                             formatPosition(start.velocity),formatPosition(start.acceleration)));
                     }
                 }
-                if (verifyMaterializedConstraints) {
-                    for (const auto component : AXIS_COMPONENTS) {
-                        if (exceeds(trajectory_detail::maximumAxisVelocity(span, component),
-                                    limits.axisVelocity.*component)
-                            || exceeds(trajectory_detail::maximumAxisAcceleration(span, component),
-                                       limits.axisAcceleration.*component)
-                            || exceeds(trajectory_detail::maximumAxisJerk(span, component),
-                                       limits.axisJerk.*component)) {
-                            return std::unexpected("continuous plan exceeds a configured axis limit");
-                        }
+                auto maximumJerkRatio =
+                    trajectory_detail::maximumPathJerk(span)
+                    / limits.pathJerk;
+                for (const auto component : AXIS_COMPONENTS) {
+                    if (exceeds(trajectory_detail::maximumAxisVelocity(span, component),
+                                limits.axisVelocity.*component)
+                        || exceedsDynamicLimit(
+                           trajectory_detail::maximumAxisAcceleration(span, component),
+                                   limits.axisAcceleration.*component)) {
+                        return std::unexpected("continuous plan exceeds a configured axis limit");
                     }
-                    const auto acceleration0 = start.acceleration.length();
-                    const auto acceleration1 = span.end.acceleration.length();
-                    const auto jerk = scalePosition(span.a, 6.0*span.inverseDurationCubed).length();
-                    if (exceeds(std::max(acceleration0, acceleration1), limits.pathAcceleration)
-                        || exceeds(jerk, limits.pathJerk)) {
-                        return std::unexpected("continuous plan exceeds a configured path limit");
-                    }
+                    maximumJerkRatio = std::max(maximumJerkRatio,
+                        trajectory_detail::maximumAxisJerk(span, component)
+                            / (limits.axisJerk.*component));
                 }
-                previous=span.end;
+                if (exceedsDynamicLimit(
+                        trajectory_detail::maximumPathAcceleration(span),
+                            limits.pathAcceleration)) {
+                    return std::unexpected("continuous plan exceeds a configured path limit");
+                }
+                const auto accelerationExcursionRatio =
+                    trajectory_detail::accelerationExcursionRatio(
+                        span,
+                        m_compiler.continuousPlanningEffort()
+                            .quinticServoPeriod,
+                        limits);
+                if (!trajectory_detail::servoAwareJerkAccepted(
+                        span.duration, maximumJerkRatio,
+                        accelerationExcursionRatio,
+                        m_compiler.continuousPlanningEffort()
+                            .quinticServoPeriod)) {
+                    return std::unexpected(std::format(
+                        "continuous plan span {} exceeds the configured jerk policy: "
+                        "duration={} maximum_jerk_ratio={} "
+                        "acceleration_excursion_ratio={} servo_period={}",
+                        span.id, span.duration, maximumJerkRatio,
+                        accelerationExcursionRatio,
+                        m_compiler.continuousPlanningEffort()
+                            .quinticServoPeriod));
+                }
+                previous = executionSpanEnd(span);
                 previousSpan=span.id;
                 ++spanIndex;
             }
@@ -616,12 +666,7 @@ namespace ngc {
                         chunkIndex,chunk.predecessorBranch,predecessor));
                 if(auto verified=verifyContinuousNormalMotion(chunk);!verified)
                     return std::unexpected(std::format("chunk {}: {}",chunkIndex,verified.error()));
-                const MotionState start {
-                    chunk.normalMotion[0].d,
-                    scalePosition(chunk.normalMotion[0].c,chunk.normalMotion[0].inverseDuration),
-                    scalePosition(chunk.normalMotion[0].b,
-                        2.0*chunk.normalMotion[0].inverseDurationSquared),
-                };
+                const auto start = executionSpanStart(chunk.normalMotion[0]);
                 if(previous) {
                     const auto positionJump=(previous->position-start.position).length();
                     const auto velocityJump=(previous->velocity-start.velocity).length();
@@ -632,7 +677,8 @@ namespace ngc {
                             "velocity jump={} acceleration jump={}",chunkIndex-1,chunkIndex,
                             positionJump,velocityJump,accelerationJump));
                 }
-                previous=chunk.normalMotion[chunk.normalMotion.size-1].end;
+                previous = executionSpanEnd(
+                    chunk.normalMotion[chunk.normalMotion.size - 1]);
                 predecessor=chunk.branch;
             }
             return {};
@@ -917,14 +963,22 @@ namespace ngc {
                 std::chrono::steady_clock::now() - started).count();
             record(*item);
             recordPlanningTime(planningSeconds,false);
-            const auto activation=std::visit([](const auto &value) -> SpanId {
+            const auto activation = std::visit([](const auto &value) {
                 using T=std::decay_t<decltype(value)>;
-                if constexpr(std::same_as<T,PlanChunk>) return value.normalMotion[0].id;
-                else return 0;
+                if constexpr(std::same_as<T,PlanChunk>) {
+                    return std::tuple{
+                        value.normalMotion[0].id,
+                        value.markers.size != 0
+                            ? value.markers[0].id : ExecutionMarkerId{},
+                    };
+                } else {
+                    return std::tuple{SpanId{}, ExecutionMarkerId{}};
+                }
             },*item);
             return std::make_unique<PlannedExecution>(
                 input.command, input.metadata, std::move(*item),
-                std::vector<TrajectoryPlannerInput>{std::move(input)},activation);
+                std::vector<TrajectoryPlannerInput>{std::move(input)},
+                std::get<0>(activation), std::get<1>(activation));
         }
 
         std::expected<std::unique_ptr<PlannedExecution>, std::string> planWindow(
@@ -985,182 +1039,59 @@ namespace ngc {
                             ?piece.length/piece.programmedVelocityLimit:0.0;
                         return nominal>0.0?piece.duration/nominal:0.0;
                     });
-                if(slowest!=continuous->pieceTiming.end()) {
-                    const auto &cubic = continuous->materialization.cubicViolations;
-                    constexpr std::array axisNames {"X","Y","Z","A","B","C"};
-                    auto worstConstraint = std::string{"none"};
-                    if (cubic.violatingSpans > 0) {
-                        worstConstraint = std::string{name(cubic.worstConstraint)};
-                        if (cubic.worstAxis < axisNames.size()) {
-                            worstConstraint = std::format(
-                                "{}_{}",axisNames[cubic.worstAxis],worstConstraint);
-                        }
-                    }
-                    auto constraintSummary = std::string{};
-                    const auto appendConstraint=[&](const std::string_view constraint,
-                            const ContinuousCubicConstraintSeverity &severity) {
-                        if (severity.violatingSpans == 0) {
-                            return;
-                        }
-                        if (!constraintSummary.empty()) {
-                            constraintSummary += ',';
-                        }
-                        constraintSummary += std::format(
-                            "{}:spans={}/duration={:.6g}s/max={:.6f}",constraint,
-                            severity.violatingSpans,severity.violatingDuration,
-                            severity.maximumRatio);
-                    };
-                    appendConstraint("path_acceleration",cubic.pathAcceleration);
-                    appendConstraint("path_jerk",cubic.pathJerk);
-                    for (std::size_t axis = 0; axis < axisNames.size(); ++axis) {
-                        appendConstraint(std::format("{}_velocity",axisNames[axis]),
-                            cubic.axisVelocity[axis]);
-                        appendConstraint(std::format("{}_acceleration",axisNames[axis]),
-                            cubic.axisAcceleration[axis]);
-                        appendConstraint(std::format("{}_jerk",axisNames[axis]),
-                            cubic.axisJerk[axis]);
-                    }
-                    if (constraintSummary.empty()) {
-                        constraintSummary = "none";
-                    }
-                    const auto &quintic = continuous->materialization.quinticPrototype;
-                    auto quinticWorstConstraint = std::string{"none"};
-                    if (quintic.initialViolatingSpans > 0) {
-                        quinticWorstConstraint = std::string{name(
-                            quintic.worstInitialConstraint)};
-                        if (quintic.worstInitialAxis < axisNames.size()) {
-                            quinticWorstConstraint = std::format("{}_{}",
-                                axisNames[quintic.worstInitialAxis],quinticWorstConstraint);
-                        }
-                    }
-                    const auto nominal=slowest->programmedVelocityLimit>0.0
-                        ?slowest->length/slowest->programmedVelocityLimit:0.0;
-                    m_lastContinuousPlanSummary=std::format(
-                        "pieces={} mode={} constraint_check={} sampled_corrections={} "
-                        "actual={:.3f}s slowest_input={} "
-                        "length={:.6g} nominal={:.6g}s actual={:.6g}s ratio={:.3f} "
-                        "programmed_v={:.6g} local_v={:.6g} entry_v={:.6g} exit_v={:.6g} "
-                        "local_a={:.6g} local_j={:.6g} correction_passes={} "
-                        "materialized={} reused={} candidate_pieces={} exact_spans={} "
-                        "geometry_checks={} axis_cubic_violation_pieces={} "
-                        "max_axis_cubic_scale={:.6f} geometry_proofs={} "
-                        "materialization_seconds={:.6f} cubic_spans={} "
-                        "cubic_violation_spans={} cubic_violation_duration={:.6g}s "
-                        "cubic_ratio_hist=[compliant={},numeric={},le0.1pct={},le1pct={},"
-                        "le5pct={},le25pct={},le50pct={},le100pct={},gt100pct={}] "
-                        "cubic_worst={}:ratio={:.6f}/duration={:.6g}s/piece={}/prepared={}/"
-                        "input={}/span={} cubic_constraints=[{}] "
-                        "quintic_initial={} quintic_initial_violating={} "
-                        "quintic_initial_hist=[compliant={},numeric={},le0.1pct={},le1pct={},"
-                        "le5pct={},le25pct={},le50pct={},le100pct={},gt100pct={}] "
-                        "quintic_final={} retained_linear_cubics={} hybrid_spans={} "
-                        "quintic_group_candidates={} quintic_grouped_boundaries={} "
-                        "quintic_group_splits={} quintic_max_phases_per_group={} "
-                        "quintic_geometry_refinements={} "
-                        "quintic_constraint_refinements={} quintic_proofs={} "
-                        "quintic_constraint_nodes={} "
-                        "quintic_failed={} quintic_ungroupable={} "
-                        "quintic_failure_locations=[whole={},begin={},end={},interior={}] "
-                        "quintic_failure_gates=[geometry={},progress={},constraint={}] "
-                        "quintic_failure_constraints=[path_v={},path_a={},path_j={},"
-                        "axis_v={},axis_a={},axis_j={}] "
-                        "quintic_failure_nonzero_boundary_a={} "
-                        "quintic_first_failure=[duration={:.6g}s,piece={},prepared={},u={},{}"
-                        ",certified={:.9f},sampled={:.9f},a={},{}"
-                        ",ramp={:.6g}s,{:.6g}s] "
-                        "quintic_failed_max=[certified={:.9f},sampled={:.9f}] "
-                        "quintic_progress_failures={} quintic_unstable={} "
-                        "quintic_resource_exhausted={} "
-                        "quintic_initial_max={:.6f} quintic_accepted_max={:.6f} "
-                        "quintic_worst={}:duration={:.6g}s/piece={}/prepared={}/input={} "
-                        "quintic_seconds={:.6f}",
-                        continuous->pieceTiming.size(),
-                        name(m_compiler.continuousPlanningEffort().boundaryAccelerationMode),
-                        name(m_compiler.continuousPlanningEffort().constraintCheckMode),
-                        usesPathTempoSampledCorrections(
-                            m_compiler.continuousPlanningEffort())?"on":"off",
-                        actualDuration,slowest->input,
-                        slowest->length,nominal,slowest->duration,
-                        nominal>0.0?slowest->duration/nominal:0.0,
-                        slowest->programmedVelocityLimit,slowest->velocityLimit,
-                        slowest->entryVelocity,slowest->exitVelocity,
-                        slowest->accelerationLimit,slowest->jerkLimit,
-                        continuous->correctionPasses,
-                        continuous->materialization.materializedPieces,
-                        continuous->materialization.reusedPieces,
-                        continuous->materialization.candidatePieces,
-                        continuous->materialization.exactConstraintSpanChecks,
-                        continuous->materialization.geometryDifferentialChecks,
-                        continuous->materialization.axisCubicViolationPieces,
-                        continuous->materialization.maximumAxisCubicTimeScale,
-                        continuous->geometryVerificationAttempts,
+                if (slowest != continuous->pieceTiming.end()) {
+                    const auto nominal = slowest->programmedVelocityLimit > 0.0
+                        ? slowest->length / slowest->programmedVelocityLimit : 0.0;
+                    const auto &quintic =
+                        continuous->materialization.quintic;
+                    const auto materializationSeconds =
                         continuous->materialization.candidateConversionSeconds
-                            +continuous->materialization.cacheComparisonSeconds
-                            +continuous->materialization.cubicConstructionSeconds
-                            +continuous->materialization.geometryVerificationSeconds
-                            +continuous->materialization.exactConstraintSeconds
-                            +continuous->materialization.correctionCollectionSeconds
-                            +continuous->materialization.finalAssemblySeconds,
-                        cubic.spans,cubic.violatingSpans,cubic.violatingDuration,
-                        cubic.worstRatioHistogram[0],cubic.worstRatioHistogram[1],
-                        cubic.worstRatioHistogram[2],cubic.worstRatioHistogram[3],
-                        cubic.worstRatioHistogram[4],cubic.worstRatioHistogram[5],
-                        cubic.worstRatioHistogram[6],cubic.worstRatioHistogram[7],
-                        cubic.worstRatioHistogram[8],worstConstraint,cubic.maximumRatio,
-                        cubic.worstSpanDuration,cubic.worstTimingPiece,
-                        cubic.worstPreparedPiece,cubic.worstInput,cubic.worstLocalSpan,
-                        constraintSummary,quintic.initialCurvedSpans,
-                        quintic.initialViolatingSpans,
-                        quintic.initialWorstRatioHistogram[0],
-                        quintic.initialWorstRatioHistogram[1],
-                        quintic.initialWorstRatioHistogram[2],
-                        quintic.initialWorstRatioHistogram[3],
-                        quintic.initialWorstRatioHistogram[4],
-                        quintic.initialWorstRatioHistogram[5],
-                        quintic.initialWorstRatioHistogram[6],
-                        quintic.initialWorstRatioHistogram[7],
-                        quintic.initialWorstRatioHistogram[8],
-                        quintic.finalQuinticSpans,quintic.retainedLinearCubicSpans,
-                        quintic.finalQuinticSpans+quintic.retainedLinearCubicSpans,
-                        quintic.groupCandidateEvaluations,quintic.groupedPhaseBoundaries,
-                        quintic.phaseBoundarySplits,quintic.maximumPhasesPerGroup,
-                        quintic.geometryRefinements,
-                        quintic.constraintRefinements,quintic.geometryProofs,
-                        quintic.constraintBoundNodes,
-                        quintic.failedIntervals,quintic.ungroupablePieces,
-                        quintic.wholePieceFailures,quintic.beginningBoundaryFailures,
-                        quintic.endingBoundaryFailures,quintic.interiorFailures,
-                        quintic.failedGeometryChecks,quintic.failedProgressChecks,
-                        quintic.failedConstraintChecks,
-                        quintic.failedConstraintKinds[0],
-                        quintic.failedConstraintKinds[1],
-                        quintic.failedConstraintKinds[2],
-                        quintic.failedConstraintKinds[3],
-                        quintic.failedConstraintKinds[4],
-                        quintic.failedConstraintKinds[5],
-                        quintic.failedNonzeroBoundaryAccelerations,
-                        quintic.firstFailureDuration,
-                        quintic.firstFailureTimingPiece,quintic.firstFailurePreparedPiece,
-                        quintic.firstFailureFrom,quintic.firstFailureTo,
-                        quintic.firstFailureCertifiedRatio,
-                        quintic.firstFailureSampledRatio,
-                        quintic.firstFailureStartAcceleration,
-                        quintic.firstFailureEndAcceleration,
-                        quintic.firstFailureStartRampDuration,
-                        quintic.firstFailureEndRampDuration,
-                        quintic.maximumFailedCertifiedRatio,
-                        quintic.maximumFailedSampledRatio,
-                        quintic.forwardProgressFailures,
-                        quintic.numericallyUnrefinableIntervals,
-                        quintic.resourceExhausted?"yes":"no",
-                        quintic.maximumInitialRatio,quintic.maximumAcceptedRatio,
-                        quinticWorstConstraint,quintic.worstInitialDuration,
-                        quintic.worstInitialTimingPiece,
-                        quintic.worstInitialPreparedPiece,quintic.worstInitialInput,
-                        quintic.seconds);
+                        + continuous->materialization.correctionCollectionSeconds;
+                    m_lastContinuousPlanSummary = std::format(
+                        "pieces={} mode={} path_tempo_sampled_corrections=on "
+                        "ngc_dynamic_tolerance=1% actual={:.3f}s "
+                        "slowest_input={} length={:.6g} nominal={:.6g}s "
+                        "slowest_actual={:.6g}s ratio={:.3f} programmed_v={:.6g} "
+                        "local_v={:.6g} entry_v={:.6g} exit_v={:.6g} "
+                        "local_a={:.6g} local_j={:.6g} correction_passes={} "
+                        "candidate_pieces={} "
+                        "geometry_proofs={} materialization_seconds={:.6f} "
+                        "quintic_initial={} quintic_final={} quintic_candidates={} "
+                        "quintic_splits={} quintic_failed={} "
+                        "quintic_unresolved_pieces={} "
+                        "quintic_subservo_jerk_accepted={} "
+                        "quintic_resource_exhausted={} "
+                        "quintic_sequence=[verified={},spans={},duration={:.9g}s,"
+                        "fingerprint={:016x}] quintic_seconds={:.6f}",
+                        continuous->pieceTiming.size(),
+                        name(m_compiler.continuousPlanningEffort()
+                            .boundaryAccelerationMode),
+                        actualDuration, slowest->input, slowest->length, nominal,
+                        slowest->duration,
+                        nominal > 0.0 ? slowest->duration / nominal : 0.0,
+                        slowest->programmedVelocityLimit, slowest->velocityLimit,
+                        slowest->entryVelocity, slowest->exitVelocity,
+                        slowest->accelerationLimit, slowest->jerkLimit,
+                        continuous->correctionPasses,
+                        continuous->materialization.candidatePieces,
+                        quintic.geometryProofs, materializationSeconds,
+                        quintic.initialSpans, quintic.finalQuinticSpans,
+                        quintic.candidateEvaluations, quintic.quinticSplits,
+                        quintic.failedIntervals, quintic.unresolvedPieces,
+                        quintic.subServoJerkAcceptedSpans,
+                        quintic.resourceExhausted ? "yes" : "no",
+                        quintic.shadowSequenceVerified ? "yes" : "no",
+                        quintic.shadowSpans.size(), quintic.shadowDuration,
+                        quintic.shadowFingerprint, quintic.seconds);
                 } else {
-                    m_lastContinuousPlanSummary="continuous plan has no piece timing diagnostics";
+                    m_lastContinuousPlanSummary =
+                        "continuous plan has no piece timing diagnostics";
                 }
+                m_lastContinuousPlanSummary += std::format(
+                    " execution_markers=[total={},interior={},max_packet={}]",
+                    continuous->executionMarkers,
+                    continuous->interiorExecutionMarkers,
+                    continuous->maximumExecutionMarkersPerChunk);
                 m_lastContinuousCorrectionHistory=continuous->correctionHistory;
                 auto planned=std::make_unique<PlannedExecution>(
                     std::move(representativeCommand),std::move(representativeMetadata),

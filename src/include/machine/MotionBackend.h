@@ -14,6 +14,7 @@ namespace ngc {
     using EpochId = std::uint64_t;
     using ChunkId = std::uint64_t;
     using SpanId = std::uint64_t;
+    using ExecutionMarkerId = std::uint64_t;
     using RequestId = std::uint64_t;
     using JogId = std::uint64_t;
     using BranchSequence = std::uint64_t;
@@ -24,20 +25,75 @@ namespace ngc {
         position_t acceleration{};
     };
 
-    // q(u) = ((a*u + b)*u + c)*u + d, u in [0, 1]. Timing and
-    // all axis-limit validation are completed by NRT before publication.
+    enum class ExecutionPolynomialDegree : std::uint8_t {
+        Cubic = 3,
+        Quintic = 5,
+    };
+
+    // q(u) = origin + c1*u + c2*u^2 + ... + c5*u^5, u in [0, 1].
+    // Cubics use zero c4 and c5 coefficients. Timing and all axis-limit
+    // validation are completed by NRT before publication.
     struct AxisPolynomialSpan {
         SpanId id = 0;
+        ExecutionPolynomialDegree degree = ExecutionPolynomialDegree::Cubic;
         double duration = 0.0;
         double inverseDuration = 0.0;
         double inverseDurationSquared = 0.0;
         double inverseDurationCubed = 0.0;
-        position_t a{};
-        position_t b{};
-        position_t c{};
-        position_t d{};
-        MotionState end{};
+        position_t origin{};
+        std::array<position_t, 5> coefficients{};
     };
+
+    struct ExecutionPolynomialEvaluation {
+        MotionState state{};
+        position_t jerk{};
+    };
+
+    inline ExecutionPolynomialEvaluation evaluateExecutionPolynomial(
+            const AxisPolynomialSpan &span, const double u) noexcept {
+        const auto component = [&](const double position_t::*member) {
+            const auto c1 = span.coefficients[0].*member;
+            const auto c2 = span.coefficients[1].*member;
+            const auto c3 = span.coefficients[2].*member;
+            const auto c4 = span.coefficients[3].*member;
+            const auto c5 = span.coefficients[4].*member;
+            return std::array{
+                span.origin.*member
+                    + ((((c5 * u + c4) * u + c3) * u + c2) * u + c1) * u,
+                ((((5.0 * c5 * u + 4.0 * c4) * u + 3.0 * c3) * u
+                    + 2.0 * c2) * u + c1) * span.inverseDuration,
+                (((20.0 * c5 * u + 12.0 * c4) * u + 6.0 * c3) * u
+                    + 2.0 * c2) * span.inverseDurationSquared,
+                ((60.0 * c5 * u + 24.0 * c4) * u + 6.0 * c3)
+                    * span.inverseDurationCubed,
+            };
+        };
+        const auto x = component(&position_t::x);
+        const auto y = component(&position_t::y);
+        const auto z = component(&position_t::z);
+        const auto a = component(&position_t::a);
+        const auto b = component(&position_t::b);
+        const auto c = component(&position_t::c);
+
+        return {
+            .state = {
+                .position = {x[0], y[0], z[0], a[0], b[0], c[0]},
+                .velocity = {x[1], y[1], z[1], a[1], b[1], c[1]},
+                .acceleration = {x[2], y[2], z[2], a[2], b[2], c[2]},
+            },
+            .jerk = {x[3], y[3], z[3], a[3], b[3], c[3]},
+        };
+    }
+
+    inline MotionState executionSpanStart(
+            const AxisPolynomialSpan &span) noexcept {
+        return evaluateExecutionPolynomial(span, 0.0).state;
+    }
+
+    inline MotionState executionSpanEnd(
+            const AxisPolynomialSpan &span) noexcept {
+        return evaluateExecutionPolynomial(span, 1.0).state;
+    }
 
     struct SpindleEvent {
         bool enabled = false;
@@ -56,6 +112,13 @@ namespace ngc {
     inline constexpr std::size_t MAX_NORMAL_SPANS_PER_CHUNK = 256;
     inline constexpr std::size_t MAX_STOP_SPANS_PER_CHUNK = 16;
     inline constexpr std::size_t MAX_EVENTS_PER_CHUNK = 16;
+    inline constexpr std::size_t MAX_EXECUTION_MARKERS_PER_CHUNK = 256;
+
+    struct ExecutionMarker {
+        ExecutionMarkerId id = 0;
+        std::uint32_t span = 0;
+        double parameter = 0.0;
+    };
 
     template<typename T, std::size_t Capacity>
     struct FixedArray {
@@ -84,6 +147,7 @@ namespace ngc {
         FixedArray<AxisPolynomialSpan, MAX_NORMAL_SPANS_PER_CHUNK> normalMotion;
         FixedArray<AxisPolynomialSpan, MAX_STOP_SPANS_PER_CHUNK> stopTail;
         FixedArray<ScheduledEvent, MAX_EVENTS_PER_CHUNK> events;
+        FixedArray<ExecutionMarker, MAX_EXECUTION_MARKERS_PER_CHUNK> markers;
         MotionState branchState{};
         MotionState stopState{};
     };
@@ -289,12 +353,20 @@ namespace ngc {
         JointMotionState jointState;
     };
     struct RequestCompleted { RequestId request; bool succeeded; };
+    struct ExecutionMarkerReached {
+        EpochId epoch;
+        ChunkId chunk;
+        ExecutionMarkerId marker;
+        SpanId span;
+        double parameter;
+    };
     enum class BackendHoldReason : std::uint8_t { StopBranch, FeedHold };
     struct BackendHeld { EpochId epoch; MotionState state; BackendHoldReason reason; };
     struct BackendFault { std::uint32_t code; };
     using ExecutionEvent = std::variant<ChunkAccepted, ChunkRejected, ChunkRetired, BranchSelected,
                                         TriggeredMoveCompleted, TriggeredJointMoveCompleted,
-                                        JogStopped, RequestCompleted, BackendHeld, BackendFault>;
+                                        JogStopped, RequestCompleted, ExecutionMarkerReached,
+                                        BackendHeld, BackendFault>;
     static_assert(std::is_trivially_copyable_v<ExecutionEvent>);
 
     struct ExecutionSnapshot {
