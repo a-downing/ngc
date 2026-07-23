@@ -134,6 +134,9 @@ namespace ngc {
                                    CurveEvaluationWorkspace &workspace);
     position_t curvatureDerivativeAtDistance(const PreparedCurve &curve, double distance,
                                               CurveEvaluationWorkspace &workspace);
+    position_t curvatureDerivativeAtDistance(const PreparedCurve &curve, double distance,
+                                              CurveEvaluationWorkspace &workspace,
+                                              std::size_t splineParameterSpan);
     double chordErrorBound(const PreparedCurve &curve, double fromDistance,
                            double toDistance, CurveEvaluationWorkspace &workspace);
     std::shared_ptr<const PreparedCurve> prepareDisplayCurve(const MachineCommand &command);
@@ -166,6 +169,9 @@ namespace ngc {
     struct PreparedSplineKnotInterval {
         double curveFrom = 0.0;
         double curveTo = 0.0;
+        // Original spline parameter span. This identity survives rolling
+        // splits so endpoint q''' is evaluated on the owning side of a C2 knot.
+        std::size_t parameterSpan = 0;
         double programmedFeed = 0.0;
         // Producer-computed static geometric velocity cap. Rolling horizon
         // selection combines it with programmed feed; exact dynamic timing

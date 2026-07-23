@@ -382,7 +382,8 @@ namespace ngc {
         samplePreparedInterval(const PreparedPathPiece &piece,
                                CurveEvaluationWorkspace &workspace,
                                const double curveFrom,const double curveTo,
-                               const std::size_t sampleIntervals) {
+                               const std::size_t sampleIntervals,
+                               const std::optional<std::size_t> splineParameterSpan = {}) {
             const auto length=curveTo-curveFrom;
             const auto sampled=path_tempo::sampleArcLengthCurve<6>(length,1,1.0,
                 sampleIntervals,[&](const double distance) {
@@ -392,8 +393,12 @@ namespace ngc {
                             *piece.curve,source,workspace)),
                         .curvature=pathTempoVector(curvatureAtDistance(
                             *piece.curve,source,workspace)),
-                        .thirdDerivative=pathTempoVector(curvatureDerivativeAtDistance(
-                            *piece.curve,source,workspace)),
+                        .thirdDerivative=pathTempoVector(
+                            splineParameterSpan
+                                ?curvatureDerivativeAtDistance(
+                                    *piece.curve,source,workspace,*splineParameterSpan)
+                                :curvatureDerivativeAtDistance(
+                                    *piece.curve,source,workspace)),
                     };
                 });
             if(!sampled)
@@ -482,7 +487,7 @@ namespace ngc {
 
             if(effort.generateSamples)
                 piece.geometricSamples.reserve(
-                    PREPARED_CURVE_SAMPLE_INTERVALS*intervalCount+1);
+                    (PREPARED_CURVE_SAMPLE_INTERVALS + 1) * intervalCount);
             piece.splineKnotIntervals.reserve(intervalCount);
             auto sourceIndex = std::size_t{0};
             for(std::size_t interval = 0; interval < intervalCount; ++interval) {
@@ -513,21 +518,19 @@ namespace ngc {
                 PreparedSplineKnotInterval prepared{
                     .curveFrom = curveBoundaries[interval],
                     .curveTo = curveBoundaries[interval + 1],
+                    .parameterSpan = interval,
                     .programmedFeed = programmedFeed,
                 };
                 if(effort.generateSamples) {
                     prepared.firstGeometricSample = piece.geometricSamples.size();
-                    if(interval > 0) --prepared.firstGeometricSample;
-                    prepared.geometricSampleCount=PREPARED_CURVE_SAMPLE_INTERVALS+1;
-                    auto intervalSamples=samplePreparedInterval(piece,workspace,
-                        prepared.curveFrom,prepared.curveTo,
-                        PREPARED_CURVE_SAMPLE_INTERVALS);
+                    prepared.geometricSampleCount = PREPARED_CURVE_SAMPLE_INTERVALS + 1;
+                    auto intervalSamples = samplePreparedInterval(
+                        piece, workspace, prepared.curveFrom, prepared.curveTo,
+                        PREPARED_CURVE_SAMPLE_INTERVALS, prepared.parameterSpan);
                     if(!intervalSamples) return std::unexpected(intervalSamples.error());
-                    const auto firstSample = interval == 0 ? std::size_t{0} : std::size_t{1};
-                    for(std::size_t sample=firstSample;
-                            sample<intervalSamples->size();++sample) {
-                        auto geometric=(*intervalSamples)[sample];
-                        geometric.distance+=prepared.curveFrom-piece.curveFrom;
+                    for(std::size_t sample = 0; sample < intervalSamples->size(); ++sample) {
+                        auto geometric = (*intervalSamples)[sample];
+                        geometric.distance += prepared.curveFrom - piece.curveFrom;
                         piece.geometricSamples.push_back(geometric);
                     }
                 }
@@ -747,27 +750,46 @@ namespace ngc {
         }, curve.value);
     }
 
+    namespace {
+        position_t curvatureDerivativeAtDistanceImpl(const PreparedCurve &curve,
+                const double requested, CurveEvaluationWorkspace &workspace,
+                const std::optional<std::size_t> splineParameterSpan) {
+            const auto distance = std::clamp(requested, 0.0, curve.length);
+            return std::visit([&](const auto &value) -> position_t {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr(std::same_as<T, PreparedLineCurve>) return {};
+                else if constexpr(std::same_as<T, PreparedArcCurve>) {
+                    const auto *reference = arcReference(curve, workspace);
+                    return reference
+                        ? reference->curvatureDerivativeAtDistance(distance) : position_t{};
+                } else {
+                    const auto parameter = splineParameterAtDistance(
+                        curve, value, distance, workspace);
+                    const auto first = derivativeAt(
+                        value, parameter, 1, splineParameterSpan);
+                    const auto second = derivativeAt(
+                        value, parameter, 2, splineParameterSpan);
+                    const auto third = derivativeAt(
+                        value, parameter, 3, splineParameterSpan);
+                    const auto speed = first.length();
+                    if(speed <= 1e-15) return {};
+                    return curvatureDerivativeFromParameterDerivatives(
+                        first, second, third, speed);
+                }
+            }, curve.value);
+        }
+    }
+
     position_t curvatureDerivativeAtDistance(const PreparedCurve &curve, const double requested,
                                               CurveEvaluationWorkspace &workspace) {
-        const auto distance = std::clamp(requested, 0.0, curve.length);
-        return std::visit([&](const auto &value) -> position_t {
-            using T = std::decay_t<decltype(value)>;
-            if constexpr(std::same_as<T, PreparedLineCurve>) return {};
-            else if constexpr(std::same_as<T, PreparedArcCurve>) {
-                const auto *reference = arcReference(curve, workspace);
-                return reference
-                    ? reference->curvatureDerivativeAtDistance(distance) : position_t{};
-            } else {
-                const auto parameter = splineParameterAtDistance(curve, value, distance, workspace);
-                const auto first = derivativeAt(value, parameter, 1);
-                const auto second = derivativeAt(value, parameter, 2);
-                const auto third = derivativeAt(value, parameter, 3);
-                const auto speed = first.length();
-                if(speed <= 1e-15) return {};
-                return curvatureDerivativeFromParameterDerivatives(
-                    first, second, third, speed);
-            }
-        }, curve.value);
+        return curvatureDerivativeAtDistanceImpl(curve, requested, workspace, std::nullopt);
+    }
+
+    position_t curvatureDerivativeAtDistance(const PreparedCurve &curve, const double requested,
+                                              CurveEvaluationWorkspace &workspace,
+                                              const std::size_t splineParameterSpan) {
+        return curvatureDerivativeAtDistanceImpl(
+            curve, requested, workspace, splineParameterSpan);
     }
 
     double chordErrorBound(const PreparedCurve &curve, const double fromDistance,

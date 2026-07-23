@@ -2976,9 +2976,33 @@ final_move_together = true
                     ==blendSpline->controls.size()-blendSpline->degree,
                 "a cubic junction blend should prepare one timing piece per knot interval");
         require(blend.geometricSamples.size()
-                    ==ngc::PREPARED_CURVE_SAMPLE_INTERVALS
-                        *blend.splineKnotIntervals.size()+1,
-                "each cubic junction interval should retain 17 shared-boundary samples");
+                    ==(ngc::PREPARED_CURVE_SAMPLE_INTERVALS+1)
+                        *blend.splineKnotIntervals.size(),
+                "each cubic junction interval should retain 17 owned samples");
+        auto foundOneSidedThirdDerivativeJump=false;
+        for(std::size_t interval=0;interval<blend.splineKnotIntervals.size();++interval) {
+            const auto &metadata=blend.splineKnotIntervals[interval];
+            require(metadata.parameterSpan==interval,
+                "junction knot metadata should retain its original parameter span");
+            require(metadata.firstGeometricSample
+                        ==(ngc::PREPARED_CURVE_SAMPLE_INTERVALS+1)*interval,
+                "junction knot intervals should own disjoint sample ranges");
+            if(interval==0) continue;
+            const auto &previous=blend.splineKnotIntervals[interval-1];
+            const auto &left=blend.geometricSamples[
+                previous.firstGeometricSample+previous.geometricSampleCount-1];
+            const auto &right=blend.geometricSamples[metadata.firstGeometricSample];
+            requireNear(left.distance,right.distance,
+                "adjacent junction intervals should sample the same knot distance");
+            require((left.tangent-right.tangent).length()<1e-9,
+                "a cubic junction knot should retain its continuous tangent");
+            require((left.curvature-right.curvature).length()<1e-8,
+                "a cubic junction knot should retain its continuous curvature");
+            foundOneSidedThirdDerivativeJump |=
+                (left.curvatureDerivative-right.curvatureDerivative).length()>1e-6;
+        }
+        require(foundOneSidedThirdDerivativeJump,
+            "cubic junction knot samples should preserve distinct one-sided q''' values");
         require(incoming.geometricSamples.size()
                     ==ngc::PREPARED_CURVE_SAMPLE_INTERVALS+1
                     &&outgoing.geometricSamples.size()
@@ -3212,18 +3236,20 @@ final_move_together = true
         require(found->splineKnotIntervals.size()==intervalCount,
                 "cluster preparation should retain one metadata record per knot interval");
         require(found->geometricSamples.size()
-                    ==ngc::PREPARED_CURVE_SAMPLE_INTERVALS*intervalCount+1,
-                "cluster preparation should retain 17 shared-boundary samples per knot interval");
+                    ==(ngc::PREPARED_CURVE_SAMPLE_INTERVALS+1)*intervalCount,
+                "cluster preparation should retain 17 owned samples per knot interval");
         requireNear(found->programmedFeed,2.0,
                     "cluster-wide programmed feed must remain unchanged");
         auto minimumIntervalFeed=std::numeric_limits<double>::infinity();
         for(std::size_t interval=0;interval<intervalCount;++interval) {
             const auto &metadata=found->splineKnotIntervals[interval];
             require(metadata.firstGeometricSample
-                        ==ngc::PREPARED_CURVE_SAMPLE_INTERVALS*interval
+                        ==(ngc::PREPARED_CURVE_SAMPLE_INTERVALS+1)*interval
                     &&metadata.geometricSampleCount
                         ==ngc::PREPARED_CURVE_SAMPLE_INTERVALS+1,
                     "cluster knot interval should address its configured samples without a search");
+            require(metadata.parameterSpan==interval,
+                "cluster knot metadata should retain its original parameter span");
             require(metadata.curveTo>metadata.curveFrom,
                     "cluster knot interval distances should be strictly ordered");
             require(metadata.geometricVelocityLimit>0.0
@@ -3269,7 +3295,8 @@ final_move_together = true
         require(planningEffort.boundaryAccelerationMode
                     == ngc::ContinuousBoundaryAccelerationMode::Optimized
                     && name(planningEffort.boundaryAccelerationMode) == "optimized"
-                    && name(ngc::ContinuousBoundaryAccelerationMode::Zero) == "zero",
+                    && name(ngc::ContinuousBoundaryAccelerationMode::Zero) == "zero"
+                    &&!ngc::usesPathTempoSampledCorrections(planningEffort),
                 "continuous planning should default to PathTempo's optimized boundary mode");
         compiler.setContinuousPlanningEffort(planningEffort);
         compiler.reset(94,points.front());
@@ -3321,19 +3348,30 @@ final_move_together = true
                 })&&std::ranges::is_sorted(commandActivationSpans)
                 &&commandActivationSpans[1]!=commandActivationSpans.back(),
                 "cluster source commands should activate progressively through emitted spans");
-        require(std::ranges::all_of((*planned)->pieceTiming,[](const auto &piece) {
-                    return piece.velocityLimit>=piece.initialVelocityLimit*0.02
-                        &&piece.jerkLimit>=piece.initialJerkLimit*0.001;
-                }),
-                "numerically conditioned curved subdivision must not collapse local limits "
-                "in response to a nanosecond cubic");
+        require(std::ranges::any_of((*planned)->pieceTiming,[](const auto &piece) {
+                    return std::isfinite(piece.staticVelocityLimit);
+                })
+                    &&std::ranges::all_of((*planned)->pieceTiming,[](const auto &piece) {
+                        return piece.velocityLimit
+                            <=std::min(piece.programmedVelocityLimit,
+                                piece.staticVelocityLimit)+1e-12;
+                    }),
+                "PathTempo should retain prepared static velocity caps without caller-side "
+                "acceleration or jerk reduction");
         require((*planned)->correctionPasses > 1
                     && (*planned)->correctionHistory.contains("pass 1:"),
                 "the focused continuous-path fixture should re-solve through PathTempo's materialization callback");
+        require((*planned)->materialization.callbackPasses==(*planned)->correctionPasses
+                    &&(*planned)->materialization.reusedPieces>0
+                    &&(*planned)->materialization.materializedPieces
+                        <(*planned)->materialization.candidatePieces,
+                "materialized correction should reuse bit-exact timing pieces across callbacks");
 
         ngc::TrajectoryCompiler sampledCompiler(trajectoryLimits);
         auto sampledEffort = planningEffort;
         sampledEffort.constraintCheckMode = ngc::ContinuousConstraintCheckMode::Sampled;
+        require(ngc::usesPathTempoSampledCorrections(sampledEffort),
+                "sampled checking should enable PathTempo sampled corrections by default");
         sampledCompiler.setContinuousPlanningEffort(sampledEffort);
         sampledCompiler.reset(94, points.front());
         const auto sampledPlan = sampledCompiler.compileContinuous(*prepared, 0.05);
@@ -3345,6 +3383,92 @@ final_move_together = true
                     }),
                 "sampled checking should retain materialization, geometry proof, and stop tails "
                 "without running exact execution-span constraint correction");
+
+        ngc::TrajectoryCompiler preconditionedCompiler(trajectoryLimits);
+        auto preconditionedEffort=planningEffort;
+        preconditionedEffort.pathTempoSampledCorrections=true;
+        require(ngc::usesPathTempoSampledCorrections(preconditionedEffort),
+                "materialized checking should accept explicit sampled preconditioning");
+        preconditionedCompiler.setContinuousPlanningEffort(preconditionedEffort);
+        preconditionedCompiler.reset(94,points.front());
+        const auto preconditionedPlan=
+            preconditionedCompiler.compileContinuous(*prepared,0.05);
+        require(preconditionedPlan&&*preconditionedPlan,
+            preconditionedPlan?"":preconditionedPlan.error());
+        require((*preconditionedPlan)->materialization.callbackPasses>0
+                    &&(*preconditionedPlan)->materialization.callbackPasses
+                        <=(*preconditionedPlan)->correctionPasses
+                    &&(*preconditionedPlan)->materialization.exactConstraintSpanChecks>0,
+                "sampled preconditioning must retain the materialized exact-cubic gate");
+
+        ngc::TrajectoryCompiler geometryDiagnosticCompiler(trajectoryLimits);
+        auto geometryDiagnosticEffort=planningEffort;
+        geometryDiagnosticEffort.constraintCheckMode=
+            ngc::ContinuousConstraintCheckMode::GeometryDiagnostic;
+        geometryDiagnosticEffort.pathTempoSampledCorrections=false;
+        geometryDiagnosticCompiler.setContinuousPlanningEffort(geometryDiagnosticEffort);
+        geometryDiagnosticCompiler.reset(94,points.front());
+        const auto geometryDiagnosticPlan=
+            geometryDiagnosticCompiler.compileContinuous(*prepared,0.05);
+        require(geometryDiagnosticPlan&&*geometryDiagnosticPlan,
+            geometryDiagnosticPlan?"":geometryDiagnosticPlan.error());
+        require(name(geometryDiagnosticEffort.constraintCheckMode)=="geometry"
+                    &&(*geometryDiagnosticPlan)->correctionHistory.contains(
+                        "check=actual_geometry")
+                    &&(*geometryDiagnosticPlan)->materialization.geometryDifferentialChecks>0
+                    &&(*geometryDiagnosticPlan)->materialization.exactConstraintSpanChecks>0
+                    &&std::ranges::all_of((*geometryDiagnosticPlan)->pieceTiming,
+                        [&](const auto &piece) {
+                            return piece.accelerationLimit
+                                    <=trajectoryLimits.pathAcceleration*0.99+1e-12
+                                &&piece.jerkLimit
+                                    <=trajectoryLimits.pathJerk*0.99+1e-12;
+                        }),
+                "geometry diagnostic checking should apply 99 percent planning limits, "
+                "correct actual geometry, and retain axis-cubic detection");
+        const auto &cubicDiagnostics =
+            (*geometryDiagnosticPlan)->materialization.cubicViolations;
+        const auto histogramSpans = std::accumulate(
+            cubicDiagnostics.worstRatioHistogram.begin(),
+            cubicDiagnostics.worstRatioHistogram.end(),std::size_t{0});
+        const auto materiallyViolatingHistogramSpans = std::accumulate(
+            cubicDiagnostics.worstRatioHistogram.begin()+2,
+            cubicDiagnostics.worstRatioHistogram.end(),std::size_t{0});
+        require(cubicDiagnostics.spans>0
+                    &&histogramSpans==cubicDiagnostics.spans
+                    &&materiallyViolatingHistogramSpans
+                        ==cubicDiagnostics.violatingSpans
+                    &&cubicDiagnostics.violatingSpans>0
+                    &&cubicDiagnostics.violatingPieces
+                        ==(*geometryDiagnosticPlan)->materialization
+                            .axisCubicViolationPieces
+                    &&cubicDiagnostics.maximumRatio>1.0
+                    &&cubicDiagnostics.worstSpanDuration>0.0
+                    &&cubicDiagnostics.worstPreparedPiece!=0,
+                "geometry diagnostics should classify every final emitted cubic and retain "
+                "the worst material violation provenance");
+        const auto &quinticPrototype =
+            (*geometryDiagnosticPlan)->materialization.quinticPrototype;
+        const auto quinticInitialHistogramSpans = std::accumulate(
+            quinticPrototype.initialWorstRatioHistogram.begin(),
+            quinticPrototype.initialWorstRatioHistogram.end(), std::size_t{0});
+        require(quinticPrototype.ran && quinticPrototype.initialCurvedSpans > 0,
+                "the NRT quintic grouping prototype should run on curved timing pieces");
+        require(quinticInitialHistogramSpans == quinticPrototype.initialCurvedSpans,
+                "the NRT quintic grouping prototype should classify every initial candidate");
+        require(quinticPrototype.finalQuinticSpans > 0
+                    || (quinticPrototype.resourceExhausted
+                        && quinticPrototype.failedIntervals > 0),
+                "the bounded NRT quintic grouping prototype should either accept proved "
+                "candidates or explicitly report resource exhaustion");
+        require(quinticPrototype.geometryProofs
+                    >= quinticPrototype.finalQuinticSpans,
+                "the NRT quintic grouping prototype should geometry-prove accepted candidates");
+        require(quinticPrototype.constraintBoundNodes
+                    >= quinticPrototype.geometryProofs,
+                "the NRT quintic grouping prototype should certify derivative bounds");
+        require(quinticPrototype.maximumAcceptedRatio <= 1.0 + 1e-9,
+                "the NRT quintic grouping prototype must not accept a constraint violation");
 
         const auto planFingerprint=[](const ngc::ContinuousTrajectoryPlan &plan) {
             std::vector<std::uint64_t> result;
@@ -3388,10 +3512,7 @@ final_move_together = true
                 appendPosition(piece.startPosition);
                 appendPosition(piece.endPosition);
                 appendDouble(piece.programmedVelocityLimit);
-                appendDouble(piece.initialVelocityLimit);
-                appendInteger(piece.initialVelocityLimitCause);
-                appendDouble(piece.initialAccelerationLimit);
-                appendDouble(piece.initialJerkLimit);
+                appendDouble(piece.staticVelocityLimit);
                 appendDouble(piece.velocityLimit);
                 appendDouble(piece.accelerationLimit);
                 appendDouble(piece.jerkLimit);
@@ -3400,15 +3521,6 @@ final_move_together = true
                 appendDouble(piece.exitVelocity);
                 appendDouble(piece.exitAcceleration);
                 appendDouble(piece.duration);
-                appendDouble(piece.curvatureDerivativeSampleDistance);
-                appendDouble(piece.curvatureDerivativeMagnitude);
-                appendDouble(piece.curvatureMagnitudeAtDerivativeSample);
-                appendDouble(piece.curvatureDerivativeTangentialMagnitude);
-                appendDouble(piece.curvatureDerivativeNormalMagnitude);
-                appendDouble(piece.curvatureDerivativeFiniteDifferenceCoarse);
-                appendDouble(piece.curvatureDerivativeFiniteDifferenceFine);
-                appendDouble(piece.curvatureDerivativeFiniteDifferenceCoarseStep);
-                appendDouble(piece.curvatureDerivativeFiniteDifferenceFineStep);
             }
             appendInteger(plan.activations.size());
             for(const auto &activation:plan.activations) {
@@ -3434,6 +3546,24 @@ final_move_together = true
             }
             return result;
         };
+        ngc::TrajectoryCompiler uncachedCompiler(trajectoryLimits);
+        auto uncachedEffort=planningEffort;
+        uncachedEffort.reuseMaterializedPieces=false;
+        uncachedCompiler.setContinuousPlanningEffort(uncachedEffort);
+        uncachedCompiler.reset(94,points.front());
+        const auto uncachedPlan=uncachedCompiler.compileContinuous(*prepared,0.05);
+        require(uncachedPlan&&*uncachedPlan,uncachedPlan?"":uncachedPlan.error());
+        require(planFingerprint(**uncachedPlan)==planFingerprint(**planned)
+                    &&(*uncachedPlan)->correctionHistory==(*planned)->correctionHistory,
+                "cached materialization must emit the bit-exact uncached plan and corrections");
+        require((*uncachedPlan)->materialization.reusedPieces==0
+                    &&(*uncachedPlan)->materialization.materializedPieces
+                        ==(*uncachedPlan)->materialization.candidatePieces
+                    &&(*planned)->geometryVerificationAttempts
+                        <(*uncachedPlan)->geometryVerificationAttempts
+                    &&(*planned)->materialization.exactConstraintSpanChecks
+                        <(*uncachedPlan)->materialization.exactConstraintSpanChecks,
+                "cached materialization should skip unchanged geometry proofs and exact span checks");
         ngc::TrajectoryCompiler repeatedCompiler(trajectoryLimits);
         repeatedCompiler.setContinuousPlanningEffort(planningEffort);
         repeatedCompiler.reset(94,points.front());

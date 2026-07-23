@@ -39,19 +39,29 @@ namespace ngc {
             return scaled(add(a, b), 0.5);
         }
 
-        template<typename T>
-        std::pair<std::array<T, 4>, std::array<T, 4>> splitBezier(const std::array<T, 4> &control) {
+        template<typename T, std::size_t N>
+        std::pair<std::array<T, N>, std::array<T, N>> splitBezier(
+                const std::array<T, N> &control) {
             const auto middle = [](const T &a, const T &b) {
-                if constexpr(std::same_as<T, double>) return std::midpoint(a, b);
-                else return midpoint(a, b);
+                if constexpr(std::same_as<T, double>) {
+                    return std::midpoint(a, b);
+                } else {
+                    return midpoint(a, b);
+                }
             };
-            const auto p01 = middle(control[0], control[1]);
-            const auto p12 = middle(control[1], control[2]);
-            const auto p23 = middle(control[2], control[3]);
-            const auto p012 = middle(p01, p12);
-            const auto p123 = middle(p12, p23);
-            const auto p0123 = middle(p012, p123);
-            return {{ control[0], p01, p012, p0123 }, { p0123, p123, p23, control[3] }};
+            auto work = control;
+            std::array<T, N> left{};
+            std::array<T, N> right{};
+            left.front() = work.front();
+            right.back() = work.back();
+            for (std::size_t level = 1; level < N; ++level) {
+                for (std::size_t index = 0; index < N - level; ++index) {
+                    work[index] = middle(work[index], work[index + 1]);
+                }
+                left[level] = work.front();
+                right[N - level - 1] = work[N - level - 1];
+            }
+            return {left, right};
         }
 
         std::array<position_t, 4> bezierControls(const AxisPolynomialSpan &span) {
@@ -222,6 +232,47 @@ namespace ngc {
             position_t velocity{};
             position_t acceleration{};
         };
+
+        std::array<position_t, 6> quinticBezierControls(const KinematicPathState &from,
+                                                        const KinematicPathState &to,
+                                                        const double duration) {
+            const auto durationSquared = duration * duration;
+            return {
+                from.position,
+                add(from.position, scaled(from.velocity, duration / 5.0)),
+                add(from.position, add(scaled(from.velocity, 2.0 * duration / 5.0),
+                    scaled(from.acceleration, durationSquared / 20.0))),
+                add(to.position, add(scaled(to.velocity, -2.0 * duration / 5.0),
+                    scaled(to.acceleration, durationSquared / 20.0))),
+                add(to.position, scaled(to.velocity, -duration / 5.0)),
+                to.position,
+            };
+        }
+
+        template<std::size_t N>
+        std::array<position_t, N - 1> derivativeBezierControls(
+                const std::array<position_t, N> &controls, const double inverseDuration) {
+            std::array<position_t, N - 1> result{};
+            const auto scale = static_cast<double>(N - 1) * inverseDuration;
+            for (std::size_t index = 0; index < result.size(); ++index) {
+                result[index] = scaled(
+                    subtract(controls[index + 1], controls[index]), scale);
+            }
+            return result;
+        }
+
+        template<std::size_t N>
+        position_t evaluateBezierControls(
+                const std::array<position_t, N> &controls, const double parameter) {
+            auto work = controls;
+            for (std::size_t remaining = N; remaining > 1; --remaining) {
+                for (std::size_t control = 0; control + 1 < remaining; ++control) {
+                    work[control] = add(scaled(work[control], 1.0 - parameter),
+                        scaled(work[control + 1], parameter));
+                }
+            }
+            return work.front();
+        }
 
         std::array<AxisPolynomialSpan,3> c2CubicChain(const SpanId firstId,
                                                       const KinematicPathState &from,
@@ -436,28 +487,61 @@ namespace ngc {
             return verify(verify, bezierControls(span), scalarControl, 0);
         }
 
-        template<typename PositionAt>
-        bool verifiesOrderedCurveTolerance(const AxisPolynomialSpan &span,const double distance0,
-                                           const double distance1,const double tolerance,
-                                           const PositionAt &positionAt,const auto &referenceErrorAt) {
+        template<std::size_t N, typename PositionAt>
+        bool verifiesOrderedCurveTolerance(const std::array<position_t, N> &controls,
+                                           const double distance0,const double distance1,
+                                           const double tolerance,const PositionAt &positionAt,
+                                           const auto &referenceErrorAt,
+                                           const bool requireForwardProgress = false) {
             std::size_t visitedNodes=0;
             constexpr std::size_t MAX_VISITED_NODES=64;
-            const auto verify=[&](const auto &self,const std::array<position_t,4> &curve,
+            const auto verify=[&](const auto &self,const std::array<position_t,N> &curve,
                                   const double from,const double to,const unsigned depth) -> bool {
                 if(++visitedNodes>MAX_VISITED_NODES) return false;
                 const auto source0=positionAt(from);
                 const auto source1=positionAt(to);
                 const auto available=tolerance-referenceErrorAt(from,to);
-                if(available>=0.0&&std::ranges::all_of(curve,[&](const position_t &control) {
-                    return distanceToSegment(control,source0,source1)<=available;
-                })) return true;
+                const auto geometryVerified =
+                    available>=0.0&&std::ranges::all_of(curve,[&](const position_t &control) {
+                        return distanceToSegment(control,source0,source1)<=available;
+                    });
+                auto progressVerified = !requireForwardProgress;
+                if (geometryVerified && requireForwardProgress) {
+                    const auto direction = subtract(source1, source0);
+                    const auto directionSquared =
+                        direction.x * direction.x + direction.y * direction.y
+                        + direction.z * direction.z + direction.a * direction.a
+                        + direction.b * direction.b + direction.c * direction.c;
+                    const auto toleranceSquared = std::max(1e-24, directionSquared * 1e-12);
+                    progressVerified = directionSquared > 1e-24;
+                    for (std::size_t control = 1;
+                            progressVerified && control < curve.size(); ++control) {
+                        const auto delta = subtract(curve[control], curve[control - 1]);
+                        const auto projection =
+                            delta.x * direction.x + delta.y * direction.y
+                            + delta.z * direction.z + delta.a * direction.a
+                            + delta.b * direction.b + delta.c * direction.c;
+                        progressVerified = projection >= -toleranceSquared;
+                    }
+                }
+                if (geometryVerified && progressVerified) {
+                    return true;
+                }
                 if(depth>=20) return false;
                 const auto [left,right]=splitBezier(curve);
                 const auto middle=std::midpoint(from,to);
                 return self(self,left,from,middle,depth+1)
                     &&self(self,right,middle,to,depth+1);
             };
-            return verify(verify,bezierControls(span),distance0,distance1,0);
+            return verify(verify,controls,distance0,distance1,0);
+        }
+
+        template<typename PositionAt>
+        bool verifiesOrderedCurveTolerance(const AxisPolynomialSpan &span,const double distance0,
+                                           const double distance1,const double tolerance,
+                                           const PositionAt &positionAt,const auto &referenceErrorAt) {
+            return verifiesOrderedCurveTolerance(bezierControls(span),distance0,distance1,
+                tolerance,positionAt,referenceErrorAt);
         }
 
         double maximumLinearAcceleration(const AxisPolynomialSpan &span) {
@@ -476,11 +560,183 @@ namespace ngc {
                 + value.a*value.a + value.b*value.b + value.c*value.c);
         }
 
+        std::size_t cubicSeverityBin(const double ratio) {
+            if (ratio <= 1.0) {
+                return 0;
+            }
+            if (ratio <= 1.0 + 1e-9) {
+                return 1;
+            }
+            if (ratio <= 1.001) {
+                return 2;
+            }
+            if (ratio <= 1.01) {
+                return 3;
+            }
+            if (ratio <= 1.05) {
+                return 4;
+            }
+            if (ratio <= 1.25) {
+                return 5;
+            }
+            if (ratio <= 1.5) {
+                return 6;
+            }
+            if (ratio <= 2.0) {
+                return 7;
+            }
+            return 8;
+        }
+
         constexpr std::array AXIS_COMPONENTS {
             &position_t::x, &position_t::y, &position_t::z,
             &position_t::a, &position_t::b, &position_t::c,
         };
         constexpr std::array AXIS_NAMES {"X","Y","Z","A","B","C"};
+
+        struct QuinticConstraintBounds {
+            double maximumRatio = 0.0;
+            ContinuousPolynomialConstraintKind constraint =
+                ContinuousPolynomialConstraintKind::PathAcceleration;
+            std::size_t axis = std::numeric_limits<std::size_t>::max();
+        };
+
+        template<std::size_t N, typename Magnitude>
+        double certifiedBezierMaximum(const std::array<position_t, N> &controls,
+                                      const double limit, const Magnitude &magnitude,
+                                      std::size_t &visitedNodes, const unsigned depth = 0) {
+            ++visitedNodes;
+            auto upper = 0.0;
+            for (const auto &control : controls) {
+                upper = std::max(upper, magnitude(control));
+            }
+            if (upper <= limit || depth >= 12) {
+                return upper;
+            }
+            const auto [left, right] = splitBezier(controls);
+            const auto lower = std::max({magnitude(controls.front()),
+                magnitude(left.back()), magnitude(controls.back())});
+            if (upper - lower <= std::max(1e-12, upper * 1e-8)) {
+                return upper;
+            }
+            return std::max(
+                certifiedBezierMaximum(left, limit, magnitude, visitedNodes, depth + 1),
+                certifiedBezierMaximum(right, limit, magnitude, visitedNodes, depth + 1));
+        }
+
+        QuinticConstraintBounds quinticConstraintBounds(
+                const std::array<position_t, 6> &positionControls, const double duration,
+                const double pathVelocityLimit, const TrajectoryLimits &limits,
+                std::size_t &visitedNodes) {
+            const auto inverseDuration = 1.0 / duration;
+            const auto velocityControls = derivativeBezierControls(
+                positionControls, inverseDuration);
+            const auto accelerationControls = derivativeBezierControls(
+                velocityControls, inverseDuration);
+            const auto jerkControls = derivativeBezierControls(
+                accelerationControls, inverseDuration);
+            QuinticConstraintBounds result;
+
+            const auto observe = [&](const double measured, const double limit,
+                    const ContinuousPolynomialConstraintKind constraint,
+                    const std::size_t axis) {
+                const auto ratio = measured / limit;
+                if (ratio > result.maximumRatio) {
+                    result.maximumRatio = ratio;
+                    result.constraint = constraint;
+                    result.axis = axis;
+                }
+            };
+
+            const auto vectorMagnitude = [](const position_t &control) {
+                return control.length();
+            };
+            observe(certifiedBezierMaximum(velocityControls, pathVelocityLimit,
+                        vectorMagnitude, visitedNodes), pathVelocityLimit,
+                ContinuousPolynomialConstraintKind::PathVelocity,
+                std::numeric_limits<std::size_t>::max());
+            observe(certifiedBezierMaximum(accelerationControls, limits.pathAcceleration,
+                        vectorMagnitude, visitedNodes), limits.pathAcceleration,
+                ContinuousPolynomialConstraintKind::PathAcceleration,
+                std::numeric_limits<std::size_t>::max());
+            observe(certifiedBezierMaximum(jerkControls, limits.pathJerk,
+                        vectorMagnitude, visitedNodes), limits.pathJerk,
+                ContinuousPolynomialConstraintKind::PathJerk,
+                std::numeric_limits<std::size_t>::max());
+            for (std::size_t axis = 0; axis < AXIS_COMPONENTS.size(); ++axis) {
+                const auto component = AXIS_COMPONENTS[axis];
+                const auto componentMagnitude = [&](const position_t &control) {
+                    return std::abs(control.*component);
+                };
+                observe(certifiedBezierMaximum(velocityControls,
+                            limits.axisVelocity.*component, componentMagnitude, visitedNodes),
+                    limits.axisVelocity.*component,
+                    ContinuousPolynomialConstraintKind::AxisVelocity, axis);
+                observe(certifiedBezierMaximum(accelerationControls,
+                            limits.axisAcceleration.*component, componentMagnitude, visitedNodes),
+                    limits.axisAcceleration.*component,
+                    ContinuousPolynomialConstraintKind::AxisAcceleration, axis);
+                observe(certifiedBezierMaximum(jerkControls,
+                            limits.axisJerk.*component, componentMagnitude, visitedNodes),
+                    limits.axisJerk.*component,
+                    ContinuousPolynomialConstraintKind::AxisJerk, axis);
+            }
+            return result;
+        }
+
+        QuinticConstraintBounds sampledQuinticConstraintBounds(
+                const std::array<position_t, 6> &positionControls, const double duration,
+                const double pathVelocityLimit, const TrajectoryLimits &limits) {
+            const auto inverseDuration = 1.0 / duration;
+            const auto velocityControls = derivativeBezierControls(
+                positionControls, inverseDuration);
+            const auto accelerationControls = derivativeBezierControls(
+                velocityControls, inverseDuration);
+            const auto jerkControls = derivativeBezierControls(
+                accelerationControls, inverseDuration);
+            QuinticConstraintBounds result;
+            const auto observe = [&](const double measured, const double limit,
+                    const ContinuousPolynomialConstraintKind constraint,
+                    const std::size_t axis) {
+                const auto ratio = measured / limit;
+                if (ratio > result.maximumRatio) {
+                    result.maximumRatio = ratio;
+                    result.constraint = constraint;
+                    result.axis = axis;
+                }
+            };
+            constexpr std::size_t SAMPLE_INTERVALS = 128;
+            for (std::size_t sample = 0; sample <= SAMPLE_INTERVALS; ++sample) {
+                const auto parameter =
+                    static_cast<double>(sample) / SAMPLE_INTERVALS;
+                const auto velocity =
+                    evaluateBezierControls(velocityControls, parameter);
+                const auto acceleration =
+                    evaluateBezierControls(accelerationControls, parameter);
+                const auto jerk = evaluateBezierControls(jerkControls, parameter);
+                observe(velocity.length(), pathVelocityLimit,
+                    ContinuousPolynomialConstraintKind::PathVelocity,
+                    std::numeric_limits<std::size_t>::max());
+                observe(acceleration.length(), limits.pathAcceleration,
+                    ContinuousPolynomialConstraintKind::PathAcceleration,
+                    std::numeric_limits<std::size_t>::max());
+                observe(jerk.length(), limits.pathJerk,
+                    ContinuousPolynomialConstraintKind::PathJerk,
+                    std::numeric_limits<std::size_t>::max());
+                for (std::size_t axis = 0; axis < AXIS_COMPONENTS.size(); ++axis) {
+                    const auto component = AXIS_COMPONENTS[axis];
+                    observe(std::abs(velocity.*component),
+                        limits.axisVelocity.*component,
+                        ContinuousPolynomialConstraintKind::AxisVelocity, axis);
+                    observe(std::abs(acceleration.*component),
+                        limits.axisAcceleration.*component,
+                        ContinuousPolynomialConstraintKind::AxisAcceleration, axis);
+                    observe(std::abs(jerk.*component), limits.axisJerk.*component,
+                        ContinuousPolynomialConstraintKind::AxisJerk, axis);
+                }
+            }
+            return result;
+        }
 
         bool positiveAxisLimits(const position_t &limits) {
             return std::ranges::all_of(AXIS_COMPONENTS, [&](const auto component) {
@@ -577,11 +833,20 @@ namespace ngc {
             double distance=0.0;
         };
 
-       struct GeometryPiece {
+        struct GeometryPiece {
             std::size_t input=0;
+            PreparedPieceId preparedPiece=0;
+            PreparedPieceKind preparedKind=PreparedPieceKind::RetainedLineSection;
+            std::size_t knotInterval=std::numeric_limits<std::size_t>::max();
+            std::size_t firstSourceInput=0;
+            std::size_t lastSourceInput=0;
+            std::size_t sourceInputCount=0;
             std::vector<GeometryActivation> activations{};
             double length=0.0;
-            double speed=0.0;
+            double curveFrom=0.0;
+            double curveTo=0.0;
+            double programmedVelocity=0.0;
+            double staticVelocityLimit=std::numeric_limits<double>::infinity();
             bool linear=false;
             std::span<const PreparedGeometricSample> geometricSamples{};
             double geometricSampleDistanceOffset=0.0;
@@ -1021,9 +1286,6 @@ namespace ngc {
            ||m_continuousPlanningEffort.maximumLocalCorrectionPasses>128
            ||m_continuousPlanningEffort.geometryVerificationBudgetMultiplier<36
            ||m_continuousPlanningEffort.geometryVerificationBudgetMultiplier>256
-           ||!std::isfinite(m_continuousPlanningEffort
-                .curvatureDerivativeVelocityCapMultiplier)
-           ||m_continuousPlanningEffort.curvatureDerivativeVelocityCapMultiplier<=0.0
            ||(m_continuousPlanningEffort.boundaryAccelerationMode
                   != ContinuousBoundaryAccelerationMode::Zero
               && m_continuousPlanningEffort.boundaryAccelerationMode
@@ -1031,7 +1293,9 @@ namespace ngc {
            ||(m_continuousPlanningEffort.constraintCheckMode
                   != ContinuousConstraintCheckMode::Materialized
               && m_continuousPlanningEffort.constraintCheckMode
-                  != ContinuousConstraintCheckMode::Sampled))
+                  != ContinuousConstraintCheckMode::Sampled
+              && m_continuousPlanningEffort.constraintCheckMode
+                  != ContinuousConstraintCheckMode::GeometryDiagnostic))
             return std::unexpected("continuous planning effort is outside its bounded range");
         reportProgress();
 
@@ -1066,15 +1330,28 @@ namespace ngc {
                     prepared.id));
             const auto primary=inputFor(prepared.primaryCommand);
             if(!primary) return std::unexpected(primary.error());
+            auto firstSourceInput=*primary;
+            auto lastSourceInput=*primary;
+            auto sourceInputCount=std::size_t{0};
+            for(const auto source:prepared.sourceCommands) {
+                const auto input=inputFor(source);
+                if(!input) return std::unexpected(input.error());
+                if(sourceInputCount==0) firstSourceInput=*input;
+                lastSourceInput=*input;
+                ++sourceInputCount;
+            }
+            if(sourceInputCount==0) sourceInputCount=1;
             auto nextActivation=std::size_t{0};
             const auto appendTimingPiece=[&](
-                    const double from,const double to,const double speed,
+                    const double from,const double to,const double programmedVelocity,
+                    const double staticVelocityLimit,const std::size_t knotInterval,
                     const std::span<const PreparedGeometricSample> samples)
                     ->std::expected<void,std::string> {
                 const auto length=to-from;
                 const auto sampleOffset=from-prepared.curveFrom;
                 if(!std::isfinite(length)||length<=1e-12
-                   ||!std::isfinite(speed)||speed<=0.0)
+                   ||!std::isfinite(programmedVelocity)||programmedVelocity<=0.0
+                   ||std::isnan(staticVelocityLimit)||staticVelocityLimit<=0.0)
                     return std::unexpected(std::format(
                         "prepared continuous piece {} has an invalid timing interval",
                         prepared.id));
@@ -1118,9 +1395,18 @@ namespace ngc {
                 const auto curve=prepared.curve;
                 pieces.push_back({
                     .input=*primary,
+                    .preparedPiece=prepared.id,
+                    .preparedKind=prepared.kind,
+                    .knotInterval=knotInterval,
+                    .firstSourceInput=firstSourceInput,
+                    .lastSourceInput=lastSourceInput,
+                    .sourceInputCount=sourceInputCount,
                     .activations=std::move(activations),
                     .length=length,
-                    .speed=speed,
+                    .curveFrom=from,
+                    .curveTo=to,
+                    .programmedVelocity=programmedVelocity,
+                    .staticVelocityLimit=staticVelocityLimit,
                     .linear=prepared.curve->geometricallyLinear,
                     .geometricSamples=samples,
                     .geometricSampleDistanceOffset=sampleOffset,
@@ -1139,9 +1425,13 @@ namespace ngc {
                             return curvatureAtDistance(*curve,
                                 from+std::clamp(distance,0.0,length),*workspace);
                         }}:std::function<position_t(double)>{},
-                    .curvatureDerivativeAt=[curve,workspace,from,length](const double distance) {
-                        return curvatureDerivativeAtDistance(*curve,
-                            from+std::clamp(distance,0.0,length),*workspace);
+                    .curvatureDerivativeAt=[curve,workspace,from,length,knotInterval](
+                            const double distance) {
+                        const auto source=from+std::clamp(distance,0.0,length);
+                        if(knotInterval != std::numeric_limits<std::size_t>::max())
+                            return curvatureDerivativeAtDistance(
+                                *curve,source,*workspace,knotInterval);
+                        return curvatureDerivativeAtDistance(*curve,source,*workspace);
                     },
                     .positionAt=[curve,workspace,from,length](const double distance) {
                         return positionAtDistance(*curve,
@@ -1157,7 +1447,9 @@ namespace ngc {
 
             if(prepared.splineKnotIntervals.empty()) {
                 if(auto appended=appendTimingPiece(prepared.curveFrom,prepared.curveTo,
-                        prepared.programmedFeed,prepared.geometricSamples); !appended)
+                        prepared.programmedFeed,std::numeric_limits<double>::infinity(),
+                        std::numeric_limits<std::size_t>::max(),prepared.geometricSamples);
+                        !appended)
                     return std::unexpected(appended.error());
                 if(nextActivation!=prepared.activationStations.size())
                     return std::unexpected(std::format(
@@ -1165,12 +1457,17 @@ namespace ngc {
                         prepared.id));
                 continue;
             }
-            const auto expectedSampleCount=PREPARED_CURVE_SAMPLE_INTERVALS
-                *prepared.splineKnotIntervals.size()+1;
+            const auto expectedSampleCount = (PREPARED_CURVE_SAMPLE_INTERVALS + 1)
+                * prepared.splineKnotIntervals.size();
             if(prepared.geometricSamples.size()!=expectedSampleCount)
                 return std::unexpected(std::format(
                     "prepared spline {} has {} geometric samples; expected {}",
                     prepared.id,prepared.geometricSamples.size(),expectedSampleCount));
+            const auto *spline = std::get_if<PreparedSplineCurve>(&prepared.curve->value);
+            if(!spline || spline->controls.size() <= spline->degree)
+                return std::unexpected(std::format(
+                    "prepared piece {} has knot intervals but is not a spline",prepared.id));
+            const auto parameterSpanCount = spline->controls.size() - spline->degree;
             auto expectedFrom=prepared.curveFrom;
             for(std::size_t intervalIndex=0;
                     intervalIndex<prepared.splineKnotIntervals.size();++intervalIndex) {
@@ -1188,10 +1485,15 @@ namespace ngc {
                         "prepared spline {} knot interval {} does not provide {} samples",
                         prepared.id,intervalIndex,
                         PREPARED_CURVE_SAMPLE_INTERVALS+1));
+                if(interval.parameterSpan >= parameterSpanCount)
+                    return std::unexpected(std::format(
+                        "prepared spline {} knot interval {} has invalid parameter span {}",
+                        prepared.id,intervalIndex,interval.parameterSpan));
                 const auto samples=std::span{prepared.geometricSamples}.subspan(
                     interval.firstGeometricSample,interval.geometricSampleCount);
                 if(auto appended=appendTimingPiece(interval.curveFrom,interval.curveTo,
-                        interval.programmedFeed,samples); !appended)
+                        interval.programmedFeed,interval.geometricVelocityLimit,
+                        interval.parameterSpan,samples); !appended)
                     return std::unexpected(appended.error());
                 expectedFrom=interval.curveTo;
             }
@@ -1243,7 +1545,8 @@ namespace ngc {
             infiniteJerkPieces.reserve(pieces.size());
             for(const auto &piece:pieces) infiniteJerkPieces.push_back({
                 .length=piece.length,
-                .velocityLimit=piece.speed,
+                .velocityLimit=std::min(
+                    piece.programmedVelocity,piece.staticVelocityLimit),
                 .tangentAt=[sample=piece.sampleAt](const double distance) {
                     return sample(distance).tangent;
                 },
@@ -1261,8 +1564,16 @@ namespace ngc {
         }
 
         auto result=std::make_unique<ContinuousTrajectoryPlan>();
+        const auto geometryDiagnostic=m_continuousPlanningEffort.constraintCheckMode
+            ==ContinuousConstraintCheckMode::GeometryDiagnostic;
+        constexpr auto GEOMETRY_DIAGNOSTIC_LIMIT_SCALE=0.99;
+        const auto planningLimitScale=
+            geometryDiagnostic?GEOMETRY_DIAGNOSTIC_LIMIT_SCALE:1.0;
+        const auto planningPathAcceleration=m_limits.pathAcceleration*planningLimitScale;
+        const auto planningPathJerk=m_limits.pathJerk*planningLimitScale;
+        const auto planningAxisAcceleration=scaled(m_limits.axisAcceleration,planningLimitScale);
+        const auto planningAxisJerk=scaled(m_limits.axisJerk,planningLimitScale);
         std::vector<AxisPolynomialSpan> normalSpans;
-        std::vector<std::size_t> normalSpanPieces;
         const auto maximumStagedNormalSpans=std::max<std::size_t>(8192,pieces.size()*8);
         const auto maximumGeometryVerificationAttemptsPerPass=
             std::max<std::size_t>(8192,pieces.size()*4);
@@ -1273,131 +1584,7 @@ namespace ngc {
         auto nextSpan=m_nextSpan;
         std::vector<SpanId> activationSpans(geometry.commands.size(),0);
 
-        struct LocalLimits {
-            double velocity;
-            double acceleration;
-            double jerk;
-            ContinuousVelocityLimitCause velocityCause=
-                ContinuousVelocityLimitCause::ProgrammedFeed;
-        };
-        std::vector<LocalLimits> localLimits;
-        localLimits.reserve(pieces.size());
-        struct CurvatureDerivativeDiagnostic {
-            double distance=0.0;
-            double analyticMagnitude=0.0;
-            double curvatureMagnitude=0.0;
-            double tangentialMagnitude=0.0;
-            double normalMagnitude=0.0;
-            double coarseMagnitude=0.0;
-            double fineMagnitude=0.0;
-            double coarseStep=0.0;
-            double fineStep=0.0;
-        };
-        std::vector<CurvatureDerivativeDiagnostic> curvatureDerivativeDiagnostics;
-        curvatureDerivativeDiagnostics.reserve(pieces.size());
-        for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
-            if((pieceIndex&15U)==0) reportProgress();
-            const auto &piece=pieces[pieceIndex];
-            LocalLimits limits{piece.speed,m_limits.pathAcceleration,m_limits.pathJerk};
-            const auto limitVelocity=[&](const double candidate,
-                                         const ContinuousVelocityLimitCause cause) {
-                if(candidate<limits.velocity) {
-                    limits.velocity=candidate;
-                    limits.velocityCause=cause;
-                }
-            };
-            CurvatureDerivativeDiagnostic derivativeDiagnostic;
-            for(const auto &geometric:piece.geometricSamples) {
-                const auto distance=geometric.distance-piece.geometricSampleDistanceOffset;
-                const auto &curvature=geometric.curvature;
-                const auto &curvatureDerivative=geometric.curvatureDerivative;
-                const auto derivativeMagnitude=curvatureDerivative.length();
-                if(derivativeMagnitude>derivativeDiagnostic.analyticMagnitude) {
-                    derivativeDiagnostic.distance=distance;
-                    derivativeDiagnostic.analyticMagnitude=derivativeMagnitude;
-                }
-                for(const auto component:AXIS_COMPONENTS) {
-                    const auto tangent=std::abs(geometric.tangent.*component);
-                    if(tangent>1e-15) {
-                        limitVelocity(m_limits.axisVelocity.*component/tangent,
-                            ContinuousVelocityLimitCause::AxisVelocity);
-                        limits.acceleration=std::min(limits.acceleration,
-                            m_limits.axisAcceleration.*component/tangent);
-                        limits.jerk=std::min(limits.jerk,m_limits.axisJerk.*component/tangent);
-                    }
-                    const auto axisCurvature=std::abs(curvature.*component);
-                    if(axisCurvature>1e-15)
-                        limitVelocity(std::sqrt(
-                            m_limits.axisAcceleration.*component/axisCurvature),
-                            ContinuousVelocityLimitCause::AxisCentripetalAcceleration);
-                }
-                const auto curvatureMagnitude=curvature.length();
-                if(curvatureMagnitude>1e-15)
-                    limitVelocity(std::sqrt(m_limits.pathAcceleration/curvatureMagnitude),
-                        ContinuousVelocityLimitCause::PathCentripetalAcceleration);
-                if(m_continuousPlanningEffort.applyCurvatureDerivativeVelocityCap) {
-                    const auto derivativeMultiplier=m_continuousPlanningEffort
-                        .curvatureDerivativeVelocityCapMultiplier;
-                    if(derivativeMagnitude>1e-15)
-                        limitVelocity(derivativeMultiplier
-                                *std::cbrt(m_limits.pathJerk/derivativeMagnitude),
-                            ContinuousVelocityLimitCause::PathCurvatureDerivativeJerk);
-                    for(const auto component:AXIS_COMPONENTS) {
-                        const auto axisDerivative=std::abs(curvatureDerivative.*component);
-                        if(axisDerivative>1e-15)
-                            limitVelocity(derivativeMultiplier*std::cbrt(
-                                    m_limits.axisJerk.*component/axisDerivative),
-                                ContinuousVelocityLimitCause::AxisCurvatureDerivativeJerk);
-                    }
-                }
-            }
-            const auto finiteDifferenceMagnitude=[&](const double requestedStep) {
-                const auto step=std::clamp(requestedStep,1e-10,piece.length);
-                const auto distance=derivativeDiagnostic.distance;
-                position_t difference{};
-                double denominator=0.0;
-                if(distance<=step) {
-                    difference=subtract(piece.curvatureAt(std::min(piece.length,distance+step)),
-                                        piece.curvatureAt(distance));
-                    denominator=std::min(piece.length,distance+step)-distance;
-                } else if(piece.length-distance<=step) {
-                    difference=subtract(piece.curvatureAt(distance),
-                                        piece.curvatureAt(std::max(0.0,distance-step)));
-                    denominator=distance-std::max(0.0,distance-step);
-                } else {
-                    difference=subtract(piece.curvatureAt(distance+step),
-                                        piece.curvatureAt(distance-step));
-                    denominator=2.0*step;
-                }
-                return denominator>1e-15?scaled(difference,1.0/denominator).length():0.0;
-            };
-            if(m_continuousPlanningEffort.measureCurvatureDerivativeNumerics) {
-                derivativeDiagnostic.coarseStep=std::max(1e-9,piece.length*1e-4);
-                derivativeDiagnostic.fineStep=std::max(1e-10,piece.length*1e-5);
-                derivativeDiagnostic.coarseMagnitude=
-                    finiteDifferenceMagnitude(derivativeDiagnostic.coarseStep);
-                derivativeDiagnostic.fineMagnitude=
-                    finiteDifferenceMagnitude(derivativeDiagnostic.fineStep);
-                const auto sample=piece.sampleAt(derivativeDiagnostic.distance);
-                const auto curvature=piece.curvatureAt(derivativeDiagnostic.distance);
-                const auto derivative=piece.curvatureDerivativeAt(
-                    derivativeDiagnostic.distance);
-                const auto tangential=positionDot(sample.tangent,derivative);
-                derivativeDiagnostic.curvatureMagnitude=curvature.length();
-                derivativeDiagnostic.tangentialMagnitude=std::abs(tangential);
-                derivativeDiagnostic.normalMagnitude=
-                    subtract(derivative,scaled(sample.tangent,tangential)).length();
-            }
-            if(limits.velocity<=0.0||limits.acceleration<=0.0||limits.jerk<=0.0
-               ||!std::isfinite(limits.velocity)||!std::isfinite(limits.acceleration)
-               ||!std::isfinite(limits.jerk))
-                return std::unexpected(std::format(
-                    "continuous piece {} for input {} has invalid local limits v={} a={} j={}",
-                    pieceIndex,piece.input,limits.velocity,limits.acceleration,limits.jerk));
-            localLimits.push_back(limits);
-            curvatureDerivativeDiagnostics.push_back(derivativeDiagnostic);
-        }
-        const auto initialLocalLimits=localLimits;
+        std::vector<path_tempo::InitialPieceLimits> effectiveLimits(pieces.size());
 
         const auto kinematicAt=[&](const std::size_t pieceIndex,const TimeBoundary &boundary) {
             const auto &piece=pieces[pieceIndex];
@@ -1440,6 +1627,42 @@ namespace ngc {
             }
             return true;
         };
+        const auto bitExactLimits=[&](const path_tempo::InitialPieceLimits &left,
+                                      const path_tempo::InitialPieceLimits &right) {
+            return bitExactDouble(left.velocity,right.velocity)
+                &&bitExactDouble(left.acceleration,right.acceleration)
+                &&bitExactDouble(left.jerk,right.jerk);
+        };
+        struct ConstraintViolationDiagnostic {
+            double factor=1.0;
+            std::size_t localSpan=0;
+            const char *constraint="none";
+            const char *axis="path";
+            double measured=0.0;
+            double limit=0.0;
+            double ratio=1.0;
+            double duration=0.0;
+            std::size_t scalarPhase=0;
+            double scalarJerk=0.0;
+            double phaseDistanceChange=0.0;
+            double phaseVelocityChange=0.0;
+            double phaseAccelerationChange=0.0;
+            double sampleDistance=0.0;
+            double sampleVelocity=0.0;
+            double sampleAcceleration=0.0;
+        };
+        struct MaterializedPiece {
+            bool valid=false;
+            TimeLaw timing;
+            path_tempo::InitialPieceLimits limits{};
+            std::vector<AxisPolynomialSpan> spans;
+            std::vector<std::pair<std::size_t,std::size_t>> activationOwners;
+            double correction=1.0;
+            ConstraintViolationDiagnostic violation;
+            double geometryCorrection=1.0;
+            ConstraintViolationDiagnostic geometryViolation;
+        };
+        std::vector<MaterializedPiece> materializedPieces(pieces.size());
         std::vector<path_tempo::SampledPathPiece<6>> pathTempoStorage;
         pathTempoStorage.reserve(pieces.size());
         for (std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
@@ -1447,8 +1670,8 @@ namespace ngc {
             path_tempo::SampledPathPiece<6> timingPiece {
                 .id=pieceIndex+1,
                 .length=piece.length,
-                .maxVelocity=piece.speed,
-                .initialLimits={},
+                .maxVelocity=piece.programmedVelocity,
+                .initialLimits={.velocity=piece.staticVelocityLimit},
                 .stations={},
             };
             timingPiece.stations.reserve(piece.geometricSamples.size());
@@ -1470,14 +1693,8 @@ namespace ngc {
 
         std::vector<path_tempo::PathPiece<6>> pathTempoPieces;
         pathTempoPieces.reserve(pathTempoStorage.size());
-        for (std::size_t pieceIndex = 0; pieceIndex < pathTempoStorage.size(); ++pieceIndex) {
-            pathTempoStorage[pieceIndex].initialLimits = {
-                .velocity = localLimits[pieceIndex].velocity,
-                .acceleration = localLimits[pieceIndex].acceleration,
-                .jerk = localLimits[pieceIndex].jerk,
-            };
-            pathTempoPieces.push_back(pathTempoStorage[pieceIndex].view());
-        }
+        for (const auto &piece:pathTempoStorage)
+            pathTempoPieces.push_back(piece.view());
 
         const path_tempo::PathPlanningRequest<6> pathTempoRequest {
             .pieces = pathTempoPieces,
@@ -1490,16 +1707,16 @@ namespace ngc {
                 .acceleration = scalarEnd->second,
             },
             .limits = {
-                .pathAcceleration = m_limits.pathAcceleration,
-                .pathJerk = m_limits.pathJerk,
+                .pathAcceleration = planningPathAcceleration,
+                .pathJerk = planningPathJerk,
                 .coordinateVelocity = pathTempoVector(m_limits.axisVelocity),
-                .coordinateAcceleration = pathTempoVector(m_limits.axisAcceleration),
-                .coordinateJerk = pathTempoVector(m_limits.axisJerk),
+                .coordinateAcceleration = pathTempoVector(planningAxisAcceleration),
+                .coordinateJerk = pathTempoVector(planningAxisJerk),
             },
             .settings = {
                 .maximumCorrectionPasses = maximumLocalCorrectionPasses,
-                .applySampledCorrections = m_continuousPlanningEffort.constraintCheckMode
-                    == ContinuousConstraintCheckMode::Sampled,
+                .applySampledCorrections =
+                    usesPathTempoSampledCorrections(m_continuousPlanningEffort),
                 .boundaryAccelerationMode =
                     m_continuousPlanningEffort.boundaryAccelerationMode
                             == ContinuousBoundaryAccelerationMode::Zero
@@ -1512,6 +1729,9 @@ namespace ngc {
             [&](const path_tempo::PlannedPath &candidate)
                 -> std::expected<std::vector<path_tempo::PieceCorrection>, std::string> {
             const auto correctionPass = materializationPass++;
+            ++result->materialization.callbackPasses;
+            result->materialization.candidatePieces+=pieces.size();
+            const auto conversionStarted=std::chrono::steady_clock::now();
             reportProgress();
             const auto *planned = &candidate;
             if (planned->pieceBoundaries.size()!=pieces.size()+1
@@ -1534,12 +1754,10 @@ namespace ngc {
             }
             auto pieceTiming=std::move(*convertedTiming);
 
-            for (std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
-                localLimits[pieceIndex].velocity=planned->pieceLimits[pieceIndex].velocity;
-                localLimits[pieceIndex].acceleration=
-                    planned->pieceLimits[pieceIndex].acceleration;
-                localLimits[pieceIndex].jerk=planned->pieceLimits[pieceIndex].jerk;
-            }
+            effectiveLimits=planned->pieceLimits;
+            result->materialization.candidateConversionSeconds+=
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now()-conversionStarted).count();
             result->correctionPasses =
                 static_cast<unsigned>(planned->diagnostics.correctionPasses);
 
@@ -1639,68 +1857,62 @@ namespace ngc {
             auto maximumStationAcceleration=0.0;
             for(const auto value:stationAcceleration)
                 maximumStationAcceleration=std::max(maximumStationAcceleration,std::abs(value));
-            result->pieceTiming.clear();
-            result->pieceTiming.reserve(pieces.size());
-            for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
-                result->pieceTiming.push_back({
-                    .input=pieces[pieceIndex].input,
-                    .length=pieces[pieceIndex].length,
-                    .linear=pieces[pieceIndex].linear,
-                    .startPosition=pieces[pieceIndex].positionAt(0.0),
-                    .endPosition=pieces[pieceIndex].positionAt(pieces[pieceIndex].length),
-                    .programmedVelocityLimit=pieces[pieceIndex].speed,
-                    .initialVelocityLimit=initialLocalLimits[pieceIndex].velocity,
-                    .initialVelocityLimitCause=initialLocalLimits[pieceIndex].velocityCause,
-                    .initialAccelerationLimit=initialLocalLimits[pieceIndex].acceleration,
-                    .initialJerkLimit=initialLocalLimits[pieceIndex].jerk,
-                    .velocityLimit=localLimits[pieceIndex].velocity,
-                    .accelerationLimit=localLimits[pieceIndex].acceleration,
-                    .jerkLimit=localLimits[pieceIndex].jerk,
-                    .entryVelocity=stationVelocity[pieceIndex],
-                    .entryAcceleration=stationAcceleration[pieceIndex],
-                    .exitVelocity=stationVelocity[pieceIndex+1],
-                    .exitAcceleration=stationAcceleration[pieceIndex+1],
-                    .duration=pieceTiming[pieceIndex].back().time,
-                    .curvatureDerivativeSampleDistance=
-                        curvatureDerivativeDiagnostics[pieceIndex].distance,
-                    .curvatureDerivativeMagnitude=
-                        curvatureDerivativeDiagnostics[pieceIndex].analyticMagnitude,
-                    .curvatureMagnitudeAtDerivativeSample=
-                        curvatureDerivativeDiagnostics[pieceIndex].curvatureMagnitude,
-                    .curvatureDerivativeTangentialMagnitude=
-                        curvatureDerivativeDiagnostics[pieceIndex].tangentialMagnitude,
-                    .curvatureDerivativeNormalMagnitude=
-                        curvatureDerivativeDiagnostics[pieceIndex].normalMagnitude,
-                    .curvatureDerivativeFiniteDifferenceCoarse=
-                        curvatureDerivativeDiagnostics[pieceIndex].coarseMagnitude,
-                    .curvatureDerivativeFiniteDifferenceFine=
-                        curvatureDerivativeDiagnostics[pieceIndex].fineMagnitude,
-                    .curvatureDerivativeFiniteDifferenceCoarseStep=
-                        curvatureDerivativeDiagnostics[pieceIndex].coarseStep,
-                    .curvatureDerivativeFiniteDifferenceFineStep=
-                        curvatureDerivativeDiagnostics[pieceIndex].fineStep,
-                });
-            }
-
-            normalSpans.clear();
-            normalSpanPieces.clear();
             std::size_t geometryVerificationAttempts=0;
-            std::ranges::fill(activationSpans,SpanId{});
-            nextSpan=m_nextSpan;
+            std::size_t stagedSpanCount=0;
+            std::vector<std::size_t> pieceSpanOffsets(pieces.size());
+            std::vector<double> correction(pieces.size(),1.0);
+            std::vector<ConstraintViolationDiagnostic> violation(pieces.size());
             for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
                 if((pieceIndex&15U)==0) reportProgress();
                 const auto &piece=pieces[pieceIndex];
                 const auto &boundaries=pieceTiming[pieceIndex];
+                pieceSpanOffsets[pieceIndex]=stagedSpanCount;
+                auto &cached=materializedPieces[pieceIndex];
+                const auto comparisonStarted=std::chrono::steady_clock::now();
+                // Geometry, machine limits, tolerance, and the materialization
+                // algorithm are immutable for this solve-local cache. Exact
+                // time-law and effective-limit equality therefore completes
+                // the candidate fingerprint.
+                const auto reusable=m_continuousPlanningEffort.reuseMaterializedPieces
+                    &&cached.valid
+                    &&bitExactTimeLaw(cached.timing,boundaries)
+                    &&bitExactLimits(cached.limits,effectiveLimits[pieceIndex]);
+                result->materialization.cacheComparisonSeconds+=
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now()-comparisonStarted).count();
+                if(reusable) {
+                    ++result->materialization.reusedPieces;
+                    if(stagedSpanCount>maximumStagedNormalSpans
+                       ||cached.spans.size()>maximumStagedNormalSpans-stagedSpanCount)
+                        return std::unexpected(std::format(
+                            "continuous cached staged-span resource bound exceeded: staged={} "
+                            "cached={} bound={} pieces={} piece={} input={}",stagedSpanCount,
+                            cached.spans.size(),maximumStagedNormalSpans,pieces.size(),pieceIndex,
+                            piece.input));
+                    stagedSpanCount+=cached.spans.size();
+                    correction[pieceIndex]=geometryDiagnostic
+                        ?cached.geometryCorrection:cached.correction;
+                    violation[pieceIndex]=geometryDiagnostic
+                        ?cached.geometryViolation:cached.violation;
+                    continue;
+                }
+
+                ++result->materialization.materializedPieces;
+                MaterializedPiece materialized;
+                materialized.timing=boundaries;
+                materialized.limits=effectiveLimits[pieceIndex];
                 const auto emit=[&](const auto &self,const auto &stateAt,
                                     const double totalDuration,const std::size_t interval,
                                     const double u0,const double u1,
                                     const unsigned depth) -> std::optional<std::string> {
-                        if(normalSpans.size()>=maximumStagedNormalSpans)
+                        if(stagedSpanCount+materialized.spans.size()>=maximumStagedNormalSpans)
                             return std::format(
                                 "continuous staged-span resource bound exceeded: staged={} bound={} "
                                 "pieces={} piece={} input={} interval={} depth={} jerk_limit={}",
-                                normalSpans.size(),maximumStagedNormalSpans,pieces.size(),
-                                pieceIndex,piece.input,interval,depth,localLimits[pieceIndex].jerk);
+                                stagedSpanCount+materialized.spans.size(),
+                                maximumStagedNormalSpans,pieces.size(),
+                                pieceIndex,piece.input,interval,depth,
+                                effectiveLimits[pieceIndex].jerk);
                         ++geometryVerificationAttempts;
                         ++totalGeometryVerificationAttempts;
                         if((geometryVerificationAttempts&127U)==0) reportProgress();
@@ -1710,16 +1922,19 @@ namespace ngc {
                                 "pass={} attempts={} bound={} total_attempts={} staged={} pieces={} "
                                 "piece={} input={} interval={} depth={} jerk_limit={}",correctionPass,
                                 geometryVerificationAttempts,maximumGeometryVerificationAttemptsPerPass,
-                                totalGeometryVerificationAttempts,normalSpans.size(),pieces.size(),
-                                pieceIndex,piece.input,interval,depth,localLimits[pieceIndex].jerk);
+                                totalGeometryVerificationAttempts,
+                                stagedSpanCount+materialized.spans.size(),pieces.size(),
+                                pieceIndex,piece.input,interval,depth,
+                                effectiveLimits[pieceIndex].jerk);
                         if(totalGeometryVerificationAttempts>maximumTotalGeometryVerificationAttempts)
                             return std::format(
                                 "continuous cumulative geometry-verification resource bound exceeded: "
                                 "pass={} total_attempts={} bound={} pass_attempts={} staged={} pieces={} "
                                 "piece={} input={} interval={} depth={} jerk_limit={}",correctionPass,
                                 totalGeometryVerificationAttempts,maximumTotalGeometryVerificationAttempts,
-                                geometryVerificationAttempts,normalSpans.size(),pieces.size(),pieceIndex,
-                                piece.input,interval,depth,localLimits[pieceIndex].jerk);
+                                geometryVerificationAttempts,
+                                stagedSpanCount+materialized.spans.size(),pieces.size(),pieceIndex,
+                                piece.input,interval,depth,effectiveLimits[pieceIndex].jerk);
                         auto from=stateAt(u0);
                         auto to=stateAt(u1);
                         const auto duration=totalDuration*(u1-u0);
@@ -1733,12 +1948,13 @@ namespace ngc {
                                 "distance=[{},{}] piece_length={} duration={}",
                                 correctionPass,pieceIndex,piece.input,depth,u0,u1,
                                 localFrom,localTo,piece.length,duration);
+                        const auto constructionStarted=std::chrono::steady_clock::now();
                         std::vector<AxisPolynomialSpan> chain;
                         if(piece.linear) {
                             const auto start=piece.sampleAt(localFrom);
                             const auto finish=piece.sampleAt(localTo);
                             AxisPolynomialSpan span;
-                            span.id=nextSpan;
+                            span.id=0;
                             span.duration=duration;
                             span.inverseDuration=1.0/duration;
                             span.inverseDurationSquared=span.inverseDuration*span.inverseDuration;
@@ -1753,10 +1969,21 @@ namespace ngc {
                             span.end.acceleration=scaled(finish.tangent,to.acceleration);
                             chain.push_back(span);
                         } else {
-                            const auto curved=c2CubicChain(nextSpan,kinematicAt(pieceIndex,from),
+                            const auto curved=c2CubicChain(0,kinematicAt(pieceIndex,from),
                                 kinematicAt(pieceIndex,to),duration);
                             chain.assign(curved.begin(),curved.end());
                         }
+                        result->materialization.cubicConstructionSeconds+=
+                            std::chrono::duration<double>(
+                                std::chrono::steady_clock::now()-constructionStarted).count();
+                        if(stagedSpanCount+materialized.spans.size()+chain.size()
+                                >maximumStagedNormalSpans)
+                            return std::format(
+                                "continuous staged-span resource bound exceeded: staged={} bound={} "
+                                "pieces={} piece={} input={} interval={} depth={} jerk_limit={}",
+                                stagedSpanCount+materialized.spans.size()+chain.size(),
+                                maximumStagedNormalSpans,pieces.size(),pieceIndex,piece.input,
+                                interval,depth,effectiveLimits[pieceIndex].jerk);
                         auto verified=true;
                         for(std::size_t chainSpan=0;chainSpan<chain.size();++chainSpan) {
                             const auto fraction0=static_cast<double>(chainSpan)/chain.size();
@@ -1765,9 +1992,13 @@ namespace ngc {
                             const auto source1=stateAt(std::lerp(u0,u1,fraction1)).distance;
                             const auto proofFrom=std::clamp(source0,localFrom,localTo);
                             const auto proofTo=std::clamp(source1,localFrom,localTo);
+                            const auto verificationStarted=std::chrono::steady_clock::now();
                             const auto proof=verifiesOrderedCurveTolerance(chain[chainSpan],
                                 proofFrom,proofTo,m_limits.arcChordTolerance,piece.positionAt,
                                 piece.chordErrorBound);
+                            result->materialization.geometryVerificationSeconds+=
+                                std::chrono::duration<double>(
+                                    std::chrono::steady_clock::now()-verificationStarted).count();
                             if(!proof) {
                                 verified=false;
                                 break;
@@ -1813,14 +2044,18 @@ namespace ngc {
                                 return error;
                             return self(self,stateAt,totalDuration,interval,split,u1,depth+1);
                         }
-                        normalSpans.insert(normalSpans.end(),chain.begin(),chain.end());
-                        normalSpanPieces.insert(normalSpanPieces.end(),chain.size(),pieceIndex);
+                        const auto firstLocalSpan=materialized.spans.size();
+                        materialized.spans.insert(
+                            materialized.spans.end(),chain.begin(),chain.end());
                         const auto activationTolerance=std::max(
                             1e-12,piece.length*1e-10);
                         const auto finalEmission=
                             localTo>=piece.length-activationTolerance;
                         for(const auto &activation:piece.activations) {
-                            if(activationSpans[activation.input]!=0
+                            if(std::ranges::any_of(materialized.activationOwners,
+                                    [&](const auto &owner) {
+                                        return owner.first==activation.input;
+                                    })
                                ||activation.distance<localFrom-activationTolerance
                                ||(activation.distance>=localTo-activationTolerance
                                   &&!(finalEmission&&activation.distance
@@ -1837,9 +2072,9 @@ namespace ngc {
                                     break;
                                 }
                             }
-                            activationSpans[activation.input]=chain[owningSpan].id;
+                            materialized.activationOwners.emplace_back(
+                                activation.input,firstLocalSpan+owningSpan);
                         }
-                        nextSpan+=chain.size();
                         return std::nullopt;
                 };
                 if(piece.linear) {
@@ -1865,89 +2100,819 @@ namespace ngc {
                     if(auto error=emit(emit,stateAt,totalDuration,0,0.0,1.0,0))
                         return std::unexpected(*error);
                 }
+
+                if(materialized.spans.empty())
+                    return std::unexpected(std::format(
+                        "continuous timing piece {} emitted no motion spans",pieceIndex));
+                if(geometryDiagnostic) {
+                    auto geometrySample=std::size_t {0};
+                    const auto evaluateGeometry=[&](const TimeBoundary &state,
+                                                    const double scalarJerk,
+                                                    const std::size_t scalarPhase,
+                                                    const TimeBoundary &phaseFrom,
+                                                    const TimeBoundary &phaseTo) {
+                        ++result->materialization.geometryDifferentialChecks;
+                        const auto distance=std::clamp(state.distance,0.0,piece.length);
+                        const auto pathSample=piece.sampleAt(distance);
+                        const auto curvature=piece.curvatureAt(distance);
+                        const auto thirdDerivative=piece.curvatureDerivativeAt(distance);
+                        const auto velocity=scaled(pathSample.tangent,state.velocity);
+                        const auto acceleration=add(
+                            scaled(pathSample.tangent,state.acceleration),
+                            scaled(curvature,state.velocity*state.velocity));
+                        const auto jerk=add(
+                            add(scaled(pathSample.tangent,scalarJerk),
+                                scaled(curvature,3.0*state.velocity*state.acceleration)),
+                            scaled(thirdDerivative,state.velocity*state.velocity*state.velocity));
+                        const auto consider=[&](const double factor,const char *constraintName,
+                                                const char *axis,const double measured,
+                                                const double limit) {
+                            if(factor<=materialized.geometryCorrection) return;
+                            materialized.geometryCorrection=factor;
+                            materialized.geometryViolation={
+                                .factor=factor,.localSpan=geometrySample,
+                                .constraint=constraintName,.axis=axis,.measured=measured,
+                                .limit=limit,.ratio=measured/limit,
+                                .duration=phaseTo.time-phaseFrom.time,
+                                .scalarPhase=scalarPhase,.scalarJerk=scalarJerk,
+                                .phaseDistanceChange=phaseTo.distance-phaseFrom.distance,
+                                .phaseVelocityChange=phaseTo.velocity-phaseFrom.velocity,
+                                .phaseAccelerationChange=
+                                    phaseTo.acceleration-phaseFrom.acceleration,
+                                .sampleDistance=state.distance,.sampleVelocity=state.velocity,
+                                .sampleAcceleration=state.acceleration,
+                            };
+                        };
+                        consider(std::sqrt(acceleration.length()/m_limits.pathAcceleration),
+                            "path_acceleration","path",acceleration.length(),
+                            m_limits.pathAcceleration);
+                        consider(std::cbrt(jerk.length()/m_limits.pathJerk),
+                            "path_jerk","path",jerk.length(),m_limits.pathJerk);
+                        for(std::size_t axis=0;axis<AXIS_COMPONENTS.size();++axis) {
+                            const auto component=AXIS_COMPONENTS[axis];
+                            consider(std::abs(velocity.*component)
+                                    /(m_limits.axisVelocity.*component),
+                                "axis_velocity",AXIS_NAMES[axis],
+                                std::abs(velocity.*component),m_limits.axisVelocity.*component);
+                            consider(std::sqrt(std::abs(acceleration.*component)
+                                    /(m_limits.axisAcceleration.*component)),
+                                "axis_acceleration",AXIS_NAMES[axis],
+                                std::abs(acceleration.*component),
+                                m_limits.axisAcceleration.*component);
+                            consider(std::cbrt(std::abs(jerk.*component)
+                                    /(m_limits.axisJerk.*component)),
+                                "axis_jerk",AXIS_NAMES[axis],std::abs(jerk.*component),
+                                m_limits.axisJerk.*component);
+                        }
+                        ++geometrySample;
+                    };
+                    for(std::size_t phase=1;phase<boundaries.size();++phase) {
+                        const auto scalar=localScalarPhase(
+                            boundaries[phase-1],boundaries[phase]);
+                        for(const auto u:std::array{0.0,0.5,1.0})
+                            evaluateGeometry(scalar.at(u),boundaries[phase-1].jerk,
+                                phase-1,boundaries[phase-1],boundaries[phase]);
+                    }
+                    for(std::size_t sampleIndex=0;sampleIndex<piece.geometricSamples.size();
+                            ++sampleIndex) {
+                        const auto requested=sampleIndex==0?0.0
+                            :sampleIndex+1==piece.geometricSamples.size()?piece.length
+                            :piece.geometricSamples[sampleIndex].distance
+                                -piece.geometricSampleDistanceOffset;
+                        const auto upper=std::ranges::lower_bound(
+                            boundaries,requested,{},&TimeBoundary::distance);
+                        const auto phase=std::clamp<std::size_t>(
+                            upper-boundaries.begin(),1,boundaries.size()-1);
+                        const auto scalar=localScalarPhase(
+                            boundaries[phase-1],boundaries[phase]);
+                        auto low=0.0;
+                        auto high=1.0;
+                        for(auto iteration=0;iteration<48;++iteration) {
+                            const auto middle=std::midpoint(low,high);
+                            if(scalar.at(middle).distance<requested) low=middle;
+                            else high=middle;
+                        }
+                        evaluateGeometry(scalar.at(std::midpoint(low,high)),
+                            boundaries[phase-1].jerk,phase-1,
+                            boundaries[phase-1],boundaries[phase]);
+                    }
+                }
+                if(m_continuousPlanningEffort.constraintCheckMode
+                        !=ContinuousConstraintCheckMode::Sampled) {
+                    const auto constraintStarted=std::chrono::steady_clock::now();
+                    for(std::size_t localSpan=0;localSpan<materialized.spans.size();++localSpan) {
+                        const auto &span=materialized.spans[localSpan];
+                        ++result->materialization.exactConstraintSpanChecks;
+                        const auto consider=[&](const double factor,const char *constraintName,
+                                                const char *axis,const double measured,
+                                                const double limit) {
+                            if(factor<=materialized.correction) return;
+                            materialized.correction=factor;
+                            materialized.violation={
+                                .factor=factor,.localSpan=localSpan,.constraint=constraintName,
+                                .axis=axis,.measured=measured,.limit=limit,
+                                .ratio=measured/limit,.duration=span.duration,
+                            };
+                        };
+                        const auto pathAcceleration=maximumLinearAcceleration(span);
+                        consider(std::sqrt(pathAcceleration/m_limits.pathAcceleration),
+                            "path_acceleration","path",pathAcceleration,m_limits.pathAcceleration);
+                        const auto pathJerk=maximumLinearJerk(span);
+                        consider(std::cbrt(pathJerk/m_limits.pathJerk),
+                            "path_jerk","path",pathJerk,m_limits.pathJerk);
+                        for(std::size_t axis=0;axis<AXIS_COMPONENTS.size();++axis) {
+                            const auto component=AXIS_COMPONENTS[axis];
+                            const auto velocity=trajectory_detail::maximumAxisVelocity(span,component);
+                            consider(velocity/(m_limits.axisVelocity.*component),"axis_velocity",
+                                AXIS_NAMES[axis],velocity,m_limits.axisVelocity.*component);
+                            const auto acceleration=
+                                trajectory_detail::maximumAxisAcceleration(span,component);
+                            consider(std::sqrt(acceleration/(m_limits.axisAcceleration.*component)),
+                                "axis_acceleration",AXIS_NAMES[axis],acceleration,
+                                m_limits.axisAcceleration.*component);
+                            const auto jerk=trajectory_detail::maximumAxisJerk(span,component);
+                            consider(std::cbrt(jerk/(m_limits.axisJerk.*component)),"axis_jerk",
+                                AXIS_NAMES[axis],jerk,m_limits.axisJerk.*component);
+                        }
+                    }
+                    result->materialization.exactConstraintSeconds+=
+                        std::chrono::duration<double>(
+                            std::chrono::steady_clock::now()-constraintStarted).count();
+                }
+                materialized.valid=true;
+                cached=std::move(materialized);
+                stagedSpanCount+=cached.spans.size();
+                correction[pieceIndex]=geometryDiagnostic
+                    ?cached.geometryCorrection:cached.correction;
+                violation[pieceIndex]=geometryDiagnostic
+                    ?cached.geometryViolation:cached.violation;
             }
             result->geometryVerificationAttempts=totalGeometryVerificationAttempts;
             result->geometryVerificationHighWater=std::max(
                 result->geometryVerificationHighWater,geometryVerificationAttempts);
-            if(normalSpans.empty())
+            if(stagedSpanCount==0)
                 return std::unexpected("continuous locally timed trajectory emitted no motion spans");
+            if(geometryDiagnostic) {
+                result->materialization.axisCubicViolationPieces = 0;
+                result->materialization.maximumAxisCubicTimeScale = 1.0;
+                result->materialization.cubicViolations = {};
+                auto &diagnostics = result->materialization.cubicViolations;
+                constexpr auto MATERIAL_VIOLATION_TOLERANCE = 1e-9;
+                for (std::size_t pieceIndex = 0; pieceIndex < pieces.size(); ++pieceIndex) {
+                    const auto &piece = pieces[pieceIndex];
+                    const auto &materialized = materializedPieces[pieceIndex];
+                    auto pieceViolation = false;
+                    result->materialization.maximumAxisCubicTimeScale = std::max(
+                        result->materialization.maximumAxisCubicTimeScale,
+                        materialized.correction);
+                    for (std::size_t localSpan = 0;
+                            localSpan < materialized.spans.size(); ++localSpan) {
+                        const auto &span = materialized.spans[localSpan];
+                        auto worstRatio = 0.0;
+                        auto worstConstraint =
+                            ContinuousPolynomialConstraintKind::PathAcceleration;
+                        auto worstAxis = std::numeric_limits<std::size_t>::max();
+                        const auto observe = [&](const double measured, const double limit,
+                                ContinuousCubicConstraintSeverity &severity,
+                                const ContinuousPolynomialConstraintKind constraint,
+                                const std::size_t axis) {
+                            const auto ratio = measured / limit;
+                            if (ratio > worstRatio) {
+                                worstRatio = ratio;
+                                worstConstraint = constraint;
+                                worstAxis = axis;
+                            }
+                            if (ratio <= 1.0 + MATERIAL_VIOLATION_TOLERANCE) {
+                                return;
+                            }
+                            ++severity.violatingSpans;
+                            severity.violatingDuration += span.duration;
+                            if (ratio > severity.maximumRatio) {
+                                severity.maximumRatio = ratio;
+                                severity.worstSpanDuration = span.duration;
+                                severity.worstTimingPiece = pieceIndex;
+                                severity.worstLocalSpan = localSpan;
+                            }
+                        };
+                        observe(maximumLinearAcceleration(span), m_limits.pathAcceleration,
+                            diagnostics.pathAcceleration,
+                            ContinuousPolynomialConstraintKind::PathAcceleration,
+                            std::numeric_limits<std::size_t>::max());
+                        observe(maximumLinearJerk(span), m_limits.pathJerk,
+                            diagnostics.pathJerk, ContinuousPolynomialConstraintKind::PathJerk,
+                            std::numeric_limits<std::size_t>::max());
+                        for (std::size_t axis = 0; axis < AXIS_COMPONENTS.size(); ++axis) {
+                            const auto component = AXIS_COMPONENTS[axis];
+                            observe(trajectory_detail::maximumAxisVelocity(span, component),
+                                m_limits.axisVelocity.*component,
+                                diagnostics.axisVelocity[axis],
+                                ContinuousPolynomialConstraintKind::AxisVelocity, axis);
+                            observe(trajectory_detail::maximumAxisAcceleration(span, component),
+                                m_limits.axisAcceleration.*component,
+                                diagnostics.axisAcceleration[axis],
+                                ContinuousPolynomialConstraintKind::AxisAcceleration, axis);
+                            observe(trajectory_detail::maximumAxisJerk(span, component),
+                                m_limits.axisJerk.*component, diagnostics.axisJerk[axis],
+                                ContinuousPolynomialConstraintKind::AxisJerk, axis);
+                        }
 
-            if (m_continuousPlanningEffort.constraintCheckMode
-                    == ContinuousConstraintCheckMode::Sampled) {
-                constraintsVerified = true;
-
-                return std::vector<path_tempo::PieceCorrection>{};
-            }
-
-            struct ConstraintViolationDiagnostic {
-                double factor=1.0;
-                std::size_t stagedSpan=0;
-                SpanId spanId=0;
-                const char *constraint="none";
-                const char *axis="path";
-                double measured=0.0;
-                double limit=0.0;
-                double ratio=1.0;
-                double duration=0.0;
-            };
-            std::vector<double> correction(pieces.size(),1.0);
-            std::vector<ConstraintViolationDiagnostic> violation(pieces.size());
-            for(std::size_t spanIndex=0;spanIndex<normalSpans.size();++spanIndex) {
-                const auto &span=normalSpans[spanIndex];
-                const auto pieceIndex=normalSpanPieces[spanIndex];
-                const auto consider=[&](const double factor,const char *constraint,
-                                        const char *axis,const double measured,const double limit) {
-                    if(factor<=correction[pieceIndex]) return;
-                    correction[pieceIndex]=factor;
-                    violation[pieceIndex]={
-                        .factor=factor,.stagedSpan=spanIndex,.spanId=span.id,
-                        .constraint=constraint,.axis=axis,.measured=measured,.limit=limit,
-                        .ratio=measured/limit,.duration=span.duration,
-                    };
-                };
-                const auto pathAcceleration=maximumLinearAcceleration(span);
-                consider(std::sqrt(pathAcceleration/m_limits.pathAcceleration),
-                    "path_acceleration","path",pathAcceleration,m_limits.pathAcceleration);
-                const auto pathJerk=maximumLinearJerk(span);
-                consider(std::cbrt(pathJerk/m_limits.pathJerk),
-                    "path_jerk","path",pathJerk,m_limits.pathJerk);
-                for(std::size_t axis=0;axis<AXIS_COMPONENTS.size();++axis) {
-                    const auto component=AXIS_COMPONENTS[axis];
-                    const auto velocity=trajectory_detail::maximumAxisVelocity(span,component);
-                    consider(velocity/(m_limits.axisVelocity.*component),"axis_velocity",
-                        AXIS_NAMES[axis],velocity,m_limits.axisVelocity.*component);
-                    const auto acceleration=trajectory_detail::maximumAxisAcceleration(span,component);
-                    consider(std::sqrt(acceleration/(m_limits.axisAcceleration.*component)),
-                        "axis_acceleration",AXIS_NAMES[axis],acceleration,
-                        m_limits.axisAcceleration.*component);
-                    const auto jerk=trajectory_detail::maximumAxisJerk(span,component);
-                    consider(std::cbrt(jerk/(m_limits.axisJerk.*component)),"axis_jerk",
-                        AXIS_NAMES[axis],jerk,m_limits.axisJerk.*component);
+                        ++diagnostics.spans;
+                        ++diagnostics.worstRatioHistogram[cubicSeverityBin(worstRatio)];
+                        if (worstRatio <= 1.0 + MATERIAL_VIOLATION_TOLERANCE) {
+                            continue;
+                        }
+                        pieceViolation = true;
+                        ++diagnostics.violatingSpans;
+                        diagnostics.violatingDuration += span.duration;
+                        if(worstRatio > diagnostics.maximumRatio) {
+                            diagnostics.maximumRatio = worstRatio;
+                            diagnostics.worstSpanDuration = span.duration;
+                            diagnostics.worstTimingPiece = pieceIndex;
+                            diagnostics.worstPreparedPiece = piece.preparedPiece;
+                            diagnostics.worstInput = piece.input;
+                            diagnostics.worstLocalSpan = localSpan;
+                            diagnostics.worstConstraint = worstConstraint;
+                            diagnostics.worstAxis = worstAxis;
+                        }
+                    }
+                    if (pieceViolation) {
+                        ++diagnostics.violatingPieces;
+                    }
                 }
+                result->materialization.axisCubicViolationPieces =
+                    diagnostics.violatingPieces;
+
+                // Benchmark an alternative NRT materialization without changing the emitted
+                // cubic plan. Each accepted quintic matches endpoint PVA, stays within the
+                // prepared-geometry tolerance, and has certified derivative-control bounds.
+                auto &quintic = result->materialization.quinticPrototype;
+                quintic = {};
+                quintic.ran = true;
+                const auto quinticStarted = std::chrono::steady_clock::now();
+                const auto maximumPrototypeSpans =
+                    std::max<std::size_t>(8192,pieces.size() * 32);
+                const auto maximumPrototypeProofs =
+                    std::max<std::size_t>(32768,pieces.size() * 64);
+                for (std::size_t pieceIndex = 0; pieceIndex < pieces.size(); ++pieceIndex) {
+                    const auto &piece = pieces[pieceIndex];
+                    if (piece.linear) {
+                        quintic.retainedLinearCubicSpans +=
+                            materializedPieces[pieceIndex].spans.size();
+                        continue;
+                    }
+                    const auto &boundaries = pieceTiming[pieceIndex];
+                    struct GroupCandidate {
+                        bool accepted = false;
+                        bool constraintsVerified = false;
+                        bool geometryVerified = false;
+                        bool progressVerified = false;
+                        double maximumRatio = 0.0;
+                        ContinuousPolynomialConstraintKind constraint =
+                            ContinuousPolynomialConstraintKind::PathAcceleration;
+                        std::size_t axis = std::numeric_limits<std::size_t>::max();
+                    };
+                    const auto pathVelocityLimit =
+                        std::min(piece.programmedVelocity, piece.staticVelocityLimit);
+                    const auto evaluateStates = [&](const TimeBoundary &from,
+                                                    const TimeBoundary &to) {
+                        GroupCandidate candidate;
+                        ++quintic.groupCandidateEvaluations;
+                        if (quintic.geometryProofs >= maximumPrototypeProofs) {
+                            quintic.resourceExhausted = true;
+                            return candidate;
+                        }
+                        const auto duration = to.time - from.time;
+                        if (duration <= 1e-12) {
+                            ++quintic.numericallyUnrefinableIntervals;
+                            return candidate;
+                        }
+                        const auto controls = quinticBezierControls(
+                            kinematicAt(pieceIndex, from), kinematicAt(pieceIndex, to), duration);
+                        const auto bounds = quinticConstraintBounds(controls, duration,
+                            pathVelocityLimit, m_limits, quintic.constraintBoundNodes);
+                        candidate.maximumRatio = bounds.maximumRatio;
+                        candidate.constraint = bounds.constraint;
+                        candidate.axis = bounds.axis;
+                        const auto localFrom = std::clamp(from.distance, 0.0, piece.length);
+                        const auto localTo = std::clamp(to.distance, 0.0, piece.length);
+                        ++quintic.geometryProofs;
+                        const auto geometryAndProgressVerified = verifiesOrderedCurveTolerance(
+                            controls, localFrom, localTo, m_limits.arcChordTolerance,
+                            piece.positionAt, piece.chordErrorBound, true);
+                        auto geometryVerified = geometryAndProgressVerified;
+                        if (!geometryAndProgressVerified) {
+                            ++quintic.geometryProofs;
+                            geometryVerified = verifiesOrderedCurveTolerance(
+                                controls, localFrom, localTo, m_limits.arcChordTolerance,
+                                piece.positionAt, piece.chordErrorBound);
+                            if (geometryVerified) {
+                                ++quintic.forwardProgressFailures;
+                            }
+                        }
+                        candidate.geometryVerified = geometryVerified;
+                        candidate.progressVerified = geometryAndProgressVerified;
+                        const auto constraintsVerified =
+                            bounds.maximumRatio <= 1.0 + MATERIAL_VIOLATION_TOLERANCE;
+                        candidate.constraintsVerified = constraintsVerified;
+                        if (!geometryVerified) {
+                            ++quintic.geometryRefinements;
+                        }
+                        if (!constraintsVerified) {
+                            ++quintic.constraintRefinements;
+                        }
+                        candidate.accepted =
+                            geometryAndProgressVerified && constraintsVerified;
+                        return candidate;
+                    };
+
+                    const auto totalDuration = boundaries.back().time;
+                    const auto stateAtTime = [&](const double requested) {
+                        if (requested <= 0.0) {
+                            return boundaries.front();
+                        }
+                        if (requested >= totalDuration) {
+                            return boundaries.back();
+                        }
+                        const auto upper = std::ranges::upper_bound(
+                            boundaries, requested, {}, &TimeBoundary::time);
+                        const auto phase = std::clamp<std::size_t>(
+                            upper - boundaries.begin(), 1, boundaries.size() - 1);
+                        const auto scalar = localScalarPhase(
+                            boundaries[phase - 1], boundaries[phase]);
+                        auto result = scalar.at(std::clamp(
+                            (requested - boundaries[phase - 1].time) / scalar.duration,
+                            0.0, 1.0));
+                        result.time = requested;
+                        return result;
+                    };
+                    const auto stateAt = [&](const double u) {
+                        return stateAtTime(totalDuration * u);
+                    };
+
+                    const auto initial = evaluateStates(
+                        boundaries.front(), boundaries.back());
+                    ++quintic.initialCurvedSpans;
+                    ++quintic.initialWorstRatioHistogram[
+                        cubicSeverityBin(initial.maximumRatio)];
+                    if (!initial.constraintsVerified) {
+                        ++quintic.initialViolatingSpans;
+                    }
+                    if (initial.maximumRatio > quintic.maximumInitialRatio) {
+                        quintic.maximumInitialRatio = initial.maximumRatio;
+                        quintic.worstInitialDuration = totalDuration;
+                        quintic.worstInitialTimingPiece = pieceIndex;
+                        quintic.worstInitialPreparedPiece = piece.preparedPiece;
+                        quintic.worstInitialInput = piece.input;
+                        quintic.worstInitialConstraint = initial.constraint;
+                        quintic.worstInitialAxis = initial.axis;
+                    }
+
+                    struct AdaptiveLeaf {
+                        double from = 0.0;
+                        double to = 0.0;
+                        bool accepted = false;
+                        GroupCandidate candidate;
+                    };
+                    std::vector<AdaptiveLeaf> leaves;
+                    const auto refine = [&](const auto &self, const double u0,
+                                            const double u1, const unsigned depth) -> void {
+                        if (quintic.resourceExhausted) {
+                            return;
+                        }
+                        const auto from = stateAt(u0);
+                        const auto to = stateAt(u1);
+                        const auto candidate = evaluateStates(from, to);
+                        if (candidate.accepted) {
+                            leaves.push_back({u0, u1, true, candidate});
+                            quintic.maximumDepth = std::max(quintic.maximumDepth, depth);
+                            return;
+                        }
+                        if (depth >= 20) {
+                            leaves.push_back({u0, u1, false, candidate});
+                            ++quintic.numericallyUnrefinableIntervals;
+                            quintic.maximumDepth = std::max(quintic.maximumDepth, depth);
+                            return;
+                        }
+                        auto split = std::midpoint(u0, u1);
+                        const auto kinematicFrom = kinematicAt(pieceIndex, from);
+                        const auto kinematicTo = kinematicAt(pieceIndex, to);
+                        const auto stableSplit = [&](const double candidateSplit) {
+                            if (candidateSplit <= u0 || candidateSplit >= u1) {
+                                return false;
+                            }
+                            const auto middle =
+                                kinematicAt(pieceIndex, stateAt(candidateSplit));
+                            const auto leftDuration =
+                                totalDuration * (candidateSplit - u0);
+                            const auto rightDuration =
+                                totalDuration * (u1 - candidateSplit);
+                            return leftDuration >= minimumNumericallyStableC2Duration(
+                                       kinematicFrom, middle, m_limits)
+                                && rightDuration >= minimumNumericallyStableC2Duration(
+                                       middle, kinematicTo, m_limits);
+                        };
+                        std::optional<double> phaseSplit;
+                        const auto fromTime = totalDuration * u0;
+                        const auto toTime = totalDuration * u1;
+                        const auto targetTime = totalDuration * split;
+                        const auto phaseCandidate = std::ranges::lower_bound(
+                            boundaries, targetTime, {}, &TimeBoundary::time);
+                        const auto considerBoundary = [&](const auto iterator) {
+                            if (iterator == boundaries.end()
+                               || iterator->time <= fromTime
+                               || iterator->time >= toTime) {
+                                return;
+                            }
+                            const auto candidateSplit = iterator->time / totalDuration;
+                            if (!stableSplit(candidateSplit)) {
+                                return;
+                            }
+                            if (!phaseSplit
+                               || std::abs(candidateSplit - split)
+                                    < std::abs(*phaseSplit - split)) {
+                                phaseSplit = candidateSplit;
+                            }
+                        };
+                        considerBoundary(phaseCandidate);
+                        if (phaseCandidate != boundaries.begin()) {
+                            considerBoundary(phaseCandidate - 1);
+                        }
+                        if (phaseSplit) {
+                            split = *phaseSplit;
+                        } else if (!stableSplit(split)) {
+                            leaves.push_back({u0, u1, false, candidate});
+                            ++quintic.numericallyUnrefinableIntervals;
+                            quintic.maximumDepth = std::max(quintic.maximumDepth, depth);
+                            return;
+                        }
+                        ++quintic.subdivisions;
+                        self(self, u0, split, depth + 1);
+                        self(self, split, u1, depth + 1);
+                    };
+                    if (initial.accepted) {
+                        leaves.push_back({0.0, 1.0, true, initial});
+                    } else {
+                        refine(refine, 0.0, 1.0, 0);
+                    }
+
+                    std::vector<double> groupNodes;
+                    groupNodes.reserve(leaves.size() + 1);
+                    groupNodes.push_back(0.0);
+                    for (const auto &leaf : leaves) {
+                        groupNodes.push_back(leaf.to);
+                    }
+                    const auto groupNodeCount = groupNodes.size();
+                    std::vector<GroupCandidate> candidates(groupNodeCount * groupNodeCount);
+                    std::vector<bool> candidateEvaluated(groupNodeCount * groupNodeCount);
+                    for (std::size_t leaf = 0; leaf < leaves.size(); ++leaf) {
+                        const auto candidateIndex =
+                            leaf * groupNodeCount + leaf + 1;
+                        candidates[candidateIndex] = leaves[leaf].candidate;
+                        candidateEvaluated[candidateIndex] = true;
+                    }
+                    candidates[groupNodeCount - 1] = initial;
+                    candidateEvaluated[groupNodeCount - 1] = true;
+                    const auto evaluate = [&](const std::size_t fromNode,
+                                              const std::size_t toNode) -> GroupCandidate & {
+                        const auto candidateIndex =
+                            fromNode * groupNodeCount + toNode;
+                        if (!candidateEvaluated[candidateIndex]) {
+                            candidates[candidateIndex] = evaluateStates(
+                                stateAt(groupNodes[fromNode]),
+                                stateAt(groupNodes[toNode]));
+                            candidateEvaluated[candidateIndex] = true;
+                        }
+                        return candidates[candidateIndex];
+                    };
+                    const auto finalNode = groupNodeCount - 1;
+                    std::vector<std::int8_t> solutionState(groupNodeCount);
+                    std::vector<std::size_t> nextNode(groupNodeCount);
+                    const auto solve = [&](const auto &self,
+                                           const std::size_t fromNode) -> bool {
+                        if (fromNode == finalNode) {
+                            return true;
+                        }
+                        if (solutionState[fromNode] != 0) {
+                            return solutionState[fromNode] > 0;
+                        }
+                        for (auto toNode = finalNode; toNode > fromNode; --toNode) {
+                            if (evaluate(fromNode, toNode).accepted
+                               && self(self, toNode)) {
+                                nextNode[fromNode] = toNode;
+                                solutionState[fromNode] = 1;
+                                return true;
+                            }
+                            if (quintic.resourceExhausted) {
+                                break;
+                            }
+                        }
+                        solutionState[fromNode] = -1;
+                        return false;
+                    };
+                    const auto grouped = solve(solve, 0);
+                    if (!grouped) {
+                        auto pieceFailures = std::size_t{0};
+                        for (const auto &leaf : leaves) {
+                            if (leaf.accepted) {
+                                continue;
+                            }
+                            ++pieceFailures;
+                            if (leaf.from == 0.0 && leaf.to == 1.0) {
+                                ++quintic.wholePieceFailures;
+                            } else if (leaf.from == 0.0) {
+                                ++quintic.beginningBoundaryFailures;
+                            } else if (leaf.to == 1.0) {
+                                ++quintic.endingBoundaryFailures;
+                            } else {
+                                ++quintic.interiorFailures;
+                            }
+                            if (!leaf.candidate.geometryVerified) {
+                                ++quintic.failedGeometryChecks;
+                            } else if (!leaf.candidate.progressVerified) {
+                                ++quintic.failedProgressChecks;
+                            }
+                            if (!leaf.candidate.constraintsVerified) {
+                                ++quintic.failedConstraintChecks;
+                                ++quintic.failedConstraintKinds[
+                                    static_cast<std::size_t>(
+                                        leaf.candidate.constraint)];
+                            }
+                            const auto from = stateAt(leaf.from);
+                            const auto to = stateAt(leaf.to);
+                            const auto duration =
+                                totalDuration * (leaf.to - leaf.from);
+                            const auto controls = quinticBezierControls(
+                                kinematicAt(pieceIndex, from),
+                                kinematicAt(pieceIndex, to), duration);
+                            const auto sampled = sampledQuinticConstraintBounds(
+                                controls, duration, pathVelocityLimit, m_limits);
+                            quintic.maximumFailedCertifiedRatio = std::max(
+                                quintic.maximumFailedCertifiedRatio,
+                                leaf.candidate.maximumRatio);
+                            quintic.maximumFailedSampledRatio = std::max(
+                                quintic.maximumFailedSampledRatio,
+                                sampled.maximumRatio);
+                            const auto jerkLimit = effectiveLimits[pieceIndex].jerk;
+                            const auto startRampDuration =
+                                std::abs(from.acceleration) / jerkLimit;
+                            const auto endRampDuration =
+                                std::abs(to.acceleration) / jerkLimit;
+                            if (std::abs(from.acceleration) > 1e-12
+                               || std::abs(to.acceleration) > 1e-12) {
+                                ++quintic.failedNonzeroBoundaryAccelerations;
+                            }
+                            if (quintic.firstFailureDuration == 0.0) {
+                                quintic.firstFailureDuration = duration;
+                                quintic.firstFailureFrom = leaf.from;
+                                quintic.firstFailureTo = leaf.to;
+                                quintic.firstFailureCertifiedRatio =
+                                    leaf.candidate.maximumRatio;
+                                quintic.firstFailureSampledRatio =
+                                    sampled.maximumRatio;
+                                quintic.firstFailureStartAcceleration =
+                                    from.acceleration;
+                                quintic.firstFailureEndAcceleration =
+                                    to.acceleration;
+                                quintic.firstFailureStartRampDuration =
+                                    startRampDuration;
+                                quintic.firstFailureEndRampDuration =
+                                    endRampDuration;
+                                quintic.firstFailureTimingPiece = pieceIndex;
+                                quintic.firstFailurePreparedPiece = piece.preparedPiece;
+                            }
+                        }
+                        quintic.failedIntervals += std::max<std::size_t>(1, pieceFailures);
+                        ++quintic.ungroupablePieces;
+                        continue;
+                    }
+                    for (auto fromNode = std::size_t{0}; fromNode < finalNode;) {
+                        const auto toNode = nextNode[fromNode];
+                        const auto fromTime = totalDuration * groupNodes[fromNode];
+                        const auto toTime = totalDuration * groupNodes[toNode];
+                        const auto internalPhaseBoundaries = std::ranges::count_if(
+                            boundaries, [&](const TimeBoundary &boundary) {
+                                return boundary.time > fromTime && boundary.time < toTime;
+                            });
+                        const auto phases =
+                            static_cast<std::size_t>(internalPhaseBoundaries) + 1;
+                        const auto &candidate =
+                            candidates[fromNode * groupNodeCount + toNode];
+                        ++quintic.finalQuinticSpans;
+                        quintic.groupedPhaseBoundaries += internalPhaseBoundaries;
+                        quintic.maximumPhasesPerGroup =
+                            std::max(quintic.maximumPhasesPerGroup, phases);
+                        quintic.maximumAcceptedRatio = std::max(
+                            quintic.maximumAcceptedRatio, candidate.maximumRatio);
+                        if (toNode < finalNode) {
+                            ++quintic.phaseBoundarySplits;
+                        }
+                        fromNode = toNode;
+                    }
+                    if (quintic.finalQuinticSpans >= maximumPrototypeSpans) {
+                        quintic.resourceExhausted = true;
+                        break;
+                    }
+                }
+                quintic.seconds = std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - quinticStarted).count();
             }
+
+            const auto correctionStarted=std::chrono::steady_clock::now();
             const auto worstIterator=std::ranges::max_element(correction);
             const auto worst=*worstIterator;
             const auto worstPiece=static_cast<std::size_t>(worstIterator-correction.begin());
             const auto &worstViolation=violation[worstPiece];
-            correctionHistory+=std::format(
-                "{}pass {}: factor={} piece={} input={} geometry={} piece_length={} "
-                "span_id={} staged_span={} span_duration={} constraint={} axis={} measured={} "
-                "limit={} measured_over_limit={} timing_candidate={} candidate_duration={} "
-                "max_station_acceleration={} station_state=[v={} a={} -> v={} a={}] "
-                "local_limits=[v={} a={} j={}]",
-                correctionHistory.empty()?"":"; ",correctionPass,worst,worstPiece,
-                pieces[worstPiece].input,pieces[worstPiece].linear?"linear":"curved",
-                pieces[worstPiece].length,worstViolation.spanId,worstViolation.stagedSpan,
-                worstViolation.duration,worstViolation.constraint,worstViolation.axis,
-                worstViolation.measured,worstViolation.limit,worstViolation.ratio,
-                "velocity-seed",candidateDuration,
-                maximumStationAcceleration,
-                stationVelocity[worstPiece],stationAcceleration[worstPiece],
-                stationVelocity[worstPiece+1],stationAcceleration[worstPiece+1],
-                localLimits[worstPiece].velocity,
-                localLimits[worstPiece].acceleration,localLimits[worstPiece].jerk);
-            if (worst <= 1.0 + 1e-9) {
+            const auto worstStagedSpan=pieceSpanOffsets[worstPiece]+worstViolation.localSpan;
+            const auto worstSpanId=m_nextSpan+worstStagedSpan;
+            const auto violatingPieces=std::ranges::count_if(correction,[](const double factor) {
+                return factor>1.0+1e-9;
+            });
+            const auto sampled=m_continuousPlanningEffort.constraintCheckMode
+                ==ContinuousConstraintCheckMode::Sampled;
+            if(geometryDiagnostic) {
+                correctionHistory+=std::format(
+                    "{}pass {}: factor={} violating_pieces={} piece={} input={} "
+                    "check=actual_geometry "
+                    "sample={} scalar_phase={} phase_duration={} phase_ds={} phase_dv={} "
+                    "phase_da={} scalar_jerk={} sample_s={} sample_v={} sample_a={} "
+                    "constraint={} axis={} measured={} limit={} "
+                    "measured_over_limit={} candidate_duration={} max_station_acceleration={} "
+                    "station_state=[v={} a={} -> v={} a={}] local_limits=[v={} a={} j={}]",
+                    correctionHistory.empty()?"":"; ",correctionPass,worst,
+                    violatingPieces,worstPiece,
+                    pieces[worstPiece].input,worstViolation.localSpan,
+                    worstViolation.scalarPhase,worstViolation.duration,
+                    worstViolation.phaseDistanceChange,worstViolation.phaseVelocityChange,
+                    worstViolation.phaseAccelerationChange,worstViolation.scalarJerk,
+                    worstViolation.sampleDistance,worstViolation.sampleVelocity,
+                    worstViolation.sampleAcceleration,
+                    worstViolation.constraint,worstViolation.axis,worstViolation.measured,
+                    worstViolation.limit,worstViolation.ratio,candidateDuration,
+                    maximumStationAcceleration,stationVelocity[worstPiece],
+                    stationAcceleration[worstPiece],stationVelocity[worstPiece+1],
+                    stationAcceleration[worstPiece+1],effectiveLimits[worstPiece].velocity,
+                    effectiveLimits[worstPiece].acceleration,
+                    effectiveLimits[worstPiece].jerk);
+                if(violatingPieces>0) {
+                    const auto kindName=[](const PreparedPieceKind kind) {
+                        switch(kind) {
+                            case PreparedPieceKind::RetainedLineSection:
+                                return std::string_view{"retained_line"};
+                            case PreparedPieceKind::RetainedArcSection:
+                                return std::string_view{"retained_arc"};
+                            case PreparedPieceKind::JunctionBlend:
+                                return std::string_view{"junction_blend"};
+                            case PreparedPieceKind::ClusterSpline:
+                                return std::string_view{"cluster_spline"};
+                        }
+                        return std::string_view{"unknown"};
+                    };
+                    const auto sourceBlock=[&](const std::size_t input) {
+                        if(input>=geometry.commands.size()) return std::string{"<invalid>"};
+                        const auto &blocks=geometry.commands[input].presentation.activeBlocks;
+                        if(blocks.empty()) return std::string{"<none>"};
+                        const auto &block=blocks.back();
+                        return std::format("{}:{} block {} '{}'",block.source,block.line,
+                            block.id,block.text);
+                    };
+                    correctionHistory+=" violations=[";
+                    auto listed=std::size_t{0};
+                    constexpr auto MAXIMUM_LISTED_VIOLATIONS=16U;
+                    for(std::size_t pieceIndex=0;
+                            pieceIndex<correction.size()
+                                &&listed<MAXIMUM_LISTED_VIOLATIONS;++pieceIndex) {
+                        if(correction[pieceIndex]<=1.0+1e-9) continue;
+                        const auto &piece=pieces[pieceIndex];
+                        const auto &pieceViolation=violation[pieceIndex];
+                        const auto distance=std::clamp(
+                            pieceViolation.sampleDistance,0.0,piece.length);
+                        const auto pathSample=piece.sampleAt(distance);
+                        const auto curvature=piece.curvatureAt(distance);
+                        const auto thirdDerivative=piece.curvatureDerivativeAt(distance);
+                        const PreparedGeometricSample *nearestStation=nullptr;
+                        auto nearestStationDistance=0.0;
+                        auto nearestStationError=std::numeric_limits<double>::infinity();
+                        for(std::size_t sampleIndex=0;
+                                sampleIndex<piece.geometricSamples.size();++sampleIndex) {
+                            const auto stationDistance=sampleIndex==0?0.0
+                                :sampleIndex+1==piece.geometricSamples.size()?piece.length
+                                :piece.geometricSamples[sampleIndex].distance
+                                    -piece.geometricSampleDistanceOffset;
+                            const auto error=std::abs(stationDistance-distance);
+                            if(error<nearestStationError) {
+                                nearestStation=&piece.geometricSamples[sampleIndex];
+                                nearestStationDistance=stationDistance;
+                                nearestStationError=error;
+                            }
+                        }
+                        const auto knot=piece.knotInterval
+                                ==std::numeric_limits<std::size_t>::max()
+                            ?std::string{"none"}:std::to_string(piece.knotInterval);
+                        correctionHistory+=std::format(
+                            "{}{{piece={} prepared_piece={} kind={} knot={} "
+                            "sources={} first=\"{}\" last=\"{}\" curve=[{},{}] "
+                            "local_s={} xyz=[{},{},{}] tangent=[{},{},{}] "
+                            "curvature=[{},{},{}] curvature_magnitude={} "
+                            "q3=[{},{},{}] q3_magnitude={} phase={} phase_duration={} "
+                            "nearest_station_s={} nearest_station_error={} "
+                            "station_q3=[{},{},{}] station_q3_magnitude={} "
+                            "phase_ds={} scalar=[v={} a={} j={}] constraint={} axis={} "
+                            "measured={} limit={} ratio={} factor={}}}",
+                            listed==0?"":",",pieceIndex,piece.preparedPiece,
+                            kindName(piece.preparedKind),knot,piece.sourceInputCount,
+                            sourceBlock(piece.firstSourceInput),
+                            sourceBlock(piece.lastSourceInput),piece.curveFrom,piece.curveTo,
+                            distance,pathSample.position.x,pathSample.position.y,
+                            pathSample.position.z,pathSample.tangent.x,pathSample.tangent.y,
+                            pathSample.tangent.z,curvature.x,curvature.y,curvature.z,
+                            curvature.length(),thirdDerivative.x,thirdDerivative.y,
+                            thirdDerivative.z,thirdDerivative.length(),
+                            pieceViolation.scalarPhase,pieceViolation.duration,
+                            nearestStationDistance,nearestStationError,
+                            nearestStation->curvatureDerivative.x,
+                            nearestStation->curvatureDerivative.y,
+                            nearestStation->curvatureDerivative.z,
+                            nearestStation->curvatureDerivative.length(),
+                            pieceViolation.phaseDistanceChange,pieceViolation.sampleVelocity,
+                            pieceViolation.sampleAcceleration,pieceViolation.scalarJerk,
+                            pieceViolation.constraint,pieceViolation.axis,
+                            pieceViolation.measured,pieceViolation.limit,pieceViolation.ratio,
+                            correction[pieceIndex]);
+                        ++listed;
+                    }
+                    if(static_cast<std::size_t>(violatingPieces)>listed)
+                        correctionHistory+=std::format(",... {} omitted",
+                            static_cast<std::size_t>(violatingPieces)-listed);
+                    correctionHistory+="]";
+                }
+            } else if(!sampled)
+                correctionHistory+=std::format(
+                    "{}pass {}: factor={} piece={} input={} geometry={} piece_length={} "
+                    "span_id={} staged_span={} span_duration={} constraint={} axis={} measured={} "
+                    "limit={} measured_over_limit={} timing_candidate={} candidate_duration={} "
+                    "max_station_acceleration={} station_state=[v={} a={} -> v={} a={}] "
+                    "local_limits=[v={} a={} j={}]",
+                    correctionHistory.empty()?"":"; ",correctionPass,worst,worstPiece,
+                    pieces[worstPiece].input,pieces[worstPiece].linear?"linear":"curved",
+                    pieces[worstPiece].length,worstSpanId,worstStagedSpan,
+                    worstViolation.duration,worstViolation.constraint,worstViolation.axis,
+                    worstViolation.measured,worstViolation.limit,worstViolation.ratio,
+                    "velocity-seed",candidateDuration,
+                    maximumStationAcceleration,
+                    stationVelocity[worstPiece],stationAcceleration[worstPiece],
+                    stationVelocity[worstPiece+1],stationAcceleration[worstPiece+1],
+                    effectiveLimits[worstPiece].velocity,
+                    effectiveLimits[worstPiece].acceleration,
+                    effectiveLimits[worstPiece].jerk);
+            if(sampled||worst<=1.0+1e-9) {
                 constraintsVerified = true;
+                result->materialization.correctionCollectionSeconds+=
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now()-correctionStarted).count();
+
+                const auto assemblyStarted=std::chrono::steady_clock::now();
+                normalSpans.clear();
+                normalSpans.reserve(stagedSpanCount);
+                std::ranges::fill(activationSpans,SpanId{});
+                nextSpan=m_nextSpan;
+                for(const auto &materialized:materializedPieces) {
+                    const auto firstSpan=normalSpans.size();
+                    for(auto span:materialized.spans) {
+                        span.id=nextSpan++;
+                        normalSpans.push_back(span);
+                    }
+                    for(const auto &[input,localSpan]:materialized.activationOwners) {
+                        if(input>=activationSpans.size()||localSpan>=materialized.spans.size())
+                            return std::unexpected(
+                                "continuous cached activation ownership is inconsistent");
+                        if(activationSpans[input]!=0) continue;
+                        activationSpans[input]=normalSpans[firstSpan+localSpan].id;
+                    }
+                }
+                result->pieceTiming.clear();
+                result->pieceTiming.reserve(pieces.size());
+                for(std::size_t pieceIndex=0;pieceIndex<pieces.size();++pieceIndex) {
+                    result->pieceTiming.push_back({
+                        .input=pieces[pieceIndex].input,
+                        .length=pieces[pieceIndex].length,
+                        .linear=pieces[pieceIndex].linear,
+                        .startPosition=pieces[pieceIndex].positionAt(0.0),
+                        .endPosition=pieces[pieceIndex].positionAt(pieces[pieceIndex].length),
+                        .programmedVelocityLimit=pieces[pieceIndex].programmedVelocity,
+                        .staticVelocityLimit=pieces[pieceIndex].staticVelocityLimit,
+                        .velocityLimit=effectiveLimits[pieceIndex].velocity,
+                        .accelerationLimit=effectiveLimits[pieceIndex].acceleration,
+                        .jerkLimit=effectiveLimits[pieceIndex].jerk,
+                        .entryVelocity=stationVelocity[pieceIndex],
+                        .entryAcceleration=stationAcceleration[pieceIndex],
+                        .exitVelocity=stationVelocity[pieceIndex+1],
+                        .exitAcceleration=stationAcceleration[pieceIndex+1],
+                        .duration=pieceTiming[pieceIndex].back().time,
+                    });
+                }
+                result->materialization.finalAssemblySeconds+=
+                    std::chrono::duration<double>(
+                        std::chrono::steady_clock::now()-assemblyStarted).count();
 
                 return std::vector<path_tempo::PieceCorrection>{};
             }
@@ -1970,6 +2935,9 @@ namespace ngc {
                     .requiredTimeScale = correction[pieceIndex] * 1.01,
                 });
             }
+            result->materialization.correctionCollectionSeconds+=
+                std::chrono::duration<double>(
+                    std::chrono::steady_clock::now()-correctionStarted).count();
 
             return corrections;
         };
@@ -1983,10 +2951,11 @@ namespace ngc {
         }
 
         const auto diagnosedCorrectionPasses = planned->diagnostics.correctionPasses;
-        if ((m_continuousPlanningEffort.constraintCheckMode
-                 == ContinuousConstraintCheckMode::Materialized
-             && materializationPass != diagnosedCorrectionPasses)
-            || materializationPass > diagnosedCorrectionPasses) {
+        if ((!usesPathTempoSampledCorrections(m_continuousPlanningEffort)
+                &&m_continuousPlanningEffort.constraintCheckMode
+                    ==ContinuousConstraintCheckMode::Materialized
+                &&materializationPass!=diagnosedCorrectionPasses)
+            ||materializationPass>diagnosedCorrectionPasses) {
             return std::unexpected(
                 "PathTempo materialization callback count is inconsistent with its correction-pass diagnostics");
         }

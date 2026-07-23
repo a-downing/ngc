@@ -1,6 +1,7 @@
 #include <chrono>
 #include <cstdlib>
 #include <filesystem>
+#include <optional>
 #include <print>
 #include <string>
 #include <string_view>
@@ -79,7 +80,8 @@ namespace {
         constexpr std::string_view prefix = "--continuous-check=";
         if (!argument.starts_with(prefix)) {
             return std::unexpected(
-                "continuous-check option must use --continuous-check=materialized|sampled");
+                "continuous-check option must use "
+                "--continuous-check=materialized|sampled|geometry");
         }
         argument.remove_prefix(prefix.size());
         if (argument == "materialized") {
@@ -88,9 +90,11 @@ namespace {
         if (argument == "sampled") {
             return ngc::ContinuousConstraintCheckMode::Sampled;
         }
+        if(argument=="geometry")
+            return ngc::ContinuousConstraintCheckMode::GeometryDiagnostic;
 
         return std::unexpected(
-            "unknown continuous check; expected materialized or sampled");
+            "unknown continuous check; expected materialized, sampled, or geometry");
     }
 
     std::expected<ngc::ContinuousBoundaryAccelerationMode, std::string> parseMode(
@@ -108,12 +112,24 @@ namespace {
 
         return std::unexpected("unknown mode; expected zero or optimized");
     }
+
+    std::expected<bool,std::string> parseSampledCorrections(std::string_view argument) {
+        constexpr std::string_view prefix="--sampled-corrections=";
+        if(!argument.starts_with(prefix))
+            return std::unexpected(
+                "sampled-corrections option must use --sampled-corrections=on|off");
+        argument.remove_prefix(prefix.size());
+        if(argument=="on") return true;
+        if(argument=="off") return false;
+        return std::unexpected("unknown sampled-corrections value; expected on or off");
+    }
 }
 
 int main(const int argc, char **argv) {
     auto smoother = ngc::spline_detail::continuousSplineFitSolver();
     auto mode = ngc::ContinuousBoundaryAccelerationMode::Optimized;
     auto continuousCheck = ngc::ContinuousConstraintCheckMode::Materialized;
+    std::optional<bool> sampledCorrections;
     std::vector<std::string_view> positionalArguments;
 
     for (auto argument = 1; argument < argc; ++argument) {
@@ -144,6 +160,13 @@ int main(const int argc, char **argv) {
                 return 2;
             }
             continuousCheck = *parsed;
+        } else if(option.starts_with("--sampled-corrections=")) {
+            const auto parsed=parseSampledCorrections(option);
+            if(!parsed) {
+                std::println(stderr,"{}",parsed.error());
+                return 2;
+            }
+            sampledCorrections=*parsed;
         } else if (option.starts_with("--")) {
             std::println(stderr, "unknown diagnostic option: {}", option);
             return 2;
@@ -157,7 +180,8 @@ int main(const int argc, char **argv) {
             "[maximum-program-seconds] [tick-multiplier] "
             "[--smoother=none|coordinate|uniform|peak-targeted|velocity-targeted] "
             "[--mode=zero|optimized] "
-            "[--continuous-check=materialized|sampled]");
+            "[--continuous-check=materialized|sampled|geometry] "
+            "[--sampled-corrections=on|off]");
         return 2;
     }
 
@@ -202,6 +226,7 @@ int main(const int argc, char **argv) {
     auto planningEffort = ngc::ContinuousPlanningEffort{};
     planningEffort.boundaryAccelerationMode = mode;
     planningEffort.constraintCheckMode = continuousCheck;
+    planningEffort.pathTempoSampledCorrections=sampledCorrections;
     if (!worker.setContinuousPlanningEffort(planningEffort)) {
         std::println(stderr, "simulation worker rejected the continuous planning selection");
         return 1;
@@ -211,9 +236,11 @@ int main(const int argc, char **argv) {
         return 1;
     }
 
-    std::println("program={} multiplier={} stop_after={:.3f}s smoother={} mode={} continuous_check={}",
+    std::println("program={} multiplier={} stop_after={:.3f}s smoother={} mode={} "
+        "continuous_check={} sampled_corrections={}",
         program.string(),multiplier,maximumProgramSeconds,smootherName(smoother),
-        name(mode),name(continuousCheck));
+        name(mode),name(continuousCheck),
+        ngc::usesPathTempoSampledCorrections(planningEffort)?"on":"off");
     ngc::EpochId lastEpoch=0;
     ngc::ChunkId lastChunk=0;
     ngc::SpanId lastSpan=0;

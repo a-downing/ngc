@@ -1,6 +1,7 @@
 #pragma once
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstdint>
 #include <expected>
@@ -36,12 +37,14 @@ namespace ngc {
     enum class ContinuousConstraintCheckMode : std::uint8_t {
         Materialized,
         Sampled,
+        GeometryDiagnostic,
     };
 
     inline std::string_view name(const ContinuousConstraintCheckMode mode) {
         switch (mode) {
             case ContinuousConstraintCheckMode::Materialized: return "materialized";
             case ContinuousConstraintCheckMode::Sampled: return "sampled";
+            case ContinuousConstraintCheckMode::GeometryDiagnostic: return "geometry";
         }
 
         return "unknown";
@@ -78,26 +81,26 @@ namespace ngc {
         }
     }
 
-    enum class ContinuousVelocityLimitCause {
-        ProgrammedFeed,
-        AxisVelocity,
-        AxisCentripetalAcceleration,
-        PathCentripetalAcceleration,
-        AxisCurvatureDerivativeJerk,
-        PathCurvatureDerivativeJerk,
-    };
-
     struct ContinuousPlanningEffort {
         unsigned maximumLocalCorrectionPasses = 32;
         std::size_t geometryVerificationBudgetMultiplier = 36;
-        double curvatureDerivativeVelocityCapMultiplier = 1.0;
-        bool applyCurvatureDerivativeVelocityCap = true;
-        bool measureCurvatureDerivativeNumerics = false;
+        // Diagnostic escape hatch for bit-exact cached-versus-uncached plan
+        // comparisons. Production keeps solve-local piece reuse enabled.
+        bool reuseMaterializedPieces = true;
+        // No value preserves the check-mode default: sampled checking enables
+        // PathTempo's differential-station corrections and materialized
+        // checking does not. A value explicitly overrides that choice.
+        std::optional<bool> pathTempoSampledCorrections;
         ContinuousBoundaryAccelerationMode boundaryAccelerationMode =
             ContinuousBoundaryAccelerationMode::Optimized;
         ContinuousConstraintCheckMode constraintCheckMode =
             ContinuousConstraintCheckMode::Materialized;
     };
+
+    inline bool usesPathTempoSampledCorrections(const ContinuousPlanningEffort &effort) {
+        return effort.pathTempoSampledCorrections.value_or(
+            effort.constraintCheckMode==ContinuousConstraintCheckMode::Sampled);
+    }
 
     struct ContinuousPieceTimingDiagnostic {
         std::size_t input = 0;
@@ -106,11 +109,7 @@ namespace ngc {
         position_t startPosition{};
         position_t endPosition{};
         double programmedVelocityLimit = 0.0;
-        double initialVelocityLimit = 0.0;
-        ContinuousVelocityLimitCause initialVelocityLimitCause =
-            ContinuousVelocityLimitCause::ProgrammedFeed;
-        double initialAccelerationLimit = 0.0;
-        double initialJerkLimit = 0.0;
+        double staticVelocityLimit = std::numeric_limits<double>::infinity();
         double velocityLimit = 0.0;
         double accelerationLimit = 0.0;
         double jerkLimit = 0.0;
@@ -119,17 +118,6 @@ namespace ngc {
         double exitVelocity = 0.0;
         double exitAcceleration = 0.0;
         double duration = 0.0;
-        // NRT-only numerical diagnostics at the sample producing the largest
-        // analytic curvature-derivative magnitude for this geometry piece.
-        double curvatureDerivativeSampleDistance = 0.0;
-        double curvatureDerivativeMagnitude = 0.0;
-        double curvatureMagnitudeAtDerivativeSample = 0.0;
-        double curvatureDerivativeTangentialMagnitude = 0.0;
-        double curvatureDerivativeNormalMagnitude = 0.0;
-        double curvatureDerivativeFiniteDifferenceCoarse = 0.0;
-        double curvatureDerivativeFiniteDifferenceFine = 0.0;
-        double curvatureDerivativeFiniteDifferenceCoarseStep = 0.0;
-        double curvatureDerivativeFiniteDifferenceFineStep = 0.0;
     };
 
     // NRT-only cost evidence for exact-stop calls into PathTempo's scalar
@@ -242,6 +230,145 @@ namespace ngc {
         std::size_t chunk = 0;
     };
 
+    enum class ContinuousPolynomialConstraintKind : std::uint8_t {
+        PathVelocity,
+        PathAcceleration,
+        PathJerk,
+        AxisVelocity,
+        AxisAcceleration,
+        AxisJerk,
+    };
+
+    inline std::string_view name(const ContinuousPolynomialConstraintKind kind) {
+        switch (kind) {
+            case ContinuousPolynomialConstraintKind::PathVelocity: return "path_velocity";
+            case ContinuousPolynomialConstraintKind::PathAcceleration: return "path_acceleration";
+            case ContinuousPolynomialConstraintKind::PathJerk: return "path_jerk";
+            case ContinuousPolynomialConstraintKind::AxisVelocity: return "axis_velocity";
+            case ContinuousPolynomialConstraintKind::AxisAcceleration: return "axis_acceleration";
+            case ContinuousPolynomialConstraintKind::AxisJerk: return "axis_jerk";
+        }
+
+        return "unknown";
+    }
+
+    struct ContinuousCubicConstraintSeverity {
+        std::size_t violatingSpans = 0;
+        double violatingDuration = 0.0;
+        double maximumRatio = 1.0;
+        double worstSpanDuration = 0.0;
+        std::size_t worstTimingPiece = 0;
+        std::size_t worstLocalSpan = 0;
+    };
+
+    inline constexpr std::size_t CONTINUOUS_POLYNOMIAL_SEVERITY_BIN_COUNT = 9;
+
+    struct ContinuousCubicViolationDiagnostics {
+        // Each final emitted cubic is placed in exactly one bin according to
+        // its worst raw measured/limit ratio across every path and axis check:
+        // compliant, numerical, <=0.1%, <=1%, <=5%, <=25%, <=50%, <=100%, >100%.
+        std::array<std::size_t, CONTINUOUS_POLYNOMIAL_SEVERITY_BIN_COUNT>
+            worstRatioHistogram{};
+        std::size_t spans = 0;
+        std::size_t violatingSpans = 0;
+        std::size_t violatingPieces = 0;
+        double violatingDuration = 0.0;
+        double maximumRatio = 1.0;
+        double worstSpanDuration = 0.0;
+        std::size_t worstTimingPiece = 0;
+        PreparedPieceId worstPreparedPiece = 0;
+        std::size_t worstInput = 0;
+        std::size_t worstLocalSpan = 0;
+        ContinuousPolynomialConstraintKind worstConstraint =
+            ContinuousPolynomialConstraintKind::PathAcceleration;
+        std::size_t worstAxis = std::numeric_limits<std::size_t>::max();
+        ContinuousCubicConstraintSeverity pathAcceleration;
+        ContinuousCubicConstraintSeverity pathJerk;
+        std::array<ContinuousCubicConstraintSeverity, 6> axisVelocity{};
+        std::array<ContinuousCubicConstraintSeverity, 6> axisAcceleration{};
+        std::array<ContinuousCubicConstraintSeverity, 6> axisJerk{};
+    };
+
+    struct ContinuousQuinticPrototypeDiagnostics {
+        bool ran = false;
+        std::array<std::size_t, CONTINUOUS_POLYNOMIAL_SEVERITY_BIN_COUNT>
+            initialWorstRatioHistogram{};
+        std::size_t initialCurvedSpans = 0;
+        std::size_t initialViolatingSpans = 0;
+        std::size_t finalQuinticSpans = 0;
+        std::size_t retainedLinearCubicSpans = 0;
+        std::size_t groupCandidateEvaluations = 0;
+        std::size_t groupedPhaseBoundaries = 0;
+        std::size_t ungroupablePieces = 0;
+        std::size_t beginningBoundaryFailures = 0;
+        std::size_t endingBoundaryFailures = 0;
+        std::size_t interiorFailures = 0;
+        std::size_t wholePieceFailures = 0;
+        std::size_t failedGeometryChecks = 0;
+        std::size_t failedProgressChecks = 0;
+        std::size_t failedConstraintChecks = 0;
+        std::array<std::size_t, 6> failedConstraintKinds{};
+        std::size_t failedNonzeroBoundaryAccelerations = 0;
+        std::size_t forwardProgressFailures = 0;
+        std::size_t maximumPhasesPerGroup = 0;
+        std::size_t subdivisions = 0;
+        std::size_t phaseBoundarySplits = 0;
+        std::size_t geometryRefinements = 0;
+        std::size_t constraintRefinements = 0;
+        std::size_t geometryProofs = 0;
+        std::size_t constraintBoundNodes = 0;
+        std::size_t failedIntervals = 0;
+        std::size_t numericallyUnrefinableIntervals = 0;
+        bool resourceExhausted = false;
+        unsigned maximumDepth = 0;
+        double maximumInitialRatio = 1.0;
+        double maximumAcceptedRatio = 0.0;
+        double worstInitialDuration = 0.0;
+        double firstFailureDuration = 0.0;
+        double firstFailureFrom = 0.0;
+        double firstFailureTo = 0.0;
+        double firstFailureCertifiedRatio = 0.0;
+        double firstFailureSampledRatio = 0.0;
+        double firstFailureStartAcceleration = 0.0;
+        double firstFailureEndAcceleration = 0.0;
+        double firstFailureStartRampDuration = 0.0;
+        double firstFailureEndRampDuration = 0.0;
+        double maximumFailedCertifiedRatio = 0.0;
+        double maximumFailedSampledRatio = 0.0;
+        std::size_t firstFailureTimingPiece = 0;
+        PreparedPieceId firstFailurePreparedPiece = 0;
+        std::size_t worstInitialTimingPiece = 0;
+        PreparedPieceId worstInitialPreparedPiece = 0;
+        std::size_t worstInitialInput = 0;
+        ContinuousPolynomialConstraintKind worstInitialConstraint =
+            ContinuousPolynomialConstraintKind::PathAcceleration;
+        std::size_t worstInitialAxis = std::numeric_limits<std::size_t>::max();
+        double seconds = 0.0;
+    };
+
+    // NRT-only evidence for PathTempo materialization callback work. Cache
+    // entries live for one continuous compilation attempt and never cross the
+    // RT-facing backend boundary.
+    struct ContinuousMaterializationDiagnostics {
+        std::size_t callbackPasses = 0;
+        std::size_t candidatePieces = 0;
+        std::size_t materializedPieces = 0;
+        std::size_t reusedPieces = 0;
+        std::size_t exactConstraintSpanChecks = 0;
+        std::size_t geometryDifferentialChecks = 0;
+        std::size_t axisCubicViolationPieces = 0;
+        double maximumAxisCubicTimeScale = 1.0;
+        ContinuousCubicViolationDiagnostics cubicViolations;
+        ContinuousQuinticPrototypeDiagnostics quinticPrototype;
+        double candidateConversionSeconds = 0.0;
+        double cacheComparisonSeconds = 0.0;
+        double cubicConstructionSeconds = 0.0;
+        double geometryVerificationSeconds = 0.0;
+        double exactConstraintSeconds = 0.0;
+        double correctionCollectionSeconds = 0.0;
+        double finalAssemblySeconds = 0.0;
+    };
+
     struct ContinuousTrajectoryPlan {
         std::vector<PlanChunk> chunks;
         // Ordered by chunk and then prepared-command input. Geometry supplies
@@ -254,6 +381,7 @@ namespace ngc {
         std::size_t geometryVerificationAttempts = 0;
         std::size_t geometryVerificationHighWater = 0;
         unsigned correctionPasses = 0;
+        ContinuousMaterializationDiagnostics materialization;
         TimeLawDiagnostics timeLaw;
     };
 

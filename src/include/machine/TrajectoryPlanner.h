@@ -383,7 +383,7 @@ namespace ngc {
                     suffixPiece.splineKnotIntervals.begin(),
                     suffixPiece.splineKnotIntervals.begin()
                         +static_cast<std::ptrdiff_t>(suffixInterval));
-                prefixPiece.geometricSamples.resize(firstSuffixSample+1);
+                prefixPiece.geometricSamples.resize(firstSuffixSample);
                 suffixPiece.geometricSamples.assign(
                     piece.geometricSamples.begin()
                         +static_cast<std::ptrdiff_t>(firstSuffixSample),
@@ -986,23 +986,178 @@ namespace ngc {
                         return nominal>0.0?piece.duration/nominal:0.0;
                     });
                 if(slowest!=continuous->pieceTiming.end()) {
+                    const auto &cubic = continuous->materialization.cubicViolations;
+                    constexpr std::array axisNames {"X","Y","Z","A","B","C"};
+                    auto worstConstraint = std::string{"none"};
+                    if (cubic.violatingSpans > 0) {
+                        worstConstraint = std::string{name(cubic.worstConstraint)};
+                        if (cubic.worstAxis < axisNames.size()) {
+                            worstConstraint = std::format(
+                                "{}_{}",axisNames[cubic.worstAxis],worstConstraint);
+                        }
+                    }
+                    auto constraintSummary = std::string{};
+                    const auto appendConstraint=[&](const std::string_view constraint,
+                            const ContinuousCubicConstraintSeverity &severity) {
+                        if (severity.violatingSpans == 0) {
+                            return;
+                        }
+                        if (!constraintSummary.empty()) {
+                            constraintSummary += ',';
+                        }
+                        constraintSummary += std::format(
+                            "{}:spans={}/duration={:.6g}s/max={:.6f}",constraint,
+                            severity.violatingSpans,severity.violatingDuration,
+                            severity.maximumRatio);
+                    };
+                    appendConstraint("path_acceleration",cubic.pathAcceleration);
+                    appendConstraint("path_jerk",cubic.pathJerk);
+                    for (std::size_t axis = 0; axis < axisNames.size(); ++axis) {
+                        appendConstraint(std::format("{}_velocity",axisNames[axis]),
+                            cubic.axisVelocity[axis]);
+                        appendConstraint(std::format("{}_acceleration",axisNames[axis]),
+                            cubic.axisAcceleration[axis]);
+                        appendConstraint(std::format("{}_jerk",axisNames[axis]),
+                            cubic.axisJerk[axis]);
+                    }
+                    if (constraintSummary.empty()) {
+                        constraintSummary = "none";
+                    }
+                    const auto &quintic = continuous->materialization.quinticPrototype;
+                    auto quinticWorstConstraint = std::string{"none"};
+                    if (quintic.initialViolatingSpans > 0) {
+                        quinticWorstConstraint = std::string{name(
+                            quintic.worstInitialConstraint)};
+                        if (quintic.worstInitialAxis < axisNames.size()) {
+                            quinticWorstConstraint = std::format("{}_{}",
+                                axisNames[quintic.worstInitialAxis],quinticWorstConstraint);
+                        }
+                    }
                     const auto nominal=slowest->programmedVelocityLimit>0.0
                         ?slowest->length/slowest->programmedVelocityLimit:0.0;
                     m_lastContinuousPlanSummary=std::format(
-                        "pieces={} mode={} constraint_check={} actual={:.3f}s slowest_input={} "
+                        "pieces={} mode={} constraint_check={} sampled_corrections={} "
+                        "actual={:.3f}s slowest_input={} "
                         "length={:.6g} nominal={:.6g}s actual={:.6g}s ratio={:.3f} "
                         "programmed_v={:.6g} local_v={:.6g} entry_v={:.6g} exit_v={:.6g} "
-                        "local_a={:.6g} local_j={:.6g} correction_passes={}",
+                        "local_a={:.6g} local_j={:.6g} correction_passes={} "
+                        "materialized={} reused={} candidate_pieces={} exact_spans={} "
+                        "geometry_checks={} axis_cubic_violation_pieces={} "
+                        "max_axis_cubic_scale={:.6f} geometry_proofs={} "
+                        "materialization_seconds={:.6f} cubic_spans={} "
+                        "cubic_violation_spans={} cubic_violation_duration={:.6g}s "
+                        "cubic_ratio_hist=[compliant={},numeric={},le0.1pct={},le1pct={},"
+                        "le5pct={},le25pct={},le50pct={},le100pct={},gt100pct={}] "
+                        "cubic_worst={}:ratio={:.6f}/duration={:.6g}s/piece={}/prepared={}/"
+                        "input={}/span={} cubic_constraints=[{}] "
+                        "quintic_initial={} quintic_initial_violating={} "
+                        "quintic_initial_hist=[compliant={},numeric={},le0.1pct={},le1pct={},"
+                        "le5pct={},le25pct={},le50pct={},le100pct={},gt100pct={}] "
+                        "quintic_final={} retained_linear_cubics={} hybrid_spans={} "
+                        "quintic_group_candidates={} quintic_grouped_boundaries={} "
+                        "quintic_group_splits={} quintic_max_phases_per_group={} "
+                        "quintic_geometry_refinements={} "
+                        "quintic_constraint_refinements={} quintic_proofs={} "
+                        "quintic_constraint_nodes={} "
+                        "quintic_failed={} quintic_ungroupable={} "
+                        "quintic_failure_locations=[whole={},begin={},end={},interior={}] "
+                        "quintic_failure_gates=[geometry={},progress={},constraint={}] "
+                        "quintic_failure_constraints=[path_v={},path_a={},path_j={},"
+                        "axis_v={},axis_a={},axis_j={}] "
+                        "quintic_failure_nonzero_boundary_a={} "
+                        "quintic_first_failure=[duration={:.6g}s,piece={},prepared={},u={},{}"
+                        ",certified={:.9f},sampled={:.9f},a={},{}"
+                        ",ramp={:.6g}s,{:.6g}s] "
+                        "quintic_failed_max=[certified={:.9f},sampled={:.9f}] "
+                        "quintic_progress_failures={} quintic_unstable={} "
+                        "quintic_resource_exhausted={} "
+                        "quintic_initial_max={:.6f} quintic_accepted_max={:.6f} "
+                        "quintic_worst={}:duration={:.6g}s/piece={}/prepared={}/input={} "
+                        "quintic_seconds={:.6f}",
                         continuous->pieceTiming.size(),
                         name(m_compiler.continuousPlanningEffort().boundaryAccelerationMode),
                         name(m_compiler.continuousPlanningEffort().constraintCheckMode),
+                        usesPathTempoSampledCorrections(
+                            m_compiler.continuousPlanningEffort())?"on":"off",
                         actualDuration,slowest->input,
                         slowest->length,nominal,slowest->duration,
                         nominal>0.0?slowest->duration/nominal:0.0,
                         slowest->programmedVelocityLimit,slowest->velocityLimit,
                         slowest->entryVelocity,slowest->exitVelocity,
                         slowest->accelerationLimit,slowest->jerkLimit,
-                        continuous->correctionPasses);
+                        continuous->correctionPasses,
+                        continuous->materialization.materializedPieces,
+                        continuous->materialization.reusedPieces,
+                        continuous->materialization.candidatePieces,
+                        continuous->materialization.exactConstraintSpanChecks,
+                        continuous->materialization.geometryDifferentialChecks,
+                        continuous->materialization.axisCubicViolationPieces,
+                        continuous->materialization.maximumAxisCubicTimeScale,
+                        continuous->geometryVerificationAttempts,
+                        continuous->materialization.candidateConversionSeconds
+                            +continuous->materialization.cacheComparisonSeconds
+                            +continuous->materialization.cubicConstructionSeconds
+                            +continuous->materialization.geometryVerificationSeconds
+                            +continuous->materialization.exactConstraintSeconds
+                            +continuous->materialization.correctionCollectionSeconds
+                            +continuous->materialization.finalAssemblySeconds,
+                        cubic.spans,cubic.violatingSpans,cubic.violatingDuration,
+                        cubic.worstRatioHistogram[0],cubic.worstRatioHistogram[1],
+                        cubic.worstRatioHistogram[2],cubic.worstRatioHistogram[3],
+                        cubic.worstRatioHistogram[4],cubic.worstRatioHistogram[5],
+                        cubic.worstRatioHistogram[6],cubic.worstRatioHistogram[7],
+                        cubic.worstRatioHistogram[8],worstConstraint,cubic.maximumRatio,
+                        cubic.worstSpanDuration,cubic.worstTimingPiece,
+                        cubic.worstPreparedPiece,cubic.worstInput,cubic.worstLocalSpan,
+                        constraintSummary,quintic.initialCurvedSpans,
+                        quintic.initialViolatingSpans,
+                        quintic.initialWorstRatioHistogram[0],
+                        quintic.initialWorstRatioHistogram[1],
+                        quintic.initialWorstRatioHistogram[2],
+                        quintic.initialWorstRatioHistogram[3],
+                        quintic.initialWorstRatioHistogram[4],
+                        quintic.initialWorstRatioHistogram[5],
+                        quintic.initialWorstRatioHistogram[6],
+                        quintic.initialWorstRatioHistogram[7],
+                        quintic.initialWorstRatioHistogram[8],
+                        quintic.finalQuinticSpans,quintic.retainedLinearCubicSpans,
+                        quintic.finalQuinticSpans+quintic.retainedLinearCubicSpans,
+                        quintic.groupCandidateEvaluations,quintic.groupedPhaseBoundaries,
+                        quintic.phaseBoundarySplits,quintic.maximumPhasesPerGroup,
+                        quintic.geometryRefinements,
+                        quintic.constraintRefinements,quintic.geometryProofs,
+                        quintic.constraintBoundNodes,
+                        quintic.failedIntervals,quintic.ungroupablePieces,
+                        quintic.wholePieceFailures,quintic.beginningBoundaryFailures,
+                        quintic.endingBoundaryFailures,quintic.interiorFailures,
+                        quintic.failedGeometryChecks,quintic.failedProgressChecks,
+                        quintic.failedConstraintChecks,
+                        quintic.failedConstraintKinds[0],
+                        quintic.failedConstraintKinds[1],
+                        quintic.failedConstraintKinds[2],
+                        quintic.failedConstraintKinds[3],
+                        quintic.failedConstraintKinds[4],
+                        quintic.failedConstraintKinds[5],
+                        quintic.failedNonzeroBoundaryAccelerations,
+                        quintic.firstFailureDuration,
+                        quintic.firstFailureTimingPiece,quintic.firstFailurePreparedPiece,
+                        quintic.firstFailureFrom,quintic.firstFailureTo,
+                        quintic.firstFailureCertifiedRatio,
+                        quintic.firstFailureSampledRatio,
+                        quintic.firstFailureStartAcceleration,
+                        quintic.firstFailureEndAcceleration,
+                        quintic.firstFailureStartRampDuration,
+                        quintic.firstFailureEndRampDuration,
+                        quintic.maximumFailedCertifiedRatio,
+                        quintic.maximumFailedSampledRatio,
+                        quintic.forwardProgressFailures,
+                        quintic.numericallyUnrefinableIntervals,
+                        quintic.resourceExhausted?"yes":"no",
+                        quintic.maximumInitialRatio,quintic.maximumAcceptedRatio,
+                        quinticWorstConstraint,quintic.worstInitialDuration,
+                        quintic.worstInitialTimingPiece,
+                        quintic.worstInitialPreparedPiece,quintic.worstInitialInput,
+                        quintic.seconds);
                 } else {
                     m_lastContinuousPlanSummary="continuous plan has no piece timing diagnostics";
                 }
