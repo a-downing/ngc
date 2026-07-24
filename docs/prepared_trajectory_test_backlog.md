@@ -38,7 +38,6 @@ Do not recreate a planner-owned geometry-construction path.
 
 - Verify invalid continuous limits fail a prepared run fatally and publish one
   information-rich chronological status error.
-- Verify immediate draining stops at Held and does not execute stale descendants.
 - Verify the historical N70/N75 preview-prefix fixtures complete within a bounded
   number of prepared-driver pump cycles.
 - Verify the prepared execution driver connects interpretation, geometry streaming,

@@ -2169,6 +2169,99 @@ G57 G1 X0.6
                 "mock diagnostics should distinguish the executed stop tail");
     }
 
+    void testImmediateDrainStopsAtHeldWithStaleDescendants() {
+        ngc::MockMotionBackend backend;
+        require(backend.trySubmit(ngc::ResetRequest { 1, 6 }) == ngc::SubmitResult::Submitted,
+                "stale-descendant test reset should publish");
+        require(backend.trySubmit(ngc::StartRequest { 2, 6 }) == ngc::SubmitResult::Submitted,
+                "stale-descendant test start should publish");
+        backend.advance(0.0);
+        ngc::ExecutionEvent event;
+        while (backend.tryTakeEvent(event)) { }
+
+        ngc::PlanChunk first;
+        first.epoch = 6;
+        first.id = 1;
+        first.branch = 1;
+        require(first.normalMotion.push(linearSpan(1, 0.0, 1.0, 0.01)),
+                "stale-descendant lead motion should fit");
+        require(first.stopTail.push(linearSpan(2, 1.0, 1.0, 1e-6)),
+                "stale-descendant lead stop tail should fit");
+        first.branchState.position.x = 1.0;
+        first.stopState.position.x = 1.0;
+
+        auto stale = first;
+        stale.id = 2;
+        stale.predecessorBranch = 999;
+        stale.branch = 2;
+        stale.normalMotion[0] = linearSpan(3, 1.0, 2.0, 0.01);
+        stale.branchState.position.x = 2.0;
+        stale.stopState.position.x = 2.0;
+        require(stale.markers.push({ 200, 0, 0.0 }),
+                "rejected stale-descendant marker should fit");
+
+        auto staleBehindIt = stale;
+        staleBehindIt.id = 3;
+        staleBehindIt.predecessorBranch = 2;
+        staleBehindIt.branch = 3;
+        staleBehindIt.normalMotion[0] = linearSpan(4, 2.0, 3.0, 0.01);
+        staleBehindIt.branchState.position.x = 3.0;
+        staleBehindIt.stopState.position.x = 3.0;
+        staleBehindIt.markers[0].id = 300;
+
+        require(backend.tryPublish(first) == ngc::PublishResult::Published,
+                "stale-descendant lead chunk should publish");
+        require(backend.tryPublish(stale) == ngc::PublishResult::Published,
+                "mismatched stale descendant should publish");
+        require(backend.tryPublish(staleBehindIt) == ngc::PublishResult::Published,
+                "a second stale descendant should queue behind the mismatched chunk");
+
+        const auto started = std::chrono::steady_clock::now();
+        backend.runUntilIdle();
+        const auto elapsed = std::chrono::duration<double>(
+            std::chrono::steady_clock::now() - started).count();
+
+        require(elapsed < 0.1,
+                "immediate draining must not spin while held with stale queued descendants");
+        bool rejectedStale = false;
+        bool selectedStop = false;
+        bool held = false;
+        bool acceptedStale = false;
+        bool emittedStaleMarker = false;
+        while (backend.tryTakeEvent(event)) {
+            if (const auto *rejected = std::get_if<ngc::ChunkRejected>(&event)) {
+                rejectedStale = rejectedStale || rejected->chunk == stale.id;
+            } else if (const auto *branch = std::get_if<ngc::BranchSelected>(&event)) {
+                selectedStop = selectedStop || (branch->choice == ngc::BranchChoice::Stop
+                    && branch->branch == first.branch);
+            } else if (const auto *accepted = std::get_if<ngc::ChunkAccepted>(&event)) {
+                acceptedStale = acceptedStale || accepted->chunk == stale.id
+                    || accepted->chunk == staleBehindIt.id;
+            } else if (const auto *marker = std::get_if<ngc::ExecutionMarkerReached>(&event)) {
+                emittedStaleMarker = emittedStaleMarker || marker->marker == 200
+                    || marker->marker == 300;
+            } else if (const auto *heldEvent = std::get_if<ngc::BackendHeld>(&event)) {
+                held = held || heldEvent->reason == ngc::BackendHoldReason::StopBranch;
+            }
+        }
+        require(rejectedStale && selectedStop && held,
+                "a mismatched continuation should be rejected before its predecessor stops held");
+        require(!acceptedStale && !emittedStaleMarker,
+                "stale descendants must not execute or emit presentation markers");
+
+        ngc::ExecutionSnapshot snapshot;
+        ngc::ExecutionSnapshot latest;
+        while (backend.tryTakeSnapshot(snapshot)) {
+            latest = snapshot;
+        }
+        require(latest.state == ngc::BackendState::Held
+                    && latest.activeChunk == first.id
+                    && latest.queuedExecutionItems == 1,
+                "held state should retain the unconsumed stale descendant for NRT recovery");
+        requireNear(latest.commanded.position.x, 1.0,
+                    "immediate draining must stop at the lead chunk's proved stop state");
+    }
+
     void testMockBackendEmitsOrderedInSpanExecutionMarkers() {
         ngc::MockMotionBackend backend;
         ngc::PlanChunk chunk;
@@ -4999,6 +5092,7 @@ int main() {
         testSpscChannelIsBoundedAndOrdered();
         testOwningSpscChannelTransfersMoveOnlyValues();
         testMockMotionBackendUsesProductionTransportContract();
+        testImmediateDrainStopsAtHeldWithStaleDescendants();
         testMockBackendEmitsOrderedInSpanExecutionMarkers();
         testContinuousMarkerBoundPacketsExecuteWithoutIntermediateStops();
         testJogControlUsesBoundedBackendTransport();
