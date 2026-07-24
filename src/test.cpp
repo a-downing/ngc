@@ -533,6 +533,120 @@ final_move_together = true
         worker.join();
     }
 
+    void testSimulationPresentationFollowsNestedToolChangeExecution() {
+        constexpr std::string_view TOOL_CHANGE = R"NGC(
+sub _tool_change[#tool_number] {
+    G90 G64 P0.0001
+    G55 G1 F60 X0.2
+    G56 G1 X0.4
+    return 1
+}
+)NGC";
+        constexpr std::string_view MAIN = R"NGC(
+G54
+T1 M6
+G57 G1 X0.6
+)NGC";
+
+        SimulationWorker worker;
+        ngc::ToolTable tools;
+        tools.set(1, {
+            .number = 1,
+            .x = 0,
+            .y = 0,
+            .z = 0.5,
+            .a = 0,
+            .b = 0,
+            .c = 0,
+            .diameter = 0.25,
+            .comment = "marker presentation tool",
+        });
+        require(worker.start({
+                    {std::string(TOOL_CHANGE), "presentation-tool-change.ngc"},
+                    {std::string(MAIN), "presentation-main.ngc"},
+                }, tools),
+                "nested tool-change presentation simulation should start");
+
+        auto snapshot = worker.snapshot();
+        auto sawG55Motion = false;
+        auto sawG56Motion = false;
+        auto sawFinalG57Motion = false;
+        auto sawNestedOwnership = false;
+        auto priorMaximumX = 0.0;
+        for (auto attempt = 0; attempt < 5000
+             && snapshot.status != ngc::SimulationStatus::Completed
+             && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+            priorMaximumX = std::max(priorMaximumX, snapshot.machinePosition.x);
+            if (!snapshot.hasActiveMotion
+                || !snapshot.activePresentation.workCoordinateSystem) {
+                continue;
+            }
+
+            const auto &presentation = snapshot.activePresentation;
+            const auto &workCoordinateSystem =
+                presentation.workCoordinateSystem->name;
+            require(presentation.tool.number == 1,
+                    "tool-change motion presentation should expose the prepared tool");
+            if (snapshot.machinePosition.x > 0.02
+                && snapshot.machinePosition.x < 0.18) {
+                require(workCoordinateSystem == "G55",
+                        "interpreter lookahead must not expose G56 or G57 "
+                        "during the G55 tool-change move");
+                sawG55Motion = true;
+                sawNestedOwnership = sawNestedOwnership
+                    || (std::ranges::any_of(
+                            presentation.activeBlocks, [](const auto &block) {
+                                return block.source
+                                        == "presentation-main.ngc"
+                                    && block.text == "T1 M6";
+                            })
+                        && std::ranges::any_of(
+                            presentation.activeBlocks, [](const auto &block) {
+                                return block.source
+                                        == "presentation-tool-change.ngc"
+                                    && block.text == "G55 G1 F60 X0.2";
+                            }));
+            } else if (snapshot.machinePosition.x > 0.22
+                       && snapshot.machinePosition.x < 0.38) {
+                require(workCoordinateSystem == "G56",
+                        "G56 presentation should activate only with its "
+                        "owning tool-change move");
+                sawG56Motion = true;
+            } else if (snapshot.machinePosition.x > 0.42
+                       && snapshot.machinePosition.x < 0.58) {
+                require(workCoordinateSystem == "G57",
+                        "the main program's final WCS should activate only "
+                        "with its owning move");
+                sawFinalG57Motion = true;
+            }
+        }
+
+        require(snapshot.status == ngc::SimulationStatus::Completed,
+                std::format(
+                    "nested tool-change presentation simulation did not "
+                    "complete: status={} maximum_x={} error='{}'",
+                    static_cast<int>(snapshot.status), priorMaximumX,
+                    snapshot.error));
+        require(snapshot.trajectoryPlanning.planChunks >= 3,
+                "nested and final WCS motion should cross multiple prepared "
+                "execution chunks");
+        require(sawG55Motion && sawG56Motion && sawFinalG57Motion,
+                "timed presentation should expose every nested and final WCS "
+                "while its owning prepared motion executes");
+        require(sawNestedOwnership,
+                "nested tool-change presentation should retain both the M6 "
+                "caller and active subroutine block");
+        require(snapshot.activePresentation.tool.number == 1
+                    && snapshot.activePresentation.workCoordinateSystem
+                    && snapshot.activePresentation.workCoordinateSystem->name
+                        == "G57",
+                "completed presentation should retain the executed tool and "
+                "final work-coordinate system");
+        worker.join();
+    }
+
     void testAdaptivePocketsStartsSimulation() {
         auto main=boundedPreviewFixture(24,true);
         main="T2 M6\n"+main;
@@ -4834,6 +4948,7 @@ int main() {
         testInterpreterCancellationInterruptsEvaluation();
         std::cerr << "checkpoint simulation start\n";
         testSimulationWorkerStartsPlayback();
+        testSimulationPresentationFollowsNestedToolChangeExecution();
         std::cerr << "checkpoint adaptive start\n";
         testAdaptivePocketsStartsSimulation();
         std::cerr << "checkpoint prepared G64 refill\n";

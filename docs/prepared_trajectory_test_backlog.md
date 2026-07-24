@@ -20,8 +20,6 @@ Do not recreate a planner-owned geometry-construction path.
   junction blends, cluster splines, and arc interiors.
 - Verify an exact-stop lead-in advances the prepared rolling boundary correctly.
 - Verify C2 boundary checks remain stable at large absolute machine coordinates.
-- Verify prepared continuous geometry packetizes beyond normal-span capacity without
-  adding a semantic stop at packet boundaries.
 - Restore the dense continuous-timing fixture using geometry produced once by
   `prepareContinuousGeometry()`.
 - Verify local time laws retain Ruckig brake pre-profiles and their exact outgoing jerk.
@@ -40,8 +38,6 @@ Do not recreate a planner-owned geometry-construction path.
 
 - Verify invalid continuous limits fail a prepared run fatally and publish one
   information-rich chronological status error.
-- Verify tool-change presentation applies nested and final work-coordinate systems
-  when their owning prepared activation spans execute.
 - Verify immediate draining stops at Held and does not execute stale descendants.
 - Verify the historical N70/N75 preview-prefix fixtures complete within a bounded
   number of prepared-driver pump cycles.
