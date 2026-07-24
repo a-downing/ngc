@@ -163,6 +163,10 @@ namespace ngc {
             const auto *probing = document["probing"].as_table();
             const auto *joints = document["joints"].as_array();
             const auto *homing = document["homing"].as_table();
+            const auto *parameterStoreNode = document.get("parameter_store");
+            const auto *parameterStores = parameterStoreNode ? parameterStoreNode->as_table() : nullptr;
+            const auto *toolTableStoreNode = document.get("tool_table_store");
+            const auto *toolTableStores = toolTableStoreNode ? toolTableStoreNode->as_table() : nullptr;
             if(!machine) return std::unexpected(configurationError(path, "machine", "missing table"));
             if(!trajectory) return std::unexpected(configurationError(path, "trajectory", "missing table"));
             if(!simulation) return std::unexpected(configurationError(path, "simulation", "missing table"));
@@ -175,8 +179,72 @@ namespace ngc {
             if(!joints || joints->empty())
                 return std::unexpected(configurationError(path, "joints", "must be a non-empty array of tables"));
             if(!homing) return std::unexpected(configurationError(path, "homing", "missing table"));
+            if (parameterStoreNode && !parameterStores) {
+                return std::unexpected(configurationError(
+                    path, "parameter_store", "must be a table", parameterStoreNode));
+            }
+            if (toolTableStoreNode && !toolTableStores) {
+                return std::unexpected(configurationError(
+                    path, "tool_table_store", "must be a table", toolTableStoreNode));
+            }
 
             MachineConfiguration result;
+            const auto resolveStorePath = [&](const std::filesystem::path &configured) {
+                if (configured.is_absolute()) {
+                    return configured;
+                }
+
+                return path.parent_path() / configured;
+            };
+            result.parameterStores.real = resolveStorePath(result.parameterStores.real);
+            result.parameterStores.simulation = resolveStorePath(result.parameterStores.simulation);
+            result.toolTableStores.legacy = resolveStorePath(result.toolTableStores.legacy);
+            result.toolTableStores.real = resolveStorePath(result.toolTableStores.real);
+            result.toolTableStores.simulation = resolveStorePath(result.toolTableStores.simulation);
+            if (parameterStores) {
+                if (const auto configured = parameterStores->get("real")) {
+                    const auto value = configured->value<std::string>();
+                    if (!value || value->empty()) {
+                        return std::unexpected(configurationError(
+                            path, "parameter_store.real", "must be a non-empty path", configured));
+                    }
+                    result.parameterStores.real = resolveStorePath(*value);
+                }
+                if (const auto configured = parameterStores->get("simulation")) {
+                    const auto value = configured->value<std::string>();
+                    if (!value || value->empty()) {
+                        return std::unexpected(configurationError(
+                            path, "parameter_store.simulation", "must be a non-empty path", configured));
+                    }
+                    result.parameterStores.simulation = resolveStorePath(*value);
+                }
+            }
+            if (toolTableStores) {
+                if (const auto configured = toolTableStores->get("legacy")) {
+                    const auto value = configured->value<std::string>();
+                    if (!value || value->empty()) {
+                        return std::unexpected(configurationError(
+                            path, "tool_table_store.legacy", "must be a non-empty path", configured));
+                    }
+                    result.toolTableStores.legacy = resolveStorePath(*value);
+                }
+                if (const auto configured = toolTableStores->get("real")) {
+                    const auto value = configured->value<std::string>();
+                    if (!value || value->empty()) {
+                        return std::unexpected(configurationError(
+                            path, "tool_table_store.real", "must be a non-empty path", configured));
+                    }
+                    result.toolTableStores.real = resolveStorePath(*value);
+                }
+                if (const auto configured = toolTableStores->get("simulation")) {
+                    const auto value = configured->value<std::string>();
+                    if (!value || value->empty()) {
+                        return std::unexpected(configurationError(
+                            path, "tool_table_store.simulation", "must be a non-empty path", configured));
+                    }
+                    result.toolTableStores.simulation = resolveStorePath(*value);
+                }
+            }
             const auto units = requiredString(*machine, "units", path);
             if(!units) return std::unexpected(units.error());
             if(*units != "inch" && *units != "mm")

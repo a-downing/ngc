@@ -4,5 +4,7 @@
 .cache/
 imgui.ini
 window_state.ini
+real_parameters.var
+simulation_parameters.var
 my_LinuxCNC_machine/
 tools/clarabel_trajectory_oracle/target/

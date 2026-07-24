@@ -2,6 +2,7 @@
 
 #include <expected>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -15,6 +16,23 @@ namespace ngc {
     public:
         enum class Axis { X, Y, Z, A, B, C };
         enum class Unit { Millimeter, Inch };
+
+        struct ToolChangeModalCheckpoint {
+            GCMotion motion;
+            GCPlane plane;
+            GCDist distance;
+            GCArcDist arcDistance;
+            GCFeed feedMode;
+            GCUnits units;
+            GCTLen toolOffsetMode;
+            GCCoord coordinateSystem;
+            GCPath pathMode;
+            std::optional<double> pathTolerance;
+            std::optional<double> feedrate;
+            std::optional<double> spindleSpeed;
+            std::optional<double> selectedTool;
+            position_t appliedToolOffset;
+        };
 
         explicit Machine(Unit unit);
         ~Machine();
@@ -31,6 +49,8 @@ namespace ngc {
         ToolGeometry toolGeometry() const;
         position_t physicalToolOffset() const;
         void prepareToolChange(int toolNumber);
+        ToolChangeModalCheckpoint captureToolChangeModalCheckpoint() const;
+        void restoreToolChangeModalCheckpoint(const ToolChangeModalCheckpoint &checkpoint);
         Memory &memory();
         const Memory &memory() const;
         ToolTable &toolTable();

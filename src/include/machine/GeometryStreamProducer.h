@@ -69,6 +69,7 @@ namespace ngc {
         PreparedPieceId m_nextPiece = 1;
         ContinuousChainId m_nextChain = 1;
         SynchronizationFenceId m_nextFence = 1;
+        ProgramPauseId m_nextPause = 1;
         std::optional<ProbeMove> m_pendingProbe;
         std::optional<SynchronizationFenceId> m_pendingSynchronization;
         std::vector<BlockExecution> m_activeBlocks;
@@ -484,6 +485,42 @@ namespace ngc {
                         })) return false;
                         m_session.provideSynchronization();
                         m_pendingSynchronization.reset();
+                    } else if (std::holds_alternative<InterpreterWaitingForProgramResume>(event)) {
+                        if (!flushContinuous()) {
+                            return false;
+                        }
+                        const auto pause = m_nextPause++;
+                        if (!publish(PreparedProgramPause {
+                                m_epoch, m_sequence++, pause
+                            })) {
+                            return false;
+                        }
+                        if (!waitForFeedback([&](const GeometryFeedback &feedback) {
+                                const auto *resume = std::get_if<ResumeProgram>(&feedback);
+                                return resume
+                                    && resume->epoch == m_epoch
+                                    && resume->pause == pause;
+                            })) {
+                            return false;
+                        }
+                        m_session.provideProgramResume();
+                    } else if (const auto *status =
+                                   std::get_if<InterpreterStatusMessage>(&event)) {
+                        if (!publish(PreparedStatusMessage {
+                                m_epoch, m_sequence++, *status
+                            })) {
+                            return false;
+                        }
+                    } else if (std::holds_alternative<
+                                   InterpreterToolChangeModalStateRestored>(event)) {
+                        if (!flushContinuous()) {
+                            return false;
+                        }
+                        if (!publish(PreparedPresentationUpdate {
+                                m_epoch, m_sequence++, capturePresentation()
+                            })) {
+                            return false;
+                        }
                     } else if(const auto *error = std::get_if<InterpreterError>(&event)) {
                         m_diagnostics.lastFailure = error->message;
                         publish(PreparedFailure{m_epoch, m_sequence++, error->message});

@@ -14,7 +14,7 @@
 #include "machine/MotionBackend.h"
 
 namespace ngc {
-    enum class PreparedDriverState { Running, Completed, Error };
+    enum class PreparedDriverState { Running, ProgramPaused, Completed, Error };
 
     // Planning owner for the split pipeline. It has no InterpreterSession
     // reference: barrier results travel back through GeometryFeedbackChannel.
@@ -27,11 +27,13 @@ namespace ngc {
         std::unique_ptr<PlannedExecution> m_pending;
         std::size_t m_pendingItem = 0;
         std::optional<PreparedStreamMessage> m_deferredMessage;
+        std::optional<TrajectoryCommandPresentation> m_presentationUpdate;
         std::optional<std::string> m_error;
         std::size_t m_outstandingChunks = 0;
         bool m_forwardComplete = false;
         bool m_probePending = false;
         std::optional<std::uint64_t> m_probeFence;
+        std::optional<ProgramPauseId> m_programPause;
         std::optional<SynchronizationFenceId> m_synchronizationFence;
         bool m_waitingForHeld = false;
         GeometryEpoch m_epoch = 0;
@@ -166,10 +168,28 @@ namespace ngc {
                 } else if constexpr(std::same_as<T, PreparedProbeFence>) {
                     m_probeFence = value.commandId;
                     return true;
+                } else if constexpr (std::same_as<T, PreparedProgramPause>) {
+                    if (m_planner.windowSize() != 0 && !planWindow()) {
+                        return false;
+                    }
+                    m_programPause = value.pause;
+                    return true;
                 } else if constexpr(std::same_as<T, PreparedStatusMessage>) {
                     if constexpr(!std::same_as<std::remove_cvref_t<decltype(observeStatus)>,
                                                std::nullptr_t>)
                         observeStatus(value.status);
+                    return true;
+                } else if constexpr (std::same_as<T, PreparedPresentationUpdate>) {
+                    if (m_pending || m_planner.windowSize() != 0
+                        || m_synchronizationFence || m_probePending) {
+                        fail("tool-change modal presentation was restored before its ordered boundary");
+                        return false;
+                    }
+                    if (m_presentationUpdate) {
+                        fail("prepared trajectory driver received overlapping presentation updates");
+                        return false;
+                    }
+                    m_presentationUpdate = std::move(value.presentation);
                     return true;
                 } else if constexpr(std::same_as<T, PreparedProgramEnd>) {
                     if(m_planner.windowSize() != 0 && !planWindow()) return false;
@@ -209,11 +229,13 @@ namespace ngc {
             m_pending.reset();
             m_pendingItem = 0;
             m_deferredMessage.reset();
+            m_presentationUpdate.reset();
             m_error.reset();
             m_outstandingChunks = 0;
             m_forwardComplete = false;
             m_probePending = false;
             m_probeFence.reset();
+            m_programPause.reset();
             m_synchronizationFence.reset();
             m_waitingForHeld = false;
             m_backendReady = false;
@@ -240,11 +262,36 @@ namespace ngc {
             m_planner.setProgressCallback(std::move(callback));
         }
 
+        std::optional<TrajectoryCommandPresentation> takePresentationUpdate() {
+            if (m_outstandingChunks != 0 || m_pending
+                || m_planner.windowSize() != 0 || m_synchronizationFence
+                || m_probePending) {
+                return std::nullopt;
+            }
+            return std::exchange(m_presentationUpdate, std::nullopt);
+        }
+
+        bool resumeProgram() {
+            if (state() != PreparedDriverState::ProgramPaused) {
+                return false;
+            }
+            if (!m_feedback.tryPush(std::make_unique<const GeometryFeedback>(
+                    ResumeProgram {m_epoch, *m_programPause}))) {
+                return false;
+            }
+            m_programPause.reset();
+
+            return true;
+        }
+
         template<typename Observe, typename ObserveLifecycle = std::nullptr_t,
                  typename ObserveStatus = std::nullptr_t>
         bool pumpOne(Observe &&observe, ObserveLifecycle &&observeLifecycle = nullptr,
                      ObserveStatus &&observeStatus = nullptr) {
-            if(m_error || !m_backendReady || m_waitingForHeld) return false;
+            if (m_error || !m_backendReady || m_waitingForHeld
+                || m_presentationUpdate) {
+                return false;
+            }
             if(m_pending) {
                 if(m_pendingItem >= m_pending->items.size()) {
                     fail("prepared trajectory driver retained an invalid packet index");
@@ -359,9 +406,16 @@ namespace ngc {
 
         PreparedDriverState state() const {
             if(m_error) return PreparedDriverState::Error;
+            if (m_programPause && !m_pending && !m_deferredMessage
+                && m_planner.windowSize() == 0 && m_outstandingChunks == 0
+                && !m_probePending && !m_synchronizationFence
+                && !m_presentationUpdate) {
+                return PreparedDriverState::ProgramPaused;
+            }
             if(m_forwardComplete && !m_pending && !m_deferredMessage
                &&m_planner.windowSize() == 0 && m_outstandingChunks == 0
-               &&!m_probePending && !m_synchronizationFence)
+               &&!m_probePending && !m_synchronizationFence
+               && !m_presentationUpdate)
                 return PreparedDriverState::Completed;
             return PreparedDriverState::Running;
         }
@@ -383,6 +437,9 @@ namespace ngc {
         std::string activity() const {
             if(m_error) return "error: "+*m_error;
             if(!m_backendReady) return "waiting for backend start acknowledgement";
+            if (state() == PreparedDriverState::ProgramPaused) {
+                return "waiting for operator Resume after M0";
+            }
             if(m_waitingForHeld) return std::format(
                 "waiting for backend held event: outstanding={} retained_commands={} "
                 "retained_pieces={} retained_nominal={:.3f}s rolling_continuation={}",

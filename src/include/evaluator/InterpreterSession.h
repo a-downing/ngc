@@ -49,6 +49,10 @@ namespace ngc {
 
     struct InterpreterWaitingForSynchronization { };
 
+    struct InterpreterWaitingForProgramResume { };
+
+    struct InterpreterToolChangeModalStateRestored { };
+
     struct BlockExecution {
         std::uint64_t id;
         std::string text;
@@ -65,7 +69,9 @@ namespace ngc {
 
     using InterpreterEvent = std::variant<MachineCommand, InterpreterBlockLifecycle,
         InterpreterWaitingForProbe, InterpreterWaitingForSynchronization,
-        InterpreterCompleted, InterpreterError>;
+        InterpreterWaitingForProgramResume, InterpreterStatusMessage,
+        InterpreterToolChangeModalStateRestored, InterpreterCompleted,
+        InterpreterError>;
 
     class InterpreterSession {
         struct ExecutionStopped { };
@@ -87,6 +93,9 @@ namespace ngc {
         std::deque<InterpreterBlockLifecycle> m_pendingBlockLifecycle;
         std::optional<std::uint64_t> m_pendingProbe;
         bool m_pendingSynchronization = false;
+        bool m_pendingProgramPause = false;
+        bool m_pendingToolChangeModalStateRestored = false;
+        std::optional<Machine::ToolChangeModalCheckpoint> m_toolChangeModalCheckpoint;
         bool m_evaluatorPaused = false;
         bool m_resumeEvaluator = false;
         bool m_executionStarted = false;
@@ -169,6 +178,9 @@ namespace ngc {
             m_pendingBlockLifecycle.clear();
             m_pendingProbe.reset();
             m_pendingSynchronization = false;
+            m_pendingProgramPause = false;
+            m_pendingToolChangeModalStateRestored = false;
+            m_toolChangeModalCheckpoint.reset();
             m_pendingMessage.reset();
             m_pendingMessageBlock.reset();
             m_executionError.reset();
@@ -208,8 +220,18 @@ namespace ngc {
         InterpreterEvent next(Synchronize &&synchronize) {
             for(;;) {
                 auto event = nextImpl(std::forward<Synchronize>(synchronize), false);
-                if(!std::holds_alternative<InterpreterWaitingForSynchronization>(event)) return event;
-                provideSynchronization();
+                if (std::holds_alternative<InterpreterWaitingForSynchronization>(event)) {
+                    provideSynchronization();
+                } else if (std::holds_alternative<InterpreterWaitingForProgramResume>(event)) {
+                    provideProgramResume();
+                } else if (std::holds_alternative<InterpreterStatusMessage>(event)) {
+                    continue;
+                } else if (std::holds_alternative<
+                               InterpreterToolChangeModalStateRestored>(event)) {
+                    continue;
+                } else {
+                    return event;
+                }
             }
         }
 
@@ -232,6 +254,10 @@ namespace ngc {
 
                 if(m_pendingSynchronization) return InterpreterWaitingForSynchronization {};
 
+                if (m_pendingProgramPause) {
+                    return InterpreterWaitingForProgramResume {};
+                }
+
                 if(!m_pendingBlockLifecycle.empty()) {
                     auto lifecycle = std::move(m_pendingBlockLifecycle.front());
                     m_pendingBlockLifecycle.pop_front();
@@ -247,6 +273,11 @@ namespace ngc {
                     }
 
                     return command;
+                }
+
+                if (m_pendingToolChangeModalStateRestored) {
+                    m_pendingToolChangeModalStateRestored = false;
+                    return InterpreterToolChangeModalStateRestored {};
                 }
 
                 resumePausedEvaluator();
@@ -272,8 +303,29 @@ namespace ngc {
                         m_pendingSynchronization = true;
                         return InterpreterWaitingForSynchronization {};
                     }
+                    if (message->as<ToolChangeModalStateRestoredMessage>()) {
+                        if (!m_toolChangeModalCheckpoint) {
+                            const auto text =
+                                "tool-change modal restoration has no checkpoint";
+                            stop();
+                            reportError(text);
+                            return InterpreterError {text};
+                        }
+                        synchronize([&] {
+                            m_machine.restoreToolChangeModalCheckpoint(
+                                *m_toolChangeModalCheckpoint);
+                            m_toolChangeModalCheckpoint.reset();
+                            m_pendingCommands.emplace_back(SpindleStop {});
+                            m_pendingToolChangeModalStateRestored = true;
+                        });
+                        continue;
+                    }
                     try {
-                        synchronize([&] { processMessage(*message, block); });
+                        std::optional<InterpreterStatusMessage> status;
+                        synchronize([&] { status = processMessage(*message, block); });
+                        if (status) {
+                            return *status;
+                        }
                     } catch(const std::exception &error) {
                         const auto text = statusErrorText(*message, error.what());
                         stop();
@@ -318,6 +370,13 @@ namespace ngc {
             m_pendingSynchronization = false;
         }
 
+        void provideProgramResume() {
+            if (!m_pendingProgramPause) {
+                throw std::logic_error("interpreter is not waiting for program resume");
+            }
+            m_pendingProgramPause = false;
+        }
+
         void requestStop() {
             {
                 std::scoped_lock lock(m_executionMutex);
@@ -339,6 +398,9 @@ namespace ngc {
             m_pendingBlockLifecycle.clear();
             m_pendingProbe.reset();
             m_pendingSynchronization = false;
+            m_pendingProgramPause = false;
+            m_pendingToolChangeModalStateRestored = false;
+            m_toolChangeModalCheckpoint.reset();
         }
 
     private:
@@ -373,17 +435,48 @@ namespace ngc {
                             throw std::runtime_error(std::format("{}: {}", token.location(), error.what()));
                         }
 
+                        if (state.nonModal == GCNonModal::G10 && state.L == 11.0) {
+                            evaluator.synchronize();
+                        }
+
+                        const auto programPause =
+                            state.modeStop == MCStop::M0;
+                        if (programPause) {
+                            evaluator.synchronize();
+                        }
+
                         if(state.modeToolChange) {
                             evaluator.synchronize();
                             m_machine.prepareToolChange(static_cast<int>(*state.T));
                             publishMessage(std::move(message), execution);
-                            evaluator.call("_tool_change", *state.T);
+                            evaluator.synchronize();
+                            const auto checkpoint =
+                                m_machine.captureToolChangeModalCheckpoint();
+                            double changed = 0.0;
+                            try {
+                                changed = evaluator.call("_tool_change", *state.T);
+                                evaluator.synchronize();
+                                m_toolChangeModalCheckpoint = checkpoint;
+                                evaluator.toolChangeModalStateRestored();
+                            } catch (...) {
+                                m_machine.restoreToolChangeModalCheckpoint(checkpoint);
+                                m_toolChangeModalCheckpoint.reset();
+                                throw;
+                            }
+                            if (changed == 0.0) {
+                                throw std::runtime_error(std::format(
+                                    "tool-change routine returned failure for tool {}",
+                                    static_cast<int>(*state.T)));
+                            }
                             publishBlockLifecycle({ execution, BlockLifecyclePhase::Completed });
                             return;
                         }
 
                         publishMessage(std::move(message), execution);
                         publishBlockLifecycle({ execution, BlockLifecyclePhase::Completed });
+                        if (programPause) {
+                            evaluator.pauseProgram();
+                        }
                         return;
                     }
 
@@ -450,7 +543,8 @@ namespace ngc {
             m_evaluatorPaused = false;
         }
 
-        void processMessage(const EvaluatorMessage &message, const std::optional<BlockExecution> &block) {
+        std::optional<InterpreterStatusMessage> processMessage(
+            const EvaluatorMessage &message, const std::optional<BlockExecution> &block) {
             if(const auto blockMessage = message.as<BlockMessage>()) {
                 auto text = blockMessage->block().statement()->text();
                 m_blockMessages.emplace_back(text);
@@ -463,8 +557,26 @@ namespace ngc {
             }
 
             if(const auto printMessage = message.as<PrintMessage>()) {
-                m_statusMessages.push_back({ InterpreterStatusKind::Print, printMessage->text() });
+                auto status = InterpreterStatusMessage {
+                    InterpreterStatusKind::Print, printMessage->text()
+                };
+                m_statusMessages.push_back(status);
+                return status;
             }
+
+            if (const auto alertMessage = message.as<AlertMessage>()) {
+                auto status = InterpreterStatusMessage {
+                    InterpreterStatusKind::Alert, alertMessage->text()
+                };
+                m_statusMessages.push_back(status);
+                return status;
+            }
+
+            if (message.as<ProgramPauseMessage>()) {
+                m_pendingProgramPause = true;
+            }
+
+            return std::nullopt;
         }
 
         void resumePausedEvaluator() {

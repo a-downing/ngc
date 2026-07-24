@@ -66,6 +66,7 @@ namespace ngc {
         bool spindleRunning = false;
         double spindleSpeed = 0.0;
         Direction spindleDirection = Direction::CW;
+        std::optional<std::string> operatorAlert;
         std::string error;
         std::vector<InterpreterStatusMessage> statusMessages;
         std::vector<WorkCoordinateSystem> usedWorkCoordinateSystems;

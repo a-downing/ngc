@@ -179,6 +179,11 @@ class ApplicationImpl final {
     ngc::JoggingConfiguration m_joggingConfiguration;
     ngc::PendantConfiguration m_pendantConfiguration;
     ngc::Machine::Unit m_machineUnit;
+    ngc::ParameterStorePaths m_parameterStores;
+    ngc::ToolTableStorePaths m_toolTableStores;
+    bool m_simulationParameterStoreReady = false;
+    bool m_simulationToolTableStoreReady = false;
+    std::uint64_t m_simulationToolTableRevision = 0;
     std::vector<ngc::AxisConfiguration> m_axes;
     std::vector<ngc::JointConfiguration> m_joints;
     Worker m_worker;
@@ -442,6 +447,8 @@ public:
         : m_window(window), m_simulationTiming(configuration.simulation),
           m_joggingConfiguration(configuration.jogging),
           m_pendantConfiguration(configuration.pendant), m_machineUnit(configuration.unit),
+          m_parameterStores(configuration.parameterStores),
+          m_toolTableStores(configuration.toolTableStores),
           m_axes(configuration.axes), m_joints(configuration.joints),
           m_worker(configuration.unit,geometryPolicy(configuration.trajectory,splineFitSolver)),
           m_simulation(configuration),
@@ -469,12 +476,46 @@ public:
             m_glGenBuffers(1, &m_previewGeometryBuffer);
         }
         m_previewVisibilityThread = std::thread(&ApplicationImpl::previewVisibilityWork, this);
-        auto result = m_tools.load();
+        const auto migratedTools = ngc::migrateLegacyToolTables(m_toolTableStores);
+        if (!migratedTools) {
+            m_errorMessage = migratedTools.error();
+        } else if (auto loadedTools = m_tools.load(m_toolTableStores.simulation);
+                  !loadedTools) {
+            m_errorMessage = loadedTools.error();
+        } else if (!m_worker.setToolTable(m_tools)
+                  || !m_simulation.setToolTable(m_tools)) {
+            m_errorMessage = "Simulation tool table was loaded, but could not be applied";
+        } else if (auto configured = m_simulation.setToolTableStorePath(
+                      m_toolTableStores.simulation);
+                  !configured) {
+            m_errorMessage = configured.error();
+        } else {
+            m_simulationToolTableStoreReady = true;
+        }
 
-        if(!result) {
-            m_errorMessage = "failed to load tool table";
-        } else if(!m_worker.setToolTable(m_tools)) {
-            m_errorMessage = "tool table was loaded, but cannot be applied while the worker is busy";
+        std::error_code parameterStoreError;
+        const auto parameterStoreExists = std::filesystem::exists(
+            m_parameterStores.simulation, parameterStoreError);
+        if (parameterStoreError) {
+            m_errorMessage = std::format(
+                "failed to inspect Simulation parameter store '{}': {}",
+                m_parameterStores.simulation.string(), parameterStoreError.message());
+        } else if (parameterStoreExists) {
+            const auto loaded = m_simulation.loadPersistentParameters(
+                m_parameterStores.simulation);
+            if (!loaded) {
+                m_errorMessage = loaded.error();
+            } else {
+                m_simulationParameterStoreReady = true;
+            }
+        } else {
+            const auto configured = m_simulation.setPersistentParameterStorePath(
+                m_parameterStores.simulation);
+            if (!configured) {
+                m_errorMessage = configured.error();
+            } else {
+                m_simulationParameterStoreReady = true;
+            }
         }
 
         if(m_pendantConfiguration.enabled) {
@@ -524,6 +565,22 @@ public:
         m_previewVisibilityCv.notify_one();
         if(m_previewVisibilityThread.joinable()) m_previewVisibilityThread.join();
         m_simulation.join();
+        if (m_simulationParameterStoreReady) {
+            const auto parametersSaved = m_simulation.savePersistentParameters(
+                m_parameterStores.simulation);
+            if (!parametersSaved) {
+                m_errorMessage = parametersSaved.error();
+                std::println(stderr, "Failed to save Simulation parameters: {}", parametersSaved.error());
+            }
+        }
+        if (m_simulationToolTableStoreReady) {
+            const auto toolsSaved = m_simulation.saveToolTable(
+                m_toolTableStores.simulation);
+            if (!toolsSaved) {
+                m_errorMessage = toolsSaved.error();
+                std::println(stderr, "Failed to save Simulation tool table: {}", toolsSaved.error());
+            }
+        }
         m_worker.join();
         if(m_glDeleteBuffers) {
             m_glDeleteBuffers(1, &m_previewGeometryBuffer);
@@ -558,9 +615,16 @@ public:
             tools.set(tool->number, *tool);
         }
 
-        auto result = tools.save();
+        const auto previousTools = m_simulation.toolTable();
+        if (!m_simulation.setToolTable(tools)) {
+            m_errorMessage = "tool table cannot be saved while Simulation is busy";
+            return;
+        }
+
+        auto result = tools.save(m_toolTableStores.simulation);
 
         if(!result) {
+            (void)m_simulation.setToolTable(previousTools);
             m_errorMessage = result.error();
             return;
         }
@@ -569,24 +633,29 @@ public:
             m_errorMessage = "tool table was saved, but cannot be applied while the worker is busy";
             return;
         }
-
         m_tools = std::move(tools);
         initToolTableStrings();
     }
 
     void reloadToolTable() {
-        const auto result = m_tools.load();
+        ngc::ToolTable tools;
+        const auto result = tools.load(m_toolTableStores.simulation);
 
         if(!result) {
             m_errorMessage = result.error();
             return;
         }
 
-        if(!m_worker.setToolTable(m_tools)) {
+        if (!m_simulation.setToolTable(tools)) {
+            m_errorMessage = "tool table cannot be reloaded while Simulation is busy";
+            return;
+        }
+        if (!m_worker.setToolTable(tools)) {
             m_errorMessage = "tool table cannot be reloaded while the worker is busy";
             return;
         }
 
+        m_tools = std::move(tools);
         initToolTableStrings();
     }
 
@@ -1879,6 +1948,7 @@ public:
         if(ImGui::Button("Parameters")) m_enableMemoryWindow = true;
         ImGui::SameLine();
         if(ImGui::Button("Tool Table")) {
+            m_tools = m_simulation.toolTable();
             initToolTableStrings();
             m_enableToolWindow = true;
         }
@@ -2385,6 +2455,10 @@ public:
             for(const auto &message : messages) {
                 if(message.kind == ngc::InterpreterStatusKind::Error) {
                     ImGui::TextColored(ImVec4_Redish, "ERROR: %s", message.text.c_str());
+                } else if (message.kind == ngc::InterpreterStatusKind::Alert) {
+                    ImGui::TextColored(
+                        ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                        "ALERT: %s", message.text.c_str());
                 } else {
                     ImGui::TextColored(ImVec4_Blueish, "PRINT: %s", message.text.c_str());
                 }
@@ -2392,6 +2466,33 @@ public:
         };
         renderInterpreterMessages(m_worker.statusMessages());
         renderInterpreterMessages(simulation.statusMessages);
+        ImGui::End();
+    }
+
+    void renderOperatorAlert(const ngc::SimulationSnapshot &simulation) {
+        if (!simulation.operatorAlert) {
+            return;
+        }
+
+        const auto &viewport = *ImGui::GetMainViewport();
+        ImGui::SetNextWindowPos(
+            viewport.GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+        ImGui::SetNextWindowSizeConstraints(
+            ImVec2(360.0f, 0.0f), ImVec2(640.0f, FLT_MAX));
+        ImGui::Begin(
+            "Operator Alert", nullptr,
+            ImGuiWindowFlags_AlwaysAutoResize
+                | ImGuiWindowFlags_NoCollapse
+                | ImGuiWindowFlags_NoSavedSettings);
+        ImGui::PushTextWrapPos(ImGui::GetCursorPosX() + 560.0f);
+        ImGui::TextUnformatted(simulation.operatorAlert->c_str());
+        ImGui::PopTextWrapPos();
+        ImGui::Separator();
+        if (simulation.status == ngc::SimulationStatus::Paused) {
+            ImGui::TextUnformatted("Press Resume to continue or Stop to abort.");
+        } else {
+            ImGui::TextUnformatted("Waiting for the program pause boundary.");
+        }
         ImGui::End();
     }
 
@@ -2434,6 +2535,13 @@ public:
         auto simulation = m_simulation.snapshot();
         processPendant(simulation);
         simulation = m_simulation.snapshot();
+        const auto [simulationTools, toolTableRevision] =
+            m_simulation.toolTableSnapshot();
+        if (toolTableRevision != m_simulationToolTableRevision
+           && m_worker.setToolTable(simulationTools)) {
+            m_tools = simulationTools;
+            m_simulationToolTableRevision = toolTableRevision;
+        }
         const auto &viewport = *ImGui::GetMainViewport();
         m_toolbarHeight = ImGui::GetFrameHeight() + ImGui::GetStyle().WindowPadding.y * 2.0f;
         const auto contentBottom = viewport.Pos.y + viewport.Size.y - m_statusBarHeight;
@@ -2453,6 +2561,7 @@ public:
         }
         renderStatusBar(viewport, simulation);
         renderSplitters(viewport, contentBottom);
+        renderOperatorAlert(simulation);
 
         if(m_enableOpenDialog) renderOpenDialog();
         if(m_enableMemoryWindow) renderMemoryWindow();

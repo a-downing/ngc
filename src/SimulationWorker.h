@@ -27,6 +27,7 @@
 #include "machine/ToolTable.h"
 #include "machine/GeometryStreamProducer.h"
 #include "machine/PreparedTrajectoryExecutionDriver.h"
+#include "memory/ParameterStore.h"
 #include "WindowsServoPacer.h"
 
 class SimulationWorker {
@@ -54,6 +55,7 @@ class SimulationWorker {
     std::thread m_thread;
     std::thread m_geometryThread;
     ngc::InterpreterSession m_session;
+    ngc::Machine::Unit m_unit;
     ngc::GeometryStreamPolicy m_geometryPolicy;
     ngc::MockMotionBackend m_backend;
     ngc::PreparedGeometryForwardChannel m_geometryForward;
@@ -88,10 +90,16 @@ class SimulationWorker {
     std::optional<ChunkKey> m_lastChunk;
     std::vector<std::tuple<std::string, std::string>> m_programs;
     ngc::ToolTable m_toolTable;
+    std::optional<std::filesystem::path> m_parameterStorePath;
+    std::optional<std::filesystem::path> m_toolTableStorePath;
+    bool m_toolTableInitialized = false;
+    std::uint64_t m_toolTableRevision = 0;
     bool m_join = false;
     bool m_start = false;
     bool m_stop = false;
     bool m_paused = false;
+    bool m_programPaused = false;
+    bool m_programResumeRequested = false;
     bool m_running = false;
     bool m_programRunning = false;
     bool m_feedHoldRequested = false;
@@ -122,6 +130,7 @@ public:
                               const ngc::TrajectoryLimits limits = {},
                               const ngc::SimulationTiming timing = {})
         : m_session(unit, ngc::InterpretationMode::Simulation),
+          m_unit(unit),
           m_geometryPolicy(geometryPolicy(limits)),
           m_backend({}, limits),
           m_driver(m_backend, m_geometryForward, m_geometryFeedback, m_geometryCancelled, limits),
@@ -136,6 +145,7 @@ public:
     }
     explicit SimulationWorker(const ngc::MachineConfiguration &configuration)
         : m_session(configuration.unit, ngc::InterpretationMode::Simulation),
+          m_unit(configuration.unit),
           m_geometryPolicy(geometryPolicy(configuration.trajectory)),
           m_backend(configuration.feedHold, configuration.trajectory,
                     configuration.axes, configuration.joints),
@@ -163,11 +173,18 @@ public:
         std::scoped_lock lock(m_mutex);
         if(m_running || m_start || m_home || m_activeJog || programs.empty()) return false;
         m_programs = programs;
-        m_toolTable = tools;
+        if (!m_toolTableInitialized) {
+            m_toolTable = tools;
+            m_session.machine().toolTable() = tools;
+            m_toolTableInitialized = true;
+            ++m_toolTableRevision;
+        }
         m_preserveState = preserveState;
         m_start = true;
         m_stop = false;
         m_paused = false;
+        m_programPaused = false;
+        m_programResumeRequested = false;
         m_feedHoldRequested = false;
         m_feedHoldInProgress = false;
         m_feedHoldHeld = false;
@@ -177,6 +194,7 @@ public:
         m_pendingFeedResumeRequest.reset();
         m_snapshot.status = ngc::SimulationStatus::Running;
         m_snapshot.activity = ngc::SimulationActivity::Program;
+        m_snapshot.operatorAlert.reset();
         m_cv.notify_all();
         return true;
     }
@@ -283,6 +301,11 @@ public:
             m_snapshot.usedWorkCoordinateSystems.push_back(updated);
         else
             *existing = updated;
+        const auto saved = persistParametersAtBoundary();
+        if (!saved) {
+            return std::unexpected(saved.error());
+        }
+
         return {};
     }
 
@@ -317,8 +340,20 @@ public:
     }
     bool resume() {
         std::scoped_lock lock(m_mutex);
-        if(!m_running || !m_programRunning || !m_paused || !m_feedHoldHeld
-           || m_feedResumeRequested || m_feedResumeInProgress) return false;
+        if (!m_running || !m_programRunning || !m_paused) {
+            return false;
+        }
+        if (m_programPaused) {
+            m_programResumeRequested = true;
+            m_paused = false;
+            m_snapshot.status = ngc::SimulationStatus::Running;
+            m_snapshot.operatorAlert.reset();
+            m_cv.notify_all();
+            return true;
+        }
+        if (!m_feedHoldHeld || m_feedResumeRequested || m_feedResumeInProgress) {
+            return false;
+        }
         m_feedResumeRequested = true;
         m_feedResumeInProgress = true;
         m_paused = false;
@@ -333,6 +368,8 @@ public:
             m_start = false;
             m_home = false;
             m_paused = false;
+            m_programPaused = false;
+            m_programResumeRequested = false;
             m_feedHoldRequested = false;
             m_feedHoldInProgress = false;
             m_feedHoldHeld = false;
@@ -340,6 +377,7 @@ public:
             m_feedResumeInProgress = false;
             m_pendingFeedHoldRequest.reset();
             m_pendingFeedResumeRequest.reset();
+            m_snapshot.operatorAlert.reset();
             m_cv.notify_all();
         }
     }
@@ -377,6 +415,90 @@ public:
         if(!m_running&&!m_start&&!m_home&&!m_activeJog) m_driver.setLimits(m_limits);
     }
     ngc::SimulationSnapshot snapshot() const { std::scoped_lock lock(m_mutex); return m_snapshot; }
+
+    bool setToolTable(const ngc::ToolTable &tools) {
+        std::scoped_lock lock(m_mutex);
+        if (m_running || m_start || m_home || m_activeJog) {
+            return false;
+        }
+        m_toolTable = tools;
+        m_session.machine().toolTable() = tools;
+        m_toolTableInitialized = true;
+        ++m_toolTableRevision;
+
+        return true;
+    }
+
+    ngc::ToolTable toolTable() const {
+        std::scoped_lock lock(m_mutex);
+
+        return m_toolTable;
+    }
+
+    std::pair<ngc::ToolTable, std::uint64_t> toolTableSnapshot() const {
+        std::scoped_lock lock(m_mutex);
+
+        return {m_toolTable, m_toolTableRevision};
+    }
+
+    std::expected<void, std::string> setToolTableStorePath(
+        const std::filesystem::path &path) {
+        std::scoped_lock lock(m_mutex);
+        if (m_running || m_start || m_home || m_activeJog) {
+            return std::unexpected(
+                "cannot configure the tool-table store while motion owns the machine");
+        }
+        m_toolTableStorePath = path;
+
+        return {};
+    }
+
+    std::expected<void, std::string> saveToolTable(
+        const std::filesystem::path &path) const {
+        std::scoped_lock lock(m_mutex);
+        if (m_running || m_start || m_home || m_activeJog) {
+            return std::unexpected(
+                "cannot save the tool table while motion owns the machine");
+        }
+
+        return m_toolTable.save(path);
+    }
+
+    std::expected<void, std::string> setPersistentParameterStorePath(
+        const std::filesystem::path &path) {
+        std::scoped_lock lock(m_mutex);
+        if (m_running || m_start || m_home || m_activeJog) {
+            return std::unexpected(
+                "cannot configure persistent parameters while motion owns the machine");
+        }
+        m_parameterStorePath = path;
+
+        return {};
+    }
+    std::expected<void, std::string> loadPersistentParameters(const std::filesystem::path &path) {
+        std::scoped_lock lock(m_mutex);
+        if (m_running || m_start || m_home || m_activeJog) {
+            return std::unexpected("cannot load persistent parameters while motion owns the machine");
+        }
+
+        auto loaded = ngc::loadPersistentParameters(path, m_unit, m_session.machine().memory());
+        if (loaded) {
+            m_parameterStorePath = path;
+            m_session.machine().beginProgramRun();
+            m_snapshot.activePresentation = sessionPresentation();
+        }
+
+        return loaded;
+    }
+
+    std::expected<void, std::string> savePersistentParameters(const std::filesystem::path &path) const {
+        std::scoped_lock lock(m_mutex);
+        if (m_running || m_start || m_home || m_activeJog) {
+            return std::unexpected("cannot save persistent parameters while motion owns the machine");
+        }
+
+        return ngc::savePersistentParameters(path, m_unit, m_session.machine().memory());
+    }
     std::vector<ngc::ExecutedJerkSample> takeExecutedJerkSamples() {
         auto samples=m_backend.takeExecutedJerkSamples();
         std::scoped_lock lock(m_mutex);
@@ -398,6 +520,30 @@ public:
     }
 
 private:
+    std::expected<void, std::string> persistParametersAtBoundary() const {
+        if (!m_parameterStorePath) {
+            return {};
+        }
+
+        return ngc::savePersistentParameters(
+            *m_parameterStorePath, m_unit, m_session.machine().memory());
+    }
+
+    std::expected<void, std::string> persistToolTableAtBoundary() {
+        const auto &updated = m_session.machine().toolTable();
+        if (updated == m_toolTable) {
+            return {};
+        }
+        m_toolTable = updated;
+        m_toolTableInitialized = true;
+        ++m_toolTableRevision;
+        if (!m_toolTableStorePath) {
+            return {};
+        }
+
+        return m_toolTable.save(*m_toolTableStorePath);
+    }
+
     void clearPresentation() {
         m_chunks.clear();
         m_markerPresentations.clear();
@@ -1259,9 +1405,25 @@ private:
                     {
                         std::scoped_lock statusLock(m_mutex);
                         m_snapshot.statusMessages = m_session.statusMessages();
+                        if (auto saved = persistToolTableAtBoundary(); !saved) {
+                            m_snapshot.status = ngc::SimulationStatus::Error;
+                            m_snapshot.error = saved.error();
+                        }
                     }
                     if(joining) return;
                     break;
+                }
+                if (m_programResumeRequested) {
+                    m_programResumeRequested = false;
+                    if (!m_driver.resumeProgram()) {
+                        m_snapshot.status = ngc::SimulationStatus::Error;
+                        m_snapshot.error =
+                            "prepared trajectory driver rejected the M0 program resume";
+                        m_running = false;
+                        m_programRunning = false;
+                    } else {
+                        m_programPaused = false;
+                    }
                 }
                 if(m_feedHoldRequested) {
                     m_feedHoldRequested = false;
@@ -1317,6 +1479,9 @@ private:
                     continue;
                 }
                 m_driver.serviceBackend([&](const auto &event) { observeBackendEvent(event); });
+                if (auto presentation = m_driver.takePresentationUpdate()) {
+                    applyActivePresentation(*presentation);
+                }
                 if(executorBatchActive.load(std::memory_order_acquire)) {
                     copyTimingSnapshot();
                     lock.unlock();
@@ -1327,6 +1492,11 @@ private:
                 while(m_backend.tryTakeSnapshot(backendSnapshot)) applyBackendSnapshot(backendSnapshot);
                 copyTimingSnapshot();
                 auto state = m_driver.state();
+                if (state == ngc::PreparedDriverState::ProgramPaused) {
+                    m_programPaused = true;
+                    m_paused = true;
+                    m_snapshot.status = ngc::SimulationStatus::Paused;
+                }
                 const auto pacingError = executorError.load(std::memory_order_acquire);
                 if(pacingError != 0) {
                     m_snapshot.status = ngc::SimulationStatus::Error;
@@ -1349,7 +1519,9 @@ private:
                     }
                     m_deferredCompletedBlocks.clear();
                 }
-                if(state != ngc::PreparedDriverState::Running || !m_running) {
+                if ((state == ngc::PreparedDriverState::Completed
+                     || state == ngc::PreparedDriverState::Error)
+                    || !m_running) {
                     stopExecutor.store(true, std::memory_order_release);
                     executorRefillRequested.store(false,std::memory_order_release);
                     lock.unlock();
@@ -1362,12 +1534,24 @@ private:
                        ||state == ngc::PreparedDriverState::Error) {
                         std::scoped_lock sessionLock(m_mutex);
                         m_snapshot.statusMessages = m_session.statusMessages();
+                        const auto toolsSaved = persistToolTableAtBoundary();
                         if(state == ngc::PreparedDriverState::Completed) {
                             applyActivePresentation(sessionPresentation());
                             m_running = false;
                             m_programRunning = false;
-                            m_snapshot.status = ngc::SimulationStatus::Completed;
                             m_snapshot.activity = ngc::SimulationActivity::Idle;
+                            const auto parametersSaved = persistParametersAtBoundary();
+                            if (!toolsSaved) {
+                                m_snapshot.status = ngc::SimulationStatus::Error;
+                                m_snapshot.error = toolsSaved.error();
+                            } else if (!parametersSaved) {
+                                m_snapshot.status = ngc::SimulationStatus::Error;
+                                m_snapshot.error = parametersSaved.error();
+                            } else {
+                                m_snapshot.status = ngc::SimulationStatus::Completed;
+                            }
+                        } else if (!toolsSaved && m_snapshot.error.empty()) {
+                            m_snapshot.error = toolsSaved.error();
                         }
                     }
                     break;
@@ -1391,8 +1575,14 @@ private:
                         [&](const auto &status) {
                             std::scoped_lock presentationLock(m_mutex);
                             m_snapshot.statusMessages.push_back(status);
+                            if (status.kind == ngc::InterpreterStatusKind::Alert) {
+                                m_snapshot.operatorAlert = status.text;
+                            }
                         });
                     lock.lock();
+                    if (auto presentation = m_driver.takePresentationUpdate()) {
+                        applyActivePresentation(*presentation);
+                    }
                     if(!pumped) break;
                     filled = true;
                     if(m_join||m_stop||m_paused) break;
@@ -1411,6 +1601,10 @@ private:
                     m_snapshot.error = *m_driver.error();
                     m_running = false;
                     m_programRunning = false;
+                } else if (state == ngc::PreparedDriverState::ProgramPaused) {
+                    m_programPaused = true;
+                    m_paused = true;
+                    m_snapshot.status = ngc::SimulationStatus::Paused;
                 }
                 if(!m_running) {
                     stopExecutor.store(true, std::memory_order_release);

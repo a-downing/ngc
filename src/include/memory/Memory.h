@@ -2,8 +2,11 @@
 
 #include <expected>
 
+#include <algorithm>
+#include <compare>
 #include <cstddef>
 #include <cstdint>
+#include <cmath>
 #include <vector>
 #include <unordered_map>
 #include <format>
@@ -24,6 +27,13 @@ namespace ngc
         std::size_t m_programStorageBegin = 0;
 
     public:
+        struct PersistentParameter {
+            uint32_t address;
+            double value;
+
+            auto operator<=>(const PersistentParameter &) const = default;
+        };
+
         static constexpr uint32_t ADDR_STACK = 0x80000000;
         static constexpr uint32_t MAX_USER_PARAMETER = 5000;
 
@@ -149,6 +159,45 @@ namespace ngc
             }
 
             return isVolatileData(addr);
+        }
+
+        [[nodiscard]] bool isPersistentParameter(const uint32_t addr) const {
+            if (addr == 0 || (addr & ADDR_STACK) || addr >= m_data.size()) {
+                return false;
+            }
+
+            return std::ranges::find(m_addrs, addr) != m_addrs.end()
+                && !m_data[addr].volatileFlag();
+        }
+
+        [[nodiscard]] std::vector<PersistentParameter> persistentParameters() const {
+            std::vector<PersistentParameter> result;
+            result.reserve(m_addrs.size());
+            for (const auto address : m_addrs) {
+                if (isPersistentParameter(address)) {
+                    result.push_back({address, m_data[address].read()});
+                }
+            }
+
+            return result;
+        }
+
+        std::expected<void, Error> applyPersistentParameters(
+            const std::span<const PersistentParameter> parameters) {
+            for (const auto &[address, value] : parameters) {
+                if (!isPersistentParameter(address)) {
+                    return std::unexpected(Error::INVALID_DATA_ADDRESS);
+                }
+                if (!std::isfinite(value)) {
+                    return std::unexpected(Error::WRITE);
+                }
+            }
+
+            for (const auto &[address, value] : parameters) {
+                m_data[address].write(value);
+            }
+
+            return {};
         }
 
     private:

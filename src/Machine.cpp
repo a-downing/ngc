@@ -1,6 +1,8 @@
 #include "machine/Machine.h"
 
+#include <cmath>
 #include <expected>
+#include <limits>
 #include <optional>
 #include <print>
 #include <vector>
@@ -58,6 +60,7 @@ namespace ngc {
             m_state = GCodeState::makeDefault();
             const auto num = static_cast<int>(m_memory.read(Var::COORDSYS));
             m_state.affectState(coordsys(num));
+            m_workOffset = offset(*m_state.modeCoordSys);
         }
 
         template<typename Self> auto &workOffset(this Self &&self) { return std::forward<Self>(self).m_workOffset; }
@@ -72,7 +75,61 @@ namespace ngc {
             };
         }
         position_t physicalToolOffset() const { return toolGeometry().offset; }
-        void prepareToolChange(const int toolNumber) { m_physicalToolNumber = toolNumber; }
+        void prepareToolChange(const int toolNumber) {
+            if (!m_toolTable.get(toolNumber)) {
+                throw std::runtime_error(std::format(
+                    "M6 tool {} was not found in the active tool table", toolNumber));
+            }
+            m_physicalToolNumber = toolNumber;
+        }
+
+        Machine::ToolChangeModalCheckpoint captureToolChangeModalCheckpoint() const {
+            const auto valid = m_state.valid();
+            if (!valid) {
+                PANIC("cannot checkpoint invalid modal state: {}", valid.error());
+            }
+
+            return {
+                .motion = *m_state.modeMotion,
+                .plane = *m_state.modePlane,
+                .distance = *m_state.modeDistance,
+                .arcDistance = *m_state.modeArcDistance,
+                .feedMode = *m_state.modeFeedrate,
+                .units = *m_state.modeUnits,
+                .toolOffsetMode = *m_state.modeToolOffset,
+                .coordinateSystem = *m_state.modeCoordSys,
+                .pathMode = *m_state.modePath,
+                .pathTolerance = m_state.pathTolerance,
+                .feedrate = m_state.F,
+                .spindleSpeed = m_state.S,
+                .selectedTool = m_state.T,
+                .appliedToolOffset = m_toolOffset,
+            };
+        }
+
+        void restoreToolChangeModalCheckpoint(
+            const Machine::ToolChangeModalCheckpoint &checkpoint) {
+            m_state.resetModal();
+            m_state.modeMotion = checkpoint.motion;
+            m_state.modePlane = checkpoint.plane;
+            m_state.modeDistance = checkpoint.distance;
+            m_state.modeArcDistance = checkpoint.arcDistance;
+            m_state.modeFeedrate = checkpoint.feedMode;
+            m_state.modeUnits = checkpoint.units;
+            m_state.modeToolOffset = checkpoint.toolOffsetMode;
+            m_state.modeCoordSys = checkpoint.coordinateSystem;
+            m_state.modePath = checkpoint.pathMode;
+            m_state.pathTolerance = checkpoint.pathTolerance;
+            m_state.modeSpindle = MCSpindle::M5;
+            m_state.F = checkpoint.feedrate;
+            m_state.S = checkpoint.spindleSpeed;
+            m_state.T = checkpoint.selectedTool;
+            m_toolOffset = checkpoint.appliedToolOffset;
+            m_workOffset = offset(checkpoint.coordinateSystem);
+            m_memory.write(
+                Var::COORDSYS,
+                static_cast<double>(coordsys(checkpoint.coordinateSystem)), true);
+        }
         template<typename Self> auto &memory(this Self &&self) { return std::forward<Self>(self).m_memory; }
 
         void setActiveWorkOffset(const Axis axis, const double value) {
@@ -180,7 +237,13 @@ namespace ngc {
             const auto nextCommandIdCheckpoint = m_nextCommandId;
             const auto pendingProbeCheckpoint = m_pendingProbe;
             std::optional<Memory> memoryCheckpoint;
-            if(blockState.nonModal == GCNonModal::G10) memoryCheckpoint = m_memory;
+            if (blockState.nonModal == GCNonModal::G10 || blockState.modeCoordSys) {
+                memoryCheckpoint = m_memory;
+            }
+            std::optional<ToolTable> toolTableCheckpoint;
+            if (blockState.nonModal == GCNonModal::G10 && blockState.L == 11.0) {
+                toolTableCheckpoint = m_toolTable;
+            }
 
             try {
                 return executeBlockImpl(block);
@@ -193,6 +256,9 @@ namespace ngc {
                 m_nextCommandId = nextCommandIdCheckpoint;
                 m_pendingProbe = pendingProbeCheckpoint;
                 if(memoryCheckpoint) m_memory = std::move(*memoryCheckpoint);
+                if (toolTableCheckpoint) {
+                    m_toolTable = std::move(*toolTableCheckpoint);
+                }
                 throw;
             }
         }
@@ -222,6 +288,8 @@ namespace ngc {
 
             if(state.modeCoordSys) {
                 m_state.modeCoordSys = std::exchange(state.modeCoordSys, std::nullopt);
+                m_memory.write(
+                    Var::COORDSYS, static_cast<double>(coordsys(*m_state.modeCoordSys)), true);
                 m_workOffset = offset(*m_state.modeCoordSys);
             }
 
@@ -292,6 +360,7 @@ namespace ngc {
                 m_state.T = std::exchange(state.T, std::nullopt);
             }
 
+            const auto toolChange = state.modeToolChange.has_value();
             if(state.modeToolChange) {
                 m_state.modeToolChange = std::exchange(state.modeToolChange, std::nullopt);
             }
@@ -305,6 +374,11 @@ namespace ngc {
                     const auto dir = m_state.modeSpindle == MCSpindle::M3 ? Direction::CW : Direction::CCW;
                     commands.emplace_back(SpindleStart{dir, *m_state.S});
                 }
+            }
+
+            if (toolChange) {
+                m_state.modeSpindle = MCSpindle::M5;
+                commands.emplace_back(SpindleStop {});
             }
 
             if(state.modeToolOffset) {
@@ -428,6 +502,64 @@ namespace ngc {
                 }
 
                 m_workOffset = offset(*m_state.modeCoordSys);
+                return;
+            }
+
+            if (*m_state.L == 11.0) {
+                m_state.nonModal = std::exchange(state.nonModal, std::nullopt);
+                if (!std::isfinite(*m_state.P)
+                    || *m_state.P < 1.0
+                    || *m_state.P > static_cast<double>(std::numeric_limits<int>::max())
+                    || std::trunc(*m_state.P) != *m_state.P) {
+                    throw std::runtime_error(std::format(
+                        "{}: G10 L11 has invalid tool P{}: {}",
+                        block.statement()->startToken().location(), *m_state.P,
+                        block.statement()->text()));
+                }
+                const auto toolNumber = static_cast<int>(*m_state.P);
+                auto tool = m_toolTable.get(toolNumber);
+                if (!tool) {
+                    throw std::runtime_error(std::format(
+                        "{}: G10 L11 tool {} was not found: {}",
+                        block.statement()->startToken().location(), toolNumber,
+                        block.statement()->text()));
+                }
+                const auto reference = offset(GCCoord::G59_3);
+                if (state.X) {
+                    m_state.X = *std::exchange(state.X, std::nullopt) * linearScale();
+                    tool->x = m_pos.x - reference.x - *m_state.X;
+                }
+                if (state.Y) {
+                    m_state.Y = *std::exchange(state.Y, std::nullopt) * linearScale();
+                    tool->y = m_pos.y - reference.y - *m_state.Y;
+                }
+                if (state.Z) {
+                    m_state.Z = *std::exchange(state.Z, std::nullopt) * linearScale();
+                    tool->z = m_pos.z - reference.z - *m_state.Z;
+                }
+                if (state.A) {
+                    m_state.A = std::exchange(state.A, std::nullopt);
+                    tool->a = m_pos.a - reference.a - *m_state.A;
+                }
+                if (state.B) {
+                    m_state.B = std::exchange(state.B, std::nullopt);
+                    tool->b = m_pos.b - reference.b - *m_state.B;
+                }
+                if (state.C) {
+                    m_state.C = std::exchange(state.C, std::nullopt);
+                    tool->c = m_pos.c - reference.c - *m_state.C;
+                }
+                if (state.R) {
+                    m_state.R = std::exchange(state.R, std::nullopt);
+                    if (!std::isfinite(*m_state.R) || *m_state.R < 0.0) {
+                        throw std::runtime_error(std::format(
+                            "{}: G10 L11 tool radius must be finite and non-negative: {}",
+                            block.statement()->startToken().location(),
+                            block.statement()->text()));
+                    }
+                    tool->diameter = 2.0 * *m_state.R * linearScale();
+                }
+                m_toolTable.set(toolNumber, *tool);
                 return;
             }
 
@@ -644,6 +776,13 @@ namespace ngc {
     ToolGeometry Machine::toolGeometry() const { return m_impl->toolGeometry(); }
     position_t Machine::physicalToolOffset() const { return m_impl->physicalToolOffset(); }
     void Machine::prepareToolChange(const int toolNumber) { m_impl->prepareToolChange(toolNumber); }
+    Machine::ToolChangeModalCheckpoint Machine::captureToolChangeModalCheckpoint() const {
+        return m_impl->captureToolChangeModalCheckpoint();
+    }
+    void Machine::restoreToolChangeModalCheckpoint(
+        const ToolChangeModalCheckpoint &checkpoint) {
+        m_impl->restoreToolChangeModalCheckpoint(checkpoint);
+    }
     Memory &Machine::memory() { return m_impl->memory(); }
     const Memory &Machine::memory() const { return m_impl->memory(); }
     ToolTable &Machine::toolTable() { return m_impl->toolTable(); }

@@ -8,6 +8,7 @@
 
 #include "machine/TrajectoryCompiler.h"
 #include "machine/Machine.h"
+#include "memory/ParameterStore.h"
 
 namespace ngc {
     struct SimulationTiming {
@@ -123,6 +124,8 @@ namespace ngc {
         ProbingConfiguration probing;
         std::vector<JointConfiguration> joints;
         HomingConfiguration homing;
+        ParameterStorePaths parameterStores;
+        ToolTableStorePaths toolTableStores;
     };
 
     std::expected<MachineConfiguration, std::string>

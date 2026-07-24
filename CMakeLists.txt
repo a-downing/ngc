@@ -43,6 +43,7 @@ add_library(ngc_core STATIC
         src/Evaluator.cpp
         src/Machine.cpp
         src/MockMotionBackend.cpp
+        src/ParameterStore.cpp
         src/ToolTable.cpp)
 target_include_directories(ngc_core PUBLIC src/include)
 target_link_libraries(ngc_core PRIVATE PathTempo::PathTempo ruckig::ruckig tomlplusplus::tomlplusplus)

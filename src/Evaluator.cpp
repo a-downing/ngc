@@ -264,7 +264,7 @@ namespace ngc {
             context(ctx)->result = 0.0;
 
             // TODO: more extensible way to evaluate built in functions
-            if(expr->name() == "print") {
+            if (expr->name() == "print" || expr->name() == "alert") {
                 synchronize();
                 std::string text;
 
@@ -276,7 +276,11 @@ namespace ngc {
                     }
                 }
 
-                m_callback(std::make_unique<PrintMessage>(text), m_owner);
+                if (expr->name() == "alert") {
+                    m_callback(std::make_unique<AlertMessage>(text), m_owner);
+                } else {
+                    m_callback(std::make_unique<PrintMessage>(text), m_owner);
+                }
                 return;
             }
 
@@ -464,6 +468,15 @@ namespace ngc {
             m_callback(std::make_unique<SynchronizationMessage>(), m_owner);
         }
 
+        void pauseProgram() {
+            m_callback(std::make_unique<ProgramPauseMessage>(), m_owner);
+        }
+
+        void toolChangeModalStateRestored() {
+            m_callback(
+                std::make_unique<ToolChangeModalStateRestoredMessage>(), m_owner);
+        }
+
         void interrupt() const {
             if(m_interrupt) m_interrupt();
         }
@@ -541,5 +554,13 @@ namespace ngc {
     }
     void Evaluator::synchronize() {
         m_impl->synchronize();
+    }
+
+    void Evaluator::pauseProgram() {
+        m_impl->pauseProgram();
+    }
+
+    void Evaluator::toolChangeModalStateRestored() {
+        m_impl->toolChangeModalStateRestored();
     }
 }

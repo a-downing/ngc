@@ -203,9 +203,15 @@ private:
                     retainForPreview = true;
                 } else if constexpr(std::same_as<T, ngc::PreparedContinuousEnd>) {
                     retainForPreview = true;
+                } else if constexpr (std::same_as<T, ngc::PreparedPresentationUpdate>) {
+                    retainForPreview = true;
                 } else if constexpr(std::same_as<T, ngc::PreparedSynchronizationFence>) {
                     if(!sendFeedback(ngc::ReleaseSynchronization{value.epoch, value.fence}))
                         failure = "preview could not release an interpreter synchronization fence";
+                } else if constexpr (std::same_as<T, ngc::PreparedProgramPause>) {
+                    if (!sendFeedback(ngc::ResumeProgram {value.epoch, value.pause})) {
+                        failure = "preview could not automatically resume an M0 program pause";
+                    }
                 } else if constexpr(std::same_as<T, ngc::PreparedProbeFence>) {
                     if(!pendingProbe || pendingProbe->id() != value.commandId) {
                         failure = std::format("preview probe fence {} has no preceding probe", value.commandId);

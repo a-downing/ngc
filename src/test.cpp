@@ -31,6 +31,7 @@
 #include "machine/SplineHandleOptimization.h"
 #include "machine/ToolTable.h"
 #include "memory/Memory.h"
+#include "memory/ParameterStore.h"
 #include "parser/Program.h"
 #include "path_tempo/Planner.h"
 #include "path_tempo/Types.h"
@@ -88,6 +89,8 @@ sub _tool_change[#tool_number] {
                 {std::string(TOOL_CHANGE_FIXTURE),"fixture/tool_change.ngc"},
                 {std::move(main),std::move(name)}};
     }
+
+    void compileSession(ngc::InterpreterSession &session, std::string_view source);
 
     std::string boundedPreviewFixture(const int commands,const bool exactStop) {
         std::string source=exactStop?"G61\n":"G64 P0.005\n";
@@ -365,6 +368,156 @@ final_move_together = true
         }
     }
 
+    void testPersistentParameterCodec() {
+        ngc::Memory memory;
+        memory.init(ngc::gVars);
+        const auto g54X = memory.deref(ngc::Var::G54_X);
+        const auto exactValue = std::nextafter(7.25, 8.0);
+        require(memory.write(g54X, exactValue, true).has_value(),
+                "persistent fixture value should be writable internally");
+        require(memory.write(1, 123.0).has_value(),
+                "volatile user parameter should be writable");
+
+        const auto persistent = memory.persistentParameters();
+        require(std::ranges::find(persistent, g54X, &ngc::Memory::PersistentParameter::address)
+                    != persistent.end(),
+                "predefined nonvolatile parameters should be exported");
+        require(std::ranges::find(persistent, 1U, &ngc::Memory::PersistentParameter::address)
+                    == persistent.end(),
+                "ordinary user parameters should not be exported");
+        require(std::ranges::find(
+                    persistent, memory.deref(ngc::Var::TASK),
+                    &ngc::Memory::PersistentParameter::address) == persistent.end(),
+                "_task should not be exported");
+
+        const auto serialized = ngc::serializePersistentParameters(UNIT, persistent);
+        require(serialized.starts_with("NGC_PARAMETERS 1\nunit inch\n"),
+                "persistent parameters should use the version-1 header");
+        auto parsed = ngc::parsePersistentParameters(serialized, UNIT, memory);
+        require(parsed.has_value(), parsed ? "" : parsed.error());
+        require(*parsed == persistent, "persistent doubles should round trip exactly");
+
+        ngc::Machine restored(UNIT);
+        require(restored.memory().applyPersistentParameters(*parsed).has_value(),
+                "validated persistent parameters should apply");
+        restored.beginProgramRun();
+        requireNear(restored.workOffset().x, exactValue,
+                    "a new program run should activate the restored WCS memory");
+
+        const auto withComments = std::format(
+            "# saved values\n\nNGC_PARAMETERS 1\nunit inch\n{} {} # active X offset",
+            g54X, exactValue);
+        parsed = ngc::parsePersistentParameters(withComments, UNIT, memory);
+        require(parsed.has_value() && parsed->size() == 1,
+                "comments, blank lines, and a final unterminated record should be accepted");
+
+        require(!ngc::parsePersistentParameters(
+                    "NGC_PARAMETERS 2\nunit inch\n", UNIT, memory),
+                "unknown parameter-file versions should be rejected");
+        require(!ngc::parsePersistentParameters(
+                    "NGC_PARAMETERS 1\nunit mm\n", UNIT, memory),
+                "parameter-file unit mismatches should be rejected");
+        require(!ngc::parsePersistentParameters(
+                    "NGC_PARAMETERS 1\nunit inch\n1 5\n", UNIT, memory),
+                "volatile parameter addresses should be rejected");
+        require(!ngc::parsePersistentParameters(
+                    std::format("NGC_PARAMETERS 1\nunit inch\n{} 1\n{} 2\n", g54X, g54X),
+                    UNIT, memory),
+                "duplicate parameter addresses should be rejected");
+        require(!ngc::parsePersistentParameters(
+                    std::format("NGC_PARAMETERS 1\nunit inch\n{} 1garbage\n", g54X),
+                    UNIT, memory),
+                "parameter values with trailing text should be rejected");
+        require(!ngc::parsePersistentParameters(
+                    std::format("NGC_PARAMETERS 1\nunit inch\n{} inf\n", g54X),
+                    UNIT, memory),
+                "non-finite parameter values should be rejected");
+        require(!ngc::parsePersistentParameters(
+                    std::format("NGC_PARAMETERS 1\nunit inch\n{} 10\n",
+                                memory.deref(ngc::Var::COORDSYS)),
+                    UNIT, memory),
+                "invalid active coordinate systems should be rejected before application");
+    }
+
+    void testPersistentParameterFilesAreAtomicAndIsolated() {
+        const auto root = std::filesystem::temp_directory_path();
+        const auto simulationPath = root / "ngc-simulation-parameters-test.var";
+        const auto realPath = root / "ngc-real-parameters-test.var";
+        std::filesystem::remove(simulationPath);
+        std::filesystem::remove(realPath);
+
+        ngc::Memory simulation;
+        ngc::Memory real;
+        simulation.init(ngc::gVars);
+        real.init(ngc::gVars);
+        const auto address = simulation.deref(ngc::Var::G54_X);
+        require(simulation.write(address, 12.5, true).has_value()
+                && real.write(address, -3.25, true).has_value(),
+                "isolated parameter fixtures should be writable internally");
+        require(ngc::savePersistentParameters(simulationPath, UNIT, simulation).has_value(),
+                "Simulation parameter store should save");
+        require(ngc::savePersistentParameters(realPath, UNIT, real).has_value(),
+                "Real parameter store should save");
+
+        ngc::Memory loadedSimulation;
+        ngc::Memory loadedReal;
+        loadedSimulation.init(ngc::gVars);
+        loadedReal.init(ngc::gVars);
+        require(ngc::loadPersistentParameters(
+                    simulationPath, UNIT, loadedSimulation).has_value(),
+                "Simulation parameter store should load");
+        require(ngc::loadPersistentParameters(realPath, UNIT, loadedReal).has_value(),
+                "Real parameter store should load");
+        requireNear(*loadedSimulation.read(address), 12.5,
+                    "Simulation parameters should remain isolated");
+        requireNear(*loadedReal.read(address), -3.25,
+                    "Real parameters should remain isolated");
+
+        {
+            std::ofstream corrupt(simulationPath, std::ios::binary | std::ios::trunc);
+            corrupt << "NGC_PARAMETERS 1\nunit inch\n" << address << " 99\n"
+                    << address << " truncated";
+        }
+        const auto prior = *loadedSimulation.read(address);
+        require(!ngc::loadPersistentParameters(simulationPath, UNIT, loadedSimulation),
+                "a corrupt parameter store should fail");
+        requireNear(*loadedSimulation.read(address), prior,
+                    "a failed load should not apply a valid prefix");
+
+        std::filesystem::remove(simulationPath);
+        std::filesystem::remove(realPath);
+    }
+
+    void testSimulationPersistsCoordinateSystemAtCompletion() {
+        const auto path = std::filesystem::temp_directory_path()
+            / "ngc-simulation-coordinate-system-test.var";
+        std::filesystem::remove(path);
+
+        SimulationWorker worker;
+        require(worker.setPersistentParameterStorePath(path).has_value(),
+                "idle Simulation should accept its parameter-store path");
+        require(worker.start({{"G59.3\n", "persistent-coordinate-system.ngc"}}, {}),
+                "coordinate-system persistence program should start");
+
+        auto snapshot = worker.snapshot();
+        for (auto attempt = 0; attempt < 5000
+             && snapshot.status != ngc::SimulationStatus::Completed
+             && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(snapshot.status == ngc::SimulationStatus::Completed,
+                snapshot.error.empty() ? "coordinate-system persistence program should complete"
+                                       : snapshot.error);
+        const auto stored = ngc::readFile(path);
+        require(stored.has_value(), stored ? "" : stored.error().what());
+        require(stored->find("\n5220 9\n") != std::string::npos,
+                "G59.3 completion should persist active coordinate-system parameter #5220 as 9");
+
+        worker.join();
+        std::filesystem::remove(path);
+    }
+
     void testToolTableLoadsFinalLineWithoutNewline() {
         const auto path = std::filesystem::temp_directory_path() / "ngc-tool-table-no-newline.txt";
         {
@@ -399,6 +552,100 @@ final_move_together = true
                 "duplicate tool error should identify its row and tool number");
         require(table.get(42).has_value(), "a failed tool-table load should preserve the existing table");
         require(!table.get(7).has_value(), "a failed tool-table load should not retain partially parsed rows");
+    }
+
+    void testToolTableMigrationCreatesIsolatedStores() {
+        const auto root = std::filesystem::temp_directory_path();
+        const ngc::ToolTableStorePaths paths {
+            .legacy = root / "ngc-legacy-tool-table-test.txt",
+            .real = root / "ngc-real-tool-table-test.txt",
+            .simulation = root / "ngc-simulation-tool-table-test.txt",
+        };
+        std::filesystem::remove(paths.legacy);
+        std::filesystem::remove(paths.real);
+        std::filesystem::remove(paths.simulation);
+
+        auto legacy = fixtureToolTable();
+        require(legacy.save(paths.legacy).has_value(),
+                "legacy tool-table migration fixture should save");
+        require(ngc::migrateLegacyToolTables(paths).has_value(),
+                "legacy tool table should seed both isolated stores");
+
+        ngc::ToolTable real;
+        ngc::ToolTable simulation;
+        require(real.load(paths.real).has_value()
+                && simulation.load(paths.simulation).has_value(),
+                "both isolated tool tables should load after migration");
+        require(real == legacy && simulation == legacy,
+                "legacy migration should preserve complete tool records");
+
+        std::filesystem::remove(paths.simulation);
+        require(!ngc::migrateLegacyToolTables(paths),
+                "a partial isolated-tool-table migration should be rejected");
+
+        std::filesystem::remove(paths.legacy);
+        std::filesystem::remove(paths.real);
+    }
+
+    void testSimulationG10L11PersistsOnlySimulationToolTable() {
+        const auto root = std::filesystem::temp_directory_path();
+        const ngc::ToolTableStorePaths paths {
+            .legacy = root / "ngc-l11-legacy-tool-table-test.txt",
+            .real = root / "ngc-l11-real-tool-table-test.txt",
+            .simulation = root / "ngc-l11-simulation-tool-table-test.txt",
+        };
+        std::filesystem::remove(paths.legacy);
+        std::filesystem::remove(paths.real);
+        std::filesystem::remove(paths.simulation);
+
+        auto initial = fixtureToolTable();
+        require(initial.save(paths.legacy).has_value()
+                && ngc::migrateLegacyToolTables(paths).has_value(),
+                "G10 L11 isolation fixture should create isolated tool tables");
+
+        SimulationWorker worker;
+        require(worker.setToolTable(initial),
+                "idle Simulation should accept its isolated tool table");
+        require(worker.setToolTableStorePath(paths.simulation).has_value(),
+                "idle Simulation should accept its tool-table store path");
+        constexpr std::string_view source =
+            "G10 L2 P9 X0.01 Y0.02 Z0.03\n"
+            "G53 G0 X0.1 Y0.2 Z0.3\n"
+            "G10 L11 P1 X0 Y0 Z0\n";
+        require(worker.start({{std::string(source), "simulation-l11.ngc"}}, initial),
+                "Simulation G10 L11 fixture should start");
+
+        auto snapshot = worker.snapshot();
+        for (int attempt = 0; attempt < 5000
+            && snapshot.status != ngc::SimulationStatus::Completed
+            && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(snapshot.status == ngc::SimulationStatus::Completed,
+                snapshot.error.empty() ? "Simulation G10 L11 fixture should complete"
+                                       : snapshot.error);
+        worker.join();
+
+        ngc::ToolTable real;
+        ngc::ToolTable simulation;
+        require(real.load(paths.real).has_value()
+                && simulation.load(paths.simulation).has_value(),
+                "isolated G10 L11 result tables should load");
+        requireNear(real.get(1)->z, initial.get(1)->z,
+                    "Simulation G10 L11 must not mutate the Real tool table");
+        requireNear(simulation.get(1)->x, 0.09,
+                    "Simulation G10 L11 X calibration should persist");
+        requireNear(simulation.get(1)->y, 0.18,
+                    "Simulation G10 L11 Y calibration should persist");
+        requireNear(simulation.get(1)->z, 0.27,
+                    "Simulation G10 L11 Z calibration should persist");
+        require(worker.toolTable() == simulation,
+                "Simulation should retain its calibrated table across operation epochs");
+
+        std::filesystem::remove(paths.legacy);
+        std::filesystem::remove(paths.real);
+        std::filesystem::remove(paths.simulation);
     }
 
     void testNumericParsingRejectsTrailingGarbage() {
@@ -483,6 +730,21 @@ final_move_together = true
                     "a failed block must not retain partial persistent-offset writes");
         require(machine.state().modeUnits == ngc::GCUnits::G20,
                 "a failed block must restore its previous modal state");
+
+        static_cast<void>(execute(machine, "G59.3\n"));
+        requireNear(machine.memory().read(ngc::Var::COORDSYS), 9.0,
+                    "G59.3 should update the canonical active-coordinate-system parameter");
+        rejected = false;
+        try {
+            static_cast<void>(execute(machine, "G54 G93\n"));
+        } catch(const std::exception &) {
+            rejected = true;
+        }
+        require(rejected, "a coordinate-system block with an unsupported feed mode should fail");
+        requireNear(machine.memory().read(ngc::Var::COORDSYS), 9.0,
+                    "a failed block must roll back its #5220 coordinate-system write");
+        require(machine.state().modeCoordSys == ngc::GCCoord::G59_3,
+                "a failed block must restore its previous coordinate-system mode");
     }
 
     void testInterpreterCancellationInterruptsEvaluation() {
@@ -500,7 +762,12 @@ final_move_together = true
         SimulationWorker worker;
         ngc::ToolTable tools;
         tools.set(1, { 1, 0, 0, 2, 0, 0, 0, 0.5, "simulation tool" });
-        require(worker.start({ { "sub _tool_change[#tool] {}\nT1 M6\nG1 F60 X1\n", "simulation-worker.ngc" } }, tools),
+        require(worker.start({ {
+                    "sub _tool_change[#tool] { return 1 }\n"
+                    "T1 M6\n"
+                    "G1 F60 X1\n",
+                    "simulation-worker.ngc"
+                }}, tools),
                 "simulation worker should accept a program");
 
         auto snapshot = worker.snapshot();
@@ -543,7 +810,7 @@ sub _tool_change[#tool_number] {
 }
 )NGC";
         constexpr std::string_view MAIN = R"NGC(
-G54
+G54 F60
 T1 M6
 G57 G1 X0.6
 )NGC";
@@ -1385,6 +1652,302 @@ G57 G1 X0.6
                 "block errors should include source, line, and column");
     }
 
+    void testAlertAndM0RequireExplicitProgramResume() {
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::Simulation);
+        session.setPrograms({{
+            "alert[\"Install tool \", 7]\n"
+            "M0\n"
+            "G53 G0 X1\n",
+            "program-pause.ngc"
+        }});
+        session.compile([](const auto &callback) { callback(); });
+
+        bool sawAlert = false;
+        bool sawMotionBeforeResume = false;
+        bool waitingForResume = false;
+        for (int guard = 0; guard < 50 && !waitingForResume; ++guard) {
+            const auto event =
+                session.nextWithBlocks([](const auto &callback) { callback(); });
+            if (std::holds_alternative<ngc::InterpreterWaitingForSynchronization>(event)) {
+                session.provideSynchronization();
+            } else if (const auto *status =
+                           std::get_if<ngc::InterpreterStatusMessage>(&event)) {
+                sawAlert = status->kind == ngc::InterpreterStatusKind::Alert
+                    && status->text == "Install tool 7";
+            } else if (std::holds_alternative<ngc::InterpreterWaitingForProgramResume>(event)) {
+                waitingForResume = true;
+            } else if (std::holds_alternative<ngc::MachineCommand>(event)) {
+                sawMotionBeforeResume = true;
+            }
+        }
+
+        require(sawAlert, "alert[] should publish a typed operator alert");
+        require(waitingForResume, "M0 should wait for explicit program Resume");
+        require(!sawMotionBeforeResume,
+                "interpretation after M0 must not emit motion before Resume");
+
+        session.provideProgramResume();
+        bool sawPostPauseMotion = false;
+        bool completed = false;
+        for (int guard = 0; guard < 50 && !completed; ++guard) {
+            const auto event =
+                session.nextWithBlocks([](const auto &callback) { callback(); });
+            if (std::holds_alternative<ngc::InterpreterWaitingForSynchronization>(event)) {
+                session.provideSynchronization();
+            } else {
+                sawPostPauseMotion = sawPostPauseMotion
+                    || std::holds_alternative<ngc::MachineCommand>(event);
+                completed = std::holds_alternative<ngc::InterpreterCompleted>(event);
+            }
+        }
+        require(sawPostPauseMotion && completed,
+                "Resume should release M0 and allow later program motion");
+    }
+
+    void testSimulationM0PublishesAlertAndResumes() {
+        SimulationWorker worker;
+        ngc::ToolTable tools;
+        require(worker.start({{
+                    "alert[\"Change the tool\"]\n"
+                    "M0\n"
+                    "print[\"resumed\"]\n",
+                    "simulation-program-pause.ngc"
+                }}, tools),
+                "M0 Simulation fixture should start");
+
+        auto snapshot = worker.snapshot();
+        for (int attempt = 0; attempt < 5000
+             && snapshot.status != ngc::SimulationStatus::Paused
+             && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(snapshot.status == ngc::SimulationStatus::Paused,
+                snapshot.error.empty() ? "M0 should pause Simulation"
+                                       : snapshot.error);
+        require(snapshot.operatorAlert == "Change the tool",
+                "Simulation should expose the active operator alert while paused");
+        require(std::ranges::none_of(snapshot.statusMessages, [](const auto &status) {
+                    return status.kind == ngc::InterpreterStatusKind::Print
+                        && status.text == "resumed";
+                }),
+                "post-M0 interpretation must remain blocked before Resume");
+
+        require(worker.resume(), "Resume should release a Simulation M0 pause");
+        snapshot = worker.snapshot();
+        require(!snapshot.operatorAlert,
+                "Resume should dismiss the active operator alert");
+        for (int attempt = 0; attempt < 5000
+             && snapshot.status != ngc::SimulationStatus::Completed
+             && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        worker.join();
+        require(snapshot.status == ngc::SimulationStatus::Completed,
+                snapshot.error.empty() ? "resumed M0 program should complete"
+                                       : snapshot.error);
+        require(std::ranges::any_of(snapshot.statusMessages, [](const auto &status) {
+                    return status.kind == ngc::InterpreterStatusKind::Print
+                        && status.text == "resumed";
+                }),
+                "interpretation after M0 should continue after Resume");
+    }
+
+    void testM6RejectsMissingToolBeforeCallingRoutine() {
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::Simulation);
+        session.machine().toolTable().set(
+            1, {1, 0, 0, 0, 0, 0, 0, 0.25, "existing tool"});
+        session.setPrograms({{
+            "sub _tool_change[#tool] {\n"
+            "    alert[\"routine should not run\"]\n"
+            "    return 1\n"
+            "}\n"
+            "T2 M6\n",
+            "missing-m6-tool.ngc"
+        }});
+        session.compile([](const auto &callback) { callback(); });
+
+        auto event = session.next();
+        for (int guard = 0; guard < 50
+             && !std::holds_alternative<ngc::InterpreterError>(event)
+             && !std::holds_alternative<ngc::InterpreterCompleted>(event); ++guard) {
+            event = session.next();
+        }
+        const auto *error = std::get_if<ngc::InterpreterError>(&event);
+        require(error != nullptr,
+                "M6 should fail before calling the routine when the tool is absent");
+        require(error->message.find("M6 tool 2 was not found") != std::string::npos,
+                "missing M6 tool error should identify the requested tool");
+        require(std::ranges::none_of(
+                    session.statusMessages(), [](const auto &status) {
+                        return status.kind == ngc::InterpreterStatusKind::Alert;
+                    }),
+                "missing-tool M6 must fail before showing the change alert");
+    }
+
+    void testM6TreatsZeroRoutineReturnAsFatal() {
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::Simulation);
+        session.machine().toolTable().set(
+            1, {1, 0, 0, 2, 0, 0, 0, 0.25, "failing tool"});
+        session.setPrograms({{
+            "sub _tool_change[#tool] {\n"
+            "    G21 G91 G18 G90.1 G64 P1 F7 G59.3 G49 S999 M3\n"
+            "    return 0\n"
+            "}\n"
+            "G20 G90 G17 G91.1 G61 F123 G55\n"
+            "G43 H1\n"
+            "S500 M3\n"
+            "T1 M6\n"
+            "print[\"program continued\"]\n",
+            "failed-tool-change.ngc"
+        }});
+        session.compile([](const auto &callback) { callback(); });
+
+        auto event = session.next();
+        for (int guard = 0; guard < 50
+             && !std::holds_alternative<ngc::InterpreterError>(event)
+             && !std::holds_alternative<ngc::InterpreterCompleted>(event); ++guard) {
+            event = session.next();
+        }
+        const auto *error = std::get_if<ngc::InterpreterError>(&event);
+        require(error != nullptr, "a zero tool-change return should abort the run");
+        require(error->message.find(
+                    "tool-change routine returned failure for tool 1")
+                    != std::string::npos,
+                "failed tool-change error should identify the requested tool");
+        require(std::ranges::none_of(
+                    session.statusMessages(), [](const auto &status) {
+                        return status.kind == ngc::InterpreterStatusKind::Print
+                            && status.text == "program continued";
+                }),
+                "blocks after a failed tool change must not execute");
+        require(session.machine().state().modeUnits == ngc::GCUnits::G20
+                    && session.machine().state().modeDistance == ngc::GCDist::G90
+                    && session.machine().state().modePlane == ngc::GCPlane::G17
+                    && session.machine().state().modeArcDistance == ngc::GCArcDist::G91_1
+                    && session.machine().state().modePath == ngc::GCPath::G61,
+                "failed tool change should restore the caller's modal state");
+        require(session.machine().state().modeCoordSys == ngc::GCCoord::G55,
+                "failed tool change should restore the caller's active WCS");
+        require(session.machine().state().modeToolOffset == ngc::GCTLen::G43,
+                "failed tool change should restore the caller's G43 mode");
+        requireNear(session.machine().toolOffset().z, 2.0,
+                    "failed tool change should restore the exact applied tool offset");
+        require(session.machine().state().modeSpindle == ngc::MCSpindle::M5,
+                "failed tool change should leave the spindle stopped");
+    }
+
+    void testM6RoutineInterpreterErrorRemainsFatal() {
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::Simulation);
+        session.machine().toolTable().set(
+            1, {1, 0, 0, 0, 0, 0, 0, 0.25, "selected tool"});
+        session.setPrograms({{
+            "sub _tool_change[#tool] {\n"
+            "    G10 L11 P2 Z0\n"
+            "    return 1\n"
+            "}\n"
+            "T1 M6\n"
+            "print[\"program continued\"]\n",
+            "tool-change-interpreter-error.ngc"
+        }});
+        session.compile([](const auto &callback) { callback(); });
+
+        auto event = session.next();
+        for (int guard = 0; guard < 50
+             && !std::holds_alternative<ngc::InterpreterError>(event)
+             && !std::holds_alternative<ngc::InterpreterCompleted>(event); ++guard) {
+            event = session.next();
+        }
+        const auto *error = std::get_if<ngc::InterpreterError>(&event);
+        require(error != nullptr,
+                "an interpreter error inside the tool-change routine should abort the run");
+        require(error->message.find("G10 L11 tool 2 was not found")
+                    != std::string::npos,
+                "nested tool-change error should preserve its original diagnostic");
+        require(std::ranges::none_of(
+                    session.statusMessages(), [](const auto &status) {
+                        return status.kind == ngc::InterpreterStatusKind::Print
+                            && status.text == "program continued";
+                    }),
+                "blocks after a tool-change interpreter error must not execute");
+    }
+
+    void testM6RestoresModalCheckpointAndPreservesCalibration() {
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::Simulation);
+        session.machine().toolTable().set(
+            1, {1, 0, 0, 2, 0, 0, 0, 0.25, "old tool"});
+        session.machine().toolTable().set(
+            2, {2, 0, 0, 5, 0, 0, 0, 0.5, "new tool"});
+        session.setPrograms({{
+            "sub _tool_change[#tool] {\n"
+            "    G21 G91 G18 G90.1 G64 P1 F7 G59.3 G49 S999 M3\n"
+            "    G10 L2 P9 Z0\n"
+            "    G10 L11 P#tool Z0\n"
+            "    return 1\n"
+            "}\n"
+            "G20 G90 G17 G91.1 G61 F123 G55\n"
+            "G43 H1\n"
+            "S500 M3\n"
+            "T2 M6\n",
+            "tool-change-modal-restore.ngc"
+        }});
+        session.compile([](const auto &callback) { callback(); });
+
+        std::vector<ngc::MachineCommand> commands;
+        bool completed = false;
+        for (int guard = 0; guard < 100 && !completed; ++guard) {
+            const auto event = session.next();
+            if (const auto *command = std::get_if<ngc::MachineCommand>(&event)) {
+                commands.push_back(*command);
+            } else if (const auto *error = std::get_if<ngc::InterpreterError>(&event)) {
+                require(false, "modal restoration fixture failed: " + error->message);
+            } else {
+                completed = std::holds_alternative<ngc::InterpreterCompleted>(event);
+            }
+        }
+        require(completed, "modal restoration fixture should complete");
+
+        std::vector<std::string> spindleCommands;
+        for (const auto &command : commands) {
+            if (const auto *start = std::get_if<ngc::SpindleStart>(&command)) {
+                spindleCommands.push_back(std::format("start:{}", start->speed()));
+            } else if (std::holds_alternative<ngc::SpindleStop>(command)) {
+                spindleCommands.emplace_back("stop");
+            }
+        }
+        require(spindleCommands == std::vector<std::string> {
+                    "start:500", "stop", "start:999", "stop"
+                },
+                "M6 should stop before the routine and remain stopped after restoration");
+
+        const auto &state = session.machine().state();
+        require(state.modeUnits == ngc::GCUnits::G20
+                    && state.modeDistance == ngc::GCDist::G90
+                    && state.modePlane == ngc::GCPlane::G17
+                    && state.modeArcDistance == ngc::GCArcDist::G91_1
+                    && state.modeFeedrate == ngc::GCFeed::G94
+                    && state.modePath == ngc::GCPath::G61,
+                "M6 should restore the caller's modal G-code groups");
+        require(state.modeCoordSys == ngc::GCCoord::G55,
+                "M6 should restore the caller's active WCS");
+        requireNear(session.machine().memory().read(ngc::Var::COORDSYS), 2.0,
+                    "M6 modal restoration should restore canonical #5220");
+        requireNear(*state.F, 123.0, "M6 should restore the caller's modal feedrate");
+        requireNear(*state.S, 500.0, "M6 should retain the caller's spindle-speed setting");
+        requireNear(*state.T, 2.0, "M6 should retain the selected tool");
+        require(state.modeToolOffset == ngc::GCTLen::G43,
+                "M6 should preserve the caller's active G43 mode");
+        requireNear(session.machine().toolOffset().z, 2.0,
+                    "M6 should preserve the exact pre-change applied tool offset");
+        require(state.modeSpindle == ngc::MCSpindle::M5,
+                "M6 should leave the spindle modal state stopped");
+        require(session.machine().toolGeometry().number == 2,
+                "M6 should retain the newly loaded physical tool");
+        requireNear(session.machine().toolTable().get(2)->z, 0.0,
+                    "M6 restoration must not roll back G10 L11 calibration");
+    }
+
     void testArcUsesModalFeedrate() {
         const auto commands = run("G1 F120 X10 Y0\nG3 X0 Y10 I-10 J0\n");
         require(commands.size() == 2, "expected one line and one arc");
@@ -1541,6 +2104,67 @@ G57 G1 X0.6
             requireNear(compensated->to().z, 2.234, "G43 H must apply the tool-table Z offset");
             requireNear(cancelled->to().z, 1.0, "G49 must cancel the active tool offset");
         }
+    }
+
+    void testG10L11CalibratesToolAgainstG593() {
+        ngc::Machine machine(UNIT);
+        const ngc::ToolTable::tool_entry_t original {
+            7, 0.25, 0.5, 2.0, 3.0, 4.0, 5.0, 0.25, "probe tool"
+        };
+        machine.toolTable().set(original.number, original);
+        machine.memory().write(ngc::Var::G59_3_X, 10.0);
+        machine.memory().write(ngc::Var::G59_3_Y, 20.0);
+        machine.memory().write(ngc::Var::G59_3_Z, 30.0);
+
+        static_cast<void>(execute(machine, "G53 G0 X15 Y27 Z40\nG43 H7\n"));
+        const auto appliedOffset = machine.toolOffset();
+        static_cast<void>(execute(machine, "G10 L11 P7 X1 Y2 Z3 A4 R0.5\n"));
+
+        const auto calibrated = machine.toolTable().get(7);
+        require(calibrated.has_value(), "G10 L11 should retain the calibrated tool");
+        requireNear(calibrated->x, 4.0, "G10 L11 X calibration is incorrect");
+        requireNear(calibrated->y, 5.0, "G10 L11 Y calibration is incorrect");
+        requireNear(calibrated->z, 7.0, "G10 L11 Z calibration is incorrect");
+        requireNear(calibrated->a, -4.0, "G10 L11 A calibration is incorrect");
+        requireNear(calibrated->b, original.b,
+                    "G10 L11 should preserve unspecified tool axes");
+        requireNear(calibrated->diameter, 1.0,
+                    "G10 L11 R should update tool diameter from programmed radius");
+        require(calibrated->comment == original.comment,
+                "G10 L11 should preserve tool metadata");
+        requireNear((machine.toolOffset() - appliedOffset).length(), 0.0,
+                    "G10 L11 must not silently replace an already-applied G43 offset");
+    }
+
+    void testG10L11RequiresSynchronization() {
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::Simulation);
+        auto tools = fixtureToolTable();
+        session.machine().toolTable() = tools;
+        session.machine().memory().write(ngc::Var::G59_3_X, 0.0);
+        compileSession(session, "G53 G0 X1\nG10 L11 P1 X0\n");
+
+        bool sawMotion = false;
+        bool sawSynchronization = false;
+        for (int guard = 0; guard < 30 && !sawSynchronization; ++guard) {
+            const auto event = session.nextWithBlocks([](const auto &callback) { callback(); });
+            sawMotion = sawMotion || std::holds_alternative<ngc::MachineCommand>(event);
+            sawSynchronization =
+                std::holds_alternative<ngc::InterpreterWaitingForSynchronization>(event);
+        }
+        require(sawMotion && sawSynchronization,
+                "G10 L11 should fence after prior motion and before calibration");
+        requireNear(session.machine().toolTable().get(1)->x, tools.get(1)->x,
+                    "G10 L11 must not calibrate before synchronization is released");
+
+        session.provideSynchronization();
+        bool completed = false;
+        for (int guard = 0; guard < 30 && !completed; ++guard) {
+            const auto event = session.nextWithBlocks([](const auto &callback) { callback(); });
+            completed = std::holds_alternative<ngc::InterpreterCompleted>(event);
+        }
+        require(completed, "G10 L11 synchronization fixture should complete");
+        requireNear(session.machine().toolTable().get(1)->x, 1.0,
+                    "G10 L11 should calibrate from the synchronized MCS position");
     }
 
     void testToolLengthCompensationUsesActiveTool() {
@@ -1906,6 +2530,19 @@ G57 G1 X0.6
         require(toolChangeBlock != nullptr && toolChangeBlock->phase == ngc::BlockLifecyclePhase::Entered
                     && toolChangeBlock->block.text == "T2 M6",
                 "M6 block should be published before entering the tool-change subroutine");
+        const auto spindleStopEvent =
+            session.nextWithBlocks([](const auto &callback) { callback(); });
+        const auto *spindleStopCommand =
+            std::get_if<ngc::MachineCommand>(&spindleStopEvent);
+        require(spindleStopCommand
+                    && std::holds_alternative<ngc::SpindleStop>(*spindleStopCommand),
+                "M6 should emit an intrinsic spindle stop before the tool-change routine");
+        const auto spindleStopSynchronization =
+            session.nextWithBlocks([](const auto &callback) { callback(); });
+        require(std::holds_alternative<ngc::InterpreterWaitingForSynchronization>(
+                    spindleStopSynchronization),
+                "M6 should wait for its intrinsic spindle stop before calling the routine");
+        session.provideSynchronization();
 
         const auto safeZ = nextLine(session, "tool change should retract to safe Z");
         requireNear(safeZ.to().z, -0.1, "tool-change safe Z should use parameter #5163");
@@ -1941,6 +2578,12 @@ G57 G1 X0.6
 
         const auto finalRetract = nextLine(session, "tool change should retract to safe Z after probing");
         requireNear(finalRetract.to().z, -0.1, "final tool-change retract should use #5163");
+        const auto restoredStop = session.next();
+        const auto *restoredStopCommand =
+            std::get_if<ngc::MachineCommand>(&restoredStop);
+        require(restoredStopCommand
+                    && std::holds_alternative<ngc::SpindleStop>(*restoredStopCommand),
+                "tool-change modal restoration should leave the spindle stopped");
         requireCompleted(session, "dummy probe results should allow the tool-change program to finish");
     }
 
@@ -4641,6 +5284,20 @@ G57 G1 X0.6
                     && configuration->pendant.velocity.leaseDuration
                         >= configuration->simulation.servoPeriod,
                 "machine configuration should load validated VistaCNC P2-S jog settings");
+        require(configuration->parameterStores.real.filename() == "real_parameters.var"
+                    && configuration->parameterStores.simulation.filename()
+                        == "simulation_parameters.var"
+                    && configuration->parameterStores.real
+                        != configuration->parameterStores.simulation,
+                "machine configuration should provide isolated typed parameter-store paths");
+        require(configuration->toolTableStores.legacy.filename() == "tool_table.txt"
+                    && configuration->toolTableStores.real.filename()
+                        == "real_tool_table.txt"
+                    && configuration->toolTableStores.simulation.filename()
+                        == "simulation_tool_table.txt"
+                    && configuration->toolTableStores.real
+                        != configuration->toolTableStores.simulation,
+                "machine configuration should provide isolated typed tool-table paths");
 
         require(!configuration->coordinates.empty(),
                 "machine configuration should load at least one logical coordinate");
@@ -5027,8 +5684,13 @@ G57 G1 X0.6
 int main() {
     try {
         testMemoryStackBounds();
+        testPersistentParameterCodec();
+        testPersistentParameterFilesAreAtomicAndIsolated();
+        testSimulationPersistsCoordinateSystemAtCompletion();
         testToolTableLoadsFinalLineWithoutNewline();
         testToolTableRejectsDuplicateToolNumbers();
+        testToolTableMigrationCreatesIsolatedStores();
+        testSimulationG10L11PersistsOnlySimulationToolTable();
         testNumericParsingRejectsTrailingGarbage();
         testLexerRejectsIncompleteOperators();
         testFileHelpersHandleEmptyAndFailedIo();
@@ -5072,12 +5734,20 @@ int main() {
         testSimulationWorkerPersistsUntilReset();
         testSimulationProgramElapsedTimeIsPlaybackSpeedIndependent();
         testInterpreterStatusMessagesPreserveOrder();
+        testAlertAndM0RequireExplicitProgramResume();
+        testSimulationM0PublishesAlertAndResumes();
+        testM6RejectsMissingToolBeforeCallingRoutine();
+        testM6TreatsZeroRoutineReturnAsFatal();
+        testM6RoutineInterpreterErrorRemainsFatal();
+        testM6RestoresModalCheckpointAndPreservesCalibration();
         testArcUsesModalFeedrate();
         testArcCenterDistanceModes();
         testIncrementalMove();
         testBeginProgramRunResetsRuntimeState();
         testLinearUnitConversion();
         testToolLengthCompensation();
+        testG10L11CalibratesToolAgainstG593();
+        testG10L11RequiresSynchronization();
         testToolLengthCompensationUsesActiveTool();
         testToolLengthCompensationWithWorkOffset();
         testG53BypassesWorkOffsetButRetainsToolOffset();

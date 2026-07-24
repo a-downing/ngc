@@ -8,8 +8,11 @@ sub _tool_change[#tool_number] {
     (Retract to the machine-coordinate safe Z position.)
     G53 G0 Z#5163
 
+    alert["Install tool ", #tool_number, ", then press Resume"]
+    M0
+
     (Use G59.3 with its origin at the fixed tool probe.)
-    G10 L2 P9 X#5381 Y#5382 Z#5383
+    G10 L2 P9 X-13.940 Y2.895 Z-6.560
     G59.3
     G0 X0 Y0
     G0 Z4
@@ -29,6 +32,8 @@ sub _tool_change[#tool_number] {
     }
 
     print["tool probe Z: ", #5063]
+    (Calibrate this tool so the probe surface is Z0 in G59.3.)
+    G10 L11 P#tool_number Z0
     G53 G0 Z#5163
     return 1
 }

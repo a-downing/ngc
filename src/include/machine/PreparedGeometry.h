@@ -24,6 +24,7 @@ namespace ngc {
     using PreparedCommandId = std::uint64_t;
     using PreparedPieceId = std::uint64_t;
     using ContinuousChainId = std::uint64_t;
+    using ProgramPauseId = std::uint64_t;
     using SynchronizationFenceId = std::uint64_t;
 
     enum class ExecutablePathMode { ExactStop, Continuous };
@@ -301,10 +302,22 @@ namespace ngc {
         std::uint64_t commandId = 0;
     };
 
+    struct PreparedProgramPause {
+        GeometryEpoch epoch = 0;
+        GeometrySequence sequence = 0;
+        ProgramPauseId pause = 0;
+    };
+
     struct PreparedStatusMessage {
         GeometryEpoch epoch = 0;
         GeometrySequence sequence = 0;
         InterpreterStatusMessage status;
+    };
+
+    struct PreparedPresentationUpdate {
+        GeometryEpoch epoch = 0;
+        GeometrySequence sequence = 0;
+        TrajectoryCommandPresentation presentation;
     };
 
     struct PreparedProgramEnd {
@@ -320,8 +333,9 @@ namespace ngc {
 
     using PreparedStreamMessage = std::variant<PreparedGeometrySlice,
         PreparedStandaloneCommand, PreparedContinuousEnd, PreparedBlockLifecycleMessage,
-        PreparedSynchronizationFence, PreparedProbeFence, PreparedStatusMessage,
-        PreparedProgramEnd, PreparedFailure>;
+        PreparedSynchronizationFence, PreparedProbeFence, PreparedProgramPause,
+        PreparedStatusMessage, PreparedPresentationUpdate, PreparedProgramEnd,
+        PreparedFailure>;
 
     struct PreparedPreviewScene {
         std::vector<PreparedGeometrySlice> continuousSlices;
@@ -359,6 +373,8 @@ namespace ngc {
                         m_scene.presentations.push_back(stored.command.presentation);
                 } else if constexpr(std::same_as<T, PreparedContinuousEnd>) {
                     m_scene.geometryEnds.push_back(std::move(value));
+                } else if constexpr (std::same_as<T, PreparedPresentationUpdate>) {
+                    m_scene.presentations.push_back(std::move(value.presentation));
                 }
             }, std::move(message));
         }
@@ -381,13 +397,18 @@ namespace ngc {
         ProbeResult result{};
     };
 
+    struct ResumeProgram {
+        GeometryEpoch epoch = 0;
+        ProgramPauseId pause = 0;
+    };
+
     struct AbortGeometryRun {
         GeometryEpoch epoch = 0;
         std::string error;
     };
 
     using GeometryFeedback = std::variant<ReleaseSynchronization, DeliverProbeResult,
-                                          AbortGeometryRun>;
+                                          ResumeProgram, AbortGeometryRun>;
 
     std::expected<PreparedContinuousGeometry, std::string> prepareContinuousGeometry(
         std::span<const PreparedCommandRecord> commands, double blendScale,

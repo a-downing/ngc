@@ -4,6 +4,7 @@
 
 namespace ngc {
     enum class InterpreterStatusKind {
+        Alert,
         Print,
         Error,
     };

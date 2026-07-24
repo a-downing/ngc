@@ -16,25 +16,36 @@
 
 namespace ngc {
     class Evaluator;
+    class AlertMessage;
     class BlockMessage;
     class PrintMessage;
+    class ProgramPauseMessage;
     class SynchronizationMessage;
+    class ToolChangeModalStateRestoredMessage;
 
     class EvaluatorMessageVisitor {
     public:
         virtual ~EvaluatorMessageVisitor() = default;
+        virtual void visit(const AlertMessage &) = 0;
         virtual void visit(const BlockMessage &) = 0;
         virtual void visit(const PrintMessage &) = 0;
+        virtual void visit(const ProgramPauseMessage &) = 0;
         virtual void visit(const SynchronizationMessage &) = 0;
+        virtual void visit(const ToolChangeModalStateRestoredMessage &) = 0;
     };
 
     class EvaluatorMessage {
     public:
         virtual ~EvaluatorMessage() = default;
         virtual void accept(EvaluatorMessageVisitor &visitor) const = 0;
+        virtual bool isImpl(const AlertMessage *) const { return false; }
         virtual bool isImpl(const BlockMessage *) const { return false; }
         virtual bool isImpl(const PrintMessage *) const { return false; }
+        virtual bool isImpl(const ProgramPauseMessage *) const { return false; }
         virtual bool isImpl(const SynchronizationMessage *) const { return false; }
+        virtual bool isImpl(const ToolChangeModalStateRestoredMessage *) const {
+            return false;
+        }
 
         template<typename T> const T *as() const {
             return isImpl(static_cast<const T *>(nullptr)) ? static_cast<const T *>(this) : nullptr;
@@ -59,9 +70,32 @@ namespace ngc {
         void accept(EvaluatorMessageVisitor &visitor) const override { visitor.visit(*this); }
     };
 
+    class AlertMessage final : public EvaluatorMessage {
+        std::string m_text;
+    public:
+        explicit AlertMessage(std::string text) : m_text(std::move(text)) { }
+        const std::string &text() const { return m_text; }
+        bool isImpl(const AlertMessage *) const override { return true; }
+        void accept(EvaluatorMessageVisitor &visitor) const override { visitor.visit(*this); }
+    };
+
+    class ProgramPauseMessage final : public EvaluatorMessage {
+    public:
+        bool isImpl(const ProgramPauseMessage *) const override { return true; }
+        void accept(EvaluatorMessageVisitor &visitor) const override { visitor.visit(*this); }
+    };
+
     class SynchronizationMessage final : public EvaluatorMessage {
     public:
         bool isImpl(const SynchronizationMessage *) const override { return true; }
+        void accept(EvaluatorMessageVisitor &visitor) const override { visitor.visit(*this); }
+    };
+
+    class ToolChangeModalStateRestoredMessage final : public EvaluatorMessage {
+    public:
+        bool isImpl(const ToolChangeModalStateRestoredMessage *) const override {
+            return true;
+        }
         void accept(EvaluatorMessageVisitor &visitor) const override { visitor.visit(*this); }
     };
 
@@ -85,7 +119,9 @@ namespace ngc {
                            std::optional<double> value = std::nullopt);
         void executeFirstPass(std::span<const Statement * const> program);
         void executeSecondPass(std::span<const Statement * const> program);
+        void pauseProgram();
         void synchronize();
+        void toolChangeModalStateRestored();
 
     private:
         class Impl;
