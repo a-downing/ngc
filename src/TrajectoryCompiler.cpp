@@ -875,16 +875,22 @@ namespace ngc {
         struct QuinticConstraintBounds {
             double maximumRatio = 0.0;
             double maximumCorrectionRatio = 0.0;
-            double maximumNonJerkCorrectionRatio = 0.0;
             ContinuousPolynomialConstraintKind constraint =
                 ContinuousPolynomialConstraintKind::PathAcceleration;
             std::size_t axis = std::numeric_limits<std::size_t>::max();
-            ContinuousPolynomialConstraintKind nonJerkConstraint =
-                ContinuousPolynomialConstraintKind::PathAcceleration;
-            std::size_t nonJerkAxis = std::numeric_limits<std::size_t>::max();
             double maximumVelocityRatio = 0.0;
+            ContinuousPolynomialConstraintKind velocityConstraint =
+                ContinuousPolynomialConstraintKind::PathVelocity;
+            std::size_t velocityAxis = std::numeric_limits<std::size_t>::max();
             double maximumAccelerationRatio = 0.0;
+            ContinuousPolynomialConstraintKind accelerationConstraint =
+                ContinuousPolynomialConstraintKind::PathAcceleration;
+            std::size_t accelerationAxis =
+                std::numeric_limits<std::size_t>::max();
             double maximumJerkRatio = 0.0;
+            ContinuousPolynomialConstraintKind jerkConstraint =
+                ContinuousPolynomialConstraintKind::PathJerk;
+            std::size_t jerkAxis = std::numeric_limits<std::size_t>::max();
         };
 
         template<std::size_t N, typename Magnitude>
@@ -943,22 +949,24 @@ namespace ngc {
                     result.constraint = constraint;
                     result.axis = axis;
                 }
-                if (!jerk
-                   && correctionRatio
-                        > result.maximumNonJerkCorrectionRatio) {
-                    result.maximumNonJerkCorrectionRatio = correctionRatio;
-                    result.nonJerkConstraint = constraint;
-                    result.nonJerkAxis = axis;
-                }
                 if (jerk) {
-                    result.maximumJerkRatio =
-                        std::max(result.maximumJerkRatio, ratio);
+                    if (ratio > result.maximumJerkRatio) {
+                        result.maximumJerkRatio = ratio;
+                        result.jerkConstraint = constraint;
+                        result.jerkAxis = axis;
+                    }
                 } else if (acceleration) {
-                    result.maximumAccelerationRatio =
-                        std::max(result.maximumAccelerationRatio, ratio);
+                    if (ratio > result.maximumAccelerationRatio) {
+                        result.maximumAccelerationRatio = ratio;
+                        result.accelerationConstraint = constraint;
+                        result.accelerationAxis = axis;
+                    }
                 } else {
-                    result.maximumVelocityRatio =
-                        std::max(result.maximumVelocityRatio, ratio);
+                    if (ratio > result.maximumVelocityRatio) {
+                        result.maximumVelocityRatio = ratio;
+                        result.velocityConstraint = constraint;
+                        result.velocityAxis = axis;
+                    }
                 }
             };
 
@@ -2128,7 +2136,6 @@ namespace ngc {
 
             std::vector<double> correction(pieces.size(), 1.0);
             std::vector<double> quinticCorrection(pieces.size(), 1.0);
-            constexpr auto MATERIAL_VIOLATION_TOLERANCE = 1e-9;
             {
                 // Construct the production degree-aware normal-motion sequence.
                 auto &quintic = result->materialization.quintic;
@@ -2356,10 +2363,6 @@ namespace ngc {
                         const auto servoPeriod =
                             m_continuousPlanningEffort.quinticServoPeriod;
                         if (duration < servoPeriod
-                           && bounds.maximumVelocityRatio
-                                <= 1.0 + MATERIAL_VIOLATION_TOLERANCE
-                           && trajectory_detail::dynamicLimitRatioAccepted(
-                                bounds.maximumAccelerationRatio)
                            && bounds.maximumJerkRatio
                                 > trajectory_detail::DYNAMIC_LIMIT_RATIO
                                     + trajectory_detail::
@@ -2368,28 +2371,38 @@ namespace ngc {
                                 quinticAccelerationExcursionRatio(
                                     candidateQuintic.controls, duration,
                                     servoPeriod, m_limits);
-                            candidate.subServoJerkAccepted =
-                                trajectory_detail::servoAwareJerkAccepted(
-                                    duration, bounds.maximumJerkRatio,
-                                    candidate.accelerationExcursionRatio,
-                                    servoPeriod);
-                            if (candidate.subServoJerkAccepted) {
-                                candidate.maximumCorrectionRatio =
-                                    bounds.maximumNonJerkCorrectionRatio;
-                                candidate.constraint =
-                                    bounds.nonJerkConstraint;
-                                candidate.axis = bounds.nonJerkAxis;
-                            }
                         }
+                        const auto classification =
+                            trajectory_detail::classifyQuinticConstraints(
+                                duration, bounds.maximumVelocityRatio,
+                                bounds.maximumAccelerationRatio,
+                                bounds.maximumJerkRatio,
+                                candidate.accelerationExcursionRatio,
+                                servoPeriod);
+                        candidate.subServoJerkAccepted =
+                            classification.subServoJerkAccepted;
                         candidate.constraintsVerified =
-                            bounds.maximumVelocityRatio
-                                    <= 1.0 + MATERIAL_VIOLATION_TOLERANCE
-                                && trajectory_detail::dynamicLimitRatioAccepted(
-                                    bounds.maximumAccelerationRatio)
-                                && trajectory_detail::servoAwareJerkAccepted(
-                                    duration, bounds.maximumJerkRatio,
-                                    candidate.accelerationExcursionRatio,
-                                    servoPeriod);
+                            classification.constraintsVerified;
+                        candidate.maximumCorrectionRatio =
+                            classification.maximumFailedCorrectionRatio;
+                        switch (classification.correctionCategory) {
+                            case trajectory_detail::QuinticConstraintCategory::None:
+                                break;
+                            case trajectory_detail::QuinticConstraintCategory::Velocity:
+                                candidate.constraint =
+                                    bounds.velocityConstraint;
+                                candidate.axis = bounds.velocityAxis;
+                                break;
+                            case trajectory_detail::QuinticConstraintCategory::Acceleration:
+                                candidate.constraint =
+                                    bounds.accelerationConstraint;
+                                candidate.axis = bounds.accelerationAxis;
+                                break;
+                            case trajectory_detail::QuinticConstraintCategory::Jerk:
+                                candidate.constraint = bounds.jerkConstraint;
+                                candidate.axis = bounds.jerkAxis;
+                                break;
+                        }
                         candidate.acceptanceRatio = std::max({
                             bounds.maximumVelocityRatio,
                             bounds.maximumAccelerationRatio

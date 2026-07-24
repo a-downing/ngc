@@ -128,13 +128,20 @@ class ApplicationImpl final {
     static SourceLineExecutionState sourceLineExecutionState(
             const ngc::SimulationSnapshot &simulation, const std::string_view source) {
         SourceLineExecutionState result;
-        for(const auto &block : simulation.activeBlocks)
-            if(block.source == source) result.activeLines.insert(block.line);
-        if(!simulation.activeBlocks.empty() && simulation.activeBlocks.back().source == source)
-            result.currentLine = simulation.activeBlocks.back().line;
+        for(const auto &block : simulation.activePresentation.activeBlocks) {
+            if(block.source == source) {
+                result.activeLines.insert(block.line);
+            }
+        }
+        if(!simulation.activePresentation.activeBlocks.empty()
+           && simulation.activePresentation.activeBlocks.back().source == source) {
+            result.currentLine =
+                simulation.activePresentation.activeBlocks.back().line;
+        }
         if(const auto completed = simulation.completedLineFlags.find(std::string(source));
-           completed != simulation.completedLineFlags.end())
+           completed != simulation.completedLineFlags.end()) {
             result.completedLines = &completed->second;
+        }
         return result;
     }
 
@@ -639,8 +646,10 @@ public:
                 return m_worker.machine().workOffset();
             });
             const auto simulation = m_simulation.snapshot();
-            if(simulation.activeWorkCoordinateSystem)
-                activeWorkOrigin = simulation.activeWorkCoordinateSystem->offset;
+            if(simulation.activePresentation.workCoordinateSystem) {
+                activeWorkOrigin =
+                    simulation.activePresentation.workCoordinateSystem->offset;
+            }
 
             const glm::dvec3 machineOrigin { 0.0, 0.0, 0.0 };
             const glm::dvec3 workOrigin {
@@ -1463,8 +1472,9 @@ public:
             if(match == coordinates.used.end()) coordinates.used.push_back(workCoordinateSystem);
             else *match = workCoordinateSystem;
         }
-        if(simulationCoordinates.activeWorkCoordinateSystem) {
-            coordinates.active = *simulationCoordinates.activeWorkCoordinateSystem;
+        if(simulationCoordinates.activePresentation.workCoordinateSystem) {
+            coordinates.active =
+                *simulationCoordinates.activePresentation.workCoordinateSystem;
         }
 
         const auto drawTriad = [](const glm::dvec3 &origin, const double length, const bool dashed, const double intensity) {
@@ -1709,10 +1719,12 @@ public:
         glLineWidth(1.0f);
 
         const auto simulation = m_simulation.snapshot();
-        if(simulation.toolPose.geometry.number == 0)
+        const auto toolPose = ngc::simulationToolPose(simulation);
+        if(toolPose.geometry.number == 0) {
             drawNoToolCrosshair(simulation.machinePosition);
-        else if(simulation.status != ngc::SimulationStatus::Stopped)
-            drawToolWireframe(simulation.toolPose);
+        } else if(simulation.status != ngc::SimulationStatus::Stopped) {
+            drawToolWireframe(toolPose);
+        }
     }
 
     void saveMainProgram() {
@@ -2280,8 +2292,10 @@ public:
         }();
         auto modalGCodes = m_worker.lock([&] { return m_worker.machine().activeModalGCodes(); });
         const auto simulationHasModalState = simulation.status != ngc::SimulationStatus::Stopped
-            && !simulation.activeModalGCodes.empty();
-        if(simulationHasModalState) modalGCodes = simulation.activeModalGCodes;
+            && !simulation.activePresentation.modalGCodes.empty();
+        if(simulationHasModalState) {
+            modalGCodes = simulation.activePresentation.modalGCodes;
+        }
         std::string modalText;
         for(const auto &code : modalGCodes) {
             if(!modalText.empty()) modalText += ' ';
@@ -2291,9 +2305,12 @@ public:
         auto diagnosticText=std::format("Simulation: {}    MCS XYZ: {:.4f}, {:.4f}, {:.4f}",
             statusText,simulation.machinePosition.x,simulation.machinePosition.y,
             simulation.machinePosition.z);
-        if(simulation.toolPose.geometry.number!=0)
+        const auto toolPose = ngc::simulationToolPose(simulation);
+        if(toolPose.geometry.number!=0) {
             diagnosticText+=std::format("    Tool XYZ: {:.4f}, {:.4f}, {:.4f}",
-                simulation.toolPosition.x,simulation.toolPosition.y,simulation.toolPosition.z);
+                toolPose.tipPosition.x,toolPose.tipPosition.y,
+                toolPose.tipPosition.z);
+        }
         if(simulation.status != ngc::SimulationStatus::Stopped) {
             const auto elapsed = std::max(simulation.programElapsedSeconds, 0.0);
             const auto totalWholeSeconds = static_cast<std::uint64_t>(elapsed);
@@ -2499,12 +2516,15 @@ public:
         const auto selectedAxis = m_pendantProfile.snapshot().selectedAxis;
         if(device.connected && selectedAxis) {
             const auto selectedMachineAxis = machineAxis(*selectedAxis);
-            const auto workOffset = simulation.activeWorkCoordinateSystem
-                ? simulation.activeWorkCoordinateSystem->offset : ngc::position_t {};
+            const auto workOffset = simulation.activePresentation.workCoordinateSystem
+                ? simulation.activePresentation.workCoordinateSystem->offset
+                : ngc::position_t {};
             const auto workPosition = simulation.machinePosition
-                - workOffset - simulation.activeToolOffset;
-            const auto workCoordinateSystem = simulation.activeWorkCoordinateSystem
-                ? std::string_view(simulation.activeWorkCoordinateSystem->name)
+                - workOffset - simulation.activePresentation.activeToolOffset;
+            const auto workCoordinateSystem =
+                simulation.activePresentation.workCoordinateSystem
+                ? std::string_view(
+                    simulation.activePresentation.workCoordinateSystem->name)
                 : std::string_view("G54");
             const auto position = axisValue(workPosition, selectedMachineAxis);
             const auto &touchOff = m_pendantTouchOffController.snapshot();

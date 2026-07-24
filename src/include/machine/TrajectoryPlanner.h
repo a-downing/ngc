@@ -132,6 +132,7 @@ namespace ngc {
         std::string m_lastContinuousPlanSummary;
         std::string m_lastContinuousCorrectionHistory;
         std::string m_lastPreparedEnqueueError;
+        std::string m_lastRollingFailure;
         std::chrono::steady_clock::time_point m_planningActivityStarted{};
         std::function<void(const ContinuousTrajectoryPlan &,
             std::span<const TrajectoryPlannerInput>)> m_continuousDiagnosticCallback;
@@ -311,6 +312,8 @@ namespace ngc {
             activated.reserve(source.commands.size());
             for(const auto &piece:result.pieces) {
                 referenced.insert(piece.primaryCommand);
+                referenced.insert(
+                    piece.sourceCommands.begin(), piece.sourceCommands.end());
                 for(const auto &station:piece.activationStations) {
                     referenced.insert(station.command);
                     activated.insert(station.command);
@@ -400,9 +403,16 @@ namespace ngc {
                     sample.distance-=localDistance;
                 for(auto &interval:suffixPiece.splineKnotIntervals)
                     interval.firstGeometricSample-=firstSuffixSample;
-                velocityLimit=std::min(
-                    prefixPiece.splineKnotIntervals.back().programmedFeed,
-                    suffixPiece.splineKnotIntervals.front().programmedFeed);
+                const auto &prefixTimingInterval =
+                    prefixPiece.splineKnotIntervals.back();
+                const auto &suffixTimingInterval =
+                    suffixPiece.splineKnotIntervals.front();
+                velocityLimit = std::min({
+                    prefixTimingInterval.programmedFeed,
+                    suffixTimingInterval.programmedFeed,
+                    prefixTimingInterval.geometricVelocityLimit,
+                    suffixTimingInterval.geometricVelocityLimit,
+                });
             }
 
             std::vector<PreparedPathPiece> prefixPieces;
@@ -492,6 +502,10 @@ namespace ngc {
             return value > limit*(1.0 + 1e-9) + 1e-9;
         }
 
+        static bool exceedsVelocityLimit(const double value, const double limit) {
+            return !trajectory_detail::velocityRatioAccepted(value / limit);
+        }
+
         static bool exceedsDynamicLimit(const double value, const double limit) {
             return exceeds(value,
                 limit * trajectory_detail::DYNAMIC_LIMIT_RATIO);
@@ -529,7 +543,8 @@ namespace ngc {
                    || discontinuity(start.acceleration, previous.acceleration))
                     return std::unexpected("planned stop branch is discontinuous at a span boundary");
                 for(const auto component : AXIS_COMPONENTS) {
-                    if(exceeds(trajectory_detail::maximumAxisVelocity(span, component),
+                    if(exceedsVelocityLimit(
+                           trajectory_detail::maximumAxisVelocity(span, component),
                                limits.axisVelocity.*component)
                        || exceedsDynamicLimit(
                           trajectory_detail::maximumAxisAcceleration(span, component),
@@ -610,7 +625,8 @@ namespace ngc {
                     trajectory_detail::maximumPathJerk(span)
                     / limits.pathJerk;
                 for (const auto component : AXIS_COMPONENTS) {
-                    if (exceeds(trajectory_detail::maximumAxisVelocity(span, component),
+                    if (exceedsVelocityLimit(
+                            trajectory_detail::maximumAxisVelocity(span, component),
                                 limits.axisVelocity.*component)
                         || exceedsDynamicLimit(
                            trajectory_detail::maximumAxisAcceleration(span, component),
@@ -739,6 +755,7 @@ namespace ngc {
             m_lastContinuousPlanSummary.clear();
             m_lastContinuousCorrectionHistory.clear();
             m_lastPreparedEnqueueError.clear();
+            m_lastRollingFailure.clear();
         }
 
         void rebase(const EpochId epoch, const position_t &position) {
@@ -773,6 +790,9 @@ namespace ngc {
         }
         const std::string &lastPreparedEnqueueError() const {
             return m_lastPreparedEnqueueError;
+        }
+        const std::string &lastRollingFailure() const {
+            return m_lastRollingFailure;
         }
         double planningActivitySeconds() const {
             if(m_planningActivity.empty()) return 0.0;
@@ -1199,6 +1219,7 @@ namespace ngc {
                             suffixProbe.lastTimeLawDiagnostics();
                         if(!suffix) {
                             ++m_diagnostics.rollingSuffixProbeFailures;
+                            m_lastRollingFailure = "suffix: " + suffix.error();
                             continue;
                         }
                         auto prefixPlanner=m_compiler;
@@ -1215,6 +1236,7 @@ namespace ngc {
                             prefixPlanner.lastTimeLawDiagnostics();
                         if(!prefix) {
                             ++m_diagnostics.rollingPrefixProbeFailures;
+                            m_lastRollingFailure = "prefix: " + prefix.error();
                             continue;
                         }
 
@@ -1223,6 +1245,7 @@ namespace ngc {
                         m_continuousBoundary=boundary;
                         m_lastRollingVelocityFraction=velocityFraction;
                         m_preparedWindow=std::move(split->suffix);
+                        m_lastRollingFailure.clear();
                         retainPreparedInputs(*m_preparedWindow);
                         auto finalized=finalize(std::move(*prefix),std::move(inputs));
                         if(finalized) m_planningActivity.clear();

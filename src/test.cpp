@@ -500,21 +500,35 @@ final_move_together = true
         SimulationWorker worker;
         ngc::ToolTable tools;
         tools.set(1, { 1, 0, 0, 2, 0, 0, 0, 0.5, "simulation tool" });
-        require(worker.start({ { "sub _tool_change[#tool] {}\nT1 M6\nG0 X1\n", "simulation-worker.ngc" } }, tools),
+        require(worker.start({ { "sub _tool_change[#tool] {}\nT1 M6\nG1 F60 X1\n", "simulation-worker.ngc" } }, tools),
                 "simulation worker should accept a program");
 
         auto snapshot = worker.snapshot();
         require(snapshot.status == ngc::SimulationStatus::Running,
                 "simulation worker should publish its running state synchronously from start");
-        for(int attempt = 0; attempt < 5000 && snapshot.toolPose.geometry.number != 1; ++attempt) {
+        bool observedMovingTool = false;
+        for(int attempt = 0; attempt < 5000; ++attempt) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             snapshot = worker.snapshot();
+            const auto toolPose = ngc::simulationToolPose(snapshot);
+            if(toolPose.geometry.number == 1 && snapshot.hasActiveMotion
+               && snapshot.machinePosition.x > 1e-6 && snapshot.machinePosition.x < 1.0 - 1e-6) {
+                requireNear(toolPose.spindlePosition.x, snapshot.machinePosition.x,
+                            "loaded tool spindle pose should follow each backend position snapshot");
+                requireNear(toolPose.tipPosition.x, snapshot.machinePosition.x,
+                            "loaded tool tip position should follow each backend position snapshot");
+                observedMovingTool = true;
+                break;
+            }
         }
+        const auto toolPose = ngc::simulationToolPose(snapshot);
         const auto toolMessage = std::format("simulation worker did not publish tool 1: status {} tool {} error '{}'",
-                                             static_cast<int>(snapshot.status), snapshot.toolPose.geometry.number,
+                                             static_cast<int>(snapshot.status), toolPose.geometry.number,
                                              snapshot.error);
-        require(snapshot.toolPose.geometry.number == 1, toolMessage);
-        requireNear(snapshot.toolPose.tipPosition.z, snapshot.toolPose.spindlePosition.z - 2.0,
+        require(toolPose.geometry.number == 1, toolMessage);
+        require(observedMovingTool,
+                "simulation worker should publish a loaded tool pose during motion");
+        requireNear(toolPose.tipPosition.z, toolPose.spindlePosition.z - 2.0,
                     "simulation worker should publish the physical cutter position");
         worker.join();
     }
@@ -539,7 +553,7 @@ final_move_together = true
         const auto message = std::format("adaptive-pockets G61 simulation did not complete: status {} error '{}'",
                                          static_cast<int>(snapshot.status), snapshot.error);
         require(snapshot.status==ngc::SimulationStatus::Completed,message);
-        require(snapshot.toolPose.geometry.number==2,
+        require(ngc::simulationToolPose(snapshot).geometry.number==2,
                 "completed adaptive-pockets G61 simulation should activate tool 2");
         require(snapshot.programElapsedSeconds>0.0,
                 "completed adaptive-pockets G61 simulation should advance program time");
@@ -596,7 +610,7 @@ final_move_together = true
         worker.join();
     }
 
-    [[maybe_unused]] void testTimedSimulationPublishesSnapshotsDuringPlanning() {
+    void testTimedSimulationPublishesSnapshotsDuringPlanning() {
         std::string source="G0 X100\nG64 P0.001\n";
         constexpr int COMMANDS=800;
         for(int command=1;command<=COMMANDS;++command)
@@ -1015,6 +1029,10 @@ final_move_together = true
         require(!snapshot.error.empty()&&std::ranges::any_of(snapshot.statusMessages,[&](const auto &entry) {
             return entry.kind==ngc::InterpreterStatusKind::Error&&entry.text==snapshot.error;
         }),"fatal simulation driver error should appear in the GUI chronological status stream");
+        require(!std::ranges::contains(
+                    snapshot.activePresentation.modalGCodes, "G64"),
+                "a planning failure must preserve the last executed modal "
+                "presentation instead of exposing interpreter lookahead");
         worker.join();
     }
 
@@ -1131,14 +1149,15 @@ final_move_together = true
                 "MDI tool change should start");
 
         auto snapshot = worker.snapshot();
-        for(int attempt = 0; attempt < 3000 && snapshot.toolPose.geometry.number != 2
+        for(int attempt = 0; attempt < 3000
+            && ngc::simulationToolPose(snapshot).geometry.number != 2
             && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             snapshot = worker.snapshot();
         }
         const auto message = std::format("MDI T2 M6 did not select tool 2: status {} error '{}'",
                                          static_cast<int>(snapshot.status), snapshot.error);
-        require(snapshot.toolPose.geometry.number == 2, message);
+        require(ngc::simulationToolPose(snapshot).geometry.number == 2, message);
         worker.join();
     }
 
@@ -1178,15 +1197,23 @@ final_move_together = true
         require(worker.start({ { "G43 H1\n", "<MDI>" } }, tools, true),
                 "G43 persistent simulation command should start");
         const auto afterG43 = waitForCompletion("G43 persistent command should complete");
-        require(std::ranges::find(afterG43.activeModalGCodes, "G43") != afterG43.activeModalGCodes.end(),
+        require(std::ranges::find(afterG43.activePresentation.modalGCodes, "G43")
+                    != afterG43.activePresentation.modalGCodes.end(),
                 "simulation should preserve G43 modal G-code after running non-motion command");
+        requireNear(afterG43.activePresentation.activeToolOffset.z, 0.5,
+                    "completed state-only presentation should atomically include "
+                    "the active tool offset");
+        require(ngc::simulationToolPose(afterG43).geometry.number == 0,
+                "active tool compensation must remain distinct from physical "
+                "tool geometry");
 
         require(worker.start({ { "G91 G0 X1\n", "<MDI>" } }, tools, true),
                 "second persistent simulation command should start");
         const auto afterSecond = waitForCompletion("second persistent command should complete");
         requireNear(afterSecond.machinePosition.x, 2.0,
                     "second command should continue from the prior simulated position");
-        require(std::ranges::find(afterSecond.activeModalGCodes, "G43") != afterSecond.activeModalGCodes.end(),
+        require(std::ranges::find(afterSecond.activePresentation.modalGCodes, "G43")
+                    != afterSecond.activePresentation.modalGCodes.end(),
                 "subsequent commands should preserve G43 modal state");
 
         require(worker.resetSimulation(), "idle simulation should reset");
@@ -3402,6 +3429,28 @@ final_move_together = true
                     && !ngc::trajectory_detail::dynamicLimitRatioAccepted(1.0101),
                 "the production acceleration policy should allow one percent "
                 "but no more");
+        require(ngc::trajectory_detail::velocityRatioAccepted(1.00000005)
+                    && !ngc::trajectory_detail::velocityRatioAccepted(1.0000002),
+                "the production velocity policy should allow only its small "
+                "numerical tolerance");
+        const auto independentlyClassified =
+            ngc::trajectory_detail::classifyQuinticConstraints(
+                0.0005, 1.0000002, 1.005, 1.5, 0.8, 0.001);
+        require(!independentlyClassified.velocityAccepted
+                    && independentlyClassified.accelerationAccepted
+                    && independentlyClassified.jerkAccepted
+                    && independentlyClassified.subServoJerkAccepted
+                    && !independentlyClassified.constraintsVerified,
+                "a strict velocity failure must not suppress the independent "
+                "sub-servo jerk exception");
+        require(independentlyClassified.correctionCategory
+                    == ngc::trajectory_detail::QuinticConstraintCategory::Velocity,
+                "an accepted sub-servo jerk peak must leave correction ownership "
+                "with the failed velocity category");
+        requireNear(independentlyClassified.maximumFailedCorrectionRatio,
+            1.0000002,
+            "an accepted sub-servo jerk peak must retain only the velocity "
+            "correction ratio");
         ngc::TrajectoryCompiler compiler(trajectoryLimits);
         auto planningEffort = compiler.continuousPlanningEffort();
         require(planningEffort.boundaryAccelerationMode
@@ -3684,6 +3733,51 @@ final_move_together = true
                     found->splineKnotIntervals.size(),clusterPlanner.preparedPieceCount(),
                     clusterPlanner.windowSize(),
                     clusterPlanner.preparedNominalDuration(),clusterNominalDuration));
+
+        auto cappedClusterPiece = *found;
+        constexpr auto LOW_CLUSTER_VELOCITY_CAP = 0.001;
+        for (auto &interval : cappedClusterPiece.splineKnotIntervals) {
+            interval.geometricVelocityLimit = LOW_CLUSTER_VELOCITY_CAP;
+        }
+        auto sourceOnlyRecord = records.back();
+        sourceOnlyRecord.id = 10000;
+        sourceOnlyRecord.presentationActivation = false;
+        cappedClusterPiece.sourceCommands.push_back(sourceOnlyRecord.id);
+        ngc::TrajectoryPlanner cappedClusterPlanner(rollingLimits);
+        cappedClusterPlanner.setContinuousPlanningEffort(planningEffort);
+        cappedClusterPlanner.reset(99, clusterStart);
+        auto cappedClusterCommands = records;
+        for (auto &record : cappedClusterCommands) {
+            record.metadata.pathMode = ngc::ExecutablePathMode::Continuous;
+            record.metadata.pathTolerance = 0.05;
+        }
+        sourceOnlyRecord.metadata.pathMode =
+            ngc::ExecutablePathMode::Continuous;
+        sourceOnlyRecord.metadata.pathTolerance = 0.05;
+        cappedClusterCommands.push_back(std::move(sourceOnlyRecord));
+        const ngc::PreparedGeometrySlice cappedClusterSlice {
+            .epoch = 99,
+            .sequence = 1,
+            .chain = 1,
+            .commands = std::move(cappedClusterCommands),
+            .pieces = {std::move(cappedClusterPiece)},
+            .nominalDuration = clusterNominalDuration,
+        };
+        require(cappedClusterPlanner.enqueuePrepared(cappedClusterSlice),
+            cappedClusterPlanner.lastPreparedEnqueueError());
+        require(cappedClusterPlanner.endPreparedChain(cappedClusterSlice.chain),
+            "the low-cap cluster rolling chain should end cleanly");
+        const auto cappedClusterPlan = cappedClusterPlanner.planWindow();
+        require(cappedClusterPlan && *cappedClusterPlan,
+            cappedClusterPlan ? "low-cap cluster spline did not produce a rolling prefix"
+                              : cappedClusterPlan.error());
+        const auto &cappedBoundaryChunk =
+            std::get<ngc::PlanChunk>((*cappedClusterPlan)->items.back());
+        require(cappedClusterPlanner.preparedPieceCount() == 1
+                    && cappedBoundaryChunk.branchState.velocity.length()
+                        <= LOW_CLUSTER_VELOCITY_CAP * (1.0 + 1e-7),
+            "a cluster rolling boundary must honor the adjacent prepared "
+            "geometric velocity caps");
 
         auto missingSamples=*prepared;
         const auto missingCluster=std::ranges::find_if(
@@ -4265,9 +4359,10 @@ final_move_together = true
                     "both Y joints should finish squared at their configured home position");
         requireNear(snapshot.machinePosition.z, configuredHome(ngc::Machine::Axis::Z),
                     "Z should finish at its configured home position");
-        require(snapshot.toolPose.geometry.number == 0,
+        const auto toolPose = ngc::simulationToolPose(snapshot);
+        require(toolPose.geometry.number == 0,
                 "homing without a loaded tool should retain the no-tool presentation state");
-        requireNear(snapshot.toolPosition.x, snapshot.machinePosition.x,
+        requireNear(toolPose.tipPosition.x, snapshot.machinePosition.x,
                     "the no-tool position marker should track the machine position");
         worker.join();
     }
@@ -4560,7 +4655,8 @@ int main() {
         testAdaptivePocketsStartsSimulation();
         std::cerr << "checkpoint prepared G64 refill\n";
         testTimedSimulationRefillsMultiPacketContinuousBatch();
-        std::cerr << "checkpoint snapshots (temporarily skipped)\n";
+        std::cerr << "checkpoint snapshots\n";
+        testTimedSimulationPublishesSnapshotsDuringPlanning();
         std::cerr << "checkpoint preview\n";
         testImmediatePreviewBuildsGeometryWithoutTrajectoryExecution();
         testGeometryProducerBlendsAcrossMotionModeChanges();

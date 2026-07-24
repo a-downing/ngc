@@ -20,8 +20,7 @@ namespace ngc {
         SimulationStatus status = SimulationStatus::Stopped;
         SimulationActivity activity = SimulationActivity::Idle;
         position_t machinePosition{};
-        position_t toolPosition{};
-        ToolPose toolPose{};
+        TrajectoryCommandPresentation activePresentation{};
         double commandProgress = 0.0;
         double servoPeriodSeconds = 0.001;
         double schedulerPeriodSeconds = 0.01;
@@ -69,12 +68,19 @@ namespace ngc {
         Direction spindleDirection = Direction::CW;
         std::string error;
         std::vector<InterpreterStatusMessage> statusMessages;
-        std::optional<WorkCoordinateSystem> activeWorkCoordinateSystem;
-        position_t activeToolOffset{};
-        std::vector<std::string> activeModalGCodes;
         std::vector<WorkCoordinateSystem> usedWorkCoordinateSystems;
-        std::vector<BlockExecution> activeBlocks;
         std::vector<BlockExecution> completedBlocks;
         std::unordered_map<std::string, std::vector<std::uint8_t>> completedLineFlags;
     };
+
+    inline ToolPose simulationToolPose(const SimulationSnapshot &snapshot) {
+        const auto tipPosition =
+            snapshot.machinePosition - snapshot.activePresentation.tool.offset;
+
+        return {
+            snapshot.activePresentation.tool,
+            snapshot.machinePosition,
+            tipPosition,
+        };
+    }
 }

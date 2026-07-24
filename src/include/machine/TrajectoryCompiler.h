@@ -38,9 +38,14 @@ namespace ngc {
 
     namespace trajectory_detail {
         inline constexpr double POLYNOMIAL_RATIO_TOLERANCE = 1e-8;
+        inline constexpr double VELOCITY_RATIO_TOLERANCE = 1e-7;
         inline constexpr double DYNAMIC_LIMIT_TOLERANCE = 0.01;
         inline constexpr double DYNAMIC_LIMIT_RATIO =
             1.0 + DYNAMIC_LIMIT_TOLERANCE;
+
+        inline bool velocityRatioAccepted(const double ratio) {
+            return ratio <= 1.0 + VELOCITY_RATIO_TOLERANCE;
+        }
 
         inline bool dynamicLimitRatioAccepted(const double ratio) {
             return ratio
@@ -69,6 +74,69 @@ namespace ngc {
                     && accelerationExcursionRatio
                         <= DYNAMIC_LIMIT_RATIO
                             + POLYNOMIAL_RATIO_TOLERANCE);
+        }
+
+        enum class QuinticConstraintCategory : std::uint8_t {
+            None,
+            Velocity,
+            Acceleration,
+            Jerk,
+        };
+
+        struct QuinticConstraintClassification {
+            bool velocityAccepted = false;
+            bool accelerationAccepted = false;
+            bool pointwiseJerkAccepted = false;
+            bool jerkAccepted = false;
+            bool subServoJerkAccepted = false;
+            bool constraintsVerified = false;
+            double maximumFailedCorrectionRatio = 1.0;
+            QuinticConstraintCategory correctionCategory =
+                QuinticConstraintCategory::None;
+        };
+
+        inline QuinticConstraintClassification classifyQuinticConstraints(
+                const double duration, const double maximumVelocityRatio,
+                const double maximumAccelerationRatio,
+                const double maximumJerkRatio,
+                const double accelerationExcursionRatio,
+                const double servoPeriod) {
+            QuinticConstraintClassification result;
+            result.velocityAccepted =
+                velocityRatioAccepted(maximumVelocityRatio);
+            result.accelerationAccepted =
+                dynamicLimitRatioAccepted(maximumAccelerationRatio);
+            result.pointwiseJerkAccepted =
+                dynamicLimitRatioAccepted(maximumJerkRatio);
+            result.jerkAccepted = servoAwareJerkAccepted(
+                duration, maximumJerkRatio, accelerationExcursionRatio,
+                servoPeriod);
+            result.subServoJerkAccepted =
+                !result.pointwiseJerkAccepted && result.jerkAccepted;
+            result.constraintsVerified =
+                result.velocityAccepted && result.accelerationAccepted
+                && result.jerkAccepted;
+
+            const auto observeFailure = [&](const bool accepted,
+                    const double correctionRatio,
+                    const QuinticConstraintCategory category) {
+                if (!accepted
+                   && correctionRatio
+                        > result.maximumFailedCorrectionRatio) {
+                    result.maximumFailedCorrectionRatio = correctionRatio;
+                    result.correctionCategory = category;
+                }
+            };
+            observeFailure(result.velocityAccepted, maximumVelocityRatio,
+                QuinticConstraintCategory::Velocity);
+            observeFailure(result.accelerationAccepted,
+                maximumAccelerationRatio / DYNAMIC_LIMIT_RATIO,
+                QuinticConstraintCategory::Acceleration);
+            observeFailure(result.jerkAccepted,
+                maximumJerkRatio / DYNAMIC_LIMIT_RATIO,
+                QuinticConstraintCategory::Jerk);
+
+            return result;
         }
 
         inline double accelerationControlHullExcursionRatio(

@@ -393,12 +393,17 @@ namespace ngc {
                 m_pendingItem+1,m_pending->items.size(),m_outstandingChunks,m_forward.size());
             if(m_planner.windowSize()!=0) return std::format(
                 "retaining prepared work: commands={} pieces={} nominal={:.3f}s "
-                "chain_ended={} rolling_ready={} rolling_continuation={} outstanding={} "
-                "forward_queue={}",
+                "chain_ended={} rolling_ready={} rolling_continuation={} "
+                "rolling_candidates={} suffix_failures={} prefix_failures={} "
+                "outstanding={} forward_queue={} last_rolling_failure='{}'",
                 m_planner.windowSize(),m_planner.preparedPieceCount(),
                 m_planner.preparedNominalDuration(),m_planner.preparedChainEnded(),
                 m_planner.shouldPlanRollingPrefix(),m_planner.hasRollingContinuation(),
-                m_outstandingChunks,m_forward.size());
+                m_planner.diagnostics().rollingBoundaryCandidates,
+                m_planner.diagnostics().rollingSuffixProbeFailures,
+                m_planner.diagnostics().rollingPrefixProbeFailures,
+                m_outstandingChunks,m_forward.size(),
+                m_planner.lastRollingFailure());
             if(m_forwardComplete) return std::format(
                 "forward stream complete; outstanding={} probe_pending={} synchronization={}",
                 m_outstandingChunks,m_probePending,m_synchronizationFence.has_value());

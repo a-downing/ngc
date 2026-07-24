@@ -694,8 +694,9 @@ int main(const int argc, char **argv) {
             lastEpoch=snapshot.trajectoryBackendEpoch;
             lastChunk=snapshot.trajectoryBackendChunk;
             lastSpan=snapshot.trajectoryBackendSpan;
-            const auto block=snapshot.activeBlocks.empty()
-                ?std::string{"<none>"}:snapshot.activeBlocks.back().text;
+            const auto block=snapshot.activePresentation.activeBlocks.empty()
+                ?std::string{"<none>"}
+                :snapshot.activePresentation.activeBlocks.back().text;
             std::println(
                 "t={:.6f} backend={} epoch={} chunk={} span={} progress={:.6f} "
                 "v={:.9g} a={:.9g} committed={:.6f}s active={:.6f}s queued={:.6f}s "

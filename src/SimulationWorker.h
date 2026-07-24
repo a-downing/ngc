@@ -44,11 +44,7 @@ class SimulationWorker {
 
     static constexpr std::size_t MAX_PENDING_JOG_CONTROLS = 16;
     struct ChunkPresentation {
-        ngc::ToolGeometry tool{};
-        ngc::position_t activeToolOffset{};
-        std::optional<ngc::WorkCoordinateSystem> workCoordinateSystem;
-        std::vector<std::string> modalGCodes;
-        std::vector<ngc::BlockExecution> activeBlocks;
+        ngc::TrajectoryCommandPresentation active{};
         std::vector<ngc::BlockExecution> completedBlocks;
         std::optional<ngc::MachineCommand> command;
     };
@@ -135,11 +131,7 @@ public:
         m_snapshot.servoPeriodSeconds = m_servoPeriod;
         m_snapshot.schedulerPeriodSeconds = m_schedulerPeriod;
         m_snapshot.servoTicksPerSchedulerPeriod = m_servoTicksPerSchedulerPeriod;
-        m_snapshot.activeWorkCoordinateSystem = ngc::WorkCoordinateSystem {
-            std::string(ngc::name(*m_session.machine().state().modeCoordSys)),
-            m_session.machine().workOffset(),
-        };
-        m_snapshot.activeToolOffset = m_session.machine().toolOffset();
+        m_snapshot.activePresentation = sessionPresentation();
         m_thread = std::thread(&SimulationWorker::work, this);
     }
     explicit SimulationWorker(const ngc::MachineConfiguration &configuration)
@@ -157,13 +149,9 @@ public:
         m_snapshot.servoPeriodSeconds = m_servoPeriod;
         m_snapshot.schedulerPeriodSeconds = m_schedulerPeriod;
         m_snapshot.servoTicksPerSchedulerPeriod = m_servoTicksPerSchedulerPeriod;
-        m_snapshot.activeWorkCoordinateSystem = ngc::WorkCoordinateSystem {
-            std::string(ngc::name(*m_session.machine().state().modeCoordSys)),
-            m_session.machine().workOffset(),
-        };
-        m_snapshot.activeToolOffset = m_session.machine().toolOffset();
+        m_snapshot.activePresentation = sessionPresentation();
         m_snapshot.machinePosition = { 6.0, 6.0, -6.0, 0.0, 0.0, 0.0 };
-        updateHomingToolPose();
+        clearActiveTool();
         m_thread = std::thread(&SimulationWorker::work, this);
     }
     ~SimulationWorker() { join(); }
@@ -198,6 +186,7 @@ public:
         if(m_running || m_start || m_home || m_activeJog) return false;
         m_session.machine().beginProgramRun();
         m_snapshot = {};
+        m_snapshot.activePresentation = sessionPresentation();
         clearPresentation();
         m_programs.clear();
         return true;
@@ -278,14 +267,15 @@ public:
         if(!std::isfinite(workPosition))
             return std::unexpected("requested work coordinate is not finite");
         const auto machinePosition = axisComponent(m_snapshot.machinePosition, axis);
-        const auto toolOffset = axisComponent(m_snapshot.activeToolOffset, axis);
+        const auto toolOffset = axisComponent(
+            m_snapshot.activePresentation.activeToolOffset, axis);
         const auto offset = machinePosition - toolOffset - workPosition;
         m_session.machine().setActiveWorkOffset(axis, offset);
-        m_snapshot.activeWorkCoordinateSystem = ngc::WorkCoordinateSystem {
+        m_snapshot.activePresentation.workCoordinateSystem = ngc::WorkCoordinateSystem {
             std::string(ngc::name(*m_session.machine().state().modeCoordSys)),
             m_session.machine().workOffset(),
         };
-        const auto updated = *m_snapshot.activeWorkCoordinateSystem;
+        const auto updated = *m_snapshot.activePresentation.workCoordinateSystem;
         const auto existing = std::ranges::find_if(
             m_snapshot.usedWorkCoordinateSystems,
             [&](const auto &value) { return value.name == updated.name; });
@@ -394,7 +384,10 @@ public:
             const ChunkPresentation *presentation=nullptr;
             const auto chunk=m_chunks.find({sample.epoch,sample.chunk});
             if(chunk!=m_chunks.end()) presentation=&chunk->second;
-            if(presentation) sample.position=sample.position-presentation->tool.offset;
+            if(presentation) {
+                sample.position =
+                    sample.position - presentation->active.tool.offset;
+            }
         }
         return samples;
     }
@@ -441,11 +434,7 @@ private:
                         const ngc::TrajectoryCommandPresentation &captured,
                         const ngc::ExecutionMarkerId activationMarker) {
         ChunkPresentation presentation;
-        presentation.tool = captured.tool;
-        presentation.activeToolOffset = captured.activeToolOffset;
-        presentation.workCoordinateSystem = captured.workCoordinateSystem;
-        presentation.modalGCodes = captured.modalGCodes;
-        presentation.activeBlocks = captured.activeBlocks;
+        presentation.active = captured;
         presentation.command = command;
         const auto key = std::visit([](const auto &value) { return ChunkKey { value.epoch, value.id }; }, item);
         // A packet may own many prepared activation stations. Their
@@ -485,7 +474,8 @@ private:
         }
         if(std::holds_alternative<ngc::ProbeMove>(command)) {
             const auto &move = std::get<ngc::TriggeredMove>(item);
-            const auto contact = move.target + presentation.tool.offset - presentation.activeToolOffset;
+            const auto contact = move.target + presentation.active.tool.offset
+                - presentation.active.activeToolOffset;
             (void)m_backend.configureSyntheticInput(move.moveId, contact);
         }
         if (activationMarker != 0) {
@@ -560,18 +550,24 @@ private:
         }
     }
 
-    void applyPresentation(const ChunkPresentation &presentation) {
-        m_snapshot.activeBlocks = presentation.activeBlocks;
-        m_snapshot.activeModalGCodes = presentation.modalGCodes;
-        m_snapshot.activeWorkCoordinateSystem = presentation.workCoordinateSystem;
-        m_snapshot.activeToolOffset = presentation.activeToolOffset;
+    void applyActivePresentation(
+            const ngc::TrajectoryCommandPresentation &presentation) {
+        m_snapshot.activePresentation = presentation;
         if(presentation.workCoordinateSystem) {
             const auto system = std::ranges::find_if(m_snapshot.usedWorkCoordinateSystems,
-                [&](const auto &value) { return value.name == presentation.workCoordinateSystem->name; });
-            if(system == m_snapshot.usedWorkCoordinateSystems.end()) m_snapshot.usedWorkCoordinateSystems.push_back(*presentation.workCoordinateSystem);
+                [&](const auto &value) {
+                    return value.name ==
+                        presentation.workCoordinateSystem->name;
+                });
+            if(system == m_snapshot.usedWorkCoordinateSystems.end()) {
+                m_snapshot.usedWorkCoordinateSystems.push_back(
+                    *presentation.workCoordinateSystem);
+            }
         }
-        m_snapshot.toolPosition = m_snapshot.machinePosition - presentation.tool.offset;
-        m_snapshot.toolPose = { presentation.tool, m_snapshot.machinePosition, m_snapshot.toolPosition };
+    }
+
+    void applyPresentation(const ChunkPresentation &presentation) {
+        applyActivePresentation(presentation.active);
         if(presentation.command) std::visit([&](const auto &command) {
             using T = std::decay_t<decltype(command)>;
             if constexpr(std::same_as<T, ngc::SpindleStart>) {
@@ -645,9 +641,22 @@ private:
         return found == m_joints.end() ? nullptr : &*found;
     }
 
-    void updateHomingToolPose() {
-        m_snapshot.toolPosition = m_snapshot.machinePosition;
-        m_snapshot.toolPose = { {}, m_snapshot.machinePosition, m_snapshot.machinePosition };
+    ngc::TrajectoryCommandPresentation sessionPresentation() const {
+        return {
+            .tool = m_session.machine().toolGeometry(),
+            .activeToolOffset = m_session.machine().toolOffset(),
+            .workCoordinateSystem = ngc::WorkCoordinateSystem {
+                std::string(ngc::name(
+                    *m_session.machine().state().modeCoordSys)),
+                m_session.machine().workOffset(),
+            },
+            .modalGCodes = m_session.machine().activeModalGCodes(),
+            .activeBlocks = {},
+        };
+    }
+
+    void clearActiveTool() {
+        m_snapshot.activePresentation.tool = {};
     }
 
     void applyHomingBackendSnapshot(const ngc::ExecutionSnapshot &backend) {
@@ -666,7 +675,7 @@ private:
         m_snapshot.commandProgress = backend.spanProgress;
         m_snapshot.hasActiveMotion = backend.state == ngc::BackendState::Running
             && backend.activeJoints != 0;
-        updateHomingToolPose();
+        clearActiveTool();
     }
 
     bool homingMayContinue() {
@@ -832,7 +841,7 @@ private:
                 initial[joint.id] = axisComponent(m_snapshot.machinePosition, joint.axis)
                     * joint.coordinateScale;
             }
-            updateHomingToolPose();
+            clearActiveTool();
         }
 
         if(!submitHomingControl(ngc::ResetRequest { requestId++, epoch })
@@ -921,7 +930,7 @@ private:
         m_snapshot.hasActiveMotion = false;
         m_homedJoints = allJoints;
         m_snapshot.homedJoints = m_homedJoints;
-        updateHomingToolPose();
+        clearActiveTool();
     }
 
     void failJog(const std::string &message) {
@@ -960,7 +969,7 @@ private:
                              || std::same_as<T, ngc::StartIncrementalJogRequest>)
                     m_snapshot.activeJogTarget = request.target;
             }, firstRequest);
-            updateHomingToolPose();
+            clearActiveTool();
         }
 
         if(!submitHomingControl(ngc::ResetRequest { internalRequest--, epoch })
@@ -1027,7 +1036,7 @@ private:
         m_snapshot.jogging = false;
         m_snapshot.hasActiveMotion = false;
         m_snapshot.activeJogTarget.reset();
-        updateHomingToolPose();
+        clearActiveTool();
     }
 
     void joinGeometry(const bool cancel) {
@@ -1097,6 +1106,10 @@ private:
             m_session.machine().toolTable() = std::move(tools);
             m_session.compile([](const auto &callback) { callback(); });
             if(preserve) m_session.beginContinuation(); else m_session.begin();
+            if(!preserve) {
+                std::scoped_lock snapshotLock(m_mutex);
+                applyActivePresentation(sessionPresentation());
+            }
             m_backend.clearTrajectoryDiagnostics();
             m_geometryCancelled.store(false, std::memory_order_release);
             const auto epoch = m_nextEpoch++;
@@ -1349,11 +1362,8 @@ private:
                        ||state == ngc::PreparedDriverState::Error) {
                         std::scoped_lock sessionLock(m_mutex);
                         m_snapshot.statusMessages = m_session.statusMessages();
-                        m_snapshot.activeModalGCodes = m_session.machine().activeModalGCodes();
-                        const auto tool = m_session.machine().toolGeometry();
-                        m_snapshot.toolPosition = m_snapshot.machinePosition - tool.offset;
-                        m_snapshot.toolPose = { tool, m_snapshot.machinePosition, m_snapshot.toolPosition };
                         if(state == ngc::PreparedDriverState::Completed) {
+                            applyActivePresentation(sessionPresentation());
                             m_running = false;
                             m_programRunning = false;
                             m_snapshot.status = ngc::SimulationStatus::Completed;
