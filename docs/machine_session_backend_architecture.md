@@ -717,6 +717,11 @@ modal presentation, WCS history, and chunk/span diagnostic associations.
 
 ### Phase 4: Extract the in-process Simulation runtime
 
+Status: implemented behind the current `SimulationWorker` compatibility facade.
+`InProcessSimulationRuntime` owns the persistent mock backend, sleeping scheduler
+thread, timed-epoch activation, accelerated refill coordination, synthetic input
+policy, synchronous service stepping, and mock-only timing and jerk diagnostics.
+
 - Move `MockMotionBackend`, `WindowsServoPacer`, simulated servo scheduling,
   accelerated playback coordination, synthetic input policy, and mock-only
   diagnostics into `InProcessSimulationRuntime`.

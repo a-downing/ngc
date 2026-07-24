@@ -23,6 +23,7 @@
 #include "machine/Machine.h"
 #include "machine/MachineConfiguration.h"
 #include "machine/ArcInterpolation.h"
+#include "machine/InProcessSimulationRuntime.h"
 #include "machine/TrajectoryCompiler.h"
 #include "machine/MockMotionBackend.h"
 #include "machine/OwningSpscChannel.h"
@@ -517,6 +518,46 @@ final_move_together = true
 
         worker.join();
         std::filesystem::remove(path);
+    }
+
+    void testInProcessSimulationRuntimePersistsAcrossTimedEpochs() {
+        ngc::InProcessSimulationRuntime runtime(
+            {}, { .servoPeriod = 0.001, .schedulerPeriod = 0.002 });
+        auto *const endpoint = &runtime.endpoint();
+        runtime.start();
+        runtime.setTickMultiplier(2);
+
+        require(runtime.beginTimedExecution(),
+                "Simulation runtime should start its first timed epoch");
+        auto first = runtime.snapshot();
+        for (auto attempt = 0; attempt < 1000 && first.servoTicks == 0; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            first = runtime.snapshot();
+        }
+        require(first.servoTicks > 0,
+                "persistent Simulation scheduler should execute servo ticks");
+        require(first.tickMultiplier == 2,
+                "Simulation runtime should own accelerated playback configuration");
+        runtime.endTimedExecution();
+
+        const auto stoppedTicks = runtime.snapshot().servoTicks;
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        require(runtime.snapshot().servoTicks == stoppedTicks,
+                "idle Simulation runtime should not advance a timed epoch");
+        require(&runtime.endpoint() == endpoint,
+                "Simulation runtime should preserve its backend between epochs");
+
+        require(runtime.beginTimedExecution(),
+                "Simulation runtime should start a second timed epoch");
+        auto second = runtime.snapshot();
+        for (auto attempt = 0; attempt < 1000 && second.servoTicks == 0; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            second = runtime.snapshot();
+        }
+        require(second.servoTicks > 0,
+                "persistent Simulation scheduler should execute a later epoch");
+        runtime.endTimedExecution();
+        runtime.stop();
     }
 
     void testToolTableLoadsFinalLineWithoutNewline() {
@@ -5835,6 +5876,7 @@ int main() {
         testMemoryStackBounds();
         testPersistentParameterCodec();
         testPersistentParameterFilesAreAtomicAndIsolated();
+        testInProcessSimulationRuntimePersistsAcrossTimedEpochs();
         testSimulationPersistsCoordinateSystemAtCompletion();
         testToolTableLoadsFinalLineWithoutNewline();
         testToolTableRejectsDuplicateToolNumbers();

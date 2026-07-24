@@ -19,14 +19,13 @@
 
 #include "evaluator/InterpreterSession.h"
 #include "machine/MachineConfiguration.h"
-#include "machine/MockMotionBackend.h"
+#include "machine/InProcessSimulationRuntime.h"
 #include "machine/PresentationTracker.h"
 #include "machine/SimulationPresentation.h"
 #include "machine/ToolTable.h"
 #include "machine/GeometryStreamProducer.h"
 #include "machine/PreparedTrajectoryExecutionDriver.h"
 #include "memory/ParameterStore.h"
-#include "WindowsServoPacer.h"
 
 class SimulationWorker {
     static ngc::GeometryStreamPolicy geometryPolicy(const ngc::TrajectoryLimits &limits) {
@@ -49,7 +48,7 @@ class SimulationWorker {
     ngc::InterpreterSession m_session;
     ngc::Machine::Unit m_unit;
     ngc::GeometryStreamPolicy m_geometryPolicy;
-    ngc::MockMotionBackend m_backend;
+    ngc::InProcessSimulationRuntime m_runtime;
     ngc::PreparedGeometryForwardChannel m_geometryForward;
     ngc::GeometryFeedbackChannel m_geometryFeedback;
     std::atomic<bool> m_geometryCancelled{false};
@@ -87,11 +86,7 @@ class SimulationWorker {
     std::vector<ngc::AxisConfiguration> m_axes;
     std::vector<ngc::JointConfiguration> m_joints;
     ngc::HomingConfiguration m_homing;
-    double m_servoPeriod;
-    double m_schedulerPeriod;
-    std::uint32_t m_servoTicksPerSchedulerPeriod;
     std::uint32_t m_tickMultiplier = 1;
-    std::atomic<std::uint32_t> m_executorTickMultiplier{1};
     ngc::EpochId m_nextEpoch = 1;
     ngc::RequestId m_nextFeedHoldRequest = ngc::RequestId { 1 } << 63;
 
@@ -102,36 +97,30 @@ public:
         : m_session(unit, ngc::InterpretationMode::Simulation),
           m_unit(unit),
           m_geometryPolicy(geometryPolicy(limits)),
-          m_backend({}, limits),
-          m_driver(m_backend, m_geometryForward, m_geometryFeedback, m_geometryCancelled, limits),
-          m_limits(limits), m_servoPeriod(timing.servoPeriod), m_schedulerPeriod(timing.schedulerPeriod),
-          m_servoTicksPerSchedulerPeriod(static_cast<std::uint32_t>(
-              std::max(1.0, std::round(timing.schedulerPeriod / timing.servoPeriod)))) {
-        m_snapshot.servoPeriodSeconds = m_servoPeriod;
-        m_snapshot.schedulerPeriodSeconds = m_schedulerPeriod;
-        m_snapshot.servoTicksPerSchedulerPeriod = m_servoTicksPerSchedulerPeriod;
+          m_runtime(limits, timing),
+          m_driver(m_runtime.endpoint(), m_geometryForward, m_geometryFeedback,
+                   m_geometryCancelled, limits),
+          m_limits(limits) {
+        copyRuntimeTimingSnapshot();
         m_presentationTracker.reset(sessionPresentation());
+        m_runtime.start();
         m_thread = std::thread(&SimulationWorker::work, this);
     }
     explicit SimulationWorker(const ngc::MachineConfiguration &configuration)
         : m_session(configuration.unit, ngc::InterpretationMode::Simulation),
           m_unit(configuration.unit),
           m_geometryPolicy(geometryPolicy(configuration.trajectory)),
-          m_backend(configuration.feedHold, configuration.trajectory,
-                    configuration.axes, configuration.joints),
-          m_driver(m_backend, m_geometryForward, m_geometryFeedback, m_geometryCancelled,
-                   configuration.trajectory), m_limits(configuration.trajectory),
+          m_runtime(configuration),
+          m_driver(m_runtime.endpoint(), m_geometryForward, m_geometryFeedback,
+                   m_geometryCancelled, configuration.trajectory),
+          m_limits(configuration.trajectory),
           m_axes(configuration.axes), m_joints(configuration.joints), m_homing(configuration.homing),
-          m_servoPeriod(configuration.simulation.servoPeriod),
-          m_schedulerPeriod(configuration.simulation.schedulerPeriod),
-          m_servoTicksPerSchedulerPeriod(static_cast<std::uint32_t>(std::max(
-              1.0, std::round(configuration.simulation.schedulerPeriod / configuration.simulation.servoPeriod)))) {
-        m_snapshot.servoPeriodSeconds = m_servoPeriod;
-        m_snapshot.schedulerPeriodSeconds = m_schedulerPeriod;
-        m_snapshot.servoTicksPerSchedulerPeriod = m_servoTicksPerSchedulerPeriod;
+          m_tickMultiplier(1) {
+        copyRuntimeTimingSnapshot();
         m_presentationTracker.reset(sessionPresentation());
         m_snapshot.machinePosition = { 6.0, 6.0, -6.0, 0.0, 0.0, 0.0 };
         clearActiveTool();
+        m_runtime.start();
         m_thread = std::thread(&SimulationWorker::work, this);
     }
     ~SimulationWorker() { join(); }
@@ -174,6 +163,7 @@ public:
         if(m_running || m_start || m_home || m_activeJog) return false;
         m_session.machine().beginProgramRun();
         m_snapshot = {};
+        copyRuntimeTimingSnapshot();
         m_presentationTracker.reset(sessionPresentation());
         m_programs.clear();
         return true;
@@ -346,7 +336,7 @@ public:
     void setTickMultiplier(const int multiplier) {
         std::scoped_lock lock(m_mutex);
         m_tickMultiplier = static_cast<std::uint32_t>(std::clamp(multiplier, 1, 1000));
-        m_executorTickMultiplier.store(m_tickMultiplier, std::memory_order_relaxed);
+        m_runtime.setTickMultiplier(multiplier);
         m_snapshot.tickMultiplier = m_tickMultiplier;
     }
     bool setSplineFitSolver(const ngc::spline_detail::SplineFitSolver solver) {
@@ -359,7 +349,7 @@ public:
         std::scoped_lock lock(m_mutex);
         if(m_running || m_start || m_home || m_activeJog) return false;
         auto configuredEffort = effort;
-        configuredEffort.quinticServoPeriod = m_servoPeriod;
+        configuredEffort.quinticServoPeriod = m_runtime.servoPeriod();
         m_driver.setContinuousPlanningEffort(configuredEffort);
         return true;
     }
@@ -475,7 +465,7 @@ public:
         return ngc::savePersistentParameters(path, m_unit, m_session.machine().memory());
     }
     std::vector<ngc::ExecutedJerkSample> takeExecutedJerkSamples() {
-        auto samples=m_backend.takeExecutedJerkSamples();
+        auto samples = m_runtime.takeExecutedJerkSamples();
         std::scoped_lock lock(m_mutex);
         for(auto &sample:samples) {
             if (const auto toolOffset = m_presentationTracker.toolOffsetForChunk(
@@ -492,6 +482,24 @@ public:
     }
 
 private:
+    void copyRuntimeTimingSnapshot() {
+        const auto runtime = m_runtime.snapshot();
+        m_snapshot.servoPeriodSeconds = runtime.servoPeriodSeconds;
+        m_snapshot.schedulerPeriodSeconds = runtime.schedulerPeriodSeconds;
+        m_snapshot.servoTicksPerSchedulerPeriod =
+            runtime.servoTicksPerSchedulerPeriod;
+        m_snapshot.tickMultiplier = runtime.tickMultiplier;
+        m_snapshot.servoTicks = runtime.servoTicks;
+        m_snapshot.programElapsedSeconds = runtime.programElapsedSeconds;
+        m_snapshot.executedPathJerk = runtime.executedPathJerk;
+        m_snapshot.deadlineMisses = runtime.deadlineMisses;
+        m_snapshot.lastWakeLatenessSeconds = runtime.lastWakeLatenessSeconds;
+        m_snapshot.maximumWakeLatenessSeconds =
+            runtime.maximumWakeLatenessSeconds;
+        m_snapshot.maximumTickExecutionSeconds =
+            runtime.maximumTickExecutionSeconds;
+    }
+
     std::expected<void, std::string> persistParametersAtBoundary() const {
         if (!m_parameterStorePath) {
             return {};
@@ -531,7 +539,7 @@ private:
             const auto &move = std::get<ngc::TriggeredMove>(item);
             const auto contact = move.target + captured.tool.offset
                 - captured.activeToolOffset;
-            (void)m_backend.configureSyntheticInput(move.moveId, contact);
+            (void)m_runtime.configureSyntheticInput(move.moveId, contact);
         }
         m_presentationTracker.observeCommand(
             command, item, captured, activationMarker);
@@ -734,19 +742,18 @@ private:
     }
 
     bool submitHomingControl(const ngc::ControlRequest &request) {
-        if(m_backend.trySubmit(request) != ngc::SubmitResult::Submitted) return false;
-        m_backend.advance(0.0);
+        if (m_runtime.endpoint().trySubmit(request) != ngc::SubmitResult::Submitted) {
+            return false;
+        }
+        m_runtime.advanceImmediate(0.0);
         return true;
     }
 
     void advanceServiceMotionPeriod() {
-        const auto multiplier = m_executorTickMultiplier.load(std::memory_order_relaxed);
-        const auto ticks = static_cast<std::uint64_t>(m_servoTicksPerSchedulerPeriod) * multiplier;
-        for(std::uint64_t tick = 0; tick < ticks; ++tick)
-            m_backend.advanceTick(m_servoPeriod, tick + 1 == ticks);
+        const auto ticks = m_runtime.advanceServiceMotionPeriod();
 
         ngc::ExecutionSnapshot backendSnapshot;
-        while(m_backend.tryTakeSnapshot(backendSnapshot)) {
+        while (m_runtime.endpoint().tryTakeSnapshot(backendSnapshot)) {
             std::scoped_lock lock(m_mutex);
             applyHomingBackendSnapshot(backendSnapshot);
         }
@@ -759,18 +766,23 @@ private:
         const std::vector<std::pair<ngc::JointId, double>> &transitions,
         ngc::RequestId &requestId) {
         ngc::ExecutionEvent discarded;
-        while(m_backend.tryTakeEvent(discarded)) { }
-        for(const auto &[joint, position] : transitions)
-            if(!m_backend.configureSyntheticJointInput(move.moveId, joint, position)) return std::nullopt;
-        if(m_backend.tryPublish(ngc::ExecutionItem { move }) != ngc::PublishResult::Published)
+        while (m_runtime.endpoint().tryTakeEvent(discarded)) { }
+        for (const auto &[joint, position] : transitions) {
+            if (!m_runtime.configureSyntheticJointInput(move.moveId, joint, position)) {
+                return std::nullopt;
+            }
+        }
+        if (m_runtime.endpoint().tryPublish(ngc::ExecutionItem { move })
+            != ngc::PublishResult::Published) {
             return std::nullopt;
+        }
         if(!submitHomingControl(ngc::ResumeRequest { requestId++, move.epoch })) return std::nullopt;
 
         for(std::size_t guard = 0; guard < 10000000; ++guard) {
             if(!homingMayContinue()) return std::nullopt;
             advanceServiceMotionPeriod();
             ngc::ExecutionEvent event;
-            while(m_backend.tryTakeEvent(event)) {
+            while (m_runtime.endpoint().tryTakeEvent(event)) {
                 if(const auto *completed = std::get_if<ngc::TriggeredJointMoveCompleted>(&event))
                     if(completed->move == move.moveId) return *completed;
                 if(const auto *fault = std::get_if<ngc::BackendFault>(&event)) {
@@ -778,7 +790,8 @@ private:
                     return std::nullopt;
                 }
             }
-            std::this_thread::sleep_for(std::chrono::duration<double>(m_schedulerPeriod));
+            std::this_thread::sleep_for(
+                std::chrono::duration<double>(m_runtime.schedulerPeriod()));
         }
         return std::nullopt;
     }
@@ -789,11 +802,11 @@ private:
         if(!submitHomingControl(ngc::SetJointPositionRequest { id, joints, positions })) return false;
         bool succeeded = false;
         ngc::ExecutionEvent event;
-        while(m_backend.tryTakeEvent(event))
+        while (m_runtime.endpoint().tryTakeEvent(event))
             if(const auto *completed = std::get_if<ngc::RequestCompleted>(&event))
                 if(completed->request == id) succeeded = completed->succeeded;
         ngc::ExecutionSnapshot backendSnapshot;
-        while(m_backend.tryTakeSnapshot(backendSnapshot)) {
+        while (m_runtime.endpoint().tryTakeSnapshot(backendSnapshot)) {
             std::scoped_lock lock(m_mutex);
             applyHomingBackendSnapshot(backendSnapshot);
         }
@@ -998,11 +1011,11 @@ private:
         if(!submitHomingControl(ngc::ResetRequest { internalRequest--, epoch })
            || !submitHomingControl(ngc::EnableRequest { internalRequest-- })
            || !setHomingJointPositions(epoch, allJoints, initial, internalRequest)
-           || m_backend.trySubmit(firstRequest) != ngc::SubmitResult::Submitted) {
+           || m_runtime.endpoint().trySubmit(firstRequest) != ngc::SubmitResult::Submitted) {
             failJog("failed to initialize the mock backend for jogging");
             return;
         }
-        m_backend.advance(0.0);
+        m_runtime.advanceImmediate(0.0);
 
         bool finished = false;
         bool abortSubmitted = false;
@@ -1021,7 +1034,8 @@ private:
                 m_jogControls.clear();
             }
             for(const auto &control : controls) {
-                if(m_backend.trySubmit(control) != ngc::SubmitResult::Submitted) {
+                if (m_runtime.endpoint().trySubmit(control)
+                    != ngc::SubmitResult::Submitted) {
                     failJog("mock backend jog control channel is full");
                     return;
                 }
@@ -1030,7 +1044,7 @@ private:
             advanceServiceMotionPeriod();
 
             ngc::ExecutionEvent event;
-            while(m_backend.tryTakeEvent(event)) {
+            while (m_runtime.endpoint().tryTakeEvent(event)) {
                 if(const auto *completed = std::get_if<ngc::RequestCompleted>(&event)) {
                     if(!completed->succeeded && completed->request == firstRequestId) {
                         failJog("mock backend rejected a jog control request");
@@ -1047,7 +1061,10 @@ private:
                     return;
                 }
             }
-            if(!finished) std::this_thread::sleep_for(std::chrono::duration<double>(m_schedulerPeriod));
+            if (!finished) {
+                std::this_thread::sleep_for(
+                    std::chrono::duration<double>(m_runtime.schedulerPeriod()));
+            }
             if(joining && finished) break;
         }
 
@@ -1111,12 +1128,8 @@ private:
                 m_snapshot = {};
                 m_presentationTracker.reset();
             }
-            m_snapshot.status = ngc::SimulationStatus::Running;
-            m_snapshot.activity = ngc::SimulationActivity::Program;
-            m_snapshot.servoPeriodSeconds = m_servoPeriod;
-            m_snapshot.schedulerPeriodSeconds = m_schedulerPeriod;
-            m_snapshot.servoTicksPerSchedulerPeriod = m_servoTicksPerSchedulerPeriod;
-            m_snapshot.tickMultiplier = m_tickMultiplier;
+            m_runtime.setTickMultiplier(static_cast<int>(m_tickMultiplier));
+            copyRuntimeTimingSnapshot();
             m_snapshot.servoTicks = 0;
             m_snapshot.programElapsedSeconds = 0.0;
             m_snapshot.executedPathJerk = 0.0;
@@ -1124,7 +1137,8 @@ private:
             m_snapshot.lastWakeLatenessSeconds = 0.0;
             m_snapshot.maximumWakeLatenessSeconds = 0.0;
             m_snapshot.maximumTickExecutionSeconds = 0.0;
-            m_executorTickMultiplier.store(m_tickMultiplier, std::memory_order_relaxed);
+            m_snapshot.status = ngc::SimulationStatus::Running;
+            m_snapshot.activity = ngc::SimulationActivity::Program;
             m_driver.setLimits(m_limits);
             lock.unlock();
 
@@ -1136,7 +1150,6 @@ private:
                 std::scoped_lock snapshotLock(m_mutex);
                 applyActivePresentation(sessionPresentation());
             }
-            m_backend.clearTrajectoryDiagnostics();
             m_geometryCancelled.store(false, std::memory_order_release);
             const auto epoch = m_nextEpoch++;
             if(!m_driver.begin(epoch, startingPosition)) {
@@ -1151,100 +1164,23 @@ private:
             m_geometryThread = std::thread([this, epoch] {
                 (void)m_geometryProducer->run(epoch);
             });
-
-            std::atomic<bool> stopExecutor{false};
-            std::atomic<std::uint64_t> servoTicks{0};
-            std::atomic<double> programElapsedSeconds{0.0};
-            std::atomic<std::uint64_t> deadlineMisses{0};
-            std::atomic<double> lastWakeLateness{0.0};
-            std::atomic<double> maximumWakeLateness{0.0};
-            std::atomic<double> maximumTickExecution{0.0};
-            std::atomic<std::uint32_t> executorError{0};
-            std::atomic<bool> executorBatchActive{false};
-            std::atomic<bool> executorRefillRequested{false};
-            std::atomic<bool> nrtRefillActive{false};
-            std::atomic<bool> rollingSupplyActive{false};
-            const auto updateMaximum = [](std::atomic<double> &target, const double value) {
-                auto current = target.load(std::memory_order_relaxed);
-                while(current < value && !target.compare_exchange_weak(
-                    current, value, std::memory_order_relaxed, std::memory_order_relaxed)) { }
-            };
-            std::thread executor([&] {
-                WindowsServoPacer pacer(m_schedulerPeriod);
-                if(!pacer.valid()) {
-                    executorError.store(pacer.errorCode(), std::memory_order_release);
-                    return;
-                }
-                while(!stopExecutor.load(std::memory_order_acquire)) {
-                    WindowsServoPacer::WaitResult timing;
-                    if(!pacer.wait(timing)) {
-                        executorError.store(pacer.errorCode(), std::memory_order_release);
-                        return;
-                    }
-                    lastWakeLateness.store(timing.latenessSeconds, std::memory_order_relaxed);
-                    updateMaximum(maximumWakeLateness, timing.latenessSeconds);
-                    deadlineMisses.fetch_add(timing.missedPeriods, std::memory_order_relaxed);
-                    const auto multiplier = m_executorTickMultiplier.load(std::memory_order_relaxed);
-                    const auto ticksThisPeriod = static_cast<std::uint64_t>(m_servoTicksPerSchedulerPeriod)
-                        * multiplier;
-                    if(multiplier>1) {
-                        for(;;) {
-                            while((nrtRefillActive.load(std::memory_order_acquire)
-                                   ||rollingSupplyActive.load(std::memory_order_acquire))
-                                  &&!stopExecutor.load(std::memory_order_relaxed))
-                                std::this_thread::yield();
-                            if(stopExecutor.load(std::memory_order_relaxed)) break;
-                            executorBatchActive.store(true,std::memory_order_release);
-                            if(!nrtRefillActive.load(std::memory_order_acquire)
-                               &&!rollingSupplyActive.load(std::memory_order_acquire)) break;
-                            executorBatchActive.store(false,std::memory_order_release);
-                        }
-                        if(stopExecutor.load(std::memory_order_relaxed)) {
-                            executorBatchActive.store(false,std::memory_order_release);
-                            continue;
-                        }
-                    } else executorBatchActive.store(true, std::memory_order_release);
-                    for(std::uint64_t tick = 0; tick < ticksThisPeriod
-                        && !stopExecutor.load(std::memory_order_relaxed); ++tick) {
-                        const auto started = clock::now();
-                        const auto crossedChunk=m_backend.advanceTick(
-                            m_servoPeriod,tick+1==ticksThisPeriod);
-                        programElapsedSeconds.fetch_add(
-                            m_backend.lastAdvanceProgramSeconds(), std::memory_order_relaxed);
-                        const auto duration = std::chrono::duration<double>(clock::now() - started).count();
-                        updateMaximum(maximumTickExecution, duration);
-                        servoTicks.fetch_add(1, std::memory_order_relaxed);
-                        if(crossedChunk&&tick+1<ticksThisPeriod) {
-                            // Accelerated mock playback can consume multiple RT
-                            // packets inside one scheduler batch. Yield at each
-                            // continuation so the sole NRT producer can replace
-                            // the freed queue slot before the bounded horizon
-                            // drains and legitimately selects a stop branch.
-                            executorRefillRequested.store(true,std::memory_order_release);
-                            executorBatchActive.store(false,std::memory_order_release);
-                            while(executorRefillRequested.load(std::memory_order_acquire)
-                                  &&!stopExecutor.load(std::memory_order_relaxed))
-                                std::this_thread::yield();
-                            if(stopExecutor.load(std::memory_order_relaxed)) break;
-                            executorBatchActive.store(true,std::memory_order_release);
-                        }
-                    }
-                    executorBatchActive.store(false, std::memory_order_release);
-                }
-            });
+            if (!m_runtime.beginTimedExecution()) {
+                joinGeometry(true);
+                m_session.reportError(
+                    "in-process Simulation runtime failed to start timed execution");
+                m_session.stop();
+                lock.lock();
+                m_snapshot.status = ngc::SimulationStatus::Error;
+                m_snapshot.activity = ngc::SimulationActivity::Idle;
+                m_snapshot.error = "Simulation servo scheduler failed to start";
+                m_running = false;
+                m_programRunning = false;
+                lock.unlock();
+                continue;
+            }
 
             const auto copyTimingSnapshot = [&] {
-                m_snapshot.servoPeriodSeconds = m_servoPeriod;
-                m_snapshot.schedulerPeriodSeconds = m_schedulerPeriod;
-                m_snapshot.servoTicksPerSchedulerPeriod = m_servoTicksPerSchedulerPeriod;
-                m_snapshot.tickMultiplier = m_executorTickMultiplier.load(std::memory_order_relaxed);
-                m_snapshot.servoTicks = servoTicks.load(std::memory_order_relaxed);
-                m_snapshot.programElapsedSeconds = programElapsedSeconds.load(std::memory_order_relaxed);
-                m_snapshot.executedPathJerk=m_backend.currentProgramJerkMagnitude();
-                m_snapshot.deadlineMisses = deadlineMisses.load(std::memory_order_relaxed);
-                m_snapshot.lastWakeLatenessSeconds = lastWakeLateness.load(std::memory_order_relaxed);
-                m_snapshot.maximumWakeLatenessSeconds = maximumWakeLateness.load(std::memory_order_relaxed);
-                m_snapshot.maximumTickExecutionSeconds = maximumTickExecution.load(std::memory_order_relaxed);
+                copyRuntimeTimingSnapshot();
                 m_snapshot.trajectoryPlanningActivity=m_driver.planningActivity();
                 m_snapshot.trajectoryPlanningActivitySeconds=
                     m_driver.planningActivitySeconds();
@@ -1262,7 +1198,7 @@ private:
                 std::unique_lock snapshotLock(m_mutex,std::try_to_lock);
                 if(!snapshotLock.owns_lock()) return;
                 ngc::ExecutionSnapshot backendSnapshot;
-                while(m_backend.tryTakeSnapshot(backendSnapshot))
+                while (m_runtime.endpoint().tryTakeSnapshot(backendSnapshot))
                     applyBackendSnapshot(backendSnapshot);
                 copyTimingSnapshot();
             });
@@ -1276,10 +1212,8 @@ private:
                 if(m_join || m_stop) {
                     const auto joining = m_join; m_stop = false; m_running = false; m_programRunning = false; m_snapshot.status = ngc::SimulationStatus::Stopped; m_snapshot.activity = ngc::SimulationActivity::Idle;
                     copyTimingSnapshot();
-                    stopExecutor.store(true, std::memory_order_release);
-                    executorRefillRequested.store(false,std::memory_order_release);
                     lock.unlock();
-                    executor.join();
+                    m_runtime.endTimedExecution();
                     joinGeometry(true);
                     m_session.stop();
                     {
@@ -1308,7 +1242,7 @@ private:
                 if(m_feedHoldRequested) {
                     m_feedHoldRequested = false;
                     const auto request = m_nextFeedHoldRequest++;
-                    if(m_backend.trySubmit(ngc::FeedHoldRequest { request })
+                    if (m_runtime.endpoint().trySubmit(ngc::FeedHoldRequest { request })
                             != ngc::SubmitResult::Submitted) {
                         m_snapshot.status = ngc::SimulationStatus::Error;
                         m_snapshot.error = "motion backend control channel is full while requesting feed hold";
@@ -1319,7 +1253,8 @@ private:
                 if(m_feedResumeRequested) {
                     m_feedResumeRequested = false;
                     const auto request = m_nextFeedHoldRequest++;
-                    if(m_backend.trySubmit(ngc::ResumeRequest { request, epoch })
+                    if (m_runtime.endpoint().trySubmit(
+                            ngc::ResumeRequest { request, epoch })
                             != ngc::SubmitResult::Submitted) {
                         m_snapshot.status = ngc::SimulationStatus::Error;
                         m_snapshot.error = "motion backend control channel is full while resuming feed";
@@ -1330,7 +1265,7 @@ private:
                 if(m_paused) {
                     m_snapshot.status = ngc::SimulationStatus::Paused;
                     copyTimingSnapshot();
-                    executorRefillRequested.store(false,std::memory_order_release);
+                    m_runtime.releaseRefillOpportunity();
                     m_cv.wait(lock, [&] { return m_join || m_stop || !m_paused; });
                     lock.unlock();
                     continue;
@@ -1339,20 +1274,23 @@ private:
                     m_snapshot.status = m_feedHoldInProgress
                         ? ngc::SimulationStatus::Holding : ngc::SimulationStatus::Running;
                 struct NrtRefillGuard {
-                    std::atomic<bool> &active;
+                    ngc::InProcessSimulationRuntime &runtime;
                     bool enabled = false;
-                    NrtRefillGuard(std::atomic<bool> &value,const bool enable)
-                        :active(value),enabled(enable) {
-                        if(enabled) active.store(true,std::memory_order_release);
+                    NrtRefillGuard(ngc::InProcessSimulationRuntime &value, const bool enable)
+                        : runtime(value), enabled(enable) {
+                        if (enabled) {
+                            runtime.setNrtRefillActive(true);
+                        }
                     }
                     void release() {
-                        if(enabled) active.store(false,std::memory_order_release);
-                        enabled=false;
+                        if (enabled) {
+                            runtime.setNrtRefillActive(false);
+                        }
+                        enabled = false;
                     }
                     ~NrtRefillGuard() { release(); }
-                } nrtRefillGuard{nrtRefillActive,
-                    m_executorTickMultiplier.load(std::memory_order_relaxed)>1};
-                if(executorBatchActive.load(std::memory_order_acquire)) {
+                } nrtRefillGuard{m_runtime, m_runtime.tickMultiplier() > 1};
+                if (m_runtime.executorBatchActive()) {
                     copyTimingSnapshot();
                     lock.unlock();
                     std::this_thread::yield();
@@ -1362,14 +1300,16 @@ private:
                 if (auto presentation = m_driver.takePresentationUpdate()) {
                     applyActivePresentation(*presentation);
                 }
-                if(executorBatchActive.load(std::memory_order_acquire)) {
+                if (m_runtime.executorBatchActive()) {
                     copyTimingSnapshot();
                     lock.unlock();
                     std::this_thread::yield();
                     continue;
                 }
                 ngc::ExecutionSnapshot backendSnapshot;
-                while(m_backend.tryTakeSnapshot(backendSnapshot)) applyBackendSnapshot(backendSnapshot);
+                while (m_runtime.endpoint().tryTakeSnapshot(backendSnapshot)) {
+                    applyBackendSnapshot(backendSnapshot);
+                }
                 copyTimingSnapshot();
                 auto state = m_driver.state();
                 if (state == ngc::PreparedDriverState::ProgramPaused) {
@@ -1377,7 +1317,7 @@ private:
                     m_paused = true;
                     m_snapshot.status = ngc::SimulationStatus::Paused;
                 }
-                const auto pacingError = executorError.load(std::memory_order_acquire);
+                const auto pacingError = m_runtime.snapshot().pacingError;
                 if(pacingError != 0) {
                     m_snapshot.status = ngc::SimulationStatus::Error;
                     m_snapshot.activity = ngc::SimulationActivity::Idle;
@@ -1398,10 +1338,8 @@ private:
                 if ((state == ngc::PreparedDriverState::Completed
                      || state == ngc::PreparedDriverState::Error)
                     || !m_running) {
-                    stopExecutor.store(true, std::memory_order_release);
-                    executorRefillRequested.store(false,std::memory_order_release);
                     lock.unlock();
-                    executor.join();
+                    m_runtime.endTimedExecution();
                     joinGeometry(state == ngc::PreparedDriverState::Error);
                     if(state == ngc::PreparedDriverState::Error && m_driver.error())
                         m_session.reportError(*m_driver.error());
@@ -1465,11 +1403,11 @@ private:
                 }
                 m_snapshot.trajectoryPlanning = m_driver.planningDiagnostics();
                 copyTimingSnapshot();
-                executorRefillRequested.store(false,std::memory_order_release);
-                rollingSupplyActive.store(
-                    m_executorTickMultiplier.load(std::memory_order_relaxed)>1
-                    &&m_driver.hasUnpublishedRollingContinuation()
-                    &&!m_driver.hasPendingPublication(),std::memory_order_release);
+                m_runtime.releaseRefillOpportunity();
+                m_runtime.setRollingSupplyActive(
+                    m_runtime.tickMultiplier() > 1
+                    && m_driver.hasUnpublishedRollingContinuation()
+                    && !m_driver.hasPendingPublication());
                 state = m_driver.state();
                 if(state == ngc::PreparedDriverState::Error) {
                     m_snapshot.status = ngc::SimulationStatus::Error;
@@ -1483,10 +1421,8 @@ private:
                     m_snapshot.status = ngc::SimulationStatus::Paused;
                 }
                 if(!m_running) {
-                    stopExecutor.store(true, std::memory_order_release);
-                    executorRefillRequested.store(false,std::memory_order_release);
                     lock.unlock();
-                    executor.join();
+                    m_runtime.endTimedExecution();
                     joinGeometry(true);
                     if(state == ngc::PreparedDriverState::Error && m_driver.error())
                         m_session.reportError(*m_driver.error());
@@ -1503,7 +1439,8 @@ private:
                     continue;
                 }
                 nrtRefillGuard.release();
-                m_cv.wait_for(lock, std::chrono::duration<double>(m_servoPeriod),
+                m_cv.wait_for(lock,
+                              std::chrono::duration<double>(m_runtime.servoPeriod()),
                               [&] { return m_join || m_stop || m_paused; });
                 lock.unlock();
             }

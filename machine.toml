@@ -5,7 +5,7 @@ coordinates = ["x", "y", "z"]
 
 [trajectory]
 # machine-units / second^2
-path_acceleration = 25.1
+path_acceleration = 5.1
 # machine-units / second^3
 path_jerk = 101
 # machine-units / second
@@ -13,7 +13,7 @@ rapid_velocity = 3.33
 # machine-units
 arc_chord_tolerance = 0.0001
 # minimum seconds of provisional G64 motion before a proven rolling split
-lookahead_duration = 2.0
+lookahead_duration = 400
 
 [simulation]
 # seconds per mock executor servo tick
@@ -25,7 +25,7 @@ scheduler_period = 0.01
 # Experimental mock-backend on-path feed hold. These bound the requested
 # tangential braking profile; full and per-axis executed jerk are diagnostic.
 # machine-units / second^2
-tangential_acceleration = 5.0
+tangential_acceleration = 2.5
 # machine-units / second^3
 tangential_jerk = 25.0
 

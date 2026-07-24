@@ -48,7 +48,18 @@ GeometryStreamProducer
 
 `Worker` retains immutable prepared curves and presentation metadata as Preview's sole toolpath representation. `SimulationWorker` consumes the same prepared stream through `PreparedTrajectoryExecutionDriver`. Ordinary motion becomes timed axis-polynomial `PlanChunk` values; probes and homing/service moves use executor-owned triggered moves.
 
-`MockMotionBackend` is a non-RT implementation of the production-shaped backend contract. There is no real-time executor, HAL component, or physical backend yet. Preserve the separation between interpretation, geometry preparation, trajectory planning, execution, and hardware access. Never make geometry construction depend on whether the consumer is Preview or Simulation.
+`InProcessSimulationRuntime` owns the persistent `MockMotionBackend`, its sleeping
+servo-scheduler thread, accelerated-playback coordination, synthetic input
+policy, and mock-only timing and jerk diagnostics. `SimulationWorker` remains a
+compatibility facade and delegates those responsibilities to the runtime. The
+runtime and backend survive individual program epochs; timed scheduling is
+activated only for an active program epoch, while homing and jogging currently
+use runtime-owned synchronous service stepping. `MockMotionBackend` is a non-RT
+implementation of the production-shaped backend contract. There is no real-time
+executor, HAL component, or physical backend yet. Preserve the separation
+between interpretation, geometry preparation, trajectory planning, execution,
+and hardware access. Never make geometry construction depend on whether the
+consumer is Preview or Simulation.
 
 The intended evolution toward persistent Simulation and Real machine sessions, isolated parameter persistence, Real-to-Simulation branching, and a separate Mesa physical-backend executable is documented in [Machine sessions, persistent Simulation, and the physical backend](docs/machine_session_backend_architecture.md). Treat its remaining session and backend phases as a design and implementation roadmap, not as a description of functionality that already exists.
 
