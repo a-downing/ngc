@@ -2136,6 +2136,154 @@ final_move_together = true
                 "normalized trajectory progress");
     }
 
+    void testContinuousMarkerBoundPacketsExecuteWithoutIntermediateStops() {
+        constexpr std::size_t COMMANDS = 600;
+        constexpr std::size_t COMMANDS_PER_SOURCE = 200;
+        const std::array points{
+            ngc::position_t{},
+            ngc::position_t{4.0, 0, 0, 0, 0, 0},
+            ngc::position_t{8.0, 1.0, 0, 0, 0, 0},
+            ngc::position_t{12.0, 0, 0, 0, 0, 0},
+        };
+        std::array<ngc::PreparedCommandRecord, 3> sourceCommands;
+        for (std::size_t source = 0; source < sourceCommands.size(); ++source) {
+            sourceCommands[source].id = source * COMMANDS_PER_SOURCE + 1;
+            sourceCommands[source].command =
+                ngc::MoveLine{points[source], points[source + 1], 2.0};
+        }
+        const auto prepared = ngc::prepareContinuousGeometry(
+            sourceCommands, 0.01, points.front());
+        require(prepared.has_value(), prepared ? "" : prepared.error());
+
+        auto geometry = *prepared;
+        geometry.commands.clear();
+        geometry.commands.reserve(COMMANDS);
+        for (std::size_t command = 1; command <= COMMANDS; ++command) {
+            auto record =
+                sourceCommands[(command - 1) / COMMANDS_PER_SOURCE];
+            record.id = command;
+            geometry.commands.push_back(std::move(record));
+        }
+        for (std::size_t source = 0; source < sourceCommands.size(); ++source) {
+            const auto primary = source * COMMANDS_PER_SOURCE + 1;
+            const auto retained = std::ranges::find_if(
+                geometry.pieces, [&](const auto &piece) {
+                    return piece.kind
+                            == ngc::PreparedPieceKind::RetainedLineSection
+                        && piece.primaryCommand == primary;
+                });
+            require(retained != geometry.pieces.end(),
+                    "marker-bound packetization fixture should retain every "
+                    "source line");
+            retained->activationStations.reserve(COMMANDS_PER_SOURCE - 1);
+            for (std::size_t offset = 1;
+                    offset < COMMANDS_PER_SOURCE; ++offset) {
+                retained->activationStations.push_back({
+                    .command = primary + offset,
+                    .curveDistance = retained->curveFrom + retained->length()
+                        * static_cast<double>(offset)
+                        / static_cast<double>(COMMANDS_PER_SOURCE),
+                });
+            }
+        }
+
+        const ngc::TrajectoryLimits limits{
+            .pathAcceleration = 4.0,
+            .rapidSpeed = 10.0,
+            .arcChordTolerance = 0.0001,
+            .pathJerk = 20.0,
+            .axisVelocity = {2.0, 2.0, 2.0, 2.0, 2.0, 2.0},
+            .axisAcceleration = {4.0, 4.0, 4.0, 4.0, 4.0, 4.0},
+            .axisJerk = {20.0, 20.0, 20.0, 20.0, 20.0, 20.0},
+        };
+        ngc::TrajectoryCompiler compiler(limits);
+        compiler.reset(95, points.front());
+        const auto planned = compiler.compileContinuous(geometry, 0.01);
+        require(planned && *planned, planned ? "" : planned.error());
+        auto normalSpans = std::size_t{0};
+        for (const auto &chunk : (*planned)->chunks) {
+            normalSpans += chunk.normalMotion.size;
+        }
+        const auto spanBoundPacketCount =
+            (normalSpans + ngc::MAX_NORMAL_SPANS_PER_CHUNK - 1)
+            / ngc::MAX_NORMAL_SPANS_PER_CHUNK;
+        require((*planned)->chunks.size() > spanBoundPacketCount
+                    && (*planned)->executionMarkers == COMMANDS,
+                "dense prepared activations should force marker-bound "
+                "continuous packetization");
+
+        std::vector<ngc::ExecutionMarkerId> expectedMarkers;
+        expectedMarkers.reserve(COMMANDS);
+        for (std::size_t chunk = 0; chunk < (*planned)->chunks.size(); ++chunk) {
+            const auto &packet = (*planned)->chunks[chunk];
+            for (const auto &marker : packet.markers) {
+                expectedMarkers.push_back(marker.id);
+            }
+            require(packet.markers.size
+                        <= ngc::MAX_EXECUTION_MARKERS_PER_CHUNK,
+                    "every continuous packet must respect marker capacity");
+            if (chunk + 1 < (*planned)->chunks.size()) {
+                const auto &continuation = (*planned)->chunks[chunk + 1];
+                require(packet.stopTail.size > 0
+                            && continuation.predecessorBranch == packet.branch,
+                        "every moving intermediate packet must retain a stop "
+                        "tail and dependent continuation");
+                const auto continuationStart =
+                    ngc::executionSpanStart(continuation.normalMotion[0]);
+                require((packet.branchState.position
+                            - continuationStart.position).length() < 1e-10
+                            && (packet.branchState.velocity
+                                - continuationStart.velocity).length() < 1e-10
+                            && (packet.branchState.acceleration
+                                - continuationStart.acceleration).length()
+                                < 1e-9,
+                        "continuous packet boundaries must preserve PVA");
+            }
+        }
+        require(expectedMarkers.size() == COMMANDS,
+                "packet marker arrays should retain every prepared activation");
+
+        ngc::MockMotionBackend backend({}, limits);
+        for (const auto &packet : (*planned)->chunks) {
+            require(backend.tryPublish(packet)
+                        == ngc::PublishResult::Published,
+                    "mock backend should accept every dependent continuous "
+                    "packet");
+        }
+        require(backend.trySubmit(ngc::StartRequest{
+                    (*planned)->chunks.front().id,
+                    (*planned)->chunks.front().epoch,
+                }) == ngc::SubmitResult::Submitted,
+                "marker-bound continuous execution should start");
+
+        backend.runUntilIdle();
+        std::vector<ngc::ExecutionMarkerId> reachedMarkers;
+        auto intermediateStops = std::size_t{0};
+        auto faults = std::size_t{0};
+        ngc::ExecutionEvent event;
+        while (backend.tryTakeEvent(event)) {
+            if (const auto *marker =
+                    std::get_if<ngc::ExecutionMarkerReached>(&event)) {
+                reachedMarkers.push_back(marker->marker);
+            } else if (const auto *branch =
+                           std::get_if<ngc::BranchSelected>(&event);
+                       branch && branch->choice == ngc::BranchChoice::Stop
+                       && branch->branch
+                           != (*planned)->chunks.back().branch) {
+                ++intermediateStops;
+            } else if (std::holds_alternative<ngc::BackendFault>(event)) {
+                ++faults;
+            }
+        }
+
+        require(reachedMarkers == expectedMarkers,
+                "mock execution should emit every marker exactly once in "
+                "prepared order across packet boundaries");
+        require(intermediateStops == 0 && faults == 0,
+                "dependent marker-bound packets should execute without an "
+                "intermediate stop or backend fault");
+    }
+
     void testMockBackendFeedHoldBrakesAlongActiveTrajectory() {
         ngc::TrajectoryLimits limits;
         limits.pathAcceleration = 4.0;
@@ -4737,6 +4885,7 @@ int main() {
         testOwningSpscChannelTransfersMoveOnlyValues();
         testMockMotionBackendUsesProductionTransportContract();
         testMockBackendEmitsOrderedInSpanExecutionMarkers();
+        testContinuousMarkerBoundPacketsExecuteWithoutIntermediateStops();
         testJogControlUsesBoundedBackendTransport();
         testMockBackendAdvancesOneFixedServoTick();
         testExactStopPlannerCompilesLinesAndArcs();
