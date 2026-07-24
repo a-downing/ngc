@@ -3451,6 +3451,41 @@ final_move_together = true
             1.0000002,
             "an accepted sub-servo jerk peak must retain only the velocity "
             "correction ratio");
+        const std::vector<std::size_t> denseMarkerCounts(200, 2);
+        const auto markerBoundPackets =
+            ngc::trajectory_detail::continuousPacketRanges(
+                denseMarkerCounts);
+        require(markerBoundPackets && markerBoundPackets->size() == 2
+                    && (*markerBoundPackets)[0].firstSpan == 0
+                    && (*markerBoundPackets)[0].pastLastSpan == 128
+                    && (*markerBoundPackets)[0].markerCount
+                        == ngc::MAX_EXECUTION_MARKERS_PER_CHUNK
+                    && (*markerBoundPackets)[1].firstSpan == 128
+                    && (*markerBoundPackets)[1].pastLastSpan == 200
+                    && (*markerBoundPackets)[1].markerCount == 144,
+                "continuous packetization should split at marker capacity "
+                "before execution-span capacity");
+        const std::vector<std::size_t> sparseMarkerCounts(300, 0);
+        const auto spanBoundPackets =
+            ngc::trajectory_detail::continuousPacketRanges(
+                sparseMarkerCounts);
+        require(spanBoundPackets && spanBoundPackets->size() == 2
+                    && (*spanBoundPackets)[0].pastLastSpan
+                        == ngc::MAX_NORMAL_SPANS_PER_CHUNK
+                    && (*spanBoundPackets)[1].firstSpan
+                        == ngc::MAX_NORMAL_SPANS_PER_CHUNK
+                    && (*spanBoundPackets)[1].pastLastSpan == 300,
+                "continuous packetization should retain the independent "
+                "execution-span capacity");
+        const std::array oversizedSpanMarkerCounts {
+            ngc::MAX_EXECUTION_MARKERS_PER_CHUNK + 1,
+        };
+        const auto oversizedSpanPackets =
+            ngc::trajectory_detail::continuousPacketRanges(
+                oversizedSpanMarkerCounts);
+        require(!oversizedSpanPackets && oversizedSpanPackets.error() == 0,
+                "a single emitted span that exceeds marker capacity must "
+                "remain a bounded fatal planning error");
         ngc::TrajectoryCompiler compiler(trajectoryLimits);
         auto planningEffort = compiler.continuousPlanningEffort();
         require(planningEffort.boundaryAccelerationMode

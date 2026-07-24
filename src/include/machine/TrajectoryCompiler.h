@@ -52,6 +52,47 @@ namespace ngc {
                 <= DYNAMIC_LIMIT_RATIO + POLYNOMIAL_RATIO_TOLERANCE;
         }
 
+        struct ContinuousPacketRange {
+            std::size_t firstSpan = 0;
+            std::size_t pastLastSpan = 0;
+            std::size_t markerCount = 0;
+        };
+
+        inline std::expected<std::vector<ContinuousPacketRange>, std::size_t>
+        continuousPacketRanges(
+                const std::span<const std::size_t> spanMarkerCounts) {
+            std::vector<ContinuousPacketRange> result;
+            auto first = std::size_t { 0 };
+            while (first < spanMarkerCounts.size()) {
+                if (spanMarkerCounts[first]
+                   > MAX_EXECUTION_MARKERS_PER_CHUNK) {
+                    return std::unexpected(first);
+                }
+
+                auto markerCount = std::size_t { 0 };
+                auto last = first;
+                while (last < spanMarkerCounts.size()
+                       && last - first < MAX_NORMAL_SPANS_PER_CHUNK) {
+                    const auto spanMarkers = spanMarkerCounts[last];
+                    if (spanMarkers
+                       > MAX_EXECUTION_MARKERS_PER_CHUNK - markerCount) {
+                        break;
+                    }
+                    markerCount += spanMarkers;
+                    ++last;
+                }
+
+                result.push_back({
+                    .firstSpan = first,
+                    .pastLastSpan = last,
+                    .markerCount = markerCount,
+                });
+                first = last;
+            }
+
+            return result;
+        }
+
         double maximumAxisVelocity(const AxisPolynomialSpan &span,
             const double position_t::*component);
         double maximumAxisAcceleration(const AxisPolynomialSpan &span,

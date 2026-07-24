@@ -3375,17 +3375,52 @@ namespace ngc {
                 startMismatch[0],startMismatch[1],startMismatch[2],
                 endMismatch[0],endMismatch[1],endMismatch[2]));
 
-        result->chunks.reserve((normalSpans.size()+MAX_NORMAL_SPANS_PER_CHUNK-1)
-            /MAX_NORMAL_SPANS_PER_CHUNK);
+        std::unordered_map<SpanId, std::size_t> emittedSpanIndices;
+        emittedSpanIndices.reserve(normalSpans.size());
+        for (std::size_t span = 0; span < normalSpans.size(); ++span) {
+            emittedSpanIndices.emplace(normalSpans[span].id, span);
+        }
+        std::vector<std::size_t> spanMarkerCounts(normalSpans.size());
+        for (std::size_t input = 0;
+                input < resolvedActivations.size(); ++input) {
+            if (!geometry.commands[input].presentationActivation) {
+                continue;
+            }
+            const auto &activation = resolvedActivations[input];
+            const auto span = emittedSpanIndices.find(activation.span);
+            if (activation.span == 0 || span == emittedSpanIndices.end()
+               || !std::isfinite(activation.parameter)
+               || activation.parameter < 0.0
+               || activation.parameter > 1.0) {
+                return std::unexpected(std::format(
+                    "prepared command {} has no emitted activation owner",
+                    geometry.commands[input].id));
+            }
+            ++spanMarkerCounts[span->second];
+        }
+        const auto packetRanges =
+            trajectory_detail::continuousPacketRanges(spanMarkerCounts);
+        if (!packetRanges) {
+            const auto span = packetRanges.error();
+            return std::unexpected(std::format(
+                "continuous trajectory execution-marker capacity exceeded "
+                "within emitted span {}: required markers={} capacity={}",
+                span, spanMarkerCounts[span],
+                MAX_EXECUTION_MARKERS_PER_CHUNK));
+        }
+
+        result->chunks.reserve(packetRanges->size());
         auto predecessor=m_previousBranch;
-        for(std::size_t first=0;first<normalSpans.size();first+=MAX_NORMAL_SPANS_PER_CHUNK) {
+        for (const auto &range : *packetRanges) {
             auto &chunk=result->chunks.emplace_back();
             chunk.epoch=m_epoch;
             chunk.id=nextChunk++;
             chunk.predecessorBranch=predecessor;
             chunk.branch=chunk.id;
-            const auto last=std::min(first+MAX_NORMAL_SPANS_PER_CHUNK,normalSpans.size());
-            for(std::size_t span=first;span<last;++span) (void)chunk.normalMotion.push(normalSpans[span]);
+            for (auto span = range.firstSpan;
+                    span < range.pastLastSpan; ++span) {
+                (void)chunk.normalMotion.push(normalSpans[span]);
+            }
             chunk.branchState =
                 executionSpanEnd(chunk.normalMotion[chunk.normalMotion.size - 1]);
             if(chunk.branchState.velocity.length()<=1e-10
@@ -3401,11 +3436,13 @@ namespace ngc {
                 auto stop=stoppingSpans(chunk.branchState,m_limits,nextSpan);
                 if(!stop) return std::unexpected(std::format(
                     "continuous trajectory failed to generate stop tail for packet {} at staged span {}: {}",
-                    result->chunks.size()-1,last,stop.error()));
+                    result->chunks.size()-1,range.pastLastSpan,
+                    stop.error()));
                 if(stop->size()>MAX_STOP_SPANS_PER_CHUNK)
                     return std::unexpected(std::format(
                         "continuous trajectory moving stop tail exceeds fixed capacity for packet {} at "
-                        "staged span {}: required spans={} capacity={}",result->chunks.size()-1,last,
+                        "staged span {}: required spans={} capacity={}",
+                        result->chunks.size()-1,range.pastLastSpan,
                         stop->size(),MAX_STOP_SPANS_PER_CHUNK));
                 for(const auto &span:*stop) (void)chunk.stopTail.push(span);
                 chunk.stopState = executionSpanEnd(
@@ -3474,6 +3511,13 @@ namespace ngc {
                     right.span, right.parameter, right.id,
                 };
             });
+            if (markers.size() != (*packetRanges)[chunk].markerCount) {
+                return std::unexpected(std::format(
+                    "continuous trajectory packetization marker ownership "
+                    "mismatch for packet {}: predicted={} assigned={}",
+                    chunk, (*packetRanges)[chunk].markerCount,
+                    markers.size()));
+            }
             if (markers.size() > MAX_EXECUTION_MARKERS_PER_CHUNK) {
                 return std::unexpected(std::format(
                     "continuous trajectory execution-marker capacity exceeded "
