@@ -66,6 +66,11 @@ activity state, `MachineSessionSnapshot`, optional Simulation diagnostics, and a
 bounded owning `SessionCommand` queue. The `SimulationWorker` compatibility
 facade queues program and homing starts through that boundary; remaining
 execution coordination has not yet moved into a complete `MachineSession`.
+During timed program epochs, the facade's dedicated snapshot service is the
+sole consumer of backend execution snapshots and maintains a latest-value NRT
+observation independently of geometry and trajectory-planning work. GUI
+snapshots overlay that observation so presentation position cannot stall while
+the mock runtime continues executing.
 
 The intended evolution toward persistent Simulation and Real machine sessions, isolated parameter persistence, Real-to-Simulation branching, and a separate Mesa physical-backend executable is documented in [Machine sessions, persistent Simulation, and the physical backend](docs/machine_session_backend_architecture.md). Treat its remaining session and backend phases as a design and implementation roadmap, not as a description of functionality that already exists.
 

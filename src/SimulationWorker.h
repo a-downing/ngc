@@ -45,6 +45,11 @@ class SimulationWorker {
     std::condition_variable m_cv;
     std::thread m_thread;
     std::thread m_geometryThread;
+    mutable std::mutex m_timedSnapshotMutex;
+    std::condition_variable m_timedSnapshotCv;
+    std::thread m_timedSnapshotThread;
+    bool m_stopTimedSnapshotService = false;
+    std::optional<ngc::ExecutionSnapshot> m_latestTimedBackendSnapshot;
     ngc::InterpreterSession m_session;
     ngc::Machine::Unit m_unit;
     ngc::GeometryStreamPolicy m_geometryPolicy;
@@ -393,6 +398,15 @@ public:
     ngc::SimulationSnapshot snapshot() const {
         std::scoped_lock lock(m_mutex);
         auto result = m_snapshot;
+        if (m_programRunning) {
+            if (const auto backend = latestTimedBackendSnapshot()) {
+                applyBackendObservation(result, *backend);
+            }
+        }
+        if (result.status == ngc::SimulationStatus::Paused && !m_programPaused
+            && result.trajectoryBackendState != ngc::BackendState::Held) {
+            result.status = ngc::SimulationStatus::Holding;
+        }
         result.simulationDiagnostics = ngc::SimulationDiagnostics {
             .servoPeriodSeconds = result.servoPeriodSeconds,
             .schedulerPeriodSeconds = result.schedulerPeriodSeconds,
@@ -558,6 +572,58 @@ public:
     }
 
 private:
+    void startTimedSnapshotService() {
+        {
+            std::scoped_lock lock(m_timedSnapshotMutex);
+            m_stopTimedSnapshotService = false;
+            m_latestTimedBackendSnapshot.reset();
+        }
+        m_timedSnapshotThread = std::thread([this] {
+            const auto drainLatest = [&] {
+                std::optional<ngc::ExecutionSnapshot> latest;
+                ngc::ExecutionSnapshot backendSnapshot;
+                while (m_runtime.endpoint().tryTakeSnapshot(backendSnapshot)) {
+                    latest = backendSnapshot;
+                }
+                if (latest) {
+                    std::scoped_lock lock(m_timedSnapshotMutex);
+                    m_latestTimedBackendSnapshot = *latest;
+                }
+            };
+
+            for (;;) {
+                drainLatest();
+                std::unique_lock lock(m_timedSnapshotMutex);
+                if (m_stopTimedSnapshotService) {
+                    break;
+                }
+                m_timedSnapshotCv.wait_for(lock, std::chrono::milliseconds(1), [&] {
+                    return m_stopTimedSnapshotService;
+                });
+            }
+            drainLatest();
+        });
+    }
+
+    void stopTimedSnapshotService() {
+        {
+            std::scoped_lock lock(m_timedSnapshotMutex);
+            m_stopTimedSnapshotService = true;
+        }
+        m_timedSnapshotCv.notify_all();
+        if (m_timedSnapshotThread.joinable()) {
+            m_timedSnapshotThread.join();
+        }
+        std::scoped_lock lock(m_mutex);
+        applyLatestTimedBackendSnapshot();
+    }
+
+    [[nodiscard]] std::optional<ngc::ExecutionSnapshot> latestTimedBackendSnapshot() const {
+        std::scoped_lock lock(m_timedSnapshotMutex);
+
+        return m_latestTimedBackendSnapshot;
+    }
+
     void copyRuntimeTimingSnapshot() {
         const auto runtime = m_runtime.snapshot();
         m_snapshot.servoPeriodSeconds = runtime.servoPeriodSeconds;
@@ -673,49 +739,61 @@ private:
         m_presentationTracker.setActivePresentation(presentation);
     }
 
-    void applyBackendSnapshot(const ngc::ExecutionSnapshot &backend) {
-        m_snapshot.trajectoryBackendState = backend.state;
-        m_snapshot.trajectoryBackendEpoch = backend.epoch;
-        m_snapshot.trajectoryBackendChunk = backend.activeChunk;
-        m_snapshot.trajectoryBackendSpan = backend.activeSpan;
-        m_snapshot.trajectoryBackendSpanProgress = backend.spanProgress;
-        m_snapshot.trajectoryBackendActiveNormalRemainingSeconds =
+    void applyBackendObservation(ngc::SimulationSnapshot &target,
+                                 const ngc::ExecutionSnapshot &backend) const {
+        target.trajectoryBackendState = backend.state;
+        target.trajectoryBackendEpoch = backend.epoch;
+        target.trajectoryBackendChunk = backend.activeChunk;
+        target.trajectoryBackendSpan = backend.activeSpan;
+        target.trajectoryBackendSpanProgress = backend.spanProgress;
+        target.trajectoryBackendActiveNormalRemainingSeconds =
             backend.activeNormalMotionRemainingSeconds;
-        m_snapshot.trajectoryBackendQueuedNormalSeconds = backend.queuedNormalMotionSeconds;
-        m_snapshot.trajectoryBackendCommittedNormalSeconds = backend.committedNormalMotionSeconds;
-        m_snapshot.trajectoryBackendStopBranchSeconds = backend.stopBranchRemainingSeconds;
-        m_snapshot.trajectoryBackendQueuedExecutionItems = backend.queuedExecutionItems;
-        m_snapshot.trajectoryBackendLastBranch = backend.lastBranch;
-        m_snapshot.trajectoryBackendFaultCode = backend.faultCode;
-        m_snapshot.trajectoryBackendVelocity = backend.commanded.velocity.length();
-        m_snapshot.trajectoryBackendAcceleration = backend.commanded.acceleration.length();
-        m_snapshot.trajectoryBackendExecutionRate = backend.executionRate;
-        m_snapshot.trajectoryBackendExecutionRateAcceleration =
+        target.trajectoryBackendQueuedNormalSeconds = backend.queuedNormalMotionSeconds;
+        target.trajectoryBackendCommittedNormalSeconds = backend.committedNormalMotionSeconds;
+        target.trajectoryBackendStopBranchSeconds = backend.stopBranchRemainingSeconds;
+        target.trajectoryBackendQueuedExecutionItems = backend.queuedExecutionItems;
+        target.trajectoryBackendLastBranch = backend.lastBranch;
+        target.trajectoryBackendFaultCode = backend.faultCode;
+        target.trajectoryBackendVelocity = backend.commanded.velocity.length();
+        target.trajectoryBackendAcceleration = backend.commanded.acceleration.length();
+        target.trajectoryBackendExecutionRate = backend.executionRate;
+        target.trajectoryBackendExecutionRateAcceleration =
             backend.executionRateAcceleration;
-        if(m_feedResumeInProgress && backend.state == ngc::BackendState::Running
-           && backend.executionRate >= 1.0 - 1e-10
-           && std::abs(backend.executionRateAcceleration) <= 1e-10)
-            m_feedResumeInProgress = false;
         if(const auto detail = m_presentationTracker.executionSpanDiagnostic(
                backend.epoch, backend.activeSpan)) {
-            m_snapshot.trajectoryBackendSpanDetail=std::format(
+            target.trajectoryBackendSpanDetail=std::format(
                 "{} ordinal={} duration={:.9g}s distance={:.9g} "
                 "velocity={:.9g}->{:.9g} acceleration={:.9g}->{:.9g}",
                 detail->stopTail ? "stop-tail" : "normal", detail->ordinal,
                 detail->duration, detail->distance, detail->startVelocity,
                 detail->endVelocity, detail->startAcceleration, detail->endAcceleration);
         } else {
-            m_snapshot.trajectoryBackendSpanDetail.clear();
+            target.trajectoryBackendSpanDetail.clear();
         }
         if(backend.state == ngc::BackendState::Faulted) {
-            m_snapshot.status = ngc::SimulationStatus::Error;
-            m_snapshot.error = "mock motion backend fault " + std::to_string(backend.faultCode);
+            target.status = ngc::SimulationStatus::Error;
+            target.error = "mock motion backend fault " + std::to_string(backend.faultCode);
         }
-        m_snapshot.machinePosition = backend.commanded.position;
-        m_snapshot.commandProgress = backend.spanProgress;
-        m_snapshot.hasActiveMotion = (backend.state == ngc::BackendState::Running
-                                      || backend.state == ngc::BackendState::Holding)
+        target.machinePosition = backend.commanded.position;
+        target.commandProgress = backend.spanProgress;
+        target.hasActiveMotion = (backend.state == ngc::BackendState::Running
+                                  || backend.state == ngc::BackendState::Holding)
             && backend.activeSpan != 0;
+    }
+
+    void applyBackendSnapshot(const ngc::ExecutionSnapshot &backend) {
+        applyBackendObservation(m_snapshot, backend);
+        if(m_feedResumeInProgress && backend.state == ngc::BackendState::Running
+           && backend.executionRate >= 1.0 - 1e-10
+           && std::abs(backend.executionRateAcceleration) <= 1e-10) {
+            m_feedResumeInProgress = false;
+        }
+    }
+
+    void applyLatestTimedBackendSnapshot() {
+        if (const auto backend = latestTimedBackendSnapshot()) {
+            applyBackendSnapshot(*backend);
+        }
     }
 
     static double &axisComponent(ngc::position_t &position, const ngc::Machine::Axis axis) {
@@ -1263,6 +1341,7 @@ private:
                 lock.unlock();
                 continue;
             }
+            startTimedSnapshotService();
 
             const auto copyTimingSnapshot = [&] {
                 copyRuntimeTimingSnapshot();
@@ -1282,9 +1361,7 @@ private:
                 nextPlanningRefresh=now+std::chrono::milliseconds(16);
                 std::unique_lock snapshotLock(m_mutex,std::try_to_lock);
                 if(!snapshotLock.owns_lock()) return;
-                ngc::ExecutionSnapshot backendSnapshot;
-                while (m_runtime.endpoint().tryTakeSnapshot(backendSnapshot))
-                    applyBackendSnapshot(backendSnapshot);
+                applyLatestTimedBackendSnapshot();
                 copyTimingSnapshot();
             });
             struct PlanningProgressReset {
@@ -1294,11 +1371,13 @@ private:
 
             for(;;) {
                 lock.lock();
+                applyLatestTimedBackendSnapshot();
                 if(m_join || m_stop) {
                     const auto joining = m_join; m_stop = false; m_running = false; m_programRunning = false; m_snapshot.status = ngc::SimulationStatus::Stopped; m_snapshot.activity = ngc::SimulationActivity::Idle;
                     copyTimingSnapshot();
                     lock.unlock();
                     m_runtime.endTimedExecution();
+                    stopTimedSnapshotService();
                     joinGeometry(true);
                     m_session.stop();
                     {
@@ -1391,10 +1470,7 @@ private:
                     std::this_thread::yield();
                     continue;
                 }
-                ngc::ExecutionSnapshot backendSnapshot;
-                while (m_runtime.endpoint().tryTakeSnapshot(backendSnapshot)) {
-                    applyBackendSnapshot(backendSnapshot);
-                }
+                applyLatestTimedBackendSnapshot();
                 copyTimingSnapshot();
                 auto state = m_driver.state();
                 if (state == ngc::PreparedDriverState::ProgramPaused) {
@@ -1425,6 +1501,7 @@ private:
                     || !m_running) {
                     lock.unlock();
                     m_runtime.endTimedExecution();
+                    stopTimedSnapshotService();
                     joinGeometry(state == ngc::PreparedDriverState::Error);
                     if(state == ngc::PreparedDriverState::Error && m_driver.error())
                         m_session.reportError(*m_driver.error());
@@ -1508,6 +1585,7 @@ private:
                 if(!m_running) {
                     lock.unlock();
                     m_runtime.endTimedExecution();
+                    stopTimedSnapshotService();
                     joinGeometry(true);
                     if(state == ngc::PreparedDriverState::Error && m_driver.error())
                         m_session.reportError(*m_driver.error());

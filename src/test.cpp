@@ -1166,6 +1166,94 @@ G57 G1 X0.6
         worker.join();
     }
 
+    void testSimulationToolPoseFollowsMotionAfterCalibratingToolChange() {
+        auto configuration = fixtureMachineConfiguration();
+        require(configuration.has_value(),
+                configuration ? "" : configuration.error());
+        auto toolChange = ngc::readFile("autoload/tool_change.ngc");
+        require(toolChange.has_value(),
+                toolChange ? "" : toolChange.error().what());
+
+        constexpr std::string_view MAIN = R"NGC(
+G10 L2 P1 X-2 Y3 Z-5
+G90 G20 G53 G0 Z0
+T2 M6
+G54 G0 X1 Y1
+G43 H2 Z1.7
+G1 F60 X2
+)NGC";
+
+        SimulationWorker worker(*configuration);
+        ngc::ToolTable tools;
+        tools.set(2, {
+            .number = 2,
+            .x = 0,
+            .y = 0,
+            .z = 2,
+            .a = 0,
+            .b = 0,
+            .c = 0,
+            .diameter = 0.25,
+            .comment = "calibrated presentation tool",
+        });
+        worker.setTickMultiplier(10);
+        require(worker.start({
+                    {*toolChange, "autoload/tool_change.ngc"},
+                    {std::string(MAIN), "post-tool-change-motion.ngc"},
+                }, tools),
+                "calibrating tool-change presentation simulation should start");
+
+        auto snapshot = worker.snapshot();
+        for (int attempt = 0; attempt < 10000
+             && snapshot.status != ngc::SimulationStatus::Paused
+             && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(snapshot.status == ngc::SimulationStatus::Paused,
+                snapshot.error.empty() ? "tool change should pause for the operator"
+                                       : snapshot.error);
+        require(worker.resume(), "tool-change Resume should release M0");
+
+        std::jthread competingSnapshotReader([&](const std::stop_token stop) {
+            while (!stop.stop_requested()) {
+                (void)worker.snapshot();
+            }
+        });
+        auto sawPostChangeMotion = false;
+        for (int attempt = 0; attempt < 30000
+             && snapshot.status != ngc::SimulationStatus::Completed
+             && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+            const auto toolPose = ngc::simulationToolPose(snapshot);
+            if (snapshot.hasActiveMotion && toolPose.geometry.number == 2
+                && snapshot.machinePosition.x > -0.95
+                && snapshot.machinePosition.x < -0.05) {
+                requireNear(toolPose.spindlePosition.x, snapshot.machinePosition.x,
+                            "tool cone spindle should follow post-change backend motion");
+                requireNear(toolPose.tipPosition.x, snapshot.machinePosition.x,
+                            "tool cone tip should follow post-change backend motion");
+                require(toolPose.tipPosition.z < toolPose.spindlePosition.z,
+                        "calibrated tool cone should retain nondegenerate geometry");
+                sawPostChangeMotion = true;
+            }
+            if (sawPostChangeMotion) {
+                break;
+            }
+        }
+        competingSnapshotReader.request_stop();
+        competingSnapshotReader.join();
+        require(sawPostChangeMotion,
+                std::format("tool cone did not follow post-change motion: status={} "
+                            "tool={} xyz=[{:.9g},{:.9g},{:.9g}] error='{}'",
+                    static_cast<int>(snapshot.status),
+                    ngc::simulationToolPose(snapshot).geometry.number,
+                    snapshot.machinePosition.x, snapshot.machinePosition.y,
+                    snapshot.machinePosition.z, snapshot.error));
+        worker.join();
+    }
+
     void testAdaptivePocketsStartsSimulation() {
         auto main=boundedPreviewFixture(24,true);
         main="T2 M6\n"+main;
@@ -5961,6 +6049,7 @@ int main() {
         std::cerr << "checkpoint simulation start\n";
         testSimulationWorkerStartsPlayback();
         testSimulationPresentationFollowsNestedToolChangeExecution();
+        testSimulationToolPoseFollowsMotionAfterCalibratingToolChange();
         std::cerr << "checkpoint adaptive start\n";
         testAdaptivePocketsStartsSimulation();
         std::cerr << "checkpoint prepared G64 refill\n";
