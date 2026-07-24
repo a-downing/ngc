@@ -24,6 +24,7 @@
 #include "machine/MachineConfiguration.h"
 #include "machine/ArcInterpolation.h"
 #include "machine/InProcessSimulationRuntime.h"
+#include "machine/MachineSession.h"
 #include "machine/TrajectoryCompiler.h"
 #include "machine/MockMotionBackend.h"
 #include "machine/OwningSpscChannel.h"
@@ -518,6 +519,67 @@ final_move_together = true
 
         worker.join();
         std::filesystem::remove(path);
+    }
+
+    void testSessionCommandQueueIsBoundedAndOrdered() {
+        ngc::SessionCommandQueue commands(2);
+        require(commands.capacity() == 2 && commands.empty(),
+                "session command queue should expose its configured empty capacity");
+        require(commands.tryPush(ngc::FeedHold{}),
+                "session command queue should accept its first command");
+        require(commands.tryPush(ngc::Resume{}),
+                "session command queue should accept commands through capacity");
+        require(!commands.tryPush(ngc::Stop{}),
+                "session command queue should reject rather than drop when full");
+
+        auto first = commands.tryPop();
+        auto second = commands.tryPop();
+        require(first && std::holds_alternative<ngc::FeedHold>(*first),
+                "session commands should retain FIFO order");
+        require(second && std::holds_alternative<ngc::Resume>(*second),
+                "session commands should retain FIFO order through the final entry");
+        require(!commands.tryPop() && commands.empty(),
+                "taking every session command should leave the queue empty");
+
+        require(commands.tryPush(ngc::StartProgram{
+                    .programs = {{"G0 X1\n", "queued-program.ngc"}},
+                    .preserveState = true,
+                }),
+                "session command queue should own program request data");
+        auto program = commands.tryPop();
+        const auto *start = program ? std::get_if<ngc::StartProgram>(&*program) : nullptr;
+        require(start && start->preserveState && start->programs.size() == 1,
+                "queued program requests should retain their epoch inputs");
+    }
+
+    void testSimulationSnapshotExposesMachineSessionState() {
+        SimulationWorker worker;
+        const auto snapshot = worker.snapshot();
+        require(snapshot.powerState == ngc::MachinePowerState::On,
+                "the compatibility worker should expose its persistent powered session");
+        require(snapshot.machineActivity == ngc::MachineActivity::Idle,
+                "a newly powered Simulation session should be idle");
+        require(snapshot.simulationDiagnostics
+                    && snapshot.simulationDiagnostics->servoPeriodSeconds > 0.0,
+                "the generic session snapshot should attach Simulation-only diagnostics");
+        require(worker.start({{"G0 X0.01\n", "session-state.ngc"}}, {}),
+                "the powered compatibility session should accept a program epoch");
+        auto completed = worker.snapshot();
+        for (auto attempt = 0; attempt < 2000
+             && completed.status != ngc::SimulationStatus::Completed
+             && completed.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            completed = worker.snapshot();
+        }
+        require(completed.status == ngc::SimulationStatus::Completed,
+                completed.error.empty() ? "session-state program should complete"
+                                        : completed.error);
+        require(completed.powerState == ngc::MachinePowerState::On
+                    && completed.machineActivity == ngc::MachineActivity::Idle,
+                "program completion should return to the same powered idle session");
+        worker.join();
+        require(worker.snapshot().powerState == ngc::MachinePowerState::Off,
+                "joining the compatibility worker should end its powered lifetime");
     }
 
     void testInProcessSimulationRuntimePersistsAcrossTimedEpochs() {
@@ -5876,6 +5938,8 @@ int main() {
         testMemoryStackBounds();
         testPersistentParameterCodec();
         testPersistentParameterFilesAreAtomicAndIsolated();
+        testSessionCommandQueueIsBoundedAndOrdered();
+        testSimulationSnapshotExposesMachineSessionState();
         testInProcessSimulationRuntimePersistsAcrossTimedEpochs();
         testSimulationPersistsCoordinateSystemAtCompletion();
         testToolTableLoadsFinalLineWithoutNewline();

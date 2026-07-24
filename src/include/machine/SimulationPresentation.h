@@ -10,18 +10,14 @@
 #include "machine/TrajectoryPlanner.h"
 #include "machine/GeometryStreamProducer.h"
 #include "machine/MachineCommand.h"
+#include "machine/MachineSession.h"
 #include "machine/MotionBackend.h"
 
 namespace ngc {
     enum class SimulationStatus { Stopped, Running, Holding, Paused, Completed, Error };
     enum class SimulationActivity { Idle, Program, Homing, Jogging };
 
-    struct SimulationSnapshot {
-        SimulationStatus status = SimulationStatus::Stopped;
-        SimulationActivity activity = SimulationActivity::Idle;
-        position_t machinePosition{};
-        TrajectoryCommandPresentation activePresentation{};
-        double commandProgress = 0.0;
+    struct SimulationDiagnostics {
         double servoPeriodSeconds = 0.001;
         double schedulerPeriodSeconds = 0.01;
         std::uint32_t servoTicksPerSchedulerPeriod = 10;
@@ -33,6 +29,15 @@ namespace ngc {
         double lastWakeLatenessSeconds = 0.0;
         double maximumWakeLatenessSeconds = 0.0;
         double maximumTickExecutionSeconds = 0.0;
+    };
+
+    struct MachineSessionSnapshot {
+        MachinePowerState powerState = MachinePowerState::Off;
+        MachineActivity machineActivity = MachineActivity::Idle;
+        std::optional<SimulationDiagnostics> simulationDiagnostics;
+        position_t machinePosition{};
+        TrajectoryCommandPresentation activePresentation{};
+        double commandProgress = 0.0;
         TrajectoryPlanningDiagnostics trajectoryPlanning;
         std::string trajectoryPlanningActivity;
         double trajectoryPlanningActivitySeconds = 0.0;
@@ -74,7 +79,23 @@ namespace ngc {
         std::unordered_map<std::string, std::vector<std::uint8_t>> completedLineFlags;
     };
 
-    inline ToolPose simulationToolPose(const SimulationSnapshot &snapshot) {
+    struct SimulationSnapshot : MachineSessionSnapshot {
+        SimulationStatus status = SimulationStatus::Stopped;
+        SimulationActivity activity = SimulationActivity::Idle;
+        double servoPeriodSeconds = 0.001;
+        double schedulerPeriodSeconds = 0.01;
+        std::uint32_t servoTicksPerSchedulerPeriod = 10;
+        std::uint32_t tickMultiplier = 1;
+        std::uint64_t servoTicks = 0;
+        double programElapsedSeconds = 0.0;
+        double executedPathJerk = 0.0;
+        std::uint64_t deadlineMisses = 0;
+        double lastWakeLatenessSeconds = 0.0;
+        double maximumWakeLatenessSeconds = 0.0;
+        double maximumTickExecutionSeconds = 0.0;
+    };
+
+    inline ToolPose machineSessionToolPose(const MachineSessionSnapshot &snapshot) {
         const auto tipPosition =
             snapshot.machinePosition - snapshot.activePresentation.tool.offset;
 
@@ -83,5 +104,9 @@ namespace ngc {
             snapshot.machinePosition,
             tipPosition,
         };
+    }
+
+    inline ToolPose simulationToolPose(const SimulationSnapshot &snapshot) {
+        return machineSessionToolPose(snapshot);
     }
 }

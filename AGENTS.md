@@ -61,6 +61,12 @@ between interpretation, geometry preparation, trajectory planning, execution,
 and hardware access. Never make geometry construction depend on whether the
 consumer is Preview or Simulation.
 
+The Phase-5 session foundation defines explicit backend-neutral power and
+activity state, `MachineSessionSnapshot`, optional Simulation diagnostics, and a
+bounded owning `SessionCommand` queue. The `SimulationWorker` compatibility
+facade queues program and homing starts through that boundary; remaining
+execution coordination has not yet moved into a complete `MachineSession`.
+
 The intended evolution toward persistent Simulation and Real machine sessions, isolated parameter persistence, Real-to-Simulation branching, and a separate Mesa physical-backend executable is documented in [Machine sessions, persistent Simulation, and the physical backend](docs/machine_session_backend_architecture.md). Treat its remaining session and backend phases as a design and implementation roadmap, not as a description of functionality that already exists.
 
 `Memory` explicitly exports and imports only predefined nonvolatile canonical cells. The strict version-1 parameter store is parsed and written by NRT application code with complete validation and atomic replacement. Simulation loads `simulation_parameters.var` at application startup and saves it at orderly shutdown; `real_parameters.var` is a separate typed configuration path reserved for the future Real session. A failed Simulation load remains visible and inhibits overwriting that invalid store during shutdown. Tool tables use the same isolation model: startup migrates the legacy `tool_table.txt` into complete `real_tool_table.txt` and `simulation_tool_table.txt` stores only when neither isolated store exists, and rejects a partial migration. Simulation owns its live tool table across program and MDI epochs, persists changes only to the Simulation store, and synchronizes `G10 L11` after prior motion before calibrating a complete tool record against G59.3.

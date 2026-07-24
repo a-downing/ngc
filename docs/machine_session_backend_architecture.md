@@ -731,6 +731,13 @@ policy, synchronous service stepping, and mock-only timing and jerk diagnostics.
 
 ### Phase 5: Introduce `MachineSession`
 
+Status: in progress. The backend-neutral power/activity vocabulary,
+`MachineSessionSnapshot`, optional Simulation diagnostics, and bounded owning
+`SessionCommand` queue are implemented. The `SimulationWorker` compatibility
+facade now queues program and homing starts through that command boundary.
+Interpreter, geometry, trajectory, homing, jogging, and the remaining operation
+coordination still need to move behind the session abstraction.
+
 - Move interpreter, geometry producer, trajectory driver, homing, jogging, and
   operation coordination into backend-neutral components.
 - Replace boolean control flags with explicit power/activity state and queued
