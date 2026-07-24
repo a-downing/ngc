@@ -10,19 +10,17 @@
 #include <deque>
 #include <expected>
 #include <mutex>
-#include <map>
 #include <memory>
 #include <ranges>
 #include <thread>
 #include <tuple>
-#include <unordered_map>
-#include <set>
 #include <string>
 #include <vector>
 
 #include "evaluator/InterpreterSession.h"
 #include "machine/MachineConfiguration.h"
 #include "machine/MockMotionBackend.h"
+#include "machine/PresentationTracker.h"
 #include "machine/SimulationPresentation.h"
 #include "machine/ToolTable.h"
 #include "machine/GeometryStreamProducer.h"
@@ -44,12 +42,6 @@ class SimulationWorker {
     }
 
     static constexpr std::size_t MAX_PENDING_JOG_CONTROLS = 16;
-    struct ChunkPresentation {
-        ngc::TrajectoryCommandPresentation active{};
-        std::vector<ngc::BlockExecution> completedBlocks;
-        std::optional<ngc::MachineCommand> command;
-    };
-
     mutable std::mutex m_mutex;
     std::condition_variable m_cv;
     std::thread m_thread;
@@ -65,29 +57,7 @@ class SimulationWorker {
     ngc::PreparedTrajectoryExecutionDriver m_driver;
     ngc::TrajectoryLimits m_limits;
     ngc::SimulationSnapshot m_snapshot;
-    using ChunkKey = std::pair<ngc::EpochId, ngc::ChunkId>;
-    using SpanKey = std::pair<ngc::EpochId, ngc::SpanId>;
-    using MarkerKey = std::pair<ngc::EpochId, ngc::ExecutionMarkerId>;
-    struct ExecutionSpanDiagnostic {
-        ngc::ChunkId chunk = 0;
-        std::uint32_t ordinal = 0;
-        bool stopTail = false;
-        double duration = 0.0;
-        double distance = 0.0;
-        double startVelocity = 0.0;
-        double endVelocity = 0.0;
-        double startAcceleration = 0.0;
-        double endAcceleration = 0.0;
-    };
-    std::map<ChunkKey, ChunkPresentation> m_chunks;
-    std::map<MarkerKey, ChunkPresentation> m_markerPresentations;
-    std::map<SpanKey, ExecutionSpanDiagnostic> m_executionSpans;
-    std::set<ChunkKey> m_chunksWithMarkers;
-    std::map<std::uint64_t, ChunkKey> m_blockChunks;
-    std::map<std::uint64_t, ngc::BlockExecution> m_deferredCompletedBlocks;
-    std::set<ChunkKey> m_retiredChunks;
-    std::vector<ngc::BlockExecution> m_interpretedBlocks;
-    std::optional<ChunkKey> m_lastChunk;
+    ngc::PresentationTracker m_presentationTracker;
     std::vector<std::tuple<std::string, std::string>> m_programs;
     ngc::ToolTable m_toolTable;
     std::optional<std::filesystem::path> m_parameterStorePath;
@@ -140,7 +110,7 @@ public:
         m_snapshot.servoPeriodSeconds = m_servoPeriod;
         m_snapshot.schedulerPeriodSeconds = m_schedulerPeriod;
         m_snapshot.servoTicksPerSchedulerPeriod = m_servoTicksPerSchedulerPeriod;
-        m_snapshot.activePresentation = sessionPresentation();
+        m_presentationTracker.reset(sessionPresentation());
         m_thread = std::thread(&SimulationWorker::work, this);
     }
     explicit SimulationWorker(const ngc::MachineConfiguration &configuration)
@@ -159,7 +129,7 @@ public:
         m_snapshot.servoPeriodSeconds = m_servoPeriod;
         m_snapshot.schedulerPeriodSeconds = m_schedulerPeriod;
         m_snapshot.servoTicksPerSchedulerPeriod = m_servoTicksPerSchedulerPeriod;
-        m_snapshot.activePresentation = sessionPresentation();
+        m_presentationTracker.reset(sessionPresentation());
         m_snapshot.machinePosition = { 6.0, 6.0, -6.0, 0.0, 0.0, 0.0 };
         clearActiveTool();
         m_thread = std::thread(&SimulationWorker::work, this);
@@ -204,8 +174,7 @@ public:
         if(m_running || m_start || m_home || m_activeJog) return false;
         m_session.machine().beginProgramRun();
         m_snapshot = {};
-        m_snapshot.activePresentation = sessionPresentation();
-        clearPresentation();
+        m_presentationTracker.reset(sessionPresentation());
         m_programs.clear();
         return true;
     }
@@ -286,21 +255,14 @@ public:
             return std::unexpected("requested work coordinate is not finite");
         const auto machinePosition = axisComponent(m_snapshot.machinePosition, axis);
         const auto toolOffset = axisComponent(
-            m_snapshot.activePresentation.activeToolOffset, axis);
+            m_presentationTracker.snapshot().activePresentation.activeToolOffset, axis);
         const auto offset = machinePosition - toolOffset - workPosition;
         m_session.machine().setActiveWorkOffset(axis, offset);
-        m_snapshot.activePresentation.workCoordinateSystem = ngc::WorkCoordinateSystem {
+        const ngc::WorkCoordinateSystem updated {
             std::string(ngc::name(*m_session.machine().state().modeCoordSys)),
             m_session.machine().workOffset(),
         };
-        const auto updated = *m_snapshot.activePresentation.workCoordinateSystem;
-        const auto existing = std::ranges::find_if(
-            m_snapshot.usedWorkCoordinateSystems,
-            [&](const auto &value) { return value.name == updated.name; });
-        if(existing == m_snapshot.usedWorkCoordinateSystems.end())
-            m_snapshot.usedWorkCoordinateSystems.push_back(updated);
-        else
-            *existing = updated;
+        m_presentationTracker.setActiveWorkCoordinateSystem(updated);
         const auto saved = persistParametersAtBoundary();
         if (!saved) {
             return std::unexpected(saved.error());
@@ -414,7 +376,20 @@ public:
         m_limits.rapidSpeed = std::max(speed, 1e-6);
         if(!m_running&&!m_start&&!m_home&&!m_activeJog) m_driver.setLimits(m_limits);
     }
-    ngc::SimulationSnapshot snapshot() const { std::scoped_lock lock(m_mutex); return m_snapshot; }
+    ngc::SimulationSnapshot snapshot() const {
+        std::scoped_lock lock(m_mutex);
+        auto result = m_snapshot;
+        const auto &presentation = m_presentationTracker.snapshot();
+        result.activePresentation = presentation.activePresentation;
+        result.spindleRunning = presentation.spindleRunning;
+        result.spindleSpeed = presentation.spindleSpeed;
+        result.spindleDirection = presentation.spindleDirection;
+        result.usedWorkCoordinateSystems = presentation.usedWorkCoordinateSystems;
+        result.completedBlocks = presentation.completedBlocks;
+        result.completedLineFlags = presentation.completedLineFlags;
+
+        return result;
+    }
 
     bool setToolTable(const ngc::ToolTable &tools) {
         std::scoped_lock lock(m_mutex);
@@ -485,7 +460,7 @@ public:
         if (loaded) {
             m_parameterStorePath = path;
             m_session.machine().beginProgramRun();
-            m_snapshot.activePresentation = sessionPresentation();
+            m_presentationTracker.setActivePresentation(sessionPresentation());
         }
 
         return loaded;
@@ -503,12 +478,9 @@ public:
         auto samples=m_backend.takeExecutedJerkSamples();
         std::scoped_lock lock(m_mutex);
         for(auto &sample:samples) {
-            const ChunkPresentation *presentation=nullptr;
-            const auto chunk=m_chunks.find({sample.epoch,sample.chunk});
-            if(chunk!=m_chunks.end()) presentation=&chunk->second;
-            if(presentation) {
-                sample.position =
-                    sample.position - presentation->active.tool.offset;
+            if (const auto toolOffset = m_presentationTracker.toolOffsetForChunk(
+                    sample.epoch, sample.chunk)) {
+                sample.position = sample.position - *toolOffset;
             }
         }
         return samples;
@@ -545,113 +517,32 @@ private:
     }
 
     void clearPresentation() {
-        m_chunks.clear();
-        m_markerPresentations.clear();
-        m_executionSpans.clear();
-        m_chunksWithMarkers.clear();
-        m_blockChunks.clear();
-        m_deferredCompletedBlocks.clear();
-        m_retiredChunks.clear();
-        m_interpretedBlocks.clear();
-        m_lastChunk.reset();
-    }
-
-    void completeBlock(const ngc::BlockExecution &block) {
-        m_snapshot.completedBlocks.push_back(block);
-        auto &flags = m_snapshot.completedLineFlags[block.source];
-        if(block.line >= static_cast<int>(flags.size())) flags.resize(static_cast<std::size_t>(block.line) + 1);
-        if(block.line >= 0) flags[static_cast<std::size_t>(block.line)] = 1;
+        m_presentationTracker.clearTracking();
     }
 
     void observeLifecycle(const ngc::InterpreterBlockLifecycle &lifecycle) {
-        if(lifecycle.phase == ngc::BlockLifecyclePhase::Entered) {
-            m_interpretedBlocks.push_back(lifecycle.block);
-            return;
-        }
-        const auto match = std::ranges::find_if(m_interpretedBlocks, [&](const auto &block) { return block.id == lifecycle.block.id; });
-        if(match != m_interpretedBlocks.end()) m_interpretedBlocks.erase(match);
-        if(const auto owner=m_blockChunks.find(lifecycle.block.id);owner!=m_blockChunks.end()) {
-            if(m_retiredChunks.contains(owner->second)) completeBlock(lifecycle.block);
-            else m_chunks[owner->second].completedBlocks.push_back(lifecycle.block);
-        } else m_deferredCompletedBlocks.insert_or_assign(lifecycle.block.id,lifecycle.block);
+        m_presentationTracker.observeLifecycle(lifecycle);
     }
 
     void observeCommand(const ngc::MachineCommand &command, const ngc::ExecutionItem &item,
                         const ngc::TrajectoryCommandPresentation &captured,
                         const ngc::ExecutionMarkerId activationMarker) {
-        ChunkPresentation presentation;
-        presentation.active = captured;
-        presentation.command = command;
-        const auto key = std::visit([](const auto &value) { return ChunkKey { value.epoch, value.id }; }, item);
-        // A packet may own many prepared activation stations. Their
-        // presentation and block ownership are distinct, but the packet's
-        // execution spans are not; index those bounded spans only once so
-        // activation bookkeeping cannot delay publication of the next
-        // dependent packet until after the backend reaches the branch.
-        if(const auto *chunk=std::get_if<ngc::PlanChunk>(&item);
-           chunk&&!m_chunks.contains(key)) {
-            const auto retainSpan=[&](const ngc::AxisPolynomialSpan &span,
-                                      const std::uint32_t ordinal,const bool stopTail) {
-                const auto start = ngc::executionSpanStart(span);
-                const auto end = ngc::executionSpanEnd(span);
-                m_executionSpans.try_emplace(SpanKey{chunk->epoch,span.id},
-                    ExecutionSpanDiagnostic{
-                        .chunk=chunk->id,.ordinal=ordinal,.stopTail=stopTail,
-                        .duration=span.duration,
-                        .distance=(end.position-start.position).length(),
-                        .startVelocity=start.velocity.length(),
-                        .endVelocity=end.velocity.length(),
-                        .startAcceleration=start.acceleration.length(),
-                        .endAcceleration=end.acceleration.length(),
-                    });
-            };
-            for(std::uint32_t index=0;index<chunk->normalMotion.size;++index)
-                retainSpan(chunk->normalMotion[index],index,false);
-            for(std::uint32_t index=0;index<chunk->stopTail.size;++index)
-                retainSpan(chunk->stopTail[index],index,true);
-        }
-        for(const auto &block:captured.activeBlocks) {
-            m_blockChunks.insert_or_assign(block.id,key);
-            if(const auto completed=m_deferredCompletedBlocks.find(block.id);
-               completed!=m_deferredCompletedBlocks.end()) {
-                presentation.completedBlocks.push_back(completed->second);
-                m_deferredCompletedBlocks.erase(completed);
-            }
-        }
         if(std::holds_alternative<ngc::ProbeMove>(command)) {
             const auto &move = std::get<ngc::TriggeredMove>(item);
-            const auto contact = move.target + presentation.active.tool.offset
-                - presentation.active.activeToolOffset;
+            const auto contact = move.target + captured.tool.offset
+                - captured.activeToolOffset;
             (void)m_backend.configureSyntheticInput(move.moveId, contact);
         }
-        if (activationMarker != 0) {
-            m_markerPresentations.insert_or_assign(
-                {key.first, activationMarker}, presentation);
-            m_chunksWithMarkers.insert(key);
-        }
-        if(const auto existing=m_chunks.find(key);existing!=m_chunks.end())
-            presentation.completedBlocks.insert(presentation.completedBlocks.end(),
-                existing->second.completedBlocks.begin(),existing->second.completedBlocks.end());
-        m_chunks.insert_or_assign(key, std::move(presentation));
-        m_lastChunk = key;
+        m_presentationTracker.observeCommand(
+            command, item, captured, activationMarker);
     }
 
     void observeBackendEvent(const ngc::ExecutionEvent &event) {
         if(const auto *accepted = std::get_if<ngc::ChunkAccepted>(&event)) {
-            const ChunkKey key{accepted->epoch,accepted->chunk};
-            if (!m_chunksWithMarkers.contains(key)) {
-                const auto found = m_chunks.find(key);
-                if (found != m_chunks.end()) {
-                    applyPresentation(found->second);
-                }
-            }
+            m_presentationTracker.observeChunkAccepted(*accepted);
         } else if (const auto *marker =
                        std::get_if<ngc::ExecutionMarkerReached>(&event)) {
-            const auto found = m_markerPresentations.find(
-                {marker->epoch, marker->marker});
-            if (found != m_markerPresentations.end()) {
-                applyPresentation(found->second);
-            }
+            m_presentationTracker.observeMarkerReached(*marker);
         } else if(std::holds_alternative<ngc::TriggeredMoveCompleted>(event)) {
             if(m_feedHoldInProgress) {
                 m_pendingFeedHoldRequest.reset();
@@ -661,10 +552,7 @@ private:
                 m_snapshot.status = ngc::SimulationStatus::Running;
             }
         } else if(const auto *retired = std::get_if<ngc::ChunkRetired>(&event)) {
-            const ChunkKey key { retired->epoch, retired->chunk };
-            const auto found = m_chunks.find(key);
-            if(found != m_chunks.end()) for(const auto &block : found->second.completedBlocks) completeBlock(block);
-            m_retiredChunks.insert(key);
+            m_presentationTracker.observeChunkRetired(*retired);
         } else if(const auto *held = std::get_if<ngc::BackendHeld>(&event)) {
             if(held->reason == ngc::BackendHoldReason::FeedHold) {
                 m_pendingFeedHoldRequest.reset();
@@ -698,30 +586,7 @@ private:
 
     void applyActivePresentation(
             const ngc::TrajectoryCommandPresentation &presentation) {
-        m_snapshot.activePresentation = presentation;
-        if(presentation.workCoordinateSystem) {
-            const auto system = std::ranges::find_if(m_snapshot.usedWorkCoordinateSystems,
-                [&](const auto &value) {
-                    return value.name ==
-                        presentation.workCoordinateSystem->name;
-                });
-            if(system == m_snapshot.usedWorkCoordinateSystems.end()) {
-                m_snapshot.usedWorkCoordinateSystems.push_back(
-                    *presentation.workCoordinateSystem);
-            }
-        }
-    }
-
-    void applyPresentation(const ChunkPresentation &presentation) {
-        applyActivePresentation(presentation.active);
-        if(presentation.command) std::visit([&](const auto &command) {
-            using T = std::decay_t<decltype(command)>;
-            if constexpr(std::same_as<T, ngc::SpindleStart>) {
-                m_snapshot.spindleRunning = true; m_snapshot.spindleSpeed = command.speed(); m_snapshot.spindleDirection = command.direction();
-            } else if constexpr(std::same_as<T, ngc::SpindleStop>) {
-                m_snapshot.spindleRunning = false; m_snapshot.spindleSpeed = 0.0;
-            }
-        }, *presentation.command);
+        m_presentationTracker.setActivePresentation(presentation);
     }
 
     void applyBackendSnapshot(const ngc::ExecutionSnapshot &backend) {
@@ -747,15 +612,14 @@ private:
            && backend.executionRate >= 1.0 - 1e-10
            && std::abs(backend.executionRateAcceleration) <= 1e-10)
             m_feedResumeInProgress = false;
-        if(const auto span=m_executionSpans.find({backend.epoch,backend.activeSpan});
-           span!=m_executionSpans.end()) {
-            const auto &detail=span->second;
+        if(const auto detail = m_presentationTracker.executionSpanDiagnostic(
+               backend.epoch, backend.activeSpan)) {
             m_snapshot.trajectoryBackendSpanDetail=std::format(
                 "{} ordinal={} duration={:.9g}s distance={:.9g} "
                 "velocity={:.9g}->{:.9g} acceleration={:.9g}->{:.9g}",
-                detail.stopTail?"stop-tail":"normal",detail.ordinal,
-                detail.duration,detail.distance,detail.startVelocity,
-                detail.endVelocity,detail.startAcceleration,detail.endAcceleration);
+                detail->stopTail ? "stop-tail" : "normal", detail->ordinal,
+                detail->duration, detail->distance, detail->startVelocity,
+                detail->endVelocity, detail->startAcceleration, detail->endAcceleration);
         } else {
             m_snapshot.trajectoryBackendSpanDetail.clear();
         }
@@ -782,6 +646,19 @@ private:
         return position.x;
     }
 
+    static double axisComponent(const ngc::position_t &position, const ngc::Machine::Axis axis) {
+        switch (axis) {
+            case ngc::Machine::Axis::X: return position.x;
+            case ngc::Machine::Axis::Y: return position.y;
+            case ngc::Machine::Axis::Z: return position.z;
+            case ngc::Machine::Axis::A: return position.a;
+            case ngc::Machine::Axis::B: return position.b;
+            case ngc::Machine::Axis::C: return position.c;
+        }
+
+        return position.x;
+    }
+
     const ngc::JointConfiguration *configuredJoint(const ngc::JointId id) const {
         const auto found = std::ranges::find(m_joints, id, &ngc::JointConfiguration::id);
         return found == m_joints.end() ? nullptr : &*found;
@@ -802,7 +679,7 @@ private:
     }
 
     void clearActiveTool() {
-        m_snapshot.activePresentation.tool = {};
+        m_presentationTracker.clearActiveTool();
     }
 
     void applyHomingBackendSnapshot(const ngc::ExecutionSnapshot &backend) {
@@ -1230,7 +1107,10 @@ private:
             const auto preserve = m_preserveState;
             const auto startingPosition = preserve ? m_snapshot.machinePosition : ngc::position_t{};
             m_start = false; m_running = true; m_programRunning = true; m_stop = false;
-            if(!preserve) { m_snapshot = {}; clearPresentation(); }
+            if(!preserve) {
+                m_snapshot = {};
+                m_presentationTracker.reset();
+            }
             m_snapshot.status = ngc::SimulationStatus::Running;
             m_snapshot.activity = ngc::SimulationActivity::Program;
             m_snapshot.servoPeriodSeconds = m_servoPeriod;
@@ -1513,11 +1393,7 @@ private:
                     m_snapshot.activity = ngc::SimulationActivity::Idle;
                     m_snapshot.error = *m_driver.error(); m_running = false; m_programRunning = false;
                 } else if(state == ngc::PreparedDriverState::Completed) {
-                    for(const auto &[id,block]:m_deferredCompletedBlocks) {
-                        (void)id;
-                        completeBlock(block);
-                    }
-                    m_deferredCompletedBlocks.clear();
+                    m_presentationTracker.completeDeferredBlocks();
                 }
                 if ((state == ngc::PreparedDriverState::Completed
                      || state == ngc::PreparedDriverState::Error)

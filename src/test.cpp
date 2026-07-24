@@ -27,6 +27,7 @@
 #include "machine/MockMotionBackend.h"
 #include "machine/OwningSpscChannel.h"
 #include "machine/PreparedGeometry.h"
+#include "machine/PresentationTracker.h"
 #include "machine/SpscChannel.h"
 #include "machine/SplineHandleOptimization.h"
 #include "machine/ToolTable.h"
@@ -756,6 +757,154 @@ final_move_together = true
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
         session.requestStop();
         session.stop();
+    }
+
+    void testPresentationTrackerActivatesMarkersInExecutionOrder() {
+        ngc::PresentationTracker tracker;
+        ngc::TrajectoryCommandPresentation initial;
+        initial.tool.number = 1;
+        initial.workCoordinateSystem = ngc::WorkCoordinateSystem {"G54", {}};
+        tracker.reset(initial);
+
+        ngc::PlanChunk chunk;
+        chunk.epoch = 7;
+        chunk.id = 9;
+        ngc::AxisPolynomialSpan span;
+        span.id = 11;
+        span.duration = 2.0;
+        span.inverseDuration = 0.5;
+        span.inverseDurationSquared = 0.25;
+        span.inverseDurationCubed = 0.125;
+        span.coefficients[0] =
+            ngc::position_t {4.0, 0.0, 0.0, 0.0, 0.0, 0.0};
+        require(chunk.normalMotion.push(span),
+                "presentation tracker fixture should retain its diagnostic span");
+
+        auto spindlePresentation = initial;
+        spindlePresentation.tool.number = 2;
+        spindlePresentation.workCoordinateSystem = ngc::WorkCoordinateSystem {"G55", {}};
+        spindlePresentation.modalGCodes = {"G1", "G55"};
+        tracker.observeCommand(
+            ngc::MachineCommand {ngc::SpindleStart {ngc::Direction::CCW, 1200.0}},
+            ngc::ExecutionItem {chunk}, spindlePresentation, 101);
+
+        auto stoppedPresentation = spindlePresentation;
+        stoppedPresentation.tool.number = 3;
+        stoppedPresentation.workCoordinateSystem = ngc::WorkCoordinateSystem {"G56", {}};
+        tracker.observeCommand(
+            ngc::MachineCommand {ngc::SpindleStop {}}, ngc::ExecutionItem {chunk},
+            stoppedPresentation, 102);
+        const auto diagnostic = tracker.executionSpanDiagnostic(chunk.epoch, span.id);
+        require(diagnostic && diagnostic->chunk == chunk.id
+                    && diagnostic->ordinal == 0 && !diagnostic->stopTail,
+                "presentation tracking should retain packet/span diagnostic ownership");
+        requireNear(diagnostic->distance, 4.0,
+                    "presentation span diagnostics should retain executed distance");
+
+        tracker.observeChunkAccepted({chunk.epoch, chunk.id});
+        require(tracker.snapshot().activePresentation.tool.number == 1,
+                "a packet with markers must not activate its final presentation at acceptance");
+
+        tracker.observeMarkerReached({
+            .epoch = chunk.epoch,
+            .chunk = chunk.id,
+            .marker = 101,
+            .span = 1,
+            .parameter = 0.25,
+        });
+        require(tracker.snapshot().activePresentation.tool.number == 2,
+                "the first marker should activate only its owning presentation");
+        require(tracker.snapshot().spindleRunning,
+                "the first marker should activate its spindle command");
+        requireNear(tracker.snapshot().spindleSpeed, 1200.0,
+                    "the first marker should retain spindle speed");
+        require(tracker.snapshot().spindleDirection == ngc::Direction::CCW,
+                "the first marker should retain spindle direction");
+
+        tracker.observeMarkerReached({
+            .epoch = chunk.epoch,
+            .chunk = chunk.id,
+            .marker = 102,
+            .span = 1,
+            .parameter = 0.75,
+        });
+        require(tracker.snapshot().activePresentation.tool.number == 3,
+                "the second marker should activate its owning presentation");
+        require(!tracker.snapshot().spindleRunning
+                    && tracker.snapshot().spindleSpeed == 0.0,
+                "the second marker should activate its spindle stop");
+        require(tracker.snapshot().usedWorkCoordinateSystems.size() == 3,
+                "marker activation should retain chronological WCS presentation history");
+    }
+
+    void testPresentationTrackerDefersBlockCompletionAndResetsState() {
+        ngc::PresentationTracker tracker;
+        tracker.reset();
+
+        const ngc::BlockExecution outer {
+            .id = 41,
+            .text = "M6",
+            .source = "presentation.ngc",
+            .line = 4,
+        };
+        const ngc::BlockExecution nested {
+            .id = 42,
+            .text = "G10 L11 P2 Z0",
+            .source = "tool_change.ngc",
+            .line = 12,
+        };
+        tracker.observeLifecycle({outer, ngc::BlockLifecyclePhase::Entered});
+        tracker.observeLifecycle({nested, ngc::BlockLifecyclePhase::Entered});
+        tracker.observeLifecycle({nested, ngc::BlockLifecyclePhase::Completed});
+        tracker.observeLifecycle({outer, ngc::BlockLifecyclePhase::Completed});
+
+        ngc::PlanChunk chunk;
+        chunk.epoch = 3;
+        chunk.id = 5;
+        ngc::TrajectoryCommandPresentation presentation;
+        presentation.tool = ngc::ToolGeometry {
+            2, ngc::position_t {0.0, 0.0, 1.75, 0.0, 0.0, 0.0}, 0.25,
+        };
+        presentation.activeToolOffset =
+            ngc::position_t {0.0, 0.0, 1.5, 0.0, 0.0, 0.0};
+        presentation.workCoordinateSystem = ngc::WorkCoordinateSystem {
+            "G55", ngc::position_t {2.0, 0.0, 0.0, 0.0, 0.0, 0.0},
+        };
+        presentation.modalGCodes = {"G1", "G43", "G55"};
+        presentation.activeBlocks = {outer, nested};
+        tracker.observeCommand(
+            ngc::MachineCommand {ngc::SpindleStop {}}, ngc::ExecutionItem {chunk},
+            presentation, 0);
+
+        require(tracker.snapshot().completedBlocks.empty(),
+                "completed blocks must wait for their owning packet retirement");
+        tracker.observeChunkAccepted({chunk.epoch, chunk.id});
+        require(tracker.snapshot().activePresentation.activeBlocks.size() == 2,
+                "packet acceptance should activate nested block ownership");
+        tracker.observeChunkRetired({chunk.epoch, chunk.id});
+        require(tracker.snapshot().completedBlocks.size() == 2,
+                "packet retirement should publish both deferred block completions");
+        require(tracker.snapshot().completedBlocks[0].id == nested.id
+                    && tracker.snapshot().completedBlocks[1].id == outer.id,
+                "nested block completion order must remain chronological");
+        require(tracker.snapshot().completedLineFlags.at("presentation.ngc")[4] == 1
+                    && tracker.snapshot().completedLineFlags.at("tool_change.ngc")[12] == 1,
+                "packet retirement should publish compact completed-line flags");
+        requireNear(tracker.toolOffsetForChunk(chunk.epoch, chunk.id)->z, 1.75,
+                    "chunk diagnostics should retain their owning tool geometry");
+
+        ngc::TrajectoryCommandPresentation resetPresentation;
+        resetPresentation.tool.number = 7;
+        tracker.reset(resetPresentation);
+        require(tracker.snapshot().activePresentation.tool.number == 7,
+                "presentation reset should install the new session presentation");
+        require(tracker.snapshot().completedBlocks.empty()
+                    && tracker.snapshot().completedLineFlags.empty()
+                    && tracker.snapshot().usedWorkCoordinateSystems.empty(),
+                "presentation reset should remove prior-run lifecycle history");
+        require(!tracker.snapshot().spindleRunning
+                    && !tracker.toolOffsetForChunk(chunk.epoch, chunk.id),
+                "presentation reset should remove prior-run command associations");
     }
 
     void testSimulationWorkerStartsPlayback() {
@@ -5701,6 +5850,8 @@ int main() {
         testUnsupportedCodesProduceInterpreterErrors();
         testFailedBlockRollsBackMachineState();
         testInterpreterCancellationInterruptsEvaluation();
+        testPresentationTrackerActivatesMarkersInExecutionOrder();
+        testPresentationTrackerDefersBlockCompletionAndResetsState();
         std::cerr << "checkpoint simulation start\n";
         testSimulationWorkerStartsPlayback();
         testSimulationPresentationFollowsNestedToolChangeExecution();

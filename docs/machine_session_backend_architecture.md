@@ -706,6 +706,10 @@ the future Real session; Simulation does not write them.
 
 ### Phase 3: Extract presentation tracking
 
+Status: implemented behind the current `SimulationWorker` compatibility facade.
+`PresentationTracker` owns presentation activation, block lifecycle, spindle and
+modal presentation, WCS history, and chunk/span diagnostic associations.
+
 - Move command/marker, block lifecycle, tool/WCS/modal presentation, and
   diagnostic associations into `PresentationTracker`.
 - Preserve chronological activation and completed-line semantics.
