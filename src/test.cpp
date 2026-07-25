@@ -1009,6 +1009,30 @@ final_move_together = true
                     ngc::SessionCommandRejection::MotionOwned)
                     == "another operation owns the controlled session",
                 "the GUI should translate structured command rejection details");
+
+        snapshot.machinePosition = {10.0, 20.0, 30.0, 40.0, 50.0, 60.0};
+        snapshot.activePresentation.workCoordinateSystem =
+            ngc::WorkCoordinateSystem {"G55", {1.0, 2.0, 3.0, 4.0, 5.0, 6.0}};
+        snapshot.activePresentation.tool =
+            ngc::ToolGeometry {7, {0.1, 0.2, 0.3, 0.4, 0.5, 0.6}, 0.25};
+        snapshot.activePresentation.activeToolOffset =
+            {0.5, 1.0, 1.5, 2.0, 2.5, 3.0};
+        snapshot.spindleRunning = true;
+        snapshot.spindleSpeed = 1200.0;
+        snapshot.spindleDirection = ngc::Direction::CCW;
+        const auto dro = ngc::gui::operatorDro(snapshot);
+        require(dro.workCoordinateSystem == "G55" && dro.tool == 7,
+                "the operator DRO should identify the active WCS and tool");
+        requireNear(dro.workPosition.x, 8.5,
+                    "the operator DRO should remove WCS and applied tool offsets");
+        requireNear(dro.workPosition.c, 51.0,
+                    "the operator DRO should derive rotary work coordinates");
+        requireNear(dro.toolTipPosition.z, 29.7,
+                    "the operator DRO should derive the physical tool-tip position");
+        require(dro.spindleRunning && dro.spindleSpeed == 1200.0
+                    && dro.spindleDirection == ngc::Direction::CCW
+                    && dro.motionOwner == ngc::MachineActivity::Faulted,
+                "the operator DRO should retain live spindle and motion-owner state");
     }
 
     void testInProcessSimulationRuntimePersistsAcrossTimedEpochs() {

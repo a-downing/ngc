@@ -6,6 +6,19 @@
 #include "machine/SimulationPresentation.h"
 
 namespace ngc::gui {
+    struct OperatorDro {
+        position_t machinePosition{};
+        position_t workPosition{};
+        position_t toolTipPosition{};
+        position_t activeToolOffset{};
+        std::string_view workCoordinateSystem = "--";
+        int tool = 0;
+        bool spindleRunning = false;
+        double spindleSpeed = 0.0;
+        Direction spindleDirection = Direction::CW;
+        MachineActivity motionOwner = MachineActivity::Idle;
+    };
+
     struct MachineSessionControls {
         bool powered = false;
         bool idle = false;
@@ -17,6 +30,29 @@ namespace ngc::gui {
         bool canStop = false;
         bool canReset = false;
     };
+
+    inline OperatorDro operatorDro(const MachineSessionSnapshot &snapshot) noexcept {
+        const auto workOffset = snapshot.activePresentation.workCoordinateSystem
+            ? snapshot.activePresentation.workCoordinateSystem->offset
+            : position_t {};
+
+        return {
+            .machinePosition = snapshot.machinePosition,
+            .workPosition =
+                snapshot.machinePosition - workOffset - snapshot.activePresentation.activeToolOffset,
+            .toolTipPosition =
+                snapshot.machinePosition - snapshot.activePresentation.tool.offset,
+            .activeToolOffset = snapshot.activePresentation.activeToolOffset,
+            .workCoordinateSystem = snapshot.activePresentation.workCoordinateSystem
+                ? std::string_view(snapshot.activePresentation.workCoordinateSystem->name)
+                : std::string_view("--"),
+            .tool = snapshot.activePresentation.tool.number,
+            .spindleRunning = snapshot.spindleRunning,
+            .spindleSpeed = snapshot.spindleSpeed,
+            .spindleDirection = snapshot.spindleDirection,
+            .motionOwner = snapshot.machineActivity,
+        };
+    }
 
     constexpr std::string_view powerStateName(const MachinePowerState state) noexcept {
         switch (state) {

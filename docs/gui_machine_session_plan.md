@@ -185,9 +185,11 @@ Acceptance criteria:
 
 ### Phase 2: Add the session header and operator DRO
 
-Status: in progress. The main toolbar now displays the selected control target,
-power state, machine activity, compatibility execution state, and homed-joint
-summary. The coordinate, tool, WCS, and spindle DRO remains to be implemented.
+Status: complete. The main toolbar displays the selected control target, power
+state, machine activity, compatibility execution state, and homed-joint
+summary. The motion pane displays live machine, work, and physical tool-tip
+coordinates together with the active WCS, tool, applied XYZABC tool offset,
+spindle state, motion owner, and homing summary.
 
 - Display control target, power, activity, and homing summary.
 - Add machine, work, and tool-tip coordinates.

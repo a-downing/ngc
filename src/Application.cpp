@@ -2230,6 +2230,47 @@ public:
             | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
         ImGui::Begin("##jog_pane", nullptr, flags);
 
+        const auto dro = ngc::gui::operatorDro(simulation);
+        ImGui::TextUnformatted("Operator DRO");
+        if (ImGui::BeginTable("##operator_dro", 4, ImGuiTableFlags_BordersInnerV | ImGuiTableFlags_RowBg
+                | ImGuiTableFlags_SizingStretchProp)) {
+            ImGui::TableSetupColumn("Axis", ImGuiTableColumnFlags_WidthFixed, 34.0f);
+            ImGui::TableSetupColumn("MCS");
+            ImGui::TableSetupColumn("WCS");
+            ImGui::TableSetupColumn("Tool tip");
+            ImGui::TableHeadersRow();
+            for (const auto &axis : m_axes) {
+                ImGui::TableNextRow();
+                ImGui::TableNextColumn();
+                ImGui::TextUnformatted(axisLabel(axis.axis));
+                ImGui::TableNextColumn();
+                ImGui::Text("% .4f", axisValue(dro.machinePosition, axis.axis));
+                ImGui::TableNextColumn();
+                ImGui::Text("% .4f", axisValue(dro.workPosition, axis.axis));
+                ImGui::TableNextColumn();
+                ImGui::Text("% .4f", axisValue(dro.toolTipPosition, axis.axis));
+            }
+            ImGui::EndTable();
+        }
+
+        const auto homed = std::ranges::count_if(m_joints, [&](const auto &joint) {
+            return (simulation.homedJoints & (ngc::JointMask { 1 } << joint.id)) != 0;
+        });
+        ImGui::Text("WCS: %s    Tool: T%d", dro.workCoordinateSystem.data(), dro.tool);
+        ImGui::Text("Tool offset XYZ: % .4f  % .4f  % .4f",
+                    dro.activeToolOffset.x, dro.activeToolOffset.y, dro.activeToolOffset.z);
+        ImGui::Text("Tool offset ABC: % .4f  % .4f  % .4f",
+                    dro.activeToolOffset.a, dro.activeToolOffset.b, dro.activeToolOffset.c);
+        if (dro.spindleRunning) {
+            ImGui::Text("Spindle: %s  %.3f", ngc::name(dro.spindleDirection).data(), dro.spindleSpeed);
+        } else {
+            ImGui::TextUnformatted("Spindle: Stopped");
+        }
+        ImGui::Text("Owner: %s    Homed: %zu/%zu joints",
+                    ngc::gui::machineActivityName(dro.motionOwner).data(),
+                    static_cast<std::size_t>(homed), m_joints.size());
+        ImGui::Separator();
+
         ImGui::TextUnformatted("Jog");
         ImGui::Separator();
         const char *modes[] = { "Axes", "Coupled joints", "Individual joints" };
