@@ -5,6 +5,7 @@
 #include <cstddef>
 #include <deque>
 #include <expected>
+#include <filesystem>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -55,6 +56,18 @@ namespace ngc {
         bool workDeferred = false;
         std::optional<position_t> stoppedPosition;
         std::optional<std::string> error;
+    };
+
+    enum class ExecutionEpochOutcome {
+        Abandoned,
+        Completed,
+        Stopped,
+        Failed,
+    };
+
+    struct ExecutionEpochFinish {
+        GeometryStreamDiagnostics diagnostics;
+        std::optional<std::string> persistenceError;
     };
 
     struct StartProgram {
@@ -191,8 +204,23 @@ namespace ngc {
         [[nodiscard]] std::expected<std::optional<DispatchedSessionOperation>, std::string>
         dispatchNextOperation();
         [[nodiscard]] std::expected<GeometryEpoch, std::string> beginExecutionEpoch(
-            StartProgram start, ToolTable tools, const position_t &startingPosition);
-        [[nodiscard]] GeometryStreamDiagnostics finishExecutionEpoch();
+            StartProgram start, const position_t &startingPosition);
+        [[nodiscard]] ExecutionEpochFinish finishExecutionEpoch(ExecutionEpochOutcome outcome);
+        [[nodiscard]] bool setToolTable(const ToolTable &tools);
+        [[nodiscard]] bool toolTableInitialized() const noexcept;
+        [[nodiscard]] ToolTable toolTable() const;
+        [[nodiscard]] std::pair<ToolTable, std::uint64_t> toolTableSnapshot() const;
+        [[nodiscard]] std::expected<void, std::string>
+        setToolTableStorePath(const std::filesystem::path &path);
+        [[nodiscard]] std::expected<void, std::string>
+        saveToolTable(const std::filesystem::path &path) const;
+        [[nodiscard]] std::expected<void, std::string>
+        setPersistentParameterStorePath(const std::filesystem::path &path);
+        [[nodiscard]] std::expected<void, std::string>
+        loadPersistentParameters(const std::filesystem::path &path);
+        [[nodiscard]] std::expected<void, std::string>
+        savePersistentParameters(const std::filesystem::path &path) const;
+        [[nodiscard]] std::expected<void, std::string> persistParametersAtBoundary() const;
         void configureHoming(std::vector<AxisConfiguration> axes,
                              std::vector<JointConfiguration> joints,
                              HomingConfiguration homing);
@@ -333,7 +361,10 @@ namespace ngc {
 
     private:
         [[nodiscard]] ProgramOperationUpdate programOperationUpdate() const;
+        [[nodiscard]] bool controllerDataMutable() const noexcept;
+        [[nodiscard]] std::expected<void, std::string> persistToolTableAtBoundary();
 
+        Machine::Unit m_unit;
         InterpreterSession m_interpreter;
         GeometryStreamPolicy m_geometryPolicy;
         PreparedGeometryForwardChannel m_geometryForward;
@@ -352,5 +383,10 @@ namespace ngc {
         JointMask m_homedJoints = 0;
         TrajectoryLimits m_limits;
         GeometryEpoch m_nextEpoch = 1;
+        std::optional<std::filesystem::path> m_parameterStorePath;
+        std::optional<std::filesystem::path> m_toolTableStorePath;
+        ToolTable m_observedToolTable;
+        bool m_toolTableInitialized = false;
+        std::uint64_t m_toolTableRevision = 0;
     };
 }

@@ -753,6 +753,10 @@ Stop through that command boundary.
 `MachineSession` controls its `BackendRuntime` powered lifetime: On starts the
 runtime, idle Off stops it, and repeated power cycles reuse the same backend
 endpoint. Runtime startup or shutdown failure faults the session.
+`MachineSession` owns its live tool table, persistent parameter and tool-table
+store paths, tool-table revision tracking, and terminal program/MDI persistence
+boundaries. New program and MDI epochs reuse the existing live table rather
+than receiving a compatibility-facade copy.
 Stop uses backend constrained braking, abandons the execution epoch only at
 rest, and reconciles canonical position to the stationary backend state.
 The homing controller owns fast search, clearance backoff, slow latch,
@@ -762,11 +766,11 @@ compatibility facade. The jogging controller owns backend initialization,
 token-matched controls, constrained Stop, event handling, and final axis/joint
 observation; `MachineSession` consumes and translates queued jog commands.
 Simulation supplies only service-clock and shutdown callbacks for jogging.
-Simulation-specific runtime servicing callbacks and persistence boundaries
-still need to move behind the session abstraction.
+Simulation-specific runtime servicing callbacks still need to move behind the
+session abstraction.
 
-- Move the remaining Simulation runtime servicing and persistence boundaries
-  into backend-neutral session components.
+- Move the remaining Simulation runtime servicing into backend-neutral session
+  components.
 - Replace boolean control flags with explicit power/activity state and queued
   NRT commands.
 - Make On/Off separate from Start/Stop.

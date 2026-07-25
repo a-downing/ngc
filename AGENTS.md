@@ -79,9 +79,12 @@ program, MDI, homing, and
 jogging starts, validates their activity ownership, and releases Program/MDI
 activity when the execution epoch finishes. The `SimulationWorker`
 compatibility facade queues starts, feed hold, Resume, and Stop through that
-boundary; it still owns the Simulation-specific runtime servicing callbacks and
-persistence boundaries. Synthetic homing input policy and
-service-clock advancement for homing and jogging remain in
+boundary; it still owns the Simulation-specific runtime servicing callbacks.
+`MachineSession` owns the live tool table, persistent parameter and tool-table
+store paths, tool-table revision tracking, and completed/stopped/failed epoch
+persistence boundaries. Program and MDI epochs reuse that session-owned table
+instead of receiving an application-owned copy. Synthetic homing input policy
+and service-clock advancement for homing and jogging remain in
 `InProcessSimulationRuntime`.
 During timed program epochs, the facade's dedicated snapshot service is the
 sole consumer of backend execution snapshots and maintains a latest-value NRT

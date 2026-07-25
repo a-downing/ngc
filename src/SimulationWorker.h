@@ -45,16 +45,10 @@ class SimulationWorker {
     std::thread m_timedSnapshotThread;
     bool m_stopTimedSnapshotService = false;
     std::optional<ngc::ExecutionSnapshot> m_latestTimedBackendSnapshot;
-    ngc::Machine::Unit m_unit;
     ngc::InProcessSimulationRuntime m_runtime;
     ngc::MachineSession m_machineSession;
     ngc::TrajectoryLimits m_limits;
     ngc::SimulationSnapshot m_snapshot;
-    ngc::ToolTable m_toolTable;
-    std::optional<std::filesystem::path> m_parameterStorePath;
-    std::optional<std::filesystem::path> m_toolTableStorePath;
-    bool m_toolTableInitialized = false;
-    std::uint64_t m_toolTableRevision = 0;
     bool m_join = false;
     bool m_stop = false;
     bool m_running = false;
@@ -74,8 +68,7 @@ public:
     explicit SimulationWorker(const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch,
                               const ngc::TrajectoryLimits limits = {},
                               const ngc::SimulationTiming timing = {})
-        : m_unit(unit),
-          m_runtime(limits, timing),
+        : m_runtime(limits, timing),
           m_machineSession(unit, ngc::InterpretationMode::Simulation, m_runtime,
                            limits, geometryPolicy(limits)),
           m_limits(limits) {
@@ -86,8 +79,7 @@ public:
         m_thread = std::thread(&SimulationWorker::work, this);
     }
     explicit SimulationWorker(const ngc::MachineConfiguration &configuration)
-        : m_unit(configuration.unit),
-          m_runtime(configuration),
+        : m_runtime(configuration),
           m_machineSession(configuration.unit, ngc::InterpretationMode::Simulation,
                            m_runtime, configuration.trajectory,
                            geometryPolicy(configuration.trajectory)),
@@ -117,11 +109,9 @@ public:
         }
         const auto activity = std::get<1>(programs.back()) == "<MDI>"
             ? ngc::MachineActivity::Mdi : ngc::MachineActivity::Program;
-        if (!m_toolTableInitialized) {
-            m_toolTable = tools;
-            m_machineSession.interpreter().machine().toolTable() = tools;
-            m_toolTableInitialized = true;
-            ++m_toolTableRevision;
+        if (!m_machineSession.toolTableInitialized()
+            && !m_machineSession.setToolTable(tools)) {
+            return false;
         }
         if (!m_machineSession.queueProgram(ngc::StartProgram {
                 .programs = programs,
@@ -242,7 +232,7 @@ public:
             m_machineSession.interpreter().machine().workOffset(),
         };
         m_machineSession.presentationTracker().setActiveWorkCoordinateSystem(updated);
-        const auto saved = persistParametersAtBoundary();
+        const auto saved = m_machineSession.persistParametersAtBoundary();
         if (!saved) {
             return std::unexpected(saved.error());
         }
@@ -406,27 +396,19 @@ public:
 
     bool setToolTable(const ngc::ToolTable &tools) {
         std::scoped_lock lock(m_mutex);
-        if (motionOwnedOrQueued()) {
-            return false;
-        }
-        m_toolTable = tools;
-        m_machineSession.interpreter().machine().toolTable() = tools;
-        m_toolTableInitialized = true;
-        ++m_toolTableRevision;
-
-        return true;
+        return !motionOwnedOrQueued() && m_machineSession.setToolTable(tools);
     }
 
     ngc::ToolTable toolTable() const {
         std::scoped_lock lock(m_mutex);
 
-        return m_toolTable;
+        return m_machineSession.toolTable();
     }
 
     std::pair<ngc::ToolTable, std::uint64_t> toolTableSnapshot() const {
         std::scoped_lock lock(m_mutex);
 
-        return {m_toolTable, m_toolTableRevision};
+        return m_machineSession.toolTableSnapshot();
     }
 
     std::expected<void, std::string> setToolTableStorePath(
@@ -436,9 +418,7 @@ public:
             return std::unexpected(
                 "cannot configure the tool-table store while motion owns the machine");
         }
-        m_toolTableStorePath = path;
-
-        return {};
+        return m_machineSession.setToolTableStorePath(path);
     }
 
     std::expected<void, std::string> saveToolTable(
@@ -449,7 +429,7 @@ public:
                 "cannot save the tool table while motion owns the machine");
         }
 
-        return m_toolTable.save(path);
+        return m_machineSession.saveToolTable(path);
     }
 
     std::expected<void, std::string> setPersistentParameterStorePath(
@@ -459,9 +439,7 @@ public:
             return std::unexpected(
                 "cannot configure persistent parameters while motion owns the machine");
         }
-        m_parameterStorePath = path;
-
-        return {};
+        return m_machineSession.setPersistentParameterStorePath(path);
     }
     std::expected<void, std::string> loadPersistentParameters(const std::filesystem::path &path) {
         std::scoped_lock lock(m_mutex);
@@ -469,10 +447,8 @@ public:
             return std::unexpected("cannot load persistent parameters while motion owns the machine");
         }
 
-        auto loaded = ngc::loadPersistentParameters(path, m_unit, m_machineSession.interpreter().machine().memory());
+        auto loaded = m_machineSession.loadPersistentParameters(path);
         if (loaded) {
-            m_parameterStorePath = path;
-            m_machineSession.interpreter().machine().beginProgramRun();
             m_machineSession.presentationTracker().setActivePresentation(sessionPresentation());
         }
 
@@ -485,7 +461,7 @@ public:
             return std::unexpected("cannot save persistent parameters while motion owns the machine");
         }
 
-        return ngc::savePersistentParameters(path, m_unit, m_machineSession.interpreter().machine().memory());
+        return m_machineSession.savePersistentParameters(path);
     }
     std::vector<ngc::ExecutedJerkSample> takeExecutedJerkSamples() {
         auto samples = m_runtime.takeExecutedJerkSamples();
@@ -588,30 +564,6 @@ private:
             runtime.maximumWakeLatenessSeconds;
         m_snapshot.maximumTickExecutionSeconds =
             runtime.maximumTickExecutionSeconds;
-    }
-
-    std::expected<void, std::string> persistParametersAtBoundary() const {
-        if (!m_parameterStorePath) {
-            return {};
-        }
-
-        return ngc::savePersistentParameters(
-            *m_parameterStorePath, m_unit, m_machineSession.interpreter().machine().memory());
-    }
-
-    std::expected<void, std::string> persistToolTableAtBoundary() {
-        const auto &updated = m_machineSession.interpreter().machine().toolTable();
-        if (updated == m_toolTable) {
-            return {};
-        }
-        m_toolTable = updated;
-        m_toolTableInitialized = true;
-        ++m_toolTableRevision;
-        if (!m_toolTableStorePath) {
-            return {};
-        }
-
-        return m_toolTable.save(*m_toolTableStorePath);
     }
 
     void clearPresentation() {
@@ -923,13 +875,15 @@ private:
         clearActiveTool();
     }
 
-    void joinGeometry() {
+    std::optional<std::string> joinGeometry(const ngc::ExecutionEpochOutcome outcome) {
         const auto active = m_machineSession.executionEpochActive();
-        const auto diagnostics = m_machineSession.finishExecutionEpoch();
+        auto finished = m_machineSession.finishExecutionEpoch(outcome);
         if (active) {
             std::scoped_lock lock(m_mutex);
-            m_snapshot.geometryStream = diagnostics;
+            m_snapshot.geometryStream = std::move(finished.diagnostics);
         }
+
+        return std::move(finished.persistenceError);
     }
 
     void work() {
@@ -980,7 +934,6 @@ private:
             }
             auto start = std::get<ngc::StartProgram>(std::move(operation));
             auto programs = std::move(start.programs);
-            auto tools = m_toolTable;
             const auto preserve = start.preserveState;
             const auto startingPosition = preserve ? m_snapshot.machinePosition : ngc::position_t{};
             m_running = true; m_programRunning = true; m_stop = false;
@@ -1008,9 +961,9 @@ private:
             }
             start.programs = std::move(programs);
             const auto epochResult = m_machineSession.beginExecutionEpoch(
-                std::move(start), std::move(tools), startingPosition);
+                std::move(start), startingPosition);
             if (!epochResult) {
-                joinGeometry();
+                (void)joinGeometry(ngc::ExecutionEpochOutcome::Abandoned);
                 lock.lock();
                 m_snapshot.status = ngc::SimulationStatus::Error;
                 m_snapshot.activity = ngc::SimulationActivity::Idle;
@@ -1022,7 +975,7 @@ private:
             }
             const auto epoch = *epochResult;
             if (!m_runtime.beginTimedExecution()) {
-                joinGeometry();
+                (void)joinGeometry(ngc::ExecutionEpochOutcome::Abandoned);
                 m_machineSession.interpreter().reportError(
                     "in-process Simulation runtime failed to start timed execution");
                 m_machineSession.interpreter().stop();
@@ -1137,7 +1090,8 @@ private:
                     lock.unlock();
                     m_runtime.endTimedExecution();
                     stopTimedSnapshotService();
-                    joinGeometry();
+                    const auto persistenceError =
+                        joinGeometry(ngc::ExecutionEpochOutcome::Stopped);
                     if (controlledStopPosition) {
                         m_machineSession.interpreter().machine().synchronizePosition(
                             *controlledStopPosition);
@@ -1146,9 +1100,9 @@ private:
                     {
                         std::scoped_lock statusLock(m_mutex);
                         m_snapshot.statusMessages = m_machineSession.interpreter().statusMessages();
-                        if (auto saved = persistToolTableAtBoundary(); !saved) {
+                        if (persistenceError) {
                             m_snapshot.status = ngc::SimulationStatus::Error;
-                            m_snapshot.error = saved.error();
+                            m_snapshot.error = *persistenceError;
                         } else {
                             m_snapshot.status = ngc::SimulationStatus::Stopped;
                             m_snapshot.activity = ngc::SimulationActivity::Idle;
@@ -1203,7 +1157,11 @@ private:
                     lock.unlock();
                     m_runtime.endTimedExecution();
                     stopTimedSnapshotService();
-                    joinGeometry();
+                    const auto epochOutcome =
+                        operation.state == ngc::ProgramOperationState::Completed
+                        ? ngc::ExecutionEpochOutcome::Completed
+                        : ngc::ExecutionEpochOutcome::Failed;
+                    const auto persistenceError = joinGeometry(epochOutcome);
                     if (operation.state == ngc::ProgramOperationState::Error
                         && operation.error) {
                         m_machineSession.interpreter().reportError(*operation.error);
@@ -1213,24 +1171,19 @@ private:
                         || operation.state == ngc::ProgramOperationState::Error) {
                         std::scoped_lock sessionLock(m_mutex);
                         m_snapshot.statusMessages = m_machineSession.interpreter().statusMessages();
-                        const auto toolsSaved = persistToolTableAtBoundary();
                         if (operation.state == ngc::ProgramOperationState::Completed) {
                             applyActivePresentation(sessionPresentation());
                             m_running = false;
                             m_programRunning = false;
                             m_snapshot.activity = ngc::SimulationActivity::Idle;
-                            const auto parametersSaved = persistParametersAtBoundary();
-                            if (!toolsSaved) {
+                            if (persistenceError) {
                                 m_snapshot.status = ngc::SimulationStatus::Error;
-                                m_snapshot.error = toolsSaved.error();
-                            } else if (!parametersSaved) {
-                                m_snapshot.status = ngc::SimulationStatus::Error;
-                                m_snapshot.error = parametersSaved.error();
+                                m_snapshot.error = *persistenceError;
                             } else {
                                 m_snapshot.status = ngc::SimulationStatus::Completed;
                             }
-                        } else if (!toolsSaved && m_snapshot.error.empty()) {
-                            m_snapshot.error = toolsSaved.error();
+                        } else if (persistenceError && m_snapshot.error.empty()) {
+                            m_snapshot.error = *persistenceError;
                         }
                     }
                     break;

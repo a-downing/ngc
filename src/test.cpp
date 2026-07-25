@@ -632,7 +632,7 @@ final_move_together = true
                 "session dispatch should retain MDI epoch inputs");
         auto epoch = session.beginExecutionEpoch(
             std::move(*start),
-            {}, {});
+            {});
         require(epoch.has_value(), epoch ? "" : epoch.error());
         require(session.executionEpochActive(),
                 "MachineSession should own the prepared-geometry producer epoch");
@@ -677,7 +677,7 @@ final_move_together = true
                 "session-owned program servicing should complete Stop from a stationary backend");
         require(session.coordinator().activity() == ngc::MachineActivity::Mdi,
                 "MachineSession should expose the active MDI operation");
-        (void)session.finishExecutionEpoch();
+        (void)session.finishExecutionEpoch(ngc::ExecutionEpochOutcome::Stopped);
         require(!session.executionEpochActive(),
                 "finishing an epoch should cancel and join prepared geometry");
         require(!session.programExecution().active()
@@ -723,6 +723,127 @@ final_move_together = true
                 "a runtime start failure should fault the machine session");
         require(failingRuntime.startCalls == 1 && failingRuntime.stopCalls == 1,
                 "a runtime start failure should attempt runtime cleanup exactly once");
+    }
+
+    void testMachineSessionOwnsControllerDataPersistence() {
+        const auto root = std::filesystem::temp_directory_path();
+        const auto parameterPath = root / "ngc-session-controller-data.var";
+        const auto toolPath = root / "ngc-session-controller-tools.txt";
+        std::filesystem::remove(parameterPath);
+        std::filesystem::remove(toolPath);
+
+        CountingBackendRuntime runtime;
+        ngc::MachineSession session(
+            UNIT, ngc::InterpretationMode::Simulation, runtime, {});
+        const auto initial = fixtureToolTable();
+        require(session.setToolTable(initial),
+                "an idle session should accept its live tool table");
+        require(session.setToolTableStorePath(toolPath).has_value(),
+                "an idle session should own its isolated tool-table store");
+        require(session.setPersistentParameterStorePath(parameterPath).has_value(),
+                "an idle session should own its isolated parameter store");
+        const auto initialRevision = session.toolTableSnapshot().second;
+
+        auto calibrated = initial;
+        auto tool = calibrated.get(1);
+        require(tool.has_value(), "session persistence fixture tool should exist");
+        tool->z = 3.25;
+        calibrated.set(1, *tool);
+        session.interpreter().machine().toolTable() = calibrated;
+        const auto activeWcs = session.interpreter().machine().memory().deref(ngc::Var::COORDSYS);
+        require(session.interpreter().machine().memory().write(activeWcs, 9.0, true).has_value(),
+                "session persistence fixture should update its canonical parameter bank");
+
+        require(session.powerOn(), "controller-data session should power on");
+        require(session.queueProgram(ngc::StartProgram {
+                    .programs = {{"G90\n", "<MDI>"}},
+                    .preserveState = true,
+                    .activity = ngc::MachineActivity::Mdi,
+                }),
+                "controller-data session should admit an MDI epoch");
+        auto dispatched = session.dispatchNextOperation();
+        auto *start = dispatched && *dispatched
+            ? std::get_if<ngc::StartProgram>(&**dispatched) : nullptr;
+        require(start, "controller-data session should dispatch its MDI epoch");
+        const auto epoch = session.beginExecutionEpoch(std::move(*start), {});
+        require(epoch.has_value(), epoch ? "" : epoch.error());
+        require(!session.setToolTable(initial),
+                "an active epoch must reject replacement of the session-owned live tool table");
+        const auto finished =
+            session.finishExecutionEpoch(ngc::ExecutionEpochOutcome::Completed);
+        require(!finished.persistenceError,
+                finished.persistenceError.value_or(""));
+
+        const auto [retained, retainedRevision] = session.toolTableSnapshot();
+        require(retained == calibrated && retainedRevision == initialRevision + 1,
+                "epoch completion should retain and publish an interpreter-mutated live tool table");
+        ngc::ToolTable storedTools;
+        require(storedTools.load(toolPath).has_value() && storedTools == calibrated,
+                "epoch completion should persist the session-owned complete tool table");
+        const auto storedParameters = ngc::readFile(parameterPath);
+        require(storedParameters.has_value(),
+                storedParameters ? "" : storedParameters.error().what());
+        require(storedParameters->find("\n5220 9\n") != std::string::npos,
+                "epoch completion should persist the session-owned canonical parameter bank");
+
+        require(session.queueProgram(ngc::StartProgram {
+                    .programs = {{"G91\n", "<MDI>"}},
+                    .preserveState = true,
+                    .activity = ngc::MachineActivity::Mdi,
+                }),
+                "the same session should admit a later MDI epoch");
+        dispatched = session.dispatchNextOperation();
+        start = dispatched && *dispatched
+            ? std::get_if<ngc::StartProgram>(&**dispatched) : nullptr;
+        require(start, "the same session should dispatch its later MDI epoch");
+        require(session.beginExecutionEpoch(std::move(*start), {}).has_value(),
+                "the later MDI epoch should reuse session-owned controller data");
+        const auto stopped =
+            session.finishExecutionEpoch(ngc::ExecutionEpochOutcome::Stopped);
+        require(!stopped.persistenceError
+                    && session.toolTableSnapshot().first == calibrated
+                    && session.toolTableSnapshot().second == retainedRevision,
+                "a later stopped epoch should retain the same table without a false revision");
+        require(session.powerOff(), "controller-data session should power off");
+
+        const auto blockerPath = root / "ngc-session-controller-store-blocker";
+        std::filesystem::remove(blockerPath);
+        {
+            std::ofstream blocker(blockerPath, std::ios::binary | std::ios::trunc);
+            blocker << "not a directory";
+        }
+        require(session.setToolTableStorePath(blockerPath / "tools.txt").has_value(),
+                "an idle session should accept a replacement tool-table store path");
+        auto failedMutation = calibrated;
+        tool = failedMutation.get(1);
+        require(tool.has_value(), "failed-persistence fixture tool should exist");
+        tool->z = 4.5;
+        failedMutation.set(1, *tool);
+        session.interpreter().machine().toolTable() = failedMutation;
+        require(session.powerOn(), "failed-persistence session should power on");
+        require(session.queueProgram(ngc::StartProgram {
+                    .programs = {{"G90\n", "<MDI>"}},
+                    .preserveState = true,
+                    .activity = ngc::MachineActivity::Mdi,
+                }),
+                "failed-persistence session should admit an MDI epoch");
+        dispatched = session.dispatchNextOperation();
+        start = dispatched && *dispatched
+            ? std::get_if<ngc::StartProgram>(&**dispatched) : nullptr;
+        require(start, "failed-persistence session should dispatch its MDI epoch");
+        require(session.beginExecutionEpoch(std::move(*start), {}).has_value(),
+                "failed-persistence MDI epoch should begin");
+        const auto failed =
+            session.finishExecutionEpoch(ngc::ExecutionEpochOutcome::Failed);
+        require(failed.persistenceError.has_value(),
+                "a terminal epoch must surface session-owned tool-table persistence failure");
+        require(session.toolTableSnapshot().first == failedMutation,
+                "persistence failure must not discard the session-owned live tool table");
+        require(session.powerOff(), "failed-persistence session should power off");
+
+        std::filesystem::remove(parameterPath);
+        std::filesystem::remove(toolPath);
+        std::filesystem::remove(blockerPath);
     }
 
     void testSimulationSnapshotExposesMachineSessionState() {
@@ -6685,6 +6806,7 @@ int main() {
         testPersistentParameterFilesAreAtomicAndIsolated();
         testSessionCommandQueueIsBoundedAndOrdered();
         testMachineSessionOwnsPowerActivityAndExecutionEpoch();
+        testMachineSessionOwnsControllerDataPersistence();
         testSimulationSnapshotExposesMachineSessionState();
         testInProcessSimulationRuntimePersistsAcrossTimedEpochs();
         testHomingControllerOwnsBackendNeutralSequence();

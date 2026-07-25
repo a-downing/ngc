@@ -2,6 +2,8 @@
 
 #include <stdexcept>
 
+#include "memory/ParameterStore.h"
+
 namespace ngc {
     SessionCommandQueue::SessionCommandQueue(const std::size_t capacity) : m_capacity(capacity) {
         if (capacity == 0) {
@@ -155,7 +157,8 @@ namespace ngc {
     MachineSession::MachineSession(const Machine::Unit unit, const InterpretationMode mode,
                                    BackendRuntime &runtime, const TrajectoryLimits &limits,
                                    GeometryStreamPolicy geometryPolicy)
-        : m_interpreter(unit, mode),
+        : m_unit(unit),
+          m_interpreter(unit, mode),
           m_geometryPolicy(std::move(geometryPolicy)),
           m_runtime(runtime),
           m_backend(runtime.endpoint()),
@@ -164,7 +167,7 @@ namespace ngc {
           m_limits(limits) { }
 
     MachineSession::~MachineSession() {
-        (void)finishExecutionEpoch();
+        (void)finishExecutionEpoch(ExecutionEpochOutcome::Abandoned);
         m_coordinator.commands().clear();
         m_coordinator.finishActivity();
         (void)powerOff();
@@ -349,7 +352,7 @@ namespace ngc {
     }
 
     std::expected<GeometryEpoch, std::string> MachineSession::beginExecutionEpoch(
-        StartProgram start, ToolTable tools, const position_t &startingPosition) {
+        StartProgram start, const position_t &startingPosition) {
         if (executionEpochActive()) {
             return std::unexpected("a program or MDI execution epoch is already active");
         }
@@ -365,7 +368,6 @@ namespace ngc {
         }
 
         m_interpreter.setPrograms(start.programs);
-        m_interpreter.machine().toolTable() = std::move(tools);
         m_interpreter.compile([](const auto &callback) { callback(); });
         if (start.preserveState) {
             m_interpreter.beginContinuation();
@@ -396,7 +398,7 @@ namespace ngc {
         return epoch;
     }
 
-    GeometryStreamDiagnostics MachineSession::finishExecutionEpoch() {
+    ExecutionEpochFinish MachineSession::finishExecutionEpoch(const ExecutionEpochOutcome outcome) {
         m_geometryCancelled.store(true, std::memory_order_release);
         m_interpreter.requestStop();
         m_geometryForward.notifyAll();
@@ -405,9 +407,9 @@ namespace ngc {
             m_geometryThread.join();
         }
 
-        GeometryStreamDiagnostics diagnostics;
+        ExecutionEpochFinish result;
         if (m_geometryProducer) {
-            diagnostics = m_geometryProducer->diagnostics();
+            result.diagnostics = m_geometryProducer->diagnostics();
         }
         m_geometryProducer.reset();
         m_programExecution.finish();
@@ -420,7 +422,134 @@ namespace ngc {
             m_coordinator.finishActivity();
         }
 
-        return diagnostics;
+        if (outcome != ExecutionEpochOutcome::Abandoned) {
+            if (auto persisted = persistToolTableAtBoundary(); !persisted) {
+                result.persistenceError = persisted.error();
+            }
+        }
+        if (outcome == ExecutionEpochOutcome::Completed) {
+            if (auto persisted = persistParametersAtBoundary();
+                !persisted && !result.persistenceError) {
+                result.persistenceError = persisted.error();
+            }
+        }
+
+        return result;
+    }
+
+    bool MachineSession::controllerDataMutable() const noexcept {
+        return !executionEpochActive()
+            && m_coordinator.activity() == MachineActivity::Idle
+            && m_coordinator.commands().empty();
+    }
+
+    bool MachineSession::setToolTable(const ToolTable &tools) {
+        if (!controllerDataMutable()) {
+            return false;
+        }
+
+        m_interpreter.machine().toolTable() = tools;
+        m_observedToolTable = tools;
+        m_toolTableInitialized = true;
+        ++m_toolTableRevision;
+
+        return true;
+    }
+
+    bool MachineSession::toolTableInitialized() const noexcept {
+        return m_toolTableInitialized;
+    }
+
+    ToolTable MachineSession::toolTable() const {
+        return m_interpreter.machine().toolTable();
+    }
+
+    std::pair<ToolTable, std::uint64_t> MachineSession::toolTableSnapshot() const {
+        return {m_interpreter.machine().toolTable(), m_toolTableRevision};
+    }
+
+    std::expected<void, std::string> MachineSession::setToolTableStorePath(
+        const std::filesystem::path &path) {
+        if (!controllerDataMutable()) {
+            return std::unexpected(
+                "cannot configure the tool-table store while motion owns the machine");
+        }
+        m_toolTableStorePath = path;
+
+        return {};
+    }
+
+    std::expected<void, std::string> MachineSession::saveToolTable(
+        const std::filesystem::path &path) const {
+        if (!controllerDataMutable()) {
+            return std::unexpected("cannot save the tool table while motion owns the machine");
+        }
+
+        return m_interpreter.machine().toolTable().save(path);
+    }
+
+    std::expected<void, std::string> MachineSession::setPersistentParameterStorePath(
+        const std::filesystem::path &path) {
+        if (!controllerDataMutable()) {
+            return std::unexpected(
+                "cannot configure persistent parameters while motion owns the machine");
+        }
+        m_parameterStorePath = path;
+
+        return {};
+    }
+
+    std::expected<void, std::string> MachineSession::loadPersistentParameters(
+        const std::filesystem::path &path) {
+        if (!controllerDataMutable()) {
+            return std::unexpected(
+                "cannot load persistent parameters while motion owns the machine");
+        }
+
+        auto loaded = ngc::loadPersistentParameters(
+            path, m_unit, m_interpreter.machine().memory());
+        if (loaded) {
+            m_parameterStorePath = path;
+            m_interpreter.machine().beginProgramRun();
+        }
+
+        return loaded;
+    }
+
+    std::expected<void, std::string> MachineSession::savePersistentParameters(
+        const std::filesystem::path &path) const {
+        if (!controllerDataMutable()) {
+            return std::unexpected(
+                "cannot save persistent parameters while motion owns the machine");
+        }
+
+        return ngc::savePersistentParameters(
+            path, m_unit, m_interpreter.machine().memory());
+    }
+
+    std::expected<void, std::string> MachineSession::persistParametersAtBoundary() const {
+        if (!m_parameterStorePath) {
+            return {};
+        }
+
+        return ngc::savePersistentParameters(
+            *m_parameterStorePath, m_unit, m_interpreter.machine().memory());
+    }
+
+    std::expected<void, std::string> MachineSession::persistToolTableAtBoundary() {
+        const auto &updated = m_interpreter.machine().toolTable();
+        if (m_toolTableInitialized && updated == m_observedToolTable) {
+            return {};
+        }
+
+        m_observedToolTable = updated;
+        m_toolTableInitialized = true;
+        ++m_toolTableRevision;
+        if (!m_toolTableStorePath) {
+            return {};
+        }
+
+        return updated.save(*m_toolTableStorePath);
     }
 
     void MachineSession::configureHoming(std::vector<AxisConfiguration> axes,
