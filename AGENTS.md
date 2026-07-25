@@ -65,11 +65,13 @@ The Phase-5 session foundation defines explicit backend-neutral power and
 activity state, `MachineSessionSnapshot`, optional Simulation diagnostics, and a
 bounded owning `SessionCommand` queue. `MachineSession` owns the interpreter,
 prepared-geometry producer thread and channels, trajectory driver, presentation
-tracker, execution-epoch counter, and `ExecutionCoordinator`. The
+tracker, execution-epoch counter, backend-neutral `HomingController`, homed-joint
+state, and `ExecutionCoordinator`. The
 `SimulationWorker` compatibility facade queues program and homing starts,
 jogging controls, feed hold, Resume, and Stop through that boundary; it still
-owns the Simulation runtime servicing loop, persistence boundaries, homing,
-jogging, and remaining operation coordination.
+owns the Simulation runtime servicing callbacks, persistence boundaries,
+jogging, and remaining operation coordination. Synthetic homing input policy and
+service-clock advancement remain in `InProcessSimulationRuntime`.
 During timed program epochs, the facade's dedicated snapshot service is the
 sole consumer of backend execution snapshots and maintains a latest-value NRT
 observation independently of geometry and trajectory-planning work. GUI

@@ -17,6 +17,7 @@
 
 #include "evaluator/InterpreterSession.h"
 #include "machine/GeometryStreamProducer.h"
+#include "machine/HomingController.h"
 #include "machine/MotionBackend.h"
 #include "machine/PreparedTrajectoryExecutionDriver.h"
 #include "machine/PresentationTracker.h"
@@ -152,6 +153,13 @@ namespace ngc {
         [[nodiscard]] std::expected<GeometryEpoch, std::string> beginExecutionEpoch(
             StartProgram start, ToolTable tools, const position_t &startingPosition);
         [[nodiscard]] GeometryStreamDiagnostics finishExecutionEpoch();
+        void configureHoming(std::vector<AxisConfiguration> axes,
+                             std::vector<JointConfiguration> joints,
+                             HomingConfiguration homing);
+        [[nodiscard]] bool homingAvailable() const noexcept;
+        [[nodiscard]] std::expected<HomingResult, std::string> runHoming(
+            const position_t &startingPosition, const HomingRuntimeCallbacks &callbacks);
+        [[nodiscard]] JointMask homedJoints() const noexcept;
         void requestGeometryStop();
         [[nodiscard]] bool executionEpochActive() const noexcept;
         [[nodiscard]] GeometryEpoch nextEpoch() noexcept;
@@ -181,8 +189,11 @@ namespace ngc {
         std::atomic<bool> m_geometryCancelled { false };
         std::unique_ptr<GeometryStreamProducer> m_geometryProducer;
         std::thread m_geometryThread;
+        MotionBackend &m_backend;
         PreparedTrajectoryExecutionDriver m_driver;
         PresentationTracker m_presentationTracker;
+        std::unique_ptr<HomingController> m_homingController;
+        JointMask m_homedJoints = 0;
         ExecutionCoordinator m_coordinator;
         TrajectoryLimits m_limits;
         GeometryEpoch m_nextEpoch = 1;

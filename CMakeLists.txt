@@ -35,6 +35,7 @@ add_subdirectory(path_tempo)
 
 add_library(ngc_core STATIC
         src/ArcInterpolation.cpp
+        src/HomingController.cpp
         src/InfiniteJerkTrajectoryTime.cpp
         src/InProcessSimulationRuntime.cpp
         src/MachineSession.cpp

@@ -23,6 +23,7 @@
 #include "machine/Machine.h"
 #include "machine/MachineConfiguration.h"
 #include "machine/ArcInterpolation.h"
+#include "machine/HomingController.h"
 #include "machine/InProcessSimulationRuntime.h"
 #include "machine/MachineSession.h"
 #include "machine/TrajectoryCompiler.h"
@@ -665,6 +666,86 @@ final_move_together = true
                 "persistent Simulation scheduler should execute a later epoch");
         runtime.endTimedExecution();
         runtime.stop();
+    }
+
+    void testHomingControllerOwnsBackendNeutralSequence() {
+        const auto configuration = fixtureMachineConfiguration();
+        require(configuration.has_value(), configuration ? "" : configuration.error());
+        ngc::InProcessSimulationRuntime runtime(*configuration);
+        runtime.setTickMultiplier(1000);
+        ngc::HomingController controller(
+            configuration->axes, configuration->joints, configuration->homing,
+            runtime.endpoint());
+        const ngc::HomingRuntimeCallbacks callbacks {
+            .stopRequested = [] {
+                return false;
+            },
+            .prepareTriggeredMove = [&](const ngc::TriggeredJointMove &move) {
+                for (const auto &trigger : move.triggers) {
+                    const auto joint = std::ranges::find(
+                        configuration->joints, trigger.joint,
+                        &ngc::JointConfiguration::id);
+                    if (joint == configuration->joints.end()) {
+                        return false;
+                    }
+                    const auto position =
+                        joint->homing.switchPosition * joint->coordinateScale;
+                    if (!runtime.configureSyntheticJointInput(
+                            move.moveId, trigger.joint, position)) {
+                        return false;
+                    }
+                }
+
+                return true;
+            },
+            .serviceImmediate = [&] {
+                runtime.advanceImmediate(0.0);
+            },
+            .advanceServiceMotionPeriod = [&] {
+                return runtime.advanceServiceMotionPeriod();
+            },
+            .waitForServiceMotion = [] { },
+            .observe = {},
+        };
+        const ngc::position_t startingPosition {
+            6.0, 6.0, -6.0, 0.0, 0.0, 0.0,
+        };
+
+        const auto homing = controller.run(1, startingPosition, callbacks);
+        require(homing.has_value(), homing ? "" : homing.error());
+        require(homing->outcome == ngc::HomingOutcome::Completed,
+                "backend-neutral homing controller should complete its sequence");
+        ngc::JointMask configuredJoints = 0;
+        for (const auto &joint : configuration->joints) {
+            configuredJoints |= ngc::JointMask {1} << joint.id;
+        }
+        require(homing->homedJoints == configuredJoints,
+                "homing controller should mark every completed configured joint homed");
+        for (const auto &axis : configuration->axes) {
+            double expected = 0.0;
+            for (const auto id : axis.joints) {
+                const auto joint = std::ranges::find(
+                    configuration->joints, id, &ngc::JointConfiguration::id);
+                require(joint != configuration->joints.end(),
+                        "homing-controller fixture joint should exist");
+                expected += joint->homing.homePosition;
+            }
+            expected /= static_cast<double>(axis.joints.size());
+            const auto actual = [&] {
+                switch (axis.axis) {
+                    case ngc::Machine::Axis::X: return homing->observation.machinePosition.x;
+                    case ngc::Machine::Axis::Y: return homing->observation.machinePosition.y;
+                    case ngc::Machine::Axis::Z: return homing->observation.machinePosition.z;
+                    case ngc::Machine::Axis::A: return homing->observation.machinePosition.a;
+                    case ngc::Machine::Axis::B: return homing->observation.machinePosition.b;
+                    case ngc::Machine::Axis::C: return homing->observation.machinePosition.c;
+                }
+
+                return 0.0;
+            }();
+            requireNear(actual, expected,
+                        "homing controller should finish each axis at configured home");
+        }
     }
 
     void testToolTableLoadsFinalLineWithoutNewline() {
@@ -6382,6 +6463,7 @@ int main() {
         testMachineSessionOwnsPowerActivityAndExecutionEpoch();
         testSimulationSnapshotExposesMachineSessionState();
         testInProcessSimulationRuntimePersistsAcrossTimedEpochs();
+        testHomingControllerOwnsBackendNeutralSequence();
         testSimulationPersistsCoordinateSystemAtCompletion();
         testToolTableLoadsFinalLineWithoutNewline();
         testToolTableRejectsDuplicateToolNumbers();

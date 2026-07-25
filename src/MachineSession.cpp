@@ -122,6 +122,7 @@ namespace ngc {
                                    GeometryStreamPolicy geometryPolicy)
         : m_interpreter(unit, mode),
           m_geometryPolicy(std::move(geometryPolicy)),
+          m_backend(backend),
           m_driver(backend, m_geometryForward, m_geometryFeedback, m_geometryCancelled, limits),
           m_limits(limits) { }
 
@@ -208,6 +209,42 @@ namespace ngc {
         while (m_geometryFeedback.tryPop(feedback)) { }
 
         return diagnostics;
+    }
+
+    void MachineSession::configureHoming(std::vector<AxisConfiguration> axes,
+                                         std::vector<JointConfiguration> joints,
+                                         HomingConfiguration homing) {
+        m_homingController = std::make_unique<HomingController>(
+            std::move(axes), std::move(joints), std::move(homing), m_backend);
+    }
+
+    bool MachineSession::homingAvailable() const noexcept {
+        return m_homingController && m_homingController->available();
+    }
+
+    std::expected<HomingResult, std::string> MachineSession::runHoming(
+        const position_t &startingPosition, const HomingRuntimeCallbacks &callbacks) {
+        if (!m_homingController) {
+            return std::unexpected("homing is not configured");
+        }
+        if (m_coordinator.activity() != MachineActivity::Homing) {
+            return std::unexpected("homing does not own the machine session");
+        }
+
+        const auto homing = m_homingController->run(nextEpoch(), startingPosition, callbacks);
+        if (homing) {
+            m_interpreter.machine().synchronizePosition(homing->observation.machinePosition);
+            if (homing->outcome == HomingOutcome::Completed) {
+                m_homedJoints = homing->homedJoints;
+            }
+        }
+        m_coordinator.finishActivity();
+
+        return homing;
+    }
+
+    JointMask MachineSession::homedJoints() const noexcept {
+        return m_homedJoints;
     }
 
     void MachineSession::requestGeometryStop() {

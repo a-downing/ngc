@@ -74,10 +74,8 @@ class SimulationWorker {
     std::optional<ngc::RequestId> m_pendingFeedResumeRequest;
     std::optional<ngc::RequestId> m_pendingControlledStopRequest;
     std::optional<ngc::JogId> m_activeJog;
-    ngc::JointMask m_homedJoints = 0;
     std::vector<ngc::AxisConfiguration> m_axes;
     std::vector<ngc::JointConfiguration> m_joints;
-    ngc::HomingConfiguration m_homing;
     std::uint32_t m_tickMultiplier = 1;
     ngc::RequestId m_nextFeedHoldRequest = ngc::RequestId { 1 } << 63;
 
@@ -126,10 +124,12 @@ public:
                            m_runtime.endpoint(), configuration.trajectory,
                            geometryPolicy(configuration.trajectory)),
           m_limits(configuration.trajectory),
-          m_axes(configuration.axes), m_joints(configuration.joints), m_homing(configuration.homing),
+          m_axes(configuration.axes), m_joints(configuration.joints),
           m_tickMultiplier(1) {
         copyRuntimeTimingSnapshot();
         m_machineSession.presentationTracker().reset(sessionPresentation());
+        m_machineSession.configureHoming(
+            configuration.axes, configuration.joints, configuration.homing);
         m_snapshot.machinePosition = { 6.0, 6.0, -6.0, 0.0, 0.0, 0.0 };
         clearActiveTool();
         m_runtime.start();
@@ -203,7 +203,7 @@ public:
 
     bool home() {
         std::scoped_lock lock(m_mutex);
-        if (motionOwnedOrQueued() || m_joints.empty() || m_homing.groups.empty()) {
+        if (motionOwnedOrQueued() || !m_machineSession.homingAvailable()) {
             return false;
         }
         if (!m_machineSession.coordinator().beginActivity(ngc::MachineActivity::Homing)) {
@@ -228,7 +228,7 @@ public:
 
     bool homingAvailable() const {
         std::scoped_lock lock(m_mutex);
-        return !m_joints.empty() && !m_homing.groups.empty();
+        return m_machineSession.homingAvailable();
     }
 
     bool startJog(const ngc::ControlRequest &request) {
@@ -883,7 +883,7 @@ private:
         m_machineSession.presentationTracker().clearActiveTool();
     }
 
-    void applyHomingBackendSnapshot(const ngc::ExecutionSnapshot &backend) {
+    void applyServiceBackendSnapshot(const ngc::ExecutionSnapshot &backend) {
         m_snapshot.joints = backend.commandedJoints;
         for(const auto &axis : m_axes) {
             double sum = 0.0;
@@ -902,65 +902,7 @@ private:
         clearActiveTool();
     }
 
-    bool homingMayContinue() {
-        std::unique_lock lock(m_mutex);
-        while (auto command = m_machineSession.coordinator().commands().tryPop()) {
-            if (std::holds_alternative<ngc::Stop>(*command)) {
-                m_stop = true;
-            }
-        }
-        if (m_join) {
-            m_stop = true;
-        }
-        if (m_stop && !m_controlledStopInProgress && !m_controlledStopCompleted) {
-            const auto request = m_nextFeedHoldRequest++;
-            if (!submitHomingControl(ngc::ControlledStopRequest { request })) {
-                m_snapshot.status = ngc::SimulationStatus::Error;
-                m_snapshot.activity = ngc::SimulationActivity::Idle;
-                m_snapshot.error =
-                    "motion backend control channel is full while stopping homing";
-                m_running = false;
-                return false;
-            }
-            m_pendingControlledStopRequest = request;
-            m_controlledStopInProgress = true;
-            m_snapshot.status = ngc::SimulationStatus::Holding;
-        }
-        while(m_paused && !m_stop && !m_join && m_machineSession.coordinator().commands().empty()) {
-            m_snapshot.status = ngc::SimulationStatus::Paused;
-            m_cv.wait(lock, [&] {
-                return !m_paused || m_stop || m_join
-                    || !m_machineSession.coordinator().commands().empty();
-            });
-        }
-        if(m_controlledStopCompleted) {
-            m_stop = false;
-            m_controlledStopCompleted = false;
-            m_running = false;
-            m_snapshot.status = ngc::SimulationStatus::Stopped;
-            m_snapshot.activity = ngc::SimulationActivity::Idle;
-            m_snapshot.hasActiveMotion = false;
-            return false;
-        }
-        m_snapshot.status = ngc::SimulationStatus::Running;
-        return true;
-    }
-
-    void failHoming(const std::string &message) {
-        std::scoped_lock lock(m_mutex);
-        m_snapshot.status = ngc::SimulationStatus::Error;
-        m_snapshot.activity = ngc::SimulationActivity::Idle;
-        m_snapshot.error = message;
-        m_snapshot.hasActiveMotion = false;
-        m_running = false;
-    }
-
-    bool homingAlreadyEnded() const {
-        std::scoped_lock lock(m_mutex);
-        return !m_running;
-    }
-
-    bool submitHomingControl(const ngc::ControlRequest &request) {
+    bool submitServiceControl(const ngc::ControlRequest &request) {
         if (m_runtime.endpoint().trySubmit(request) != ngc::SubmitResult::Submitted) {
             return false;
         }
@@ -974,74 +916,16 @@ private:
         ngc::ExecutionSnapshot backendSnapshot;
         while (m_runtime.endpoint().tryTakeSnapshot(backendSnapshot)) {
             std::scoped_lock lock(m_mutex);
-            applyHomingBackendSnapshot(backendSnapshot);
+            applyServiceBackendSnapshot(backendSnapshot);
         }
         std::scoped_lock lock(m_mutex);
         m_snapshot.servoTicks += ticks;
     }
 
-    std::optional<ngc::TriggeredJointMoveCompleted> executeHomingMove(
-        const ngc::TriggeredJointMove &move,
-        const std::vector<std::pair<ngc::JointId, double>> &transitions,
-        ngc::RequestId &requestId) {
-        ngc::ExecutionEvent discarded;
-        while (m_runtime.endpoint().tryTakeEvent(discarded)) { }
-        for (const auto &[joint, position] : transitions) {
-            if (!m_runtime.configureSyntheticJointInput(move.moveId, joint, position)) {
-                return std::nullopt;
-            }
-        }
-        if (m_runtime.endpoint().tryPublish(ngc::ExecutionItem { move })
-            != ngc::PublishResult::Published) {
-            return std::nullopt;
-        }
-        if(!submitHomingControl(ngc::ResumeRequest { requestId++, move.epoch })) return std::nullopt;
-
-        for(std::size_t guard = 0; guard < 10000000; ++guard) {
-            if(!homingMayContinue()) return std::nullopt;
-            advanceServiceMotionPeriod();
-            ngc::ExecutionEvent event;
-            while (m_runtime.endpoint().tryTakeEvent(event)) {
-                if(const auto *completed = std::get_if<ngc::TriggeredJointMoveCompleted>(&event)) {
-                    if(completed->move == move.moveId) {
-                        if (completed->status == ngc::TriggeredMoveStatus::Aborted) {
-                            std::scoped_lock lock(m_mutex);
-                            m_pendingControlledStopRequest.reset();
-                            m_controlledStopInProgress = false;
-                            m_controlledStopCompleted = true;
-                            m_running = false;
-                            m_snapshot.status = ngc::SimulationStatus::Stopped;
-                            m_snapshot.activity = ngc::SimulationActivity::Idle;
-                            m_snapshot.hasActiveMotion = false;
-                            m_machineSession.interpreter().machine().synchronizePosition(
-                                m_snapshot.machinePosition);
-                        }
-                        return *completed;
-                    }
-                }
-                if (const auto *completed = std::get_if<ngc::RequestCompleted>(&event)) {
-                    if (m_pendingControlledStopRequest
-                        && completed->request == *m_pendingControlledStopRequest
-                        && !completed->succeeded) {
-                        failHoming("motion backend rejected the controlled homing stop");
-                        return std::nullopt;
-                    }
-                }
-                if(const auto *fault = std::get_if<ngc::BackendFault>(&event)) {
-                    failHoming("mock homing backend fault " + std::to_string(fault->code));
-                    return std::nullopt;
-                }
-            }
-            std::this_thread::sleep_for(
-                std::chrono::duration<double>(m_runtime.schedulerPeriod()));
-        }
-        return std::nullopt;
-    }
-
-    bool setHomingJointPositions(const ngc::EpochId epoch, const ngc::JointMask joints,
-                                 const ngc::JointVector &positions, ngc::RequestId &requestId) {
+    bool setServiceJointPositions(const ngc::EpochId epoch, const ngc::JointMask joints,
+                                  const ngc::JointVector &positions, ngc::RequestId &requestId) {
         const auto id = requestId++;
-        if(!submitHomingControl(ngc::SetJointPositionRequest { id, joints, positions })) return false;
+        if(!submitServiceControl(ngc::SetJointPositionRequest { id, joints, positions })) return false;
         bool succeeded = false;
         ngc::ExecutionEvent event;
         while (m_runtime.endpoint().tryTakeEvent(event))
@@ -1050,166 +934,102 @@ private:
         ngc::ExecutionSnapshot backendSnapshot;
         while (m_runtime.endpoint().tryTakeSnapshot(backendSnapshot)) {
             std::scoped_lock lock(m_mutex);
-            applyHomingBackendSnapshot(backendSnapshot);
+            applyServiceBackendSnapshot(backendSnapshot);
         }
         (void)epoch;
         return succeeded;
     }
 
-    ngc::TriggeredJointMove makeHomingMove(const ngc::HomingGroupConfiguration &group,
-                                           const ngc::EpochId epoch, ngc::ChunkId &chunk,
-                                           ngc::BranchSequence &branch, ngc::TriggeredMoveId &moveId,
-                                           const bool triggered, const bool slow, const bool backoff) const {
-        ngc::TriggeredJointMove move;
-        move.epoch = epoch;
-        move.id = chunk++;
-        move.predecessorBranch = branch;
-        move.branch = ++branch;
-        move.moveId = moveId++;
-        move.targetMode = backoff || triggered ? ngc::JointTargetMode::Relative
-                                               : ngc::JointTargetMode::Absolute;
-        for(const auto id : group.joints) {
-            const auto *joint = configuredJoint(id);
-            if(!joint) continue;
-            move.joints |= ngc::JointMask { 1 } << id;
-            const auto scale = joint->coordinateScale;
-            const auto searchDirection = std::copysign(1.0, joint->homing.searchVelocity * scale);
-            const auto range = (joint->maximum - joint->minimum) * std::abs(scale);
-            if(backoff)
-                move.target[id] = -searchDirection * joint->homing.backoffDistance * std::abs(scale);
-            else if(triggered)
-                move.target[id] = searchDirection * (slow
-                    ? std::max(2.0 * joint->homing.backoffDistance * std::abs(scale), 0.01)
-                    : range + 2.0 * joint->homing.backoffDistance * std::abs(scale));
-            else
-                move.target[id] = joint->homing.homePosition * scale;
-            const auto phaseVelocity = backoff ? std::abs(joint->homing.searchVelocity * scale)
-                : slow ? std::abs(joint->homing.latchVelocity * scale)
-                : triggered ? std::abs(joint->homing.searchVelocity * scale)
-                : (joint->homing.finalVelocity == 0.0 ? joint->maxVelocity
-                                                      : std::abs(joint->homing.finalVelocity * scale));
-            move.limits.velocity[id] = std::min(joint->maxVelocity, phaseVelocity);
-            move.limits.acceleration[id] = joint->maxAcceleration;
-            move.limits.jerk[id] = joint->maxJerk;
-            if(triggered)
-                (void)move.triggers.push({ id, joint->homing.input, joint->homing.condition,
-                                           joint->homing.debounce });
-        }
-        move.triggerRequired = triggered;
-        return move;
-    }
-
-    void runHoming() {
-        ActivityCompletion activityCompletion(m_machineSession.coordinator());
-        const auto epoch = m_machineSession.nextEpoch();
-        ngc::RequestId requestId = 1;
-        ngc::ChunkId chunk = 1;
-        ngc::BranchSequence branch = 0;
-        ngc::TriggeredMoveId moveId = 1;
-        ngc::JointMask allJoints = 0;
-        ngc::JointVector initial;
+    void runSessionHoming() {
+        ngc::position_t startingPosition;
         {
             std::scoped_lock lock(m_mutex);
+            startingPosition = m_snapshot.machinePosition;
             m_snapshot.status = ngc::SimulationStatus::Running;
             m_snapshot.activity = ngc::SimulationActivity::Homing;
             m_snapshot.error.clear();
             m_snapshot.servoTicks = 0;
             clearPresentation();
-            for(const auto &joint : m_joints) {
-                allJoints |= ngc::JointMask { 1 } << joint.id;
-                initial[joint.id] = axisComponent(m_snapshot.machinePosition, joint.axis)
-                    * joint.coordinateScale;
-            }
             clearActiveTool();
         }
 
-        if(!submitHomingControl(ngc::ResetRequest { requestId++, epoch })
-           || !submitHomingControl(ngc::EnableRequest { requestId++ })
-           || !setHomingJointPositions(epoch, allJoints, initial, requestId)) {
-            failHoming("failed to initialize the mock backend for homing");
-            return;
-        }
-
-        for(const auto &group : m_homing.groups) {
-            std::vector<std::pair<ngc::JointId, double>> transitions;
-            for(const auto id : group.joints) {
-                const auto *joint = configuredJoint(id);
-                if(joint) transitions.emplace_back(id, joint->homing.switchPosition * joint->coordinateScale);
-            }
-
-            const auto fast = makeHomingMove(group, epoch, chunk, branch, moveId, true, false, false);
-            const auto fastResult = executeHomingMove(fast, transitions, requestId);
-            if(!fastResult || fastResult->status != ngc::TriggeredMoveStatus::Triggered) {
-                if(!homingAlreadyEnded())
-                    failHoming("fast homing search reached its travel limit before the switch");
-                return;
-            }
-
-            const auto backoff = makeHomingMove(group, epoch, chunk, branch, moveId, false, false, true);
-            auto backoffToClearance = backoff;
-            backoffToClearance.targetMode = ngc::JointTargetMode::Absolute;
-            for(const auto id : group.joints) {
-                const auto *joint = configuredJoint(id);
-                if(!joint) continue;
-                const auto searchDirection = std::copysign(
-                    1.0, joint->homing.searchVelocity * joint->coordinateScale);
-                backoffToClearance.target[id] = fastResult->triggerState.position[id]
-                    - searchDirection * joint->homing.backoffDistance * std::abs(joint->coordinateScale);
-            }
-            const auto backoffResult = executeHomingMove(backoffToClearance, {}, requestId);
-            if(!backoffResult || backoffResult->status != ngc::TriggeredMoveStatus::ReachedTarget) {
-                if(!homingAlreadyEnded()) failHoming("fixed homing backoff did not complete");
-                return;
-            }
-            for(const auto id : group.joints) {
-                const auto *joint = configuredJoint(id);
-                if(!joint) continue;
-                const auto switchPosition = joint->homing.switchPosition * joint->coordinateScale;
-                const auto searchDirection = std::copysign(
-                    1.0, joint->homing.searchVelocity * joint->coordinateScale);
-                if(searchDirection * (backoffResult->stoppedState.position[id] - switchPosition) >= 0.0) {
-                    failHoming("configured homing backoff did not clear the switch");
-                    return;
+        const ngc::HomingRuntimeCallbacks callbacks {
+            .stopRequested = [&] {
+                std::scoped_lock lock(m_mutex);
+                while (auto command = m_machineSession.coordinator().commands().tryPop()) {
+                    if (std::holds_alternative<ngc::Stop>(*command)) {
+                        m_stop = true;
+                    }
                 }
-            }
+                if (m_join) {
+                    m_stop = true;
+                }
+                if (m_stop) {
+                    m_snapshot.status = ngc::SimulationStatus::Holding;
+                }
 
-            const auto slow = makeHomingMove(group, epoch, chunk, branch, moveId, true, true, false);
-            const auto slowResult = executeHomingMove(slow, transitions, requestId);
-            if(!slowResult || slowResult->status != ngc::TriggeredMoveStatus::Triggered) {
-                if(!homingAlreadyEnded())
-                    failHoming("slow homing search reached its travel limit before the switch");
-                return;
-            }
+                return m_stop;
+            },
+            .prepareTriggeredMove = [&](const ngc::TriggeredJointMove &move) {
+                for (const auto &trigger : move.triggers) {
+                    const auto *joint = configuredJoint(trigger.joint);
+                    if (!joint) {
+                        return false;
+                    }
+                    const auto position =
+                        joint->homing.switchPosition * joint->coordinateScale;
+                    if (!m_runtime.configureSyntheticJointInput(
+                            move.moveId, trigger.joint, position)) {
+                        return false;
+                    }
+                }
 
-            auto calibrated = slowResult->stoppedState.position;
-            for(const auto id : group.joints) {
-                const auto *joint = configuredJoint(id);
-                if(!joint) continue;
-                const auto desiredSwitch = joint->homing.switchPosition * joint->coordinateScale;
-                calibrated[id] += desiredSwitch - slowResult->triggerState.position[id];
-            }
-            if(!setHomingJointPositions(epoch, slow.triggerRequired ? slow.joints : 0, calibrated, requestId)) {
-                failHoming("failed to establish joint coordinates after slow homing search");
-                return;
-            }
-
-            const auto finalMove = makeHomingMove(group, epoch, chunk, branch, moveId, false, false, false);
-            const auto finalResult = executeHomingMove(finalMove, {}, requestId);
-            if(!finalResult || finalResult->status != ngc::TriggeredMoveStatus::ReachedTarget) {
-                if(!homingAlreadyEnded())
-                    failHoming("final move to the configured home position did not complete");
-                return;
-            }
-        }
+                return true;
+            },
+            .serviceImmediate = [&] {
+                m_runtime.advanceImmediate(0.0);
+            },
+            .advanceServiceMotionPeriod = [&] {
+                return m_runtime.advanceServiceMotionPeriod();
+            },
+            .waitForServiceMotion = [&] {
+                std::this_thread::sleep_for(
+                    std::chrono::duration<double>(m_runtime.schedulerPeriod()));
+            },
+            .observe = [&](const ngc::HomingObservation &observation) {
+                std::scoped_lock lock(m_mutex);
+                m_snapshot.machinePosition = observation.machinePosition;
+                m_snapshot.joints = observation.joints;
+                m_snapshot.commandProgress = observation.commandProgress;
+                m_snapshot.hasActiveMotion = observation.hasActiveMotion;
+                m_snapshot.servoTicks = observation.servoTicks;
+                clearActiveTool();
+            },
+        };
+        const auto result =
+            m_machineSession.runHoming(startingPosition, callbacks);
 
         std::scoped_lock lock(m_mutex);
         m_running = false;
-        m_snapshot.status = ngc::SimulationStatus::Completed;
+        m_stop = false;
         m_snapshot.activity = ngc::SimulationActivity::Idle;
         m_snapshot.hasActiveMotion = false;
-        m_homedJoints = allJoints;
-        m_snapshot.homedJoints = m_homedJoints;
-        m_machineSession.interpreter().machine().synchronizePosition(m_snapshot.machinePosition);
+        if (!result) {
+            m_snapshot.status = ngc::SimulationStatus::Error;
+            m_snapshot.error = result.error();
+            return;
+        }
+
+        m_snapshot.machinePosition = result->observation.machinePosition;
+        m_snapshot.joints = result->observation.joints;
+        m_snapshot.commandProgress = result->observation.commandProgress;
+        m_snapshot.servoTicks = result->observation.servoTicks;
+        if (result->outcome == ngc::HomingOutcome::Stopped) {
+            m_snapshot.status = ngc::SimulationStatus::Stopped;
+        } else {
+            m_snapshot.homedJoints = m_machineSession.homedJoints();
+            m_snapshot.status = ngc::SimulationStatus::Completed;
+        }
         clearActiveTool();
     }
 
@@ -1238,7 +1058,7 @@ private:
             m_snapshot.activity = ngc::SimulationActivity::Jogging;
             m_snapshot.error.clear();
             m_snapshot.jogging = true;
-            m_snapshot.homedJoints = m_homedJoints;
+            m_snapshot.homedJoints = m_machineSession.homedJoints();
             for(const auto &joint : m_joints) {
                 allJoints |= ngc::JointMask { 1 } << joint.id;
                 initial[joint.id] = axisComponent(m_snapshot.machinePosition, joint.axis)
@@ -1253,9 +1073,9 @@ private:
             clearActiveTool();
         }
 
-        if(!submitHomingControl(ngc::ResetRequest { internalRequest--, epoch })
-           || !submitHomingControl(ngc::EnableRequest { internalRequest-- })
-           || !setHomingJointPositions(epoch, allJoints, initial, internalRequest)
+        if(!submitServiceControl(ngc::ResetRequest { internalRequest--, epoch })
+           || !submitServiceControl(ngc::EnableRequest { internalRequest-- })
+           || !setServiceJointPositions(epoch, allJoints, initial, internalRequest)
            || m_runtime.endpoint().trySubmit(firstRequest) != ngc::SubmitResult::Submitted) {
             failJog("failed to initialize the mock backend for jogging");
             return;
@@ -1372,7 +1192,7 @@ private:
                 m_running = true;
                 m_stop = false;
                 lock.unlock();
-                runHoming();
+                runSessionHoming();
                 continue;
             }
             if (auto *jog = std::get_if<ngc::StartJog>(&*command)) {
