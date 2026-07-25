@@ -789,20 +789,31 @@ and synthetic homing-switch preparation.
 ### Phase 6: Introduce `MachineSessionManager`
 
 Status: in progress. Standalone Simulation is application-owned through
-`MachineSessionManager`; the former `SimulationWorker` facade is removed. The
-manager exposes the available targets and generation-tagged Simulation control
-authority, and rejects selection of an unavailable Real target without
-advancing that authority. Every target-dependent manager operation validates
-that authority under its admission lock, and stale or wrong-target operations
-are rejected before changing session state or queued commands. Optional
-concurrent Real ownership, dual-session snapshots, inactive-Real draining, and
-control transfer remain future work.
+`MachineSessionManager`; the former `SimulationWorker` facade is removed.
+The Simulation execution loop and its state now live in a per-session host
+owned behind the manager's target router. The manager exposes available
+targets, generation-tagged control authority, target-routed controller data,
+and independent snapshots for every owned session. Every target-dependent
+operation and control transfer is serialized under the same admission lock.
+Stale or wrong-target operations are rejected before changing either session,
+and transfer is rejected unless both the current and destination sessions are
+stationary and idle.
+
+Tests exercise concurrent Simulation and RealRun-mode session ownership through
+an explicitly test-only in-process Real host. They prove authority advancement,
+stale-command rejection across actual transfers, independent power and tool
+tables, and one-way motion isolation. Production still exposes Real as
+unavailable: `ExternalRealtimeRuntime`, Real configuration, inactive physical
+event draining, and live physical snapshots remain future work and must never
+fall back to the in-process test host.
 
 - Support standalone Simulation with no `[real_run]` configuration.
-- Support optional Real and Simulation sessions concurrently.
-- Add active-control-target routing and visible dual-session state.
+- Support optional Real and Simulation sessions concurrently. Complete at the
+  manager ownership and test boundary; production Real construction remains.
+- Add active-control-target routing and visible dual-session state. Complete at
+  the manager API and test boundary; the GUI still has no live Real session.
 - Add generation-tagged control authority.
-- Keep inactive Real events and snapshots drained and faults visible.
+- Keep inactive physical Real events and snapshots drained and faults visible.
 
 ### Phase 7: Add in-memory Real-to-Simulation branching
 

@@ -77,11 +77,15 @@ backend-neutral program operation service step and reports normalized running,
 held, stopped, completed, or failed outcomes. It admits and dispatches queued
 program, MDI, homing, and
 jogging starts, validates their activity ownership, and releases Program/MDI
-activity when the execution epoch finishes. `MachineSessionManager` queues
-starts, feed hold, Resume, and Stop through that boundary. Every target-dependent
-manager operation requires the current generation-tagged
-`MachineControlAuthority`; stale or wrong-target commands are rejected under
-the same manager lock used for admission. `MachineSession`
+activity when the execution epoch finishes. `MachineSessionManager` owns
+per-session hosts behind a target router and queues starts, feed hold, Resume,
+and Stop through the selected boundary. Every target-dependent manager operation
+requires the current generation-tagged `MachineControlAuthority`; stale or
+wrong-target commands and unsafe control transfers are rejected under the same
+manager lock used for admission. The production application still constructs
+only Simulation; an explicitly test-only in-process RealRun-mode host exercises
+dual-session routing without making Real available or substituting for a
+physical backend. `MachineSession`
 owns homing and jogging runtime-service callback
 construction plus thread-safe live service observations. `BackendRuntime`
 provides the NRT service mechanics used by those controllers;

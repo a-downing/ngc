@@ -1031,6 +1031,109 @@ final_move_together = true
                 "joining the manager should end its powered Simulation lifetime");
     }
 
+    void testMachineSessionManagerRoutesDualSessionControl() {
+        ngc::MachineSessionManager manager(
+            ngc::MachineSessionManager::inProcessDualSessionForTesting);
+        const auto initialState = manager.state();
+        require(initialState.simulationAvailable && initialState.realAvailable,
+                "a dual-session manager should expose both independently owned sessions");
+        require(initialState.authority.target == ngc::MachineControlTarget::Simulation,
+                "a dual-session manager should initially control Simulation");
+
+        ngc::ToolTable simulationTools;
+        simulationTools.set(1, { 1, 0, 0, 1, 0, 0, 0, 0.25, "Simulation tool" });
+        require(manager.setToolTable(initialState.authority, simulationTools),
+                "Simulation controller data should be writable under Simulation authority");
+        require(manager.powerOn(initialState.authority),
+                "Simulation should power on under its initial authority");
+
+        const auto realAuthority =
+            manager.selectControlTarget(ngc::MachineControlTarget::Real);
+        require(realAuthority.has_value(),
+                realAuthority ? "" : realAuthority.error());
+        require(realAuthority->target == ngc::MachineControlTarget::Real
+                    && realAuthority->generation
+                        == initialState.authority.generation + 1,
+                "control transfer should select Real and advance the generation");
+        const auto staleSimulationPowerOff =
+            manager.powerOff(initialState.authority);
+        require(!staleSimulationPowerOff
+                    && staleSimulationPowerOff.rejection
+                        == ngc::SessionCommandRejection::StaleControlAuthority,
+                "Simulation authority should become stale immediately after transfer");
+
+        const auto afterRealTransfer = manager.snapshots();
+        require(afterRealTransfer.simulation && afterRealTransfer.real
+                    && afterRealTransfer.simulation->powerState
+                        == ngc::MachinePowerState::On
+                    && afterRealTransfer.real->powerState
+                        == ngc::MachinePowerState::Off,
+                "target transfer should retain independent session power state");
+        require(manager.powerOn(*realAuthority),
+                "Real should accept a command routed through current Real authority");
+        ngc::ToolTable realTools;
+        realTools.set(1, { 1, 0, 0, 2, 0, 0, 0, 0.5, "Real tool" });
+        require(manager.setToolTable(*realAuthority, realTools)
+                    && manager.toolTable() == realTools,
+                "controller-data access should route to the selected Real session");
+
+        const auto simulationAuthority =
+            manager.selectControlTarget(ngc::MachineControlTarget::Simulation);
+        require(simulationAuthority.has_value(),
+                simulationAuthority ? "" : simulationAuthority.error());
+        require(simulationAuthority->generation == realAuthority->generation + 1
+                    && manager.toolTable() == simulationTools,
+                "returning to Simulation should expose its unchanged isolated tool table");
+        const auto staleRealStart =
+            manager.start(*realAuthority, {{"G0 X1\n", "stale-real.ngc"}}, realTools);
+        require(!staleRealStart
+                    && staleRealStart.rejection
+                        == ngc::SessionCommandRejection::StaleControlAuthority,
+                "commands carrying prior Real authority must not reach Simulation");
+
+        require(manager.start(
+                    *simulationAuthority, {{"G0 X0.01\n", "routed-simulation.ngc"}}, simulationTools),
+                "current Simulation authority should route a program to Simulation");
+        const auto transferDuringMotion =
+            manager.selectControlTarget(ngc::MachineControlTarget::Real);
+        require(!transferDuringMotion
+                    && transferDuringMotion.error()
+                        == "control transfer requires both machine sessions to be stationary and idle",
+                "control transfer should reject while the selected session owns motion");
+        require(manager.state().authority == *simulationAuthority,
+                "a rejected transfer must not advance or change authority");
+
+        auto completed = manager.snapshot();
+        for (auto attempt = 0; attempt < 2000
+             && completed.status != ngc::SimulationStatus::Completed
+             && completed.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            completed = manager.snapshot();
+        }
+        require(completed.status == ngc::SimulationStatus::Completed,
+                completed.error.empty() ? "routed Simulation program should complete"
+                                        : completed.error);
+        const auto separated = manager.snapshots();
+        require(separated.simulation && separated.real
+                    && separated.simulation->machinePosition.x > 0.009
+                    && std::abs(separated.real->machinePosition.x) <= 1e-12,
+                "Simulation motion must not alter the concurrently owned Real session");
+
+        const auto finalRealAuthority =
+            manager.selectControlTarget(ngc::MachineControlTarget::Real);
+        require(finalRealAuthority.has_value(),
+                finalRealAuthority ? "" : finalRealAuthority.error());
+        require(manager.powerOff(*finalRealAuthority),
+                "Real should power off through final Real authority");
+        const auto finalSimulationAuthority =
+            manager.selectControlTarget(ngc::MachineControlTarget::Simulation);
+        require(finalSimulationAuthority.has_value(),
+                finalSimulationAuthority ? "" : finalSimulationAuthority.error());
+        require(manager.powerOff(*finalSimulationAuthority),
+                "Simulation should power off through final Simulation authority");
+        manager.join();
+    }
+
     void testMachineSessionManagerPublishesOwnedParameterSnapshot() {
         ngc::MachineSessionManager manager;
         const auto authority = manager.state().authority;
@@ -7263,6 +7366,7 @@ int main() {
         testMachineSessionOwnsPowerActivityAndExecutionEpoch();
         testMachineSessionOwnsControllerDataPersistence();
         testMachineSessionManagerOwnsStandaloneSimulation();
+        testMachineSessionManagerRoutesDualSessionControl();
         testMachineSessionManagerPublishesOwnedParameterSnapshot();
         testMachineSessionViewDerivesOperatorControls();
         testInProcessSimulationRuntimePersistsAcrossTimedEpochs();

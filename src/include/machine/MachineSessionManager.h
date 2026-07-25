@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <deque>
 #include <expected>
+#include <memory>
 #include <mutex>
 #include <ranges>
 #include <thread>
@@ -28,7 +29,9 @@
 
 namespace ngc {
 
-class MachineSessionManager {
+namespace detail {
+
+class InProcessMachineSession {
     static ngc::GeometryStreamPolicy geometryPolicy(const ngc::TrajectoryLimits &limits) {
         ngc::GeometryStreamPolicy result;
         result.splineVelocityLimits={
@@ -84,26 +87,34 @@ class MachineSessionManager {
     }
 
 public:
-    explicit MachineSessionManager(const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch,
+    explicit InProcessMachineSession(const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch,
                               const ngc::TrajectoryLimits limits = {},
-                              const ngc::SimulationTiming timing = {})
+                              const ngc::SimulationTiming timing = {},
+                              const MachineControlTarget target = MachineControlTarget::Simulation)
         : m_runtime(limits, timing),
-          m_machineSession(unit, ngc::InterpretationMode::Simulation, m_runtime,
+          m_machineSession(unit, target == MachineControlTarget::Simulation
+                                    ? ngc::InterpretationMode::Simulation
+                                    : ngc::InterpretationMode::RealRun, m_runtime,
                            limits, geometryPolicy(limits)),
           m_limits(limits) {
+        m_controlAuthority.target = target;
         copyRuntimeTimingSnapshot();
         m_machineSession.presentationTracker().reset(sessionPresentation());
         refreshParameterSnapshot();
-        m_thread = std::thread(&MachineSessionManager::work, this);
+        m_thread = std::thread(&InProcessMachineSession::work, this);
     }
-    explicit MachineSessionManager(const ngc::MachineConfiguration &configuration)
+    explicit InProcessMachineSession(const ngc::MachineConfiguration &configuration,
+                                     const MachineControlTarget target = MachineControlTarget::Simulation)
         : m_runtime(configuration),
-          m_machineSession(configuration.unit, ngc::InterpretationMode::Simulation,
-                           m_runtime, configuration.trajectory,
+          m_machineSession(configuration.unit,
+                           target == MachineControlTarget::Simulation
+                               ? ngc::InterpretationMode::Simulation
+                               : ngc::InterpretationMode::RealRun, m_runtime, configuration.trajectory,
                            geometryPolicy(configuration.trajectory)),
           m_limits(configuration.trajectory),
           m_axes(configuration.axes), m_joints(configuration.joints),
           m_tickMultiplier(1) {
+        m_controlAuthority.target = target;
         copyRuntimeTimingSnapshot();
         m_machineSession.presentationTracker().reset(sessionPresentation());
         m_machineSession.configureJogging(configuration.axes, configuration.joints);
@@ -111,31 +122,28 @@ public:
             configuration.axes, configuration.joints, configuration.homing);
         clearActiveTool();
         refreshParameterSnapshot();
-        m_thread = std::thread(&MachineSessionManager::work, this);
+        m_thread = std::thread(&InProcessMachineSession::work, this);
     }
-    ~MachineSessionManager() { join(); }
-    MachineSessionManager(const MachineSessionManager &) = delete;
-    MachineSessionManager &operator=(const MachineSessionManager &) = delete;
+    ~InProcessMachineSession() { join(); }
+    InProcessMachineSession(const InProcessMachineSession &) = delete;
+    InProcessMachineSession &operator=(const InProcessMachineSession &) = delete;
 
     MachineSessionManagerState state() const {
         std::scoped_lock lock(m_mutex);
 
         return {
             .authority = m_controlAuthority,
-            .simulationAvailable = true,
-            .realAvailable = false,
+            .simulationAvailable =
+                m_controlAuthority.target == MachineControlTarget::Simulation,
+            .realAvailable = m_controlAuthority.target == MachineControlTarget::Real,
         };
     }
 
     std::expected<MachineControlAuthority, std::string> selectControlTarget(
         const MachineControlTarget target) {
         std::scoped_lock lock(m_mutex);
-        if (target == MachineControlTarget::Real) {
-            return std::unexpected("the Real machine session is not configured");
-        }
         if (target != m_controlAuthority.target) {
-            m_controlAuthority.target = target;
-            ++m_controlAuthority.generation;
+            return std::unexpected("the requested target belongs to another machine session");
         }
 
         return m_controlAuthority;
@@ -1458,6 +1466,423 @@ private:
                                });
                 lock.unlock();
             }
+        }
+    }
+};
+
+}
+
+struct MachineSessionManagerSnapshots {
+    std::optional<ngc::SimulationSnapshot> simulation;
+    std::optional<ngc::MachineSessionSnapshot> real;
+};
+
+class MachineSessionManager {
+public:
+    struct InProcessDualSessionTestTag {};
+    static constexpr InProcessDualSessionTestTag inProcessDualSessionForTesting {};
+
+private:
+    mutable std::mutex m_mutex;
+    std::unique_ptr<detail::InProcessMachineSession> m_simulation;
+    std::unique_ptr<detail::InProcessMachineSession> m_real;
+    MachineControlAuthority m_controlAuthority {
+        .target = MachineControlTarget::Simulation,
+        .generation = 1,
+    };
+
+    [[nodiscard]] detail::InProcessMachineSession *sessionLocked(
+            const MachineControlTarget target) {
+        return target == MachineControlTarget::Simulation ? m_simulation.get() : m_real.get();
+    }
+
+    [[nodiscard]] const detail::InProcessMachineSession *sessionLocked(
+            const MachineControlTarget target) const {
+        return target == MachineControlTarget::Simulation ? m_simulation.get() : m_real.get();
+    }
+
+    [[nodiscard]] detail::InProcessMachineSession *controlledSessionLocked(
+            const MachineControlAuthority authority) {
+        if (authority != m_controlAuthority) {
+            return nullptr;
+        }
+
+        return sessionLocked(authority.target);
+    }
+
+    [[nodiscard]] const detail::InProcessMachineSession *controlledSessionLocked(
+            const MachineControlAuthority authority) const {
+        if (authority != m_controlAuthority) {
+            return nullptr;
+        }
+
+        return sessionLocked(authority.target);
+    }
+
+    [[nodiscard]] detail::InProcessMachineSession &controlledSessionLocked() {
+        return *sessionLocked(m_controlAuthority.target);
+    }
+
+    [[nodiscard]] const detail::InProcessMachineSession &controlledSessionLocked() const {
+        return *sessionLocked(m_controlAuthority.target);
+    }
+
+    static MachineControlAuthority localAuthority(
+            const detail::InProcessMachineSession &session) {
+        return session.state().authority;
+    }
+
+    static std::expected<void, std::string> staleControlAuthority() {
+        return std::unexpected(
+            "control has transferred or the request targets another session");
+    }
+
+public:
+    explicit MachineSessionManager(const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch,
+                                   const ngc::TrajectoryLimits limits = {},
+                                   const ngc::SimulationTiming timing = {})
+        : m_simulation(std::make_unique<detail::InProcessMachineSession>(
+              unit, limits, timing)) {}
+
+    explicit MachineSessionManager(const ngc::MachineConfiguration &configuration)
+        : m_simulation(
+              std::make_unique<detail::InProcessMachineSession>(configuration)) {}
+
+    explicit MachineSessionManager(const InProcessDualSessionTestTag,
+                                   const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch,
+                                   const ngc::TrajectoryLimits limits = {},
+                                   const ngc::SimulationTiming timing = {})
+        : m_simulation(std::make_unique<detail::InProcessMachineSession>(
+              unit, limits, timing, MachineControlTarget::Simulation)),
+          m_real(std::make_unique<detail::InProcessMachineSession>(
+              unit, limits, timing, MachineControlTarget::Real)) {}
+
+    ~MachineSessionManager() { join(); }
+    MachineSessionManager(const MachineSessionManager &) = delete;
+    MachineSessionManager &operator=(const MachineSessionManager &) = delete;
+
+    MachineSessionManagerState state() const {
+        std::scoped_lock lock(m_mutex);
+
+        return {
+            .authority = m_controlAuthority,
+            .simulationAvailable = m_simulation != nullptr,
+            .realAvailable = m_real != nullptr,
+        };
+    }
+
+    std::expected<MachineControlAuthority, std::string> selectControlTarget(
+            const MachineControlTarget target) {
+        std::scoped_lock lock(m_mutex);
+        auto *targetSession = sessionLocked(target);
+        if (!targetSession) {
+            return std::unexpected(target == MachineControlTarget::Real
+                ? "the Real machine session is not configured"
+                : "the Simulation machine session is not configured");
+        }
+        if (target == m_controlAuthority.target) {
+            return m_controlAuthority;
+        }
+        if (!controlledSessionLocked().controllerDataMutable()
+            || !targetSession->controllerDataMutable()) {
+            return std::unexpected(
+                "control transfer requires both machine sessions to be stationary and idle");
+        }
+
+        m_controlAuthority.target = target;
+        ++m_controlAuthority.generation;
+
+        return m_controlAuthority;
+    }
+
+    bool hasControlAuthority(const MachineControlAuthority authority) const {
+        std::scoped_lock lock(m_mutex);
+
+        return authority == m_controlAuthority;
+    }
+
+    SessionCommandResult powerOn(const MachineControlAuthority authority) {
+        std::scoped_lock lock(m_mutex);
+        auto *session = controlledSessionLocked(authority);
+
+        return session ? session->powerOn(localAuthority(*session))
+                       : SessionCommandResult {
+                           SessionCommandRejection::StaleControlAuthority };
+    }
+
+    SessionCommandResult powerOff(const MachineControlAuthority authority) {
+        std::scoped_lock lock(m_mutex);
+        auto *session = controlledSessionLocked(authority);
+
+        return session ? session->powerOff(localAuthority(*session))
+                       : SessionCommandResult {
+                           SessionCommandRejection::StaleControlAuthority };
+    }
+
+    SessionCommandResult start(const MachineControlAuthority authority,
+                               const std::vector<std::tuple<std::string, std::string>> &programs,
+                               const ngc::ToolTable &tools, const bool preserveState = false) {
+        std::scoped_lock lock(m_mutex);
+        auto *session = controlledSessionLocked(authority);
+
+        return session
+            ? session->start(localAuthority(*session), programs, tools, preserveState)
+            : SessionCommandResult { SessionCommandRejection::StaleControlAuthority };
+    }
+
+    SessionCommandResult home(const MachineControlAuthority authority) {
+        std::scoped_lock lock(m_mutex);
+        auto *session = controlledSessionLocked(authority);
+
+        return session ? session->home(localAuthority(*session))
+                       : SessionCommandResult {
+                           SessionCommandRejection::StaleControlAuthority };
+    }
+
+    bool homingAvailable() const {
+        std::scoped_lock lock(m_mutex);
+
+        return controlledSessionLocked().homingAvailable();
+    }
+
+    SessionCommandResult startJog(const MachineControlAuthority authority,
+                                  const ngc::ControlRequest &request) {
+        std::scoped_lock lock(m_mutex);
+        auto *session = controlledSessionLocked(authority);
+
+        return session ? session->startJog(localAuthority(*session), request)
+                       : SessionCommandResult {
+                           SessionCommandRejection::StaleControlAuthority };
+    }
+
+    bool renewJog(const MachineControlAuthority authority, const ngc::RequestId request,
+                  const ngc::JogId jog) {
+        std::scoped_lock lock(m_mutex);
+        auto *session = controlledSessionLocked(authority);
+
+        return session && session->renewJog(localAuthority(*session), request, jog);
+    }
+
+    bool setJogVelocity(const MachineControlAuthority authority,
+                        const ngc::SetContinuousJogVelocityRequest &request) {
+        std::scoped_lock lock(m_mutex);
+        auto *session = controlledSessionLocked(authority);
+
+        return session && session->setJogVelocity(localAuthority(*session), request);
+    }
+
+    std::expected<void, std::string> setActiveWorkCoordinate(
+            const MachineControlAuthority authority, const ngc::Machine::Axis axis,
+            const double workPosition) {
+        std::scoped_lock lock(m_mutex);
+        auto *session = controlledSessionLocked(authority);
+        if (!session) {
+            return staleControlAuthority();
+        }
+
+        return session->setActiveWorkCoordinate(
+            localAuthority(*session), axis, workPosition);
+    }
+
+    bool stopJog(const MachineControlAuthority authority, const ngc::RequestId request,
+                 const ngc::JogId jog) {
+        std::scoped_lock lock(m_mutex);
+        auto *session = controlledSessionLocked(authority);
+
+        return session && session->stopJog(localAuthority(*session), request, jog);
+    }
+
+    SessionCommandResult feedHold(const MachineControlAuthority authority) {
+        std::scoped_lock lock(m_mutex);
+        auto *session = controlledSessionLocked(authority);
+
+        return session ? session->feedHold(localAuthority(*session))
+                       : SessionCommandResult {
+                           SessionCommandRejection::StaleControlAuthority };
+    }
+
+    SessionCommandResult resume(const MachineControlAuthority authority) {
+        std::scoped_lock lock(m_mutex);
+        auto *session = controlledSessionLocked(authority);
+
+        return session ? session->resume(localAuthority(*session))
+                       : SessionCommandResult {
+                           SessionCommandRejection::StaleControlAuthority };
+    }
+
+    SessionCommandResult stop(const MachineControlAuthority authority) {
+        std::scoped_lock lock(m_mutex);
+        auto *session = controlledSessionLocked(authority);
+
+        return session ? session->stop(localAuthority(*session))
+                       : SessionCommandResult {
+                           SessionCommandRejection::StaleControlAuthority };
+    }
+
+    void setTickMultiplier(const int multiplier) {
+        std::scoped_lock lock(m_mutex);
+        controlledSessionLocked().setTickMultiplier(multiplier);
+    }
+
+    bool setSplineFitSolver(const ngc::spline_detail::SplineFitSolver solver) {
+        std::scoped_lock lock(m_mutex);
+
+        return controlledSessionLocked().setSplineFitSolver(solver);
+    }
+
+    bool setContinuousPlanningEffort(const ngc::ContinuousPlanningEffort &effort) {
+        std::scoped_lock lock(m_mutex);
+
+        return controlledSessionLocked().setContinuousPlanningEffort(effort);
+    }
+
+    bool setContinuousDiagnosticCallback(std::function<void(
+            const ngc::ContinuousTrajectoryPlan &,
+            std::span<const ngc::TrajectoryPlannerInput>)> callback) {
+        std::scoped_lock lock(m_mutex);
+
+        return controlledSessionLocked().setContinuousDiagnosticCallback(
+            std::move(callback));
+    }
+
+    void setRapidSpeed(const double speed) {
+        std::scoped_lock lock(m_mutex);
+        controlledSessionLocked().setRapidSpeed(speed);
+    }
+
+    ngc::SimulationSnapshot snapshot() const {
+        std::scoped_lock lock(m_mutex);
+
+        return controlledSessionLocked().snapshot();
+    }
+
+    std::optional<ngc::MachineSessionSnapshot> snapshot(
+            const MachineControlTarget target) const {
+        std::scoped_lock lock(m_mutex);
+        const auto *session = sessionLocked(target);
+        if (!session) {
+            return std::nullopt;
+        }
+
+        return session->snapshot();
+    }
+
+    MachineSessionManagerSnapshots snapshots() const {
+        std::scoped_lock lock(m_mutex);
+        MachineSessionManagerSnapshots result;
+        if (m_simulation) {
+            result.simulation = m_simulation->snapshot();
+        }
+        if (m_real) {
+            result.real = m_real->snapshot();
+        }
+
+        return result;
+    }
+
+    bool setToolTable(const MachineControlAuthority authority,
+                      const ngc::ToolTable &tools) {
+        std::scoped_lock lock(m_mutex);
+        auto *session = controlledSessionLocked(authority);
+
+        return session && session->setToolTable(localAuthority(*session), tools);
+    }
+
+    ngc::ToolTable toolTable() const {
+        std::scoped_lock lock(m_mutex);
+
+        return controlledSessionLocked().toolTable();
+    }
+
+    std::pair<ngc::ToolTable, std::uint64_t> toolTableSnapshot() const {
+        std::scoped_lock lock(m_mutex);
+
+        return controlledSessionLocked().toolTableSnapshot();
+    }
+
+    ngc::ParameterSnapshot parameterSnapshot() const {
+        std::scoped_lock lock(m_mutex);
+
+        return controlledSessionLocked().parameterSnapshot();
+    }
+
+    bool controllerDataMutable() const {
+        std::scoped_lock lock(m_mutex);
+
+        return controlledSessionLocked().controllerDataMutable();
+    }
+
+    std::expected<void, std::string> setToolTableStorePath(
+            const MachineControlAuthority authority, const std::filesystem::path &path) {
+        std::scoped_lock lock(m_mutex);
+        auto *session = controlledSessionLocked(authority);
+        if (!session) {
+            return staleControlAuthority();
+        }
+
+        return session->setToolTableStorePath(localAuthority(*session), path);
+    }
+
+    std::expected<void, std::string> saveToolTable(
+            const MachineControlAuthority authority,
+            const std::filesystem::path &path) const {
+        std::scoped_lock lock(m_mutex);
+        const auto *session = controlledSessionLocked(authority);
+        if (!session) {
+            return staleControlAuthority();
+        }
+
+        return session->saveToolTable(localAuthority(*session), path);
+    }
+
+    std::expected<void, std::string> setPersistentParameterStorePath(
+            const MachineControlAuthority authority, const std::filesystem::path &path) {
+        std::scoped_lock lock(m_mutex);
+        auto *session = controlledSessionLocked(authority);
+        if (!session) {
+            return staleControlAuthority();
+        }
+
+        return session->setPersistentParameterStorePath(
+            localAuthority(*session), path);
+    }
+
+    std::expected<void, std::string> loadPersistentParameters(
+            const MachineControlAuthority authority, const std::filesystem::path &path) {
+        std::scoped_lock lock(m_mutex);
+        auto *session = controlledSessionLocked(authority);
+        if (!session) {
+            return staleControlAuthority();
+        }
+
+        return session->loadPersistentParameters(localAuthority(*session), path);
+    }
+
+    std::expected<void, std::string> savePersistentParameters(
+            const MachineControlAuthority authority,
+            const std::filesystem::path &path) const {
+        std::scoped_lock lock(m_mutex);
+        const auto *session = controlledSessionLocked(authority);
+        if (!session) {
+            return staleControlAuthority();
+        }
+
+        return session->savePersistentParameters(localAuthority(*session), path);
+    }
+
+    std::vector<ngc::ExecutedJerkSample> takeExecutedJerkSamples() {
+        std::scoped_lock lock(m_mutex);
+
+        return controlledSessionLocked().takeExecutedJerkSamples();
+    }
+
+    void join() {
+        std::scoped_lock lock(m_mutex);
+        if (m_simulation) {
+            m_simulation->join();
+        }
+        if (m_real) {
+            m_real->join();
         }
     }
 };

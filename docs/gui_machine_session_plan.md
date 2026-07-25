@@ -304,10 +304,12 @@ precise unavailable explanation. The manager already exposes generation-tagged
 Simulation authority and rejects unavailable Real selection without advancing
 that authority. The GUI now tags every target-dependent motion and
 controller-data operation with its current authority, and the manager rejects a
-stale generation or wrong target before admission. Concurrent Real ownership, a
-live Real snapshot, command routing between sessions, and the
-Real-to-Simulation checkpoint remain coupled to the corresponding Real-session
-manager work.
+stale generation or wrong target before admission. Concurrent production Real
+ownership, a live Real snapshot, and the Real-to-Simulation checkpoint remain
+coupled to the corresponding production Real-session work. The manager's target
+router and dual-session snapshot API are covered with an explicitly test-only
+in-process RealRun-mode session; those tests exercise actual authority transfer
+and session-state isolation without making Real available in the application.
 
 Implement this phase with the corresponding Real-session manager work.
 
@@ -317,7 +319,7 @@ Implement this phase with the corresponding Real-session manager work.
   control.
 - Tag GUI commands with current control authority where required so stale
   commands cannot reach a newly selected target. Complete for the standalone
-  Simulation manager boundary.
+  Simulation manager boundary and dual-session manager tests.
 - Keep inactive Real safety, communication, E-stop, and fault state visible.
 - Add the explicit **Simulate from Real** checkpoint operation only after its
   quiescence and validation contract exists.
@@ -361,7 +363,8 @@ Add focused tests for:
 - tool-table ownership and edit inhibition;
 - unavailable Real selection;
 - stale control-authority rejection at the standalone manager boundary and
-  across an actual target transfer when multi-session control is implemented.
+  across an actual target transfer. Complete at the in-process manager-test
+  boundary; repeat against the production Real session when available.
 
 Retain manual GUI checks for layout, legibility, tooltip clarity, resizing, and
 fault prominence.
