@@ -228,11 +228,12 @@ namespace ngc {
                               std::vector<JointConfiguration> joints);
         [[nodiscard]] bool homingAvailable() const noexcept;
         [[nodiscard]] std::expected<HomingResult, std::string> runHoming(
-            const position_t &startingPosition, const HomingRuntimeCallbacks &callbacks);
+            const position_t &startingPosition);
+        [[nodiscard]] std::optional<HomingObservation> homingObservation() const;
         [[nodiscard]] JointMask homedJoints() const noexcept;
         [[nodiscard]] std::expected<JoggingResult, std::string> runJogging(
-            const position_t &startingPosition, const ControlRequest &firstRequest,
-            const JoggingRuntimeCallbacks &callbacks);
+            const position_t &startingPosition, const ControlRequest &firstRequest);
+        [[nodiscard]] std::optional<JoggingObservation> joggingObservation() const;
         void requestGeometryStop();
         [[nodiscard]] bool executionEpochActive() const noexcept;
         [[nodiscard]] GeometryEpoch nextEpoch() noexcept;
@@ -380,6 +381,9 @@ namespace ngc {
         ProgramExecutionController m_programExecution;
         std::unique_ptr<HomingController> m_homingController;
         std::unique_ptr<JoggingController> m_joggingController;
+        mutable std::mutex m_serviceObservationMutex;
+        std::optional<HomingObservation> m_homingObservation;
+        std::optional<JoggingObservation> m_joggingObservation;
         JointMask m_homedJoints = 0;
         TrajectoryLimits m_limits;
         GeometryEpoch m_nextEpoch = 1;

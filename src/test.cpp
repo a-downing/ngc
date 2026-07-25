@@ -73,6 +73,19 @@ namespace {
             return {};
         }
 
+        [[nodiscard]] bool prepareTriggeredJointMove(
+            const ngc::TriggeredJointMove &) noexcept override {
+            return true;
+        }
+
+        void serviceImmediate() override { }
+
+        [[nodiscard]] std::uint64_t advanceServiceMotionPeriod() override {
+            return 0;
+        }
+
+        void waitForServiceMotion() override { }
+
         ngc::MockMotionBackend m_backend;
         std::size_t startCalls = 0;
         std::size_t stopCalls = 0;
@@ -996,7 +1009,7 @@ final_move_together = true
         }
     }
 
-    void testMachineSessionOwnsBackendNeutralJogging() {
+    void testMachineSessionOwnsBackendNeutralServiceOperations() {
         const auto configuration = fixtureMachineConfiguration();
         require(configuration.has_value(), configuration ? "" : configuration.error());
         ngc::InProcessSimulationRuntime runtime(*configuration);
@@ -1052,25 +1065,11 @@ final_move_together = true
                 "session dispatch should retain the admitted jog request");
         require(session.coordinator().commands().tryPush(ngc::Stop {}),
                 "session Stop should queue behind a started jog");
-        const ngc::JoggingRuntimeCallbacks callbacks {
-            .shutdownRequested = [] {
-                return false;
-            },
-            .serviceImmediate = [&] {
-                runtime.advanceImmediate(0.0);
-            },
-            .advanceServiceMotionPeriod = [&] {
-                return runtime.advanceServiceMotionPeriod();
-            },
-            .waitForServiceMotion = [] { },
-            .observe = {},
-        };
         const ngc::position_t startingPosition {
             6.0, 6.0, -6.0, 0.0, 0.0, 0.0,
         };
 
-        const auto jogging = session.runJogging(
-            startingPosition, jog->request, callbacks);
+        const auto jogging = session.runJogging(startingPosition, jog->request);
         require(jogging.has_value(), jogging ? "" : jogging.error());
         require(jogging->outcome == ngc::JoggingOutcome::Stopped
                     && jogging->stopReason == ngc::JogStopReason::RequestedStop,
@@ -1089,7 +1088,14 @@ final_move_together = true
                     && std::holds_alternative<ngc::StartHoming>(**homingDispatch),
                 homingDispatch ? "MachineSession should dispatch its queued homing operation"
                                : homingDispatch.error());
-        session.coordinator().finishActivity();
+        const auto homing = session.runHoming(jogging->observation.machinePosition);
+        require(homing.has_value(), homing ? "" : homing.error());
+        require(homing->outcome == ngc::HomingOutcome::Completed,
+                "MachineSession should service homing through its backend runtime");
+        require(session.homingObservation().has_value(),
+                "MachineSession should retain its latest homing observation");
+        require(session.coordinator().activity() == ngc::MachineActivity::Idle,
+                "session-owned homing completion should release motion ownership");
         require(session.powerOff(), "idle jogging session should power off");
     }
 
@@ -6810,7 +6816,7 @@ int main() {
         testSimulationSnapshotExposesMachineSessionState();
         testInProcessSimulationRuntimePersistsAcrossTimedEpochs();
         testHomingControllerOwnsBackendNeutralSequence();
-        testMachineSessionOwnsBackendNeutralJogging();
+        testMachineSessionOwnsBackendNeutralServiceOperations();
         testSimulationPersistsCoordinateSystemAtCompletion();
         testToolTableLoadsFinalLineWithoutNewline();
         testToolTableRejectsDuplicateToolNumbers();

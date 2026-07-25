@@ -247,11 +247,19 @@ public:
     virtual void start() = 0;
     virtual void stop() = 0;
     virtual BackendCapabilities capabilities() const = 0;
+
+    virtual bool prepareTriggeredJointMove(const TriggeredJointMove &) = 0;
+    virtual void serviceImmediate() = 0;
+    virtual std::uint64_t advanceServiceMotionPeriod() = 0;
+    virtual void waitForServiceMotion() = 0;
 };
 ```
 
-This is an NRT ownership abstraction. It does not broaden the RT-facing
-`MotionBackend` contract.
+This is an NRT ownership and service abstraction. Its service methods let
+backend-neutral session controllers submit work and observe the endpoint
+without importing mock policy. A physical runtime may progress independently;
+the in-process runtime advances its synchronous service clock. This does not
+broaden the RT-facing `MotionBackend` contract.
 
 `InProcessSimulationRuntime` owns `MockMotionBackend`, the simulated servo
 scheduler, accelerated playback coordination, synthetic input policy, and
@@ -731,7 +739,8 @@ policy, synchronous service stepping, and mock-only timing and jerk diagnostics.
 
 ### Phase 5: Introduce `MachineSession`
 
-Status: in progress. The backend-neutral power/activity vocabulary,
+Status: implemented behind the current `SimulationWorker` compatibility
+facade. The backend-neutral power/activity vocabulary,
 `MachineSessionSnapshot`, optional Simulation diagnostics, and bounded owning
 `SessionCommand` queue are implemented. `MachineSession` now owns the
 interpreter, prepared-geometry producer thread and channels, trajectory driver,
@@ -760,14 +769,14 @@ than receiving a compatibility-facade copy.
 Stop uses backend constrained braking, abandons the execution epoch only at
 rest, and reconciles canonical position to the stationary backend state.
 The homing controller owns fast search, clearance backoff, slow latch,
-coordinate establishment, final-home motion, and controlled Stop. Simulation
-supplies synthetic switch preparation and service-clock callbacks through the
-compatibility facade. The jogging controller owns backend initialization,
-token-matched controls, constrained Stop, event handling, and final axis/joint
-observation; `MachineSession` consumes and translates queued jog commands.
-Simulation supplies only service-clock and shutdown callbacks for jogging.
-Simulation-specific runtime servicing callbacks still need to move behind the
-session abstraction.
+coordinate establishment, final-home motion, and controlled Stop. The jogging
+controller owns backend initialization, token-matched controls, constrained
+Stop, event handling, and final axis/joint observation. `MachineSession`
+constructs both controllers' runtime-service callbacks, consumes and translates
+their queued commands, and retains thread-safe live observations. The
+`BackendRuntime` boundary supplies NRT service mechanics; the in-process
+Simulation implementation owns synchronous service-clock advancement, waiting,
+and synthetic homing-switch preparation.
 
 - Move the remaining Simulation runtime servicing into backend-neutral session
   components.

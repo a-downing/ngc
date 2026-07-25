@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cmath>
+#include <ranges>
 
 #include "WindowsServoPacer.h"
 
@@ -17,6 +18,7 @@ namespace ngc {
     InProcessSimulationRuntime::InProcessSimulationRuntime(const MachineConfiguration &configuration)
         : m_backend(configuration.feedHold, configuration.trajectory,
                     configuration.axes, configuration.joints),
+          m_joints(configuration.joints),
           m_servoPeriod(configuration.simulation.servoPeriod),
           m_schedulerPeriod(configuration.simulation.schedulerPeriod),
           m_servoTicksPerSchedulerPeriod(static_cast<std::uint32_t>(std::max(
@@ -33,6 +35,32 @@ namespace ngc {
 
     BackendCapabilities InProcessSimulationRuntime::capabilities() const noexcept {
         return {};
+    }
+
+    bool InProcessSimulationRuntime::prepareTriggeredJointMove(
+        const TriggeredJointMove &move) noexcept {
+        for (const auto &trigger : move.triggers) {
+            const auto found = std::ranges::find(
+                m_joints, trigger.joint, &JointConfiguration::id);
+            if (found == m_joints.end()) {
+                return false;
+            }
+            const auto position =
+                found->homing.switchPosition * found->coordinateScale;
+            if (!configureSyntheticJointInput(move.moveId, trigger.joint, position)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    void InProcessSimulationRuntime::serviceImmediate() {
+        advanceImmediate(0.0);
+    }
+
+    void InProcessSimulationRuntime::waitForServiceMotion() {
+        std::this_thread::sleep_for(std::chrono::duration<double>(m_schedulerPeriod));
     }
 
     void InProcessSimulationRuntime::start() {

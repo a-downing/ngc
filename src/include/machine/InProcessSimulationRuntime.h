@@ -41,6 +41,11 @@ namespace ngc {
         void start() override;
         void stop() override;
         [[nodiscard]] BackendCapabilities capabilities() const noexcept override;
+        [[nodiscard]] bool prepareTriggeredJointMove(
+            const TriggeredJointMove &move) noexcept override;
+        void serviceImmediate() override;
+        [[nodiscard]] std::uint64_t advanceServiceMotionPeriod() override;
+        void waitForServiceMotion() override;
         bool beginTimedExecution();
         void endTimedExecution();
         [[nodiscard]] bool timedExecutionActive() const noexcept;
@@ -58,7 +63,6 @@ namespace ngc {
         void setRollingSupplyActive(bool active) noexcept;
 
         void advanceImmediate(double seconds);
-        std::uint64_t advanceServiceMotionPeriod();
         bool configureSyntheticInput(TriggeredMoveId move, const position_t &transitionPosition) noexcept;
         bool configureSyntheticJointInput(TriggeredMoveId move, JointId joint,
                                           double transitionPosition) noexcept;
@@ -71,6 +75,7 @@ namespace ngc {
         static void updateMaximum(std::atomic<double> &target, double value) noexcept;
 
         MockMotionBackend m_backend;
+        std::vector<JointConfiguration> m_joints;
         double m_servoPeriod;
         double m_schedulerPeriod;
         std::uint32_t m_servoTicksPerSchedulerPeriod;

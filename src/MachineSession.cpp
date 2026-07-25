@@ -570,7 +570,7 @@ namespace ngc {
     }
 
     std::expected<HomingResult, std::string> MachineSession::runHoming(
-        const position_t &startingPosition, const HomingRuntimeCallbacks &callbacks) {
+        const position_t &startingPosition) {
         if (!m_homingController) {
             return std::unexpected("homing is not configured");
         }
@@ -578,6 +578,41 @@ namespace ngc {
             return std::unexpected("homing does not own the machine session");
         }
 
+        {
+            std::scoped_lock lock(m_serviceObservationMutex);
+            m_homingObservation = HomingObservation {
+                .machinePosition = startingPosition,
+            };
+            m_joggingObservation.reset();
+        }
+        bool stopRequested = false;
+        const HomingRuntimeCallbacks callbacks {
+            .stopRequested = [&] {
+                while (const auto command = m_coordinator.commands().tryPop()) {
+                    if (std::holds_alternative<Stop>(*command)) {
+                        stopRequested = true;
+                    }
+                }
+
+                return stopRequested;
+            },
+            .prepareTriggeredMove = [&](const TriggeredJointMove &move) {
+                return m_runtime.prepareTriggeredJointMove(move);
+            },
+            .serviceImmediate = [&] {
+                m_runtime.serviceImmediate();
+            },
+            .advanceServiceMotionPeriod = [&] {
+                return m_runtime.advanceServiceMotionPeriod();
+            },
+            .waitForServiceMotion = [&] {
+                m_runtime.waitForServiceMotion();
+            },
+            .observe = [&](const HomingObservation &observation) {
+                std::scoped_lock lock(m_serviceObservationMutex);
+                m_homingObservation = observation;
+            },
+        };
         const auto homing = m_homingController->run(nextEpoch(), startingPosition, callbacks);
         if (homing) {
             m_interpreter.machine().synchronizePosition(homing->observation.machinePosition);
@@ -590,13 +625,18 @@ namespace ngc {
         return homing;
     }
 
+    std::optional<HomingObservation> MachineSession::homingObservation() const {
+        std::scoped_lock lock(m_serviceObservationMutex);
+
+        return m_homingObservation;
+    }
+
     JointMask MachineSession::homedJoints() const noexcept {
         return m_homedJoints;
     }
 
     std::expected<JoggingResult, std::string> MachineSession::runJogging(
-        const position_t &startingPosition, const ControlRequest &firstRequest,
-        const JoggingRuntimeCallbacks &callbacks) {
+        const position_t &startingPosition, const ControlRequest &firstRequest) {
         if (!m_joggingController) {
             return std::unexpected("jogging is not configured");
         }
@@ -604,6 +644,13 @@ namespace ngc {
             return std::unexpected("jogging does not own the machine session");
         }
 
+        {
+            std::scoped_lock lock(m_serviceObservationMutex);
+            m_joggingObservation = JoggingObservation {
+                .machinePosition = startingPosition,
+            };
+            m_homingObservation.reset();
+        }
         bool sessionStopRequested = false;
         const auto nextControl = [&]() -> std::optional<ControlRequest> {
             while (const auto command = m_coordinator.commands().tryPop()) {
@@ -623,19 +670,38 @@ namespace ngc {
 
             return std::nullopt;
         };
-        auto controllerCallbacks = callbacks;
-        controllerCallbacks.shutdownRequested = [&] {
-            return sessionStopRequested
-                || (callbacks.shutdownRequested && callbacks.shutdownRequested());
+        const JoggingRuntimeCallbacks callbacks {
+            .shutdownRequested = [&] {
+                return sessionStopRequested;
+            },
+            .serviceImmediate = [&] {
+                m_runtime.serviceImmediate();
+            },
+            .advanceServiceMotionPeriod = [&] {
+                return m_runtime.advanceServiceMotionPeriod();
+            },
+            .waitForServiceMotion = [&] {
+                m_runtime.waitForServiceMotion();
+            },
+            .observe = [&](const JoggingObservation &observation) {
+                std::scoped_lock lock(m_serviceObservationMutex);
+                m_joggingObservation = observation;
+            },
         };
         const auto result = m_joggingController->run(
-            nextEpoch(), startingPosition, firstRequest, nextControl, controllerCallbacks);
+            nextEpoch(), startingPosition, firstRequest, nextControl, callbacks);
         if (result) {
             m_interpreter.machine().synchronizePosition(result->observation.machinePosition);
         }
         m_coordinator.finishActivity();
 
         return result;
+    }
+
+    std::optional<JoggingObservation> MachineSession::joggingObservation() const {
+        std::scoped_lock lock(m_serviceObservationMutex);
+
+        return m_joggingObservation;
     }
 
     void MachineSession::requestGeometryStop() {

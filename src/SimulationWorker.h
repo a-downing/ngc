@@ -350,6 +350,22 @@ public:
             if (const auto backend = latestTimedBackendSnapshot()) {
                 applyBackendObservation(result, *backend);
             }
+        } else if (result.activity == ngc::SimulationActivity::Homing) {
+            if (const auto observation = m_machineSession.homingObservation()) {
+                result.machinePosition = observation->machinePosition;
+                result.joints = observation->joints;
+                result.commandProgress = observation->commandProgress;
+                result.hasActiveMotion = observation->hasActiveMotion;
+                result.servoTicks = observation->servoTicks;
+            }
+        } else if (result.activity == ngc::SimulationActivity::Jogging) {
+            if (const auto observation = m_machineSession.joggingObservation()) {
+                result.machinePosition = observation->machinePosition;
+                result.joints = observation->joints;
+                result.commandProgress = observation->commandProgress;
+                result.hasActiveMotion = observation->hasActiveMotion;
+                result.servoTicks = observation->servoTicks;
+            }
         }
         if (result.status == ngc::SimulationStatus::Paused
             && !m_machineSession.programExecution().programPaused()
@@ -483,6 +499,10 @@ public:
             }
             m_snapshot.powerState = ngc::MachinePowerState::Stopping;
             m_join = true;
+            if (motionOwnedOrQueued()) {
+                m_machineSession.coordinator().commands().clear();
+                (void)m_machineSession.coordinator().commands().tryPush(ngc::Stop {});
+            }
             m_cv.notify_all();
         }
         m_thread.join();
@@ -681,11 +701,6 @@ private:
         return position.x;
     }
 
-    const ngc::JointConfiguration *configuredJoint(const ngc::JointId id) const {
-        const auto found = std::ranges::find(m_joints, id, &ngc::JointConfiguration::id);
-        return found == m_joints.end() ? nullptr : &*found;
-    }
-
     ngc::TrajectoryCommandPresentation sessionPresentation() const {
         return {
             .tool = m_machineSession.interpreter().machine().toolGeometry(),
@@ -717,61 +732,7 @@ private:
             clearActiveTool();
         }
 
-        const ngc::HomingRuntimeCallbacks callbacks {
-            .stopRequested = [&] {
-                std::scoped_lock lock(m_mutex);
-                while (auto command = m_machineSession.coordinator().commands().tryPop()) {
-                    if (std::holds_alternative<ngc::Stop>(*command)) {
-                        m_stop = true;
-                    }
-                }
-                if (m_join) {
-                    m_stop = true;
-                }
-                if (m_stop) {
-                    m_snapshot.status = ngc::SimulationStatus::Holding;
-                }
-
-                return m_stop;
-            },
-            .prepareTriggeredMove = [&](const ngc::TriggeredJointMove &move) {
-                for (const auto &trigger : move.triggers) {
-                    const auto *joint = configuredJoint(trigger.joint);
-                    if (!joint) {
-                        return false;
-                    }
-                    const auto position =
-                        joint->homing.switchPosition * joint->coordinateScale;
-                    if (!m_runtime.configureSyntheticJointInput(
-                            move.moveId, trigger.joint, position)) {
-                        return false;
-                    }
-                }
-
-                return true;
-            },
-            .serviceImmediate = [&] {
-                m_runtime.advanceImmediate(0.0);
-            },
-            .advanceServiceMotionPeriod = [&] {
-                return m_runtime.advanceServiceMotionPeriod();
-            },
-            .waitForServiceMotion = [&] {
-                std::this_thread::sleep_for(
-                    std::chrono::duration<double>(m_runtime.schedulerPeriod()));
-            },
-            .observe = [&](const ngc::HomingObservation &observation) {
-                std::scoped_lock lock(m_mutex);
-                m_snapshot.machinePosition = observation.machinePosition;
-                m_snapshot.joints = observation.joints;
-                m_snapshot.commandProgress = observation.commandProgress;
-                m_snapshot.hasActiveMotion = observation.hasActiveMotion;
-                m_snapshot.servoTicks = observation.servoTicks;
-                clearActiveTool();
-            },
-        };
-        const auto result =
-            m_machineSession.runHoming(startingPosition, callbacks);
+        const auto result = m_machineSession.runHoming(startingPosition);
 
         std::scoped_lock lock(m_mutex);
         m_running = false;
@@ -817,37 +778,7 @@ private:
             clearActiveTool();
         }
 
-        const ngc::JoggingRuntimeCallbacks callbacks {
-            .shutdownRequested = [&] {
-                std::scoped_lock lock(m_mutex);
-                if (m_join || m_stop) {
-                    m_snapshot.status = ngc::SimulationStatus::Holding;
-                }
-
-                return m_join || m_stop;
-            },
-            .serviceImmediate = [&] {
-                m_runtime.advanceImmediate(0.0);
-            },
-            .advanceServiceMotionPeriod = [&] {
-                return m_runtime.advanceServiceMotionPeriod();
-            },
-            .waitForServiceMotion = [&] {
-                std::this_thread::sleep_for(
-                    std::chrono::duration<double>(m_runtime.schedulerPeriod()));
-            },
-            .observe = [&](const ngc::JoggingObservation &observation) {
-                std::scoped_lock lock(m_mutex);
-                m_snapshot.machinePosition = observation.machinePosition;
-                m_snapshot.joints = observation.joints;
-                m_snapshot.commandProgress = observation.commandProgress;
-                m_snapshot.hasActiveMotion = observation.hasActiveMotion;
-                m_snapshot.servoTicks = observation.servoTicks;
-                clearActiveTool();
-            },
-        };
-        const auto result =
-            m_machineSession.runJogging(startingPosition, firstRequest, callbacks);
+        const auto result = m_machineSession.runJogging(startingPosition, firstRequest);
 
         std::scoped_lock lock(m_mutex);
         m_running = false;
