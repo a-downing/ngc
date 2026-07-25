@@ -17,6 +17,7 @@
 
 #include "machine/GeometryStreamProducer.h"
 #include "machine/InProcessSimulationRuntime.h"
+#include "machine/MachineControl.h"
 #include "machine/MachineConfiguration.h"
 #include "machine/MachineSessionCommand.h"
 #include "machine/MachineSession.h"
@@ -26,24 +27,6 @@
 #include "memory/ParameterStore.h"
 
 namespace ngc {
-
-enum class MachineControlTarget {
-    Simulation,
-    Real,
-};
-
-struct MachineControlAuthority {
-    MachineControlTarget target = MachineControlTarget::Simulation;
-    std::uint64_t generation = 0;
-
-    bool operator==(const MachineControlAuthority &) const = default;
-};
-
-struct MachineSessionManagerState {
-    MachineControlAuthority authority;
-    bool simulationAvailable = true;
-    bool realAvailable = false;
-};
 
 class MachineSessionManager {
     static ngc::GeometryStreamPolicy geometryPolicy(const ngc::TrajectoryLimits &limits) {

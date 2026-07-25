@@ -3,6 +3,7 @@
 #include <string>
 #include <string_view>
 
+#include "machine/MachineControl.h"
 #include "machine/MachineSessionCommand.h"
 #include "machine/SimulationPresentation.h"
 
@@ -32,6 +33,41 @@ namespace ngc::gui {
         bool canResume = false;
         bool canStop = false;
     };
+
+    constexpr std::string_view controlTargetName(const MachineControlTarget target) noexcept {
+        switch (target) {
+            case MachineControlTarget::Simulation: return "Simulation";
+            case MachineControlTarget::Real: return "Real";
+        }
+
+        return "Unknown";
+    }
+
+    constexpr bool controlTargetAvailable(
+            const MachineSessionManagerState &state, const MachineControlTarget target) noexcept {
+        switch (target) {
+            case MachineControlTarget::Simulation: return state.simulationAvailable;
+            case MachineControlTarget::Real: return state.realAvailable;
+        }
+
+        return false;
+    }
+
+    constexpr std::string_view unavailableControlTargetReason(
+            const MachineSessionManagerState &state, const MachineControlTarget target) noexcept {
+        if (controlTargetAvailable(state, target)) {
+            return "";
+        }
+
+        switch (target) {
+            case MachineControlTarget::Simulation:
+                return "The Simulation machine session is not configured.";
+            case MachineControlTarget::Real:
+                return "The Real machine session is not configured.";
+        }
+
+        return "The machine session is not available.";
+    }
 
     inline OperatorDro operatorDro(const MachineSessionSnapshot &snapshot) noexcept {
         const auto workOffset = snapshot.activePresentation.workCoordinateSystem

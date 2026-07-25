@@ -1044,6 +1044,24 @@ final_move_together = true
     }
 
     void testMachineSessionViewDerivesOperatorControls() {
+        ngc::MachineSessionManagerState managerState;
+        require(ngc::gui::controlTargetName(managerState.authority.target) == "Simulation"
+                    && ngc::gui::controlTargetAvailable(
+                        managerState, ngc::MachineControlTarget::Simulation),
+                "the session view should identify the available Simulation control target");
+        require(!ngc::gui::controlTargetAvailable(
+                    managerState, ngc::MachineControlTarget::Real)
+                    && ngc::gui::unavailableControlTargetReason(
+                        managerState, ngc::MachineControlTarget::Real)
+                        == "The Real machine session is not configured.",
+                "the session view should explain an unavailable Real control target");
+        managerState.realAvailable = true;
+        require(ngc::gui::controlTargetAvailable(
+                    managerState, ngc::MachineControlTarget::Real)
+                    && ngc::gui::unavailableControlTargetReason(
+                        managerState, ngc::MachineControlTarget::Real).empty(),
+                "the session view should permit a configured Real control target");
+
         ngc::SimulationSnapshot snapshot;
         auto controls = ngc::gui::machineSessionControls(snapshot, true);
         require(!controls.powered && !controls.canStart && !controls.canHome

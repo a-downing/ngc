@@ -297,6 +297,15 @@ Acceptance criteria:
 
 ### Phase 7: Prepare for Real and control transfer
 
+Status: in progress. The standalone application now presents an explicit
+Simulation/Real selector and simultaneous session rows. Simulation is identified
+as the current control owner, while Real remains visible and disabled with a
+precise unavailable explanation. The manager already exposes generation-tagged
+Simulation authority and rejects unavailable Real selection without advancing
+that authority. Concurrent Real ownership, a live Real snapshot, command routing
+between sessions, and the Real-to-Simulation checkpoint remain coupled to the
+corresponding Real-session manager work.
+
 Implement this phase with the corresponding Real-session manager work.
 
 - Add the Simulation/Real target selector.

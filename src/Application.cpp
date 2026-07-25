@@ -1893,18 +1893,69 @@ public:
 
         const auto homingAvailable = m_simulation.homingAvailable();
         const auto controls = ngc::gui::machineSessionControls(simulation, homingAvailable);
-        const auto target = managerState.authority.target == ngc::MachineControlTarget::Simulation
-            ? "Simulation" : "Real";
+        const auto target = ngc::gui::controlTargetName(managerState.authority.target);
         const auto homed = std::ranges::count_if(m_joints, [&](const auto &joint) {
             return (simulation.homedJoints & (ngc::JointMask { 1 } << joint.id)) != 0;
         });
+
+        ImGui::AlignTextToFramePadding();
+        ImGui::TextUnformatted("Control target:");
+        ImGui::SameLine();
+        ImGui::SetNextItemWidth(120.0f);
+        if (ImGui::BeginCombo("##control_target", target.data())) {
+            constexpr std::array targets {
+                ngc::MachineControlTarget::Simulation,
+                ngc::MachineControlTarget::Real,
+            };
+            for (const auto candidate : targets) {
+                const auto name = ngc::gui::controlTargetName(candidate);
+                const auto available =
+                    ngc::gui::controlTargetAvailable(managerState, candidate);
+                const auto selected = candidate == managerState.authority.target;
+                ImGui::BeginDisabled(!available);
+                if (ImGui::Selectable(name.data(), selected)) {
+                    const auto result = m_simulation.selectControlTarget(candidate);
+                    if (!result) {
+                        m_errorMessage = std::format(
+                            "{} control selection was rejected because {}.",
+                            name, result.error());
+                    } else {
+                        m_errorMessage.clear();
+                    }
+                }
+                ImGui::EndDisabled();
+                unavailableTooltip(!available,
+                    ngc::gui::unavailableControlTargetReason(managerState, candidate));
+                if (selected) {
+                    ImGui::SetItemDefaultFocus();
+                }
+            }
+            ImGui::EndCombo();
+        }
+
+        const auto simulationControlled =
+            managerState.authority.target == ngc::MachineControlTarget::Simulation;
         ImGui::Text(
-            "Target: %s%s    Power: %s    Activity: %s    Operation: %s    Homed: %zu/%zu joints",
-            target, managerState.realAvailable ? "" : " (Real unavailable)",
+            "SIMULATION%s | Power: %s | Activity: %s | Operation: %s | Homed: %zu/%zu joints",
+            simulationControlled ? " [CONTROL]" : "",
             ngc::gui::powerStateName(simulation.powerState).data(),
             ngc::gui::machineActivityName(simulation.machineActivity).data(),
             ngc::gui::programOperationName(simulation.programOperation).data(),
             static_cast<std::size_t>(homed), m_joints.size());
+        ImGui::SameLine();
+        ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
+        ImGui::SameLine();
+        if (managerState.realAvailable) {
+            ImGui::TextUnformatted(
+                managerState.authority.target == ngc::MachineControlTarget::Real
+                    ? "REAL [CONTROL] | Snapshot pending"
+                    : "REAL | Snapshot pending");
+        } else {
+            ImGui::TextDisabled("REAL | Unavailable");
+            unavailableTooltip(true,
+                ngc::gui::unavailableControlTargetReason(
+                    managerState, ngc::MachineControlTarget::Real));
+        }
 
         if(ImGui::Button("Open G-code")) m_enableOpenDialog = true;
         ImGui::SameLine();
@@ -2865,7 +2916,7 @@ public:
             }
         }
         const auto &viewport = *ImGui::GetMainViewport();
-        m_toolbarHeight = ImGui::GetFrameHeight() * 2.0f + ImGui::GetStyle().ItemSpacing.y
+        m_toolbarHeight = ImGui::GetFrameHeight() * 3.0f + ImGui::GetStyle().ItemSpacing.y * 2.0f
             + ImGui::GetStyle().WindowPadding.y * 2.0f;
         const auto contentBottom = viewport.Pos.y + viewport.Size.y - m_statusBarHeight;
         m_viewportRect = {
