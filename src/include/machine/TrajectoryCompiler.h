@@ -213,7 +213,7 @@ namespace ngc {
         unsigned maximumLocalCorrectionPasses = 32;
         // A sub-servo quintic may exceed the continuous pointwise jerk limit
         // only when its complete acceleration-control hull fits within one
-        // configured servo-period jerk budget. SimulationWorker replaces this
+        // configured servo-period jerk budget. MachineSessionManager replaces this
         // default with typed machine configuration.
         double quinticServoPeriod = 0.001;
         ContinuousBoundaryAccelerationMode boundaryAccelerationMode =

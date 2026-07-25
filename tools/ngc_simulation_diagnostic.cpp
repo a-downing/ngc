@@ -17,7 +17,7 @@
 #include <tuple>
 #include <vector>
 
-#include "SimulationWorker.h"
+#include "machine/MachineSessionManager.h"
 #include "machine/MachineConfiguration.h"
 #include "machine/ToolTable.h"
 #include "utils.h"
@@ -602,7 +602,7 @@ int main(const int argc, char **argv) {
         programs.emplace_back(std::move(*source),path.string());
     }
 
-    SimulationWorker worker(*configuration);
+    ngc::MachineSessionManager worker(*configuration);
     worker.setTickMultiplier(multiplier);
     if(!worker.setSplineFitSolver(smoother)) {
         std::println(stderr,"simulation worker rejected the smoother selection");

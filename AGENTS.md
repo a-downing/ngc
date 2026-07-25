@@ -46,12 +46,12 @@ GeometryStreamProducer
        -> MotionBackend
 ```
 
-`Worker` retains immutable prepared curves and presentation metadata as Preview's sole toolpath representation. `SimulationWorker` consumes the same prepared stream through `PreparedTrajectoryExecutionDriver`. Ordinary motion becomes timed axis-polynomial `PlanChunk` values; probes and homing/service moves use executor-owned triggered moves.
+`Worker` retains immutable prepared curves and presentation metadata as Preview's sole toolpath representation. `MachineSessionManager` owns the persistent Simulation session that consumes the same prepared stream through `PreparedTrajectoryExecutionDriver`. Ordinary motion becomes timed axis-polynomial `PlanChunk` values; probes and homing/service moves use executor-owned triggered moves.
 
 `InProcessSimulationRuntime` owns the persistent `MockMotionBackend`, its sleeping
 servo-scheduler thread, accelerated-playback coordination, synthetic input
-policy, and mock-only timing and jerk diagnostics. `SimulationWorker` remains a
-compatibility facade and delegates those responsibilities to the runtime. The
+policy, and mock-only timing and jerk diagnostics. `MachineSessionManager`
+delegates Simulation runtime responsibilities to that runtime. The
 runtime and backend survive individual program epochs; timed scheduling is
 activated only for an active program epoch, while homing and jogging currently
 use runtime-owned synchronous service stepping. `MockMotionBackend` is a non-RT
@@ -77,14 +77,14 @@ backend-neutral program operation service step and reports normalized running,
 held, stopped, completed, or failed outcomes. It admits and dispatches queued
 program, MDI, homing, and
 jogging starts, validates their activity ownership, and releases Program/MDI
-activity when the execution epoch finishes. The `SimulationWorker`
-compatibility facade queues starts, feed hold, Resume, and Stop through that
-boundary. `MachineSession` owns homing and jogging runtime-service callback
+activity when the execution epoch finishes. `MachineSessionManager` queues
+starts, feed hold, Resume, and Stop through that boundary. `MachineSession`
+owns homing and jogging runtime-service callback
 construction plus thread-safe live service observations. `BackendRuntime`
 provides the NRT service mechanics used by those controllers;
 `InProcessSimulationRuntime` supplies synchronous service-clock advancement,
 waiting, and synthetic homing-switch preparation without exposing that policy
-to the compatibility facade.
+to the backend-neutral session.
 `MachineSession` owns the live tool table, persistent parameter and tool-table
 store paths, tool-table revision tracking, and completed/stopped/failed epoch
 persistence boundaries. Program and MDI epochs reuse that session-owned table
@@ -230,7 +230,7 @@ Logical XYZABC axes are not motors. The backend owns axis-to-joint mapping and g
 
 Mock probing and homing policy stay outside `MotionBackend`. Synthetic mock input transitions change only simulated input state and must not supply a predicted stop point. Preview resolves a probe at its canonical target; timed Simulation returns the backend's latched physical-style result. Canonical preview toolpaths use emitted command coordinates and G53/WCS/tool-offset semantics; physical tool dimensions affect only the tool overlay and simulated contact.
 
-Jogging uses the bounded backend control/event channel, never generated G-code or `ExecutionItem`. Continuous jogs require renewal of a stable token before a fixed-tick dead-man lease expires; expiry and UI release request a constrained stop. Axis, coupled-joint-group, and individual-joint targets are mutually exclusive with other motion ownership. `SimulationWorker` is the sole NRT producer of mock jog controls; the GUI must not write directly to the backend. The backend lease remains authoritative if UI renewal stops.
+Jogging uses the bounded backend control/event channel, never generated G-code or `ExecutionItem`. Continuous jogs require renewal of a stable token before a fixed-tick dead-man lease expires; expiry and UI release request a constrained stop. Axis, coupled-joint-group, and individual-joint targets are mutually exclusive with other motion ownership. `MachineSessionManager` is the sole NRT producer of mock jog controls; the GUI must not write directly to the backend. The backend lease remains authoritative if UI renewal stops.
 
 Program feed hold is backend-owned motion, not a frozen NRT scheduler or servo clock. A hold request begins on-path braking on the next servo tick by retiming the precomputed trajectory, reports `Holding` while moving, and reports `Paused` only after `BackendHeld` establishes zero velocity and acceleration. Resume from a feed hold retains the normal-branch execution cursor and ramps the reference execution rate back to one; it must not reconstruct geometry, reset span progress, or replay events. During an axis-space triggered probe approach, feed hold uses the executor's constrained-stop machinery while retaining the active `TriggeredMove`, target, and input transition; it must not report probe completion or select the probe branch. Continue sampling the probe input while feed-hold braking: a detected transition latches the servo-sampled trigger state, supersedes the feed hold, and completes the probe through its ordinary constrained-stop result. If no transition occurs, Resume regenerates the remaining approach from the held zero-PVA state. Reaching a stop branch while normal-path feed-hold braking or resume retiming remains active is a fatal backend condition, not permission to enter the stop tail or resume from it. The initial mock-only retimer constrains acceleration and its requested tangential braking/acceleration profile while retaining executed per-axis and aggregate jerk as diagnostics; it does not establish a production jerk guarantee.
 
@@ -252,7 +252,7 @@ or the live tool table.
 
 Preview is geometry-only: it performs no trajectory timing or emitted-polynomial proof. It renders immutable `PreparedPreviewScene` data and must not reconstruct motion from `MachineCommand`. The background visibility thread performs CPU tessellation/culling and publishes complete replacement batches; only the render thread performs OpenGL calls and GPU uploads.
 
-`PresentationTracker` is the NRT authority for timed-execution presentation. It owns chunk/marker command activation, active tool/tool-offset/WCS/modal and spindle presentation, block completion and compact completed-line flags, and chunk/span diagnostic associations. `SimulationWorker` remains a compatibility facade and overlays the tracker's presentation state into `SimulationSnapshot`; do not move this bookkeeping back into backend orchestration.
+`PresentationTracker` is the NRT authority for timed-execution presentation. It owns chunk/marker command activation, active tool/tool-offset/WCS/modal and spindle presentation, block completion and compact completed-line flags, and chunk/span diagnostic associations. `MachineSessionManager` overlays the Simulation session's tracker state into `SimulationSnapshot`; do not move this bookkeeping back into backend orchestration.
 
 Presentation state is command-boundary data outside the RT contract. Timed Simulation applies tool, tool offset, WCS, modal state, and active-block state only when the backend reports the owning execution marker, not when interpretation reads ahead or merely publishes a packet. Prepared activation stations must remain ordered through slicing and rolling splits; cluster source commands activate progressively at their producer-associated curve distances rather than being collected at the cluster beginning. Keep UI/lifecycle bookkeeping and command-to-packet searches out of the planner hot path. Preserve nested block lifecycle semantics and compact completed-line flags in UI snapshots.
 

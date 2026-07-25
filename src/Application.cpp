@@ -58,7 +58,7 @@
 #include "gui/imgui_custom.h"
 
 #include "utils.h"
-#include "SimulationWorker.h"
+#include "machine/MachineSessionManager.h"
 #include "Worker.h"
 
 #include "machine/ToolTable.h"
@@ -187,7 +187,7 @@ class ApplicationImpl final {
     std::vector<ngc::AxisConfiguration> m_axes;
     std::vector<ngc::JointConfiguration> m_joints;
     Worker m_worker;
-    SimulationWorker m_simulation;
+    ngc::MachineSessionManager m_simulation;
     ngc::operator_control::JogController m_operatorJogController;
     ngc::operator_control::TouchOffController m_pendantTouchOffController;
     std::unique_ptr<ngc::pendant::vista_cnc_p2s::Manager> m_pendantManager;

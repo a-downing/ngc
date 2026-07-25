@@ -40,7 +40,7 @@
 #include "parser/Program.h"
 #include "path_tempo/Planner.h"
 #include "path_tempo/Types.h"
-#include "SimulationWorker.h"
+#include "machine/MachineSessionManager.h"
 #include "Worker.h"
 
 namespace {
@@ -546,7 +546,7 @@ final_move_together = true
             / "ngc-simulation-coordinate-system-test.var";
         std::filesystem::remove(path);
 
-        SimulationWorker worker;
+        ngc::MachineSessionManager worker;
         require(worker.setPersistentParameterStorePath(path).has_value(),
                 "idle Simulation should accept its parameter-store path");
         require(worker.start({{"G59.3\n", "persistent-coordinate-system.ngc"}}, {}),
@@ -859,24 +859,40 @@ final_move_together = true
         std::filesystem::remove(blockerPath);
     }
 
-    void testSimulationSnapshotExposesMachineSessionState() {
-        SimulationWorker worker;
-        const auto snapshot = worker.snapshot();
+    void testMachineSessionManagerOwnsStandaloneSimulation() {
+        ngc::MachineSessionManager manager;
+        const auto state = manager.state();
+        require(state.simulationAvailable && !state.realAvailable,
+                "the manager should expose a standalone Simulation session");
+        require(state.authority.target == ngc::MachineControlTarget::Simulation
+                    && state.authority.generation != 0,
+                "standalone Simulation should begin with generation-tagged control authority");
+        require(manager.hasControlAuthority(state.authority),
+                "the current manager authority should be accepted");
+        const auto unavailableReal =
+            manager.selectControlTarget(ngc::MachineControlTarget::Real);
+        require(!unavailableReal
+                    && unavailableReal.error() == "the Real machine session is not configured",
+                "standalone Simulation should reject selecting an unavailable Real session");
+        require(manager.state().authority == state.authority,
+                "a rejected control-target change must not advance control authority");
+
+        const auto snapshot = manager.snapshot();
         require(snapshot.powerState == ngc::MachinePowerState::On,
-                "the compatibility worker should expose its persistent powered session");
+                "the manager should expose its persistent powered Simulation session");
         require(snapshot.machineActivity == ngc::MachineActivity::Idle,
                 "a newly powered Simulation session should be idle");
         require(snapshot.simulationDiagnostics
                     && snapshot.simulationDiagnostics->servoPeriodSeconds > 0.0,
                 "the generic session snapshot should attach Simulation-only diagnostics");
-        require(worker.start({{"G0 X0.01\n", "session-state.ngc"}}, {}),
-                "the powered compatibility session should accept a program epoch");
-        auto completed = worker.snapshot();
+        require(manager.start({{"G0 X0.01\n", "session-state.ngc"}}, {}),
+                "the powered manager session should accept a program epoch");
+        auto completed = manager.snapshot();
         for (auto attempt = 0; attempt < 2000
              && completed.status != ngc::SimulationStatus::Completed
              && completed.status != ngc::SimulationStatus::Error; ++attempt) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            completed = worker.snapshot();
+            completed = manager.snapshot();
         }
         require(completed.status == ngc::SimulationStatus::Completed,
                 completed.error.empty() ? "session-state program should complete"
@@ -884,9 +900,9 @@ final_move_together = true
         require(completed.powerState == ngc::MachinePowerState::On
                     && completed.machineActivity == ngc::MachineActivity::Idle,
                 "program completion should return to the same powered idle session");
-        worker.join();
-        require(worker.snapshot().powerState == ngc::MachinePowerState::Off,
-                "joining the compatibility worker should end its powered lifetime");
+        manager.join();
+        require(manager.snapshot().powerState == ngc::MachinePowerState::Off,
+                "joining the manager should end its powered Simulation lifetime");
     }
 
     void testInProcessSimulationRuntimePersistsAcrossTimedEpochs() {
@@ -1184,7 +1200,7 @@ final_move_together = true
                 && ngc::migrateLegacyToolTables(paths).has_value(),
                 "G10 L11 isolation fixture should create isolated tool tables");
 
-        SimulationWorker worker;
+        ngc::MachineSessionManager worker;
         require(worker.setToolTable(initial),
                 "idle Simulation should accept its isolated tool table");
         require(worker.setToolTableStorePath(paths.simulation).has_value(),
@@ -1487,8 +1503,8 @@ final_move_together = true
                 "presentation reset should remove prior-run command associations");
     }
 
-    void testSimulationWorkerStartsPlayback() {
-        SimulationWorker worker;
+    void testMachineSessionManagerStartsSimulationPlayback() {
+        ngc::MachineSessionManager worker;
         ngc::ToolTable tools;
         tools.set(1, { 1, 0, 0, 2, 0, 0, 0, 0.5, "simulation tool" });
         require(worker.start({ {
@@ -1544,7 +1560,7 @@ T1 M6
 G57 G1 X0.6
 )NGC";
 
-        SimulationWorker worker;
+        ngc::MachineSessionManager worker;
         ngc::ToolTable tools;
         tools.set(1, {
             .number = 1,
@@ -1660,7 +1676,7 @@ G43 H2 Z1.7
 G1 F60 X2
 )NGC";
 
-        SimulationWorker worker(*configuration);
+        ngc::MachineSessionManager worker(*configuration);
         ngc::ToolTable tools;
         tools.set(2, {
             .number = 2,
@@ -1736,7 +1752,7 @@ G1 F60 X2
         main="T2 M6\n"+main;
         auto tools=fixtureToolTable();
 
-        SimulationWorker worker;
+        ngc::MachineSessionManager worker;
         worker.setTickMultiplier(1000);
         require(worker.start(fixturePrograms(std::move(main),"fixture/exact-stop.ngc"),tools),
                 "adaptive-pockets simulation should start");
@@ -1767,7 +1783,7 @@ G1 F60 X2
             source+=std::format("G1 F60 X{:.6f}\n",static_cast<double>(command)*0.01);
         source+="G0 X9\n";
 
-        SimulationWorker worker;
+        ngc::MachineSessionManager worker;
         worker.setTickMultiplier(100);
         ngc::ToolTable tools;
         require(worker.start({{source,"multi-packet-refill.ngc"}},tools),
@@ -1813,7 +1829,7 @@ G1 F60 X2
         constexpr int COMMANDS=800;
         for(int command=1;command<=COMMANDS;++command)
             source+=std::format("G1 F60 X{:.6f}\n",100.0+static_cast<double>(command)*0.001);
-        SimulationWorker worker;
+        ngc::MachineSessionManager worker;
         ngc::ToolTable tools;
         require(worker.start({{source,"planning-snapshot-progress.ngc"}},tools),
                 "planning snapshot progress simulation should start");
@@ -2058,7 +2074,7 @@ G1 F60 X2
         });
         preview.join();
 
-        SimulationWorker simulation;
+        ngc::MachineSessionManager simulation;
         simulation.setTickMultiplier(1000);
         require(simulation.start({{source,"g64-rapid.ngc"}},tools),
                 "G64 rapid simulation should start");
@@ -2086,7 +2102,7 @@ G1 F60 X2
             "G1 X3\n"
             "M30\n";
         ngc::ToolTable tools;
-        SimulationWorker simulation;
+        ngc::MachineSessionManager simulation;
         simulation.setTickMultiplier(1000);
         require(simulation.start({{source, "zero-length-chain-transition.ngc"}}, tools),
                 "zero-length chain transition simulation should start");
@@ -2211,7 +2227,7 @@ G1 F60 X2
     }
 
     void testSimulationDriverFailureAppearsInGuiStatusStream() {
-        SimulationWorker worker(UNIT,{
+        ngc::MachineSessionManager worker(UNIT,{
             .pathAcceleration=0.0,.rapidSpeed=100.0,.arcChordTolerance=0.0001,.pathJerk=10.0,
         });
         ngc::ToolTable tools;
@@ -2341,7 +2357,7 @@ G1 F60 X2
     void testMdiToolChangeUsesAutoloadPrograms() {
         auto tools=fixtureToolTable();
 
-        SimulationWorker worker;
+        ngc::MachineSessionManager worker;
         worker.setTickMultiplier(1000);
         require(worker.start(fixturePrograms("T2 M6\n","<MDI>"),tools),
                 "MDI tool change should start");
@@ -2359,8 +2375,8 @@ G1 F60 X2
         worker.join();
     }
 
-    void testSimulationWorkerPersistsUntilReset() {
-        SimulationWorker worker;
+    void testMachineSessionManagerPersistsSimulationUntilReset() {
+        ngc::MachineSessionManager worker;
         ngc::ToolTable tools;
         worker.setTickMultiplier(1000);
 
@@ -2423,7 +2439,7 @@ G1 F60 X2
 
     void testSimulationProgramElapsedTimeIsPlaybackSpeedIndependent() {
         const auto runAtMultiplier = [](const int multiplier) {
-            SimulationWorker worker;
+            ngc::MachineSessionManager worker;
             ngc::ToolTable tools;
             worker.setTickMultiplier(multiplier);
             require(worker.start({ { "G1 F60 X0.01\n", "elapsed-time.ngc" } }, tools),
@@ -2522,7 +2538,7 @@ G1 F60 X2
     }
 
     void testSimulationM0PublishesAlertAndResumes() {
-        SimulationWorker worker;
+        ngc::MachineSessionManager worker;
         ngc::ToolTable tools;
         require(worker.start({{
                     "alert[\"Change the tool\"]\n"
@@ -4400,10 +4416,10 @@ G1 F60 X2
                 "probe contact should supersede feed hold and complete through the probe branch");
     }
 
-    void testSimulationWorkerFeedHoldReachesPausedAtRest() {
+    void testMachineSessionManagerFeedHoldReachesPausedAtRest() {
         const auto configuration = ngc::loadMachineConfiguration("machine.toml");
         require(configuration.has_value(), configuration ? "" : configuration.error());
-        SimulationWorker worker(*configuration);
+        ngc::MachineSessionManager worker(*configuration);
         ngc::ToolTable tools;
         const std::vector<std::tuple<std::string, std::string>> program {
             { "G1 F60 G53 X10\n", "feed-hold-worker.ngc" },
@@ -4435,12 +4451,12 @@ G1 F60 X2
         require(snapshot.status == ngc::SimulationStatus::Paused,
                 std::format("feed hold should reach Paused rather than freezing or failing: {}",
                             snapshot.error));
-        require(sawHolding, "SimulationWorker should expose Holding while the backend brakes");
+        require(sawHolding, "the manager should expose Holding while the backend brakes");
         require(snapshot.machinePosition.x > holdStart && snapshot.machinePosition.x < 10.0,
-                "SimulationWorker feed hold should stop forward on the active path");
+                "manager feed hold should stop forward on the active path");
         require(snapshot.trajectoryBackendVelocity <= 1e-10
                 && snapshot.trajectoryBackendAcceleration <= 1e-10,
-                "SimulationWorker should publish Paused only at rest");
+                "the manager should publish Paused only at rest");
         const auto heldPosition = snapshot.machinePosition.x;
         require(worker.resume(), "a completed feed hold should accept Resume");
         require(!worker.feedHold(),
@@ -4461,10 +4477,10 @@ G1 F60 X2
         worker.join();
     }
 
-    void testSimulationWorkerStopBrakesAndAbandonsProgram() {
+    void testMachineSessionManagerStopBrakesAndAbandonsProgram() {
         const auto configuration = ngc::loadMachineConfiguration("machine.toml");
         require(configuration.has_value(), configuration ? "" : configuration.error());
-        SimulationWorker worker(*configuration);
+        ngc::MachineSessionManager worker(*configuration);
         const std::vector<std::tuple<std::string, std::string>> program {
             { "G1 F60 G53 X10\n", "controlled-stop-worker.ngc" },
         };
@@ -4529,10 +4545,10 @@ G1 F60 X2
         worker.join();
     }
 
-    void testSimulationWorkerFeedHoldResumesProbeApproach() {
+    void testMachineSessionManagerFeedHoldResumesProbeApproach() {
         const auto configuration = ngc::loadMachineConfiguration("machine.toml");
         require(configuration.has_value(), configuration ? "" : configuration.error());
-        SimulationWorker worker(*configuration);
+        ngc::MachineSessionManager worker(*configuration);
         ngc::ToolTable tools;
         const std::vector<std::tuple<std::string, std::string>> program {
             { "G38.3 F60 X10\n", "feed-hold-probe-worker.ngc" },
@@ -4584,10 +4600,10 @@ G1 F60 X2
         worker.join();
     }
 
-    void testSimulationWorkerProbeContactSupersedesFeedHold() {
+    void testMachineSessionManagerProbeContactSupersedesFeedHold() {
         const auto configuration = ngc::loadMachineConfiguration("machine.toml");
         require(configuration.has_value(), configuration ? "" : configuration.error());
-        SimulationWorker worker(*configuration);
+        ngc::MachineSessionManager worker(*configuration);
         ngc::ToolTable tools;
         const std::vector<std::tuple<std::string, std::string>> program {
             { "G38.3 F200 X13\n", "feed-hold-probe-contact-worker.ngc" },
@@ -6392,7 +6408,7 @@ G1 F60 X2
     void testConfiguredSimulationStartsAtZeroAndHomes() {
         const auto configuration=fixtureMachineConfiguration();
         require(configuration.has_value(), configuration ? "" : configuration.error());
-        SimulationWorker worker(*configuration);
+        ngc::MachineSessionManager worker(*configuration);
         worker.setTickMultiplier(1000);
         auto snapshot = worker.snapshot();
         requireNear(snapshot.machinePosition.x, 0.0, "Simulation should start with X at zero");
@@ -6434,12 +6450,12 @@ G1 F60 X2
         worker.join();
     }
 
-    void testSimulationWorkerStopBrakesHomingAtRest() {
+    void testMachineSessionManagerStopBrakesHomingAtRest() {
         auto configuration = fixtureMachineConfiguration();
         require(configuration.has_value(), configuration ? "" : configuration.error());
         configuration->simulation.schedulerPeriod =
             configuration->simulation.servoPeriod;
-        SimulationWorker worker(*configuration);
+        ngc::MachineSessionManager worker(*configuration);
         require(worker.home(), "controlled homing-stop regression should start homing");
 
         auto snapshot = worker.snapshot();
@@ -6473,11 +6489,11 @@ G1 F60 X2
         worker.join();
     }
 
-    void testSimulationWorkerJogsCoupledJointsBeforeHoming() {
+    void testMachineSessionManagerJogsCoupledJointsBeforeHoming() {
         auto configuration=fixtureMachineConfiguration();
         require(configuration.has_value(), configuration ? "" : configuration.error());
         configuration->simulation.schedulerPeriod = configuration->simulation.servoPeriod;
-        SimulationWorker worker(*configuration);
+        ngc::MachineSessionManager worker(*configuration);
 
         const auto axis = std::ranges::find(configuration->axes, ngc::Machine::Axis::Y,
                                             &ngc::AxisConfiguration::axis);
@@ -6524,12 +6540,12 @@ G1 F60 X2
         worker.join();
     }
 
-    void testSimulationWorkerSessionStopBrakesJogAtRest() {
+    void testMachineSessionManagerStopBrakesJogAtRest() {
         auto configuration = fixtureMachineConfiguration();
         require(configuration.has_value(), configuration ? "" : configuration.error());
         configuration->simulation.schedulerPeriod =
             configuration->simulation.servoPeriod;
-        SimulationWorker worker(*configuration);
+        ngc::MachineSessionManager worker(*configuration);
 
         const auto axis = std::ranges::find(configuration->axes, ngc::Machine::Axis::X,
                                             &ngc::AxisConfiguration::axis);
@@ -6816,7 +6832,7 @@ int main() {
         testSessionCommandQueueIsBoundedAndOrdered();
         testMachineSessionOwnsPowerActivityAndExecutionEpoch();
         testMachineSessionOwnsControllerDataPersistence();
-        testSimulationSnapshotExposesMachineSessionState();
+        testMachineSessionManagerOwnsStandaloneSimulation();
         testInProcessSimulationRuntimePersistsAcrossTimedEpochs();
         testHomingControllerOwnsBackendNeutralSequence();
         testMachineSessionOwnsBackendNeutralServiceOperations();
@@ -6838,7 +6854,7 @@ int main() {
         testPresentationTrackerActivatesMarkersInExecutionOrder();
         testPresentationTrackerDefersBlockCompletionAndResetsState();
         std::cerr << "checkpoint simulation start\n";
-        testSimulationWorkerStartsPlayback();
+        testMachineSessionManagerStartsSimulationPlayback();
         testSimulationPresentationFollowsNestedToolChangeExecution();
         testSimulationToolPoseFollowsMotionAfterCalibratingToolChange();
         std::cerr << "checkpoint adaptive start\n";
@@ -6862,15 +6878,15 @@ int main() {
         testMockBackendFeedHoldStopBranchIsFatal();
         testMockBackendFeedHoldPausesAndResumesProbeApproach();
         testMockBackendProbeContactDuringFeedHoldStopIsDetected();
-        testSimulationWorkerFeedHoldReachesPausedAtRest();
-        testSimulationWorkerStopBrakesAndAbandonsProgram();
-        testSimulationWorkerFeedHoldResumesProbeApproach();
-        testSimulationWorkerProbeContactSupersedesFeedHold();
+        testMachineSessionManagerFeedHoldReachesPausedAtRest();
+        testMachineSessionManagerStopBrakesAndAbandonsProgram();
+        testMachineSessionManagerFeedHoldResumesProbeApproach();
+        testMachineSessionManagerProbeContactSupersedesFeedHold();
         test1001PreviewCompletesBoundedly();
         testSingleShortEntityClusterRetainsMidpointControl();
         test1002PreparedSliceBoundaries();
         testMdiToolChangeUsesAutoloadPrograms();
-        testSimulationWorkerPersistsUntilReset();
+        testMachineSessionManagerPersistsSimulationUntilReset();
         testSimulationProgramElapsedTimeIsPlaybackSpeedIndependent();
         testInterpreterStatusMessagesPreserveOrder();
         testAlertAndM0RequireExplicitProgramResume();
@@ -6923,9 +6939,9 @@ int main() {
         testMockDiagnosticPositionsFollowServoPeriod();
         testMachineConfigurationLoadsTrajectoryLimits();
         testConfiguredSimulationStartsAtZeroAndHomes();
-        testSimulationWorkerStopBrakesHomingAtRest();
-        testSimulationWorkerJogsCoupledJointsBeforeHoming();
-        testSimulationWorkerSessionStopBrakesJogAtRest();
+        testMachineSessionManagerStopBrakesHomingAtRest();
+        testMachineSessionManagerJogsCoupledJointsBeforeHoming();
+        testMachineSessionManagerStopBrakesJogAtRest();
         testProbeCompilesAsBackendOwnedTriggeredMove();
         testDualScrewJointMoveStopsEachMotorOnItsOwnSwitch();
         testMotionWordSynchronizationPolicy();

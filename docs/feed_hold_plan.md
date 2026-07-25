@@ -26,9 +26,9 @@ mock-only and is not yet a production real-time safety guarantee.
 ## Implemented behavior
 
 - The GUI exposes a `Feed Hold` button while a timed simulation is Running.
-- The GUI submits the request to `SimulationWorker`; it never writes directly
+- The GUI submits the request to `MachineSessionManager`; it never writes directly
   to the backend control channel.
-- `SimulationWorker` continues ticking the executor throughout Holding and
+- `MachineSessionManager` continues ticking the executor throughout Holding and
   Paused. It no longer implements pause by suspending executor calls.
 - The backend accepts `FeedHoldRequest`, reports `BackendState::Holding`, and
   begins changing the executed command on the next mock servo tick.
@@ -176,7 +176,7 @@ Focused framework-free tests in `src/test.cpp` cover:
   completion or losing its target; and
 - detecting probe contact during feed-hold braking at the first crossing servo
   sample and completing without a transient Paused state; and
-- the end-to-end `SimulationWorker` transition from Running through Holding to
+- the end-to-end `MachineSessionManager` transition from Running through Holding to
   Paused and back to moving Running state.
 
 The configuration-loader regression also verifies positive feed-hold values.

@@ -4,8 +4,8 @@
 
 This document records the intended architecture for persistent machine sessions,
 standalone and Real-derived Simulation, and the future physical motion backend.
-It also defines the incremental path from the current `SimulationWorker` design
-to that architecture.
+It also defines the incremental path from the current standalone
+`MachineSessionManager` design to that architecture.
 
 The design preserves the existing interpretation, prepared-geometry, trajectory
 planning, and bounded `MotionBackend` contracts. It changes how those components
@@ -184,9 +184,9 @@ connection, or other powered-session state.
 
 ### `ExecutionCoordinator`
 
-The coordinator owns at most one motion-producing activity. It replaces the
-current collection of interdependent `SimulationWorker` boolean flags with an
-explicit activity state and an NRT request queue.
+The coordinator owns at most one motion-producing activity. It uses an explicit
+activity state and an NRT request queue instead of interdependent host-level
+boolean control flags.
 
 Representative requests are:
 
@@ -641,10 +641,10 @@ The current mock feed-hold retimer is not a production jerk guarantee. A
 bounded, proved production hold/resume design is required before physical
 program motion is enabled.
 
-## Replacing `SimulationWorker`
+## Simulation integration ownership
 
-The current `SimulationWorker` is the only complete timed-execution integration
-path, but it combines:
+`MachineSessionManager` is the complete timed-Simulation integration path. Its
+standalone Simulation host currently combines:
 
 - interpreter and canonical machine ownership;
 - program/MDI lifecycle;
@@ -658,15 +658,14 @@ path, but it combines:
 - diagnostics; and
 - the UI snapshot.
 
-It should be replaced incrementally, not rewritten in one step.
-
 The common UI model becomes `MachineSessionSnapshot`. Simulation-only
 diagnostics are optional data attached by `InProcessSimulationRuntime`; they do
 not enter the generic backend.
 
-During migration, a small compatibility facade may retain the
-`SimulationWorker` API while delegating to the extracted components. The facade
-is removed after the application uses `MachineSessionManager`.
+The former `SimulationWorker` compatibility facade has been removed. The
+application, diagnostic tool, and tests use `MachineSessionManager` directly.
+Further manager work must separate the standalone Simulation host from
+control-target routing without duplicating its proved execution loop.
 
 ## Implementation roadmap
 
@@ -682,8 +681,8 @@ is removed after the application uses `MachineSessionManager`.
 
 ### Phase 2: Implement persistent controller data
 
-Status: implemented in the current application/`SimulationWorker`
-compatibility layer. The Real parameter and tool-table paths are reserved for
+Status: implemented in the current application/`MachineSessionManager`.
+The Real parameter and tool-table paths are reserved for
 the future Real session; Simulation does not write them.
 
 - Add explicit iteration/export of eligible persistent `Memory` cells.
@@ -714,7 +713,7 @@ the future Real session; Simulation does not write them.
 
 ### Phase 3: Extract presentation tracking
 
-Status: implemented behind the current `SimulationWorker` compatibility facade.
+Status: implemented behind the current `MachineSessionManager`.
 `PresentationTracker` owns presentation activation, block lifecycle, spindle and
 modal presentation, WCS history, and chunk/span diagnostic associations.
 
@@ -725,7 +724,7 @@ modal presentation, WCS history, and chunk/span diagnostic associations.
 
 ### Phase 4: Extract the in-process Simulation runtime
 
-Status: implemented behind the current `SimulationWorker` compatibility facade.
+Status: implemented behind the current `MachineSessionManager`.
 `InProcessSimulationRuntime` owns the persistent mock backend, sleeping scheduler
 thread, timed-epoch activation, accelerated refill coordination, synthetic input
 policy, synchronous service stepping, and mock-only timing and jerk diagnostics.
@@ -739,8 +738,8 @@ policy, synchronous service stepping, and mock-only timing and jerk diagnostics.
 
 ### Phase 5: Introduce `MachineSession`
 
-Status: implemented behind the current `SimulationWorker` compatibility
-facade. The backend-neutral power/activity vocabulary,
+Status: implemented behind the current `MachineSessionManager`. The
+backend-neutral power/activity vocabulary,
 `MachineSessionSnapshot`, optional Simulation diagnostics, and bounded owning
 `SessionCommand` queue are implemented. `MachineSession` now owns the
 interpreter, prepared-geometry producer thread and channels, trajectory driver,
@@ -756,9 +755,9 @@ pumps a bounded amount of prepared work, and reports a normalized operation
 outcome.
 `MachineSession` also admits and dispatches queued program, MDI, homing, and
 jogging starts, validates their activity ownership, and releases Program/MDI
-activity when the execution epoch finishes. The `SimulationWorker`
-compatibility facade queues starts, jogging controls, feed hold, Resume, and
-Stop through that command boundary.
+activity when the execution epoch finishes. `MachineSessionManager` queues
+starts, jogging controls, feed hold, Resume, and Stop through that command
+boundary.
 `MachineSession` controls its `BackendRuntime` powered lifetime: On starts the
 runtime, idle Off stops it, and repeated power cycles reuse the same backend
 endpoint. Runtime startup or shutdown failure faults the session.
@@ -788,6 +787,13 @@ and synthetic homing-switch preparation.
 - Generalize `SimulationSnapshot` into `MachineSessionSnapshot`.
 
 ### Phase 6: Introduce `MachineSessionManager`
+
+Status: in progress. Standalone Simulation is application-owned through
+`MachineSessionManager`; the former `SimulationWorker` facade is removed. The
+manager exposes the available targets and generation-tagged Simulation control
+authority, and rejects selection of an unavailable Real target without
+advancing that authority. Optional concurrent Real ownership, dual-session
+snapshots, inactive-Real draining, and control transfer remain future work.
 
 - Support standalone Simulation with no `[real_run]` configuration.
 - Support optional Real and Simulation sessions concurrently.

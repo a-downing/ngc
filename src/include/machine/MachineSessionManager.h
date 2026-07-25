@@ -24,7 +24,27 @@
 #include "machine/ToolTable.h"
 #include "memory/ParameterStore.h"
 
-class SimulationWorker {
+namespace ngc {
+
+enum class MachineControlTarget {
+    Simulation,
+    Real,
+};
+
+struct MachineControlAuthority {
+    MachineControlTarget target = MachineControlTarget::Simulation;
+    std::uint64_t generation = 0;
+
+    bool operator==(const MachineControlAuthority &) const = default;
+};
+
+struct MachineSessionManagerState {
+    MachineControlAuthority authority;
+    bool simulationAvailable = true;
+    bool realAvailable = false;
+};
+
+class MachineSessionManager {
     static ngc::GeometryStreamPolicy geometryPolicy(const ngc::TrajectoryLimits &limits) {
         ngc::GeometryStreamPolicy result;
         result.splineVelocityLimits={
@@ -57,6 +77,10 @@ class SimulationWorker {
     std::vector<ngc::AxisConfiguration> m_axes;
     std::vector<ngc::JointConfiguration> m_joints;
     std::uint32_t m_tickMultiplier = 1;
+    MachineControlAuthority m_controlAuthority {
+        .target = MachineControlTarget::Simulation,
+        .generation = 1,
+    };
 
     [[nodiscard]] bool motionOwnedOrQueued() const noexcept {
         return m_running || !m_machineSession.coordinator().commands().empty()
@@ -65,7 +89,7 @@ class SimulationWorker {
     }
 
 public:
-    explicit SimulationWorker(const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch,
+    explicit MachineSessionManager(const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch,
                               const ngc::TrajectoryLimits limits = {},
                               const ngc::SimulationTiming timing = {})
         : m_runtime(limits, timing),
@@ -76,9 +100,9 @@ public:
         m_machineSession.presentationTracker().reset(sessionPresentation());
         (void)m_machineSession.powerOn();
         m_snapshot.powerState = m_machineSession.coordinator().powerState();
-        m_thread = std::thread(&SimulationWorker::work, this);
+        m_thread = std::thread(&MachineSessionManager::work, this);
     }
-    explicit SimulationWorker(const ngc::MachineConfiguration &configuration)
+    explicit MachineSessionManager(const ngc::MachineConfiguration &configuration)
         : m_runtime(configuration),
           m_machineSession(configuration.unit, ngc::InterpretationMode::Simulation,
                            m_runtime, configuration.trajectory,
@@ -94,11 +118,41 @@ public:
         clearActiveTool();
         (void)m_machineSession.powerOn();
         m_snapshot.powerState = m_machineSession.coordinator().powerState();
-        m_thread = std::thread(&SimulationWorker::work, this);
+        m_thread = std::thread(&MachineSessionManager::work, this);
     }
-    ~SimulationWorker() { join(); }
-    SimulationWorker(const SimulationWorker &) = delete;
-    SimulationWorker &operator=(const SimulationWorker &) = delete;
+    ~MachineSessionManager() { join(); }
+    MachineSessionManager(const MachineSessionManager &) = delete;
+    MachineSessionManager &operator=(const MachineSessionManager &) = delete;
+
+    MachineSessionManagerState state() const {
+        std::scoped_lock lock(m_mutex);
+
+        return {
+            .authority = m_controlAuthority,
+            .simulationAvailable = true,
+            .realAvailable = false,
+        };
+    }
+
+    std::expected<MachineControlAuthority, std::string> selectControlTarget(
+        const MachineControlTarget target) {
+        std::scoped_lock lock(m_mutex);
+        if (target == MachineControlTarget::Real) {
+            return std::unexpected("the Real machine session is not configured");
+        }
+        if (target != m_controlAuthority.target) {
+            m_controlAuthority.target = target;
+            ++m_controlAuthority.generation;
+        }
+
+        return m_controlAuthority;
+    }
+
+    bool hasControlAuthority(const MachineControlAuthority authority) const {
+        std::scoped_lock lock(m_mutex);
+
+        return authority == m_controlAuthority;
+    }
 
     bool start(const std::vector<std::tuple<std::string, std::string>> &programs, const ngc::ToolTable &tools,
                const bool preserveState = false) {
@@ -1145,3 +1199,5 @@ private:
         }
     }
 };
+
+}
