@@ -4,6 +4,9 @@ namespace ngc {
     enum class SessionCommandRejection {
         None,
         SessionNotPowered,
+        SessionAlreadyPowered,
+        SessionAlreadyOff,
+        PowerTransitionInProgress,
         MotionOwned,
         NoMotionOwner,
         EmptyProgram,

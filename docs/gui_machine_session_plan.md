@@ -11,25 +11,12 @@ exists. Completed claims must be verified against the current code and tests.
 
 ## Current mismatch
 
-The application now owns Simulation through `MachineSessionManager`, and the
-common snapshot exposes backend-neutral power and activity state. The GUI still
-largely presents Simulation as a one-shot execution job:
-
-- `SimulationStatus` is used to infer whether machine operations are available,
-  even though `MachinePowerState` and `MachineActivity` now express the
-  authoritative session lifecycle and motion owner.
-- Simulation is powered during manager construction. The GUI has no distinct
-  On or Off operation.
-- The primary program action is named **Simulate** rather than **Start**.
-- **Reset Simulation** combines controller-reset expectations with the old
-  execution-worker model.
-- Program, MDI, homing, and jogging activity are not presented as distinct
-  owners in the main controls.
-- The status area mixes operator state, live coordinates, modal state,
-  interpreter messages, planner internals, backend packet state, and
-  Simulation scheduler diagnostics.
-- Several GUI actions discard command rejection results rather than explaining
-  why the requested operation was unavailable.
+The application owns Simulation through `MachineSessionManager`, presents its
+backend-neutral power and activity state, and exposes the powered-session
+lifecycle explicitly. Phases 1 through 6 are complete. The remaining mismatch
+is multi-session control: Simulation is still the only available target, and
+there is no Real-session snapshot, control transfer, or Real-to-Simulation
+checkpoint operation.
 
 ## Target operator model
 
@@ -281,7 +268,14 @@ Acceptance criteria:
 
 ### Phase 6: Expose the powered-session lifecycle
 
-This phase requires manager API work before the GUI controls are meaningful.
+Status: complete. `MachineSessionManager` now starts with Simulation powered
+off and serializes explicit power-on and power-off operations through its
+persistent worker. Snapshots expose Starting, Stopping, On, Off, and Faulted
+power states. Power-off rejects while motion or a queued operation owns the
+session. The primary toolbar has a distinct On/Off lifecycle control and keeps
+Start and Stop separate. The obsolete **Reset Simulation** API and GUI action
+have been removed; power cycles retain the persistent session position, modal
+state, parameters, and live tool table.
 
 - Add manager operations for queued or safely synchronized power on and power
   off.

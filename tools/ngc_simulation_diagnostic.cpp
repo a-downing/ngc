@@ -653,6 +653,10 @@ int main(const int argc, char **argv) {
             return 1;
         }
     }
+    if (!worker.powerOn()) {
+        std::println(stderr, "simulation worker failed to power on");
+        return 1;
+    }
     if(!worker.start(programs,tools,true)) {
         std::println(stderr,"simulation worker rejected the run");
         return 1;

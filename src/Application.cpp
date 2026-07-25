@@ -1938,6 +1938,35 @@ public:
         ImGui::SameLine();
         ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
         ImGui::SameLine();
+        const auto powerOn = simulation.powerState == ngc::MachinePowerState::Off;
+        const auto powerAvailable = controls.canPowerOn || controls.canPowerOff;
+        const auto powerLabel = powerOn ? "On"
+            : simulation.powerState == ngc::MachinePowerState::Starting ? "Starting..."
+            : simulation.powerState == ngc::MachinePowerState::Stopping ? "Stopping..."
+            : simulation.powerState == ngc::MachinePowerState::Faulted ? "Faulted"
+            : "Off";
+        ImGui::BeginDisabled(!powerAvailable);
+        if (ImGui::Button(powerLabel)) {
+            const auto result = powerOn
+                ? m_simulation.powerOn() : m_simulation.powerOff();
+            if (!result) {
+                reportRejectedSessionAction(
+                    powerOn ? "Simulation power on" : "Simulation power off", result);
+            } else {
+                m_errorMessage.clear();
+            }
+        }
+        ImGui::EndDisabled();
+        if (simulation.powerState == ngc::MachinePowerState::Starting
+            || simulation.powerState == ngc::MachinePowerState::Stopping) {
+            unavailableTooltip(true, "The Simulation power transition is in progress.");
+        } else if (simulation.powerState == ngc::MachinePowerState::Faulted) {
+            unavailableTooltip(true, "The Simulation session is faulted.");
+        } else {
+            unavailableTooltip(!powerAvailable,
+                "Stop the active operation before powering off Simulation.");
+        }
+        ImGui::SameLine();
         const auto startUnavailable = !compiledMode || m_programSource.empty() || !controls.canStart;
         ImGui::BeginDisabled(startUnavailable);
         if(ImGui::Button("Start")) {
@@ -2006,19 +2035,6 @@ public:
 
         ImGui::SameLine();
         if(ImGui::Button(m_showJogPane ? "Hide Jog" : "Jog")) m_showJogPane = !m_showJogPane;
-
-        ImGui::SameLine();
-        ImGui::BeginDisabled(!controls.canReset);
-        if(ImGui::Button("Reset Simulation")) {
-            const auto result = m_simulation.resetSimulation();
-            if (!result) {
-                reportRejectedSessionAction("Simulation reset", result);
-            } else {
-                m_errorMessage.clear();
-            }
-        }
-        ImGui::EndDisabled();
-        unavailableTooltip(!controls.canReset, ngc::gui::unavailableMotionReason(simulation));
 
         ImGui::SameLine();
         ImGui::SetNextItemWidth(90.0f);

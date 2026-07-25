@@ -23,13 +23,14 @@ namespace ngc::gui {
     struct MachineSessionControls {
         bool powered = false;
         bool idle = false;
+        bool canPowerOn = false;
+        bool canPowerOff = false;
         bool canStart = false;
         bool canHome = false;
         bool canJog = false;
         bool canFeedHold = false;
         bool canResume = false;
         bool canStop = false;
-        bool canReset = false;
     };
 
     inline OperatorDro operatorDro(const MachineSessionSnapshot &snapshot) noexcept {
@@ -113,6 +114,12 @@ namespace ngc::gui {
             case SessionCommandRejection::None: return "the command was accepted";
             case SessionCommandRejection::SessionNotPowered:
                 return "the controlled session is not powered on";
+            case SessionCommandRejection::SessionAlreadyPowered:
+                return "the controlled session is already powered on";
+            case SessionCommandRejection::SessionAlreadyOff:
+                return "the controlled session is already powered off";
+            case SessionCommandRejection::PowerTransitionInProgress:
+                return "a power transition is already in progress";
             case SessionCommandRejection::MotionOwned:
                 return "another operation owns the controlled session";
             case SessionCommandRejection::NoMotionOwner:
@@ -190,6 +197,8 @@ namespace ngc::gui {
         return {
             .powered = powered,
             .idle = idle,
+            .canPowerOn = snapshot.powerState == MachinePowerState::Off,
+            .canPowerOff = powered && idle,
             .canStart = powered && idle,
             .canHome = powered && idle && homingAvailable,
             .canJog = powered && idle,
@@ -200,9 +209,6 @@ namespace ngc::gui {
                     || snapshot.programOperation
                         == ProgramOperationPresentation::ProgramPaused),
             .canStop = powered && motionOwned,
-            .canReset = powered && !operationActive
-                && (snapshot.machineActivity == MachineActivity::Idle
-                    || snapshot.machineActivity == MachineActivity::Faulted),
         };
     }
 

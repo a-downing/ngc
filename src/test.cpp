@@ -548,6 +548,7 @@ final_move_together = true
         std::filesystem::remove(path);
 
         ngc::MachineSessionManager worker;
+        require(worker.powerOn(), "Simulation should power on explicitly");
         require(worker.setPersistentParameterStorePath(path).has_value(),
                 "idle Simulation should accept its parameter-store path");
         require(worker.start({{"G59.3\n", "persistent-coordinate-system.ngc"}}, {}),
@@ -880,9 +881,23 @@ final_move_together = true
         require(manager.state().authority == state.authority,
                 "a rejected control-target change must not advance control authority");
 
+        require(manager.snapshot().powerState == ngc::MachinePowerState::Off,
+                "a new manager should leave its persistent Simulation session powered off");
+        const auto unpoweredStart = manager.start({{"G0 X1\n", "unpowered.ngc"}}, {});
+        require(!unpoweredStart
+                    && unpoweredStart.rejection
+                        == ngc::SessionCommandRejection::SessionNotPowered,
+                "an unpowered manager should reject program start");
+        require(manager.powerOn(), "the manager should power Simulation on explicitly");
+        const auto duplicatePowerOn = manager.powerOn();
+        require(!duplicatePowerOn
+                    && duplicatePowerOn.rejection
+                        == ngc::SessionCommandRejection::SessionAlreadyPowered,
+                "powering on an already powered session should retain its structured reason");
+
         const auto snapshot = manager.snapshot();
         require(snapshot.powerState == ngc::MachinePowerState::On,
-                "the manager should expose its persistent powered Simulation session");
+                "the manager should publish completed Simulation power-on");
         require(snapshot.machineActivity == ngc::MachineActivity::Idle,
                 "a newly powered Simulation session should be idle");
         require(snapshot.simulationDiagnostics
@@ -920,6 +935,10 @@ final_move_together = true
                 "an invalid jog token should retain its structured rejection reason");
         require(manager.start({{"G0 X0.01\n", "session-state.ngc"}}, {}),
                 "the powered manager session should accept a program epoch");
+        const auto activePowerOff = manager.powerOff();
+        require(!activePowerOff
+                    && activePowerOff.rejection == ngc::SessionCommandRejection::MotionOwned,
+                "power-off should reject while a program owns motion");
         auto completed = manager.snapshot();
         for (auto attempt = 0; attempt < 2000
              && completed.status != ngc::SimulationStatus::Completed
@@ -933,6 +952,15 @@ final_move_together = true
         require(completed.powerState == ngc::MachinePowerState::On
                     && completed.machineActivity == ngc::MachineActivity::Idle,
                 "program completion should return to the same powered idle session");
+        require(manager.powerOff(), "the idle manager should power Simulation off");
+        require(manager.snapshot().powerState == ngc::MachinePowerState::Off,
+                "the manager should publish completed Simulation power-off");
+        const auto duplicatePowerOff = manager.powerOff();
+        require(!duplicatePowerOff
+                    && duplicatePowerOff.rejection
+                        == ngc::SessionCommandRejection::SessionAlreadyOff,
+                "powering off an already off session should retain its structured reason");
+        require(manager.powerOn(), "the persistent Simulation session should power on again");
         manager.join();
         require(manager.snapshot().powerState == ngc::MachinePowerState::Off,
                 "joining the manager should end its powered Simulation lifetime");
@@ -968,6 +996,7 @@ final_move_together = true
         require(previewFinished, "parameter-isolation Preview should finish");
         requireNear(preview.read(ngc::Var::G54_X), 7.0,
                     "Preview should retain its independent parameter mutation");
+        require(manager.powerOn(), "parameter Simulation should power on explicitly");
         requireNear(manager.parameterSnapshot().at(ngc::Var::G54_X), 0.0,
                     "Preview evaluation must not alter the Simulation parameter snapshot");
         preview.join();
@@ -1018,16 +1047,32 @@ final_move_together = true
         ngc::SimulationSnapshot snapshot;
         auto controls = ngc::gui::machineSessionControls(snapshot, true);
         require(!controls.powered && !controls.canStart && !controls.canHome
-                    && !controls.canJog && !controls.canStop,
+                    && !controls.canJog && !controls.canStop && controls.canPowerOn
+                    && !controls.canPowerOff,
                 "an unpowered session must reject motion-producing controls");
         require(ngc::gui::powerStateName(snapshot.powerState) == "Off"
                     && ngc::gui::machineActivityName(snapshot.machineActivity) == "Idle",
                 "session view should name power and activity independently");
 
+        snapshot.powerState = ngc::MachinePowerState::Starting;
+        controls = ngc::gui::machineSessionControls(snapshot, true);
+        require(!controls.canPowerOn && !controls.canPowerOff && !controls.canStart
+                    && ngc::gui::powerStateName(snapshot.powerState) == "Starting",
+                "a starting session should inhibit competing power and motion commands");
+
+        snapshot.powerState = ngc::MachinePowerState::Stopping;
+        snapshot.machineActivity = ngc::MachineActivity::Stopping;
+        controls = ngc::gui::machineSessionControls(snapshot, true);
+        require(!controls.canPowerOn && !controls.canPowerOff && !controls.canStart
+                    && ngc::gui::powerStateName(snapshot.powerState) == "Stopping",
+                "a stopping session should inhibit competing power and motion commands");
+
         snapshot.powerState = ngc::MachinePowerState::On;
+        snapshot.machineActivity = ngc::MachineActivity::Idle;
         controls = ngc::gui::machineSessionControls(snapshot, true);
         require(controls.powered && controls.idle && controls.canStart
-                    && controls.canHome && controls.canJog && controls.canReset,
+                    && controls.canHome && controls.canJog && controls.canPowerOff
+                    && !controls.canPowerOn,
                 "a powered idle session should accept ordinary operator starts");
 
         snapshot.status = ngc::SimulationStatus::Running;
@@ -1081,8 +1126,8 @@ final_move_together = true
         snapshot.machineActivity = ngc::MachineActivity::Faulted;
         snapshot.programOperation = ngc::ProgramOperationPresentation::Failed;
         controls = ngc::gui::machineSessionControls(snapshot, true);
-        require(controls.canReset && !controls.canStop,
-                "a stationary faulted session should expose reset rather than Stop");
+        require(!controls.canPowerOn && !controls.canPowerOff && !controls.canStop,
+                "a stationary faulted session should inhibit power and motion commands");
         require(ngc::gui::unavailableMotionReason(snapshot)
                     == "The Simulation session is faulted.",
                 "faulted sessions should explain why motion is unavailable");
@@ -1419,6 +1464,7 @@ final_move_together = true
                 "G10 L11 isolation fixture should create isolated tool tables");
 
         ngc::MachineSessionManager worker;
+        require(worker.powerOn(), "Simulation should power on explicitly");
         require(worker.setToolTable(initial),
                 "idle Simulation should accept its isolated tool table");
         require(worker.setToolTableStorePath(paths.simulation).has_value(),
@@ -1723,6 +1769,7 @@ final_move_together = true
 
     void testMachineSessionManagerStartsSimulationPlayback() {
         ngc::MachineSessionManager worker;
+        require(worker.powerOn(), "Simulation should power on explicitly");
         ngc::ToolTable tools;
         tools.set(1, { 1, 0, 0, 2, 0, 0, 0, 0.5, "simulation tool" });
         require(worker.start({ {
@@ -1779,6 +1826,7 @@ G57 G1 X0.6
 )NGC";
 
         ngc::MachineSessionManager worker;
+        require(worker.powerOn(), "Simulation should power on explicitly");
         ngc::ToolTable tools;
         tools.set(1, {
             .number = 1,
@@ -1895,6 +1943,7 @@ G1 F60 X2
 )NGC";
 
         ngc::MachineSessionManager worker(*configuration);
+        require(worker.powerOn(), "Simulation should power on explicitly");
         ngc::ToolTable tools;
         tools.set(2, {
             .number = 2,
@@ -1971,6 +2020,7 @@ G1 F60 X2
         auto tools=fixtureToolTable();
 
         ngc::MachineSessionManager worker;
+        require(worker.powerOn(), "Simulation should power on explicitly");
         worker.setTickMultiplier(1000);
         require(worker.start(fixturePrograms(std::move(main),"fixture/exact-stop.ngc"),tools),
                 "adaptive-pockets simulation should start");
@@ -2002,6 +2052,7 @@ G1 F60 X2
         source+="G0 X9\n";
 
         ngc::MachineSessionManager worker;
+        require(worker.powerOn(), "Simulation should power on explicitly");
         worker.setTickMultiplier(100);
         ngc::ToolTable tools;
         require(worker.start({{source,"multi-packet-refill.ngc"}},tools),
@@ -2048,6 +2099,7 @@ G1 F60 X2
         for(int command=1;command<=COMMANDS;++command)
             source+=std::format("G1 F60 X{:.6f}\n",100.0+static_cast<double>(command)*0.001);
         ngc::MachineSessionManager worker;
+        require(worker.powerOn(), "Simulation should power on explicitly");
         ngc::ToolTable tools;
         require(worker.start({{source,"planning-snapshot-progress.ngc"}},tools),
                 "planning snapshot progress simulation should start");
@@ -2293,6 +2345,7 @@ G1 F60 X2
         preview.join();
 
         ngc::MachineSessionManager simulation;
+        require(simulation.powerOn(), "Simulation should power on explicitly");
         simulation.setTickMultiplier(1000);
         require(simulation.start({{source,"g64-rapid.ngc"}},tools),
                 "G64 rapid simulation should start");
@@ -2321,6 +2374,7 @@ G1 F60 X2
             "M30\n";
         ngc::ToolTable tools;
         ngc::MachineSessionManager simulation;
+        require(simulation.powerOn(), "Simulation should power on explicitly");
         simulation.setTickMultiplier(1000);
         require(simulation.start({{source, "zero-length-chain-transition.ngc"}}, tools),
                 "zero-length chain transition simulation should start");
@@ -2448,6 +2502,7 @@ G1 F60 X2
         ngc::MachineSessionManager worker(UNIT,{
             .pathAcceleration=0.0,.rapidSpeed=100.0,.arcChordTolerance=0.0001,.pathJerk=10.0,
         });
+        require(worker.powerOn(), "Simulation should power on explicitly");
         ngc::ToolTable tools;
         require(worker.start({{"G64 P0.01\nG1 F60 X1\nG1 Y1\n","simulation-error.ngc"}},tools),
                 "simulation GUI error regression should start");
@@ -2576,6 +2631,7 @@ G1 F60 X2
         auto tools=fixtureToolTable();
 
         ngc::MachineSessionManager worker;
+        require(worker.powerOn(), "Simulation should power on explicitly");
         worker.setTickMultiplier(1000);
         require(worker.start(fixturePrograms("T2 M6\n","<MDI>"),tools),
                 "MDI tool change should start");
@@ -2593,8 +2649,9 @@ G1 F60 X2
         worker.join();
     }
 
-    void testMachineSessionManagerPersistsSimulationUntilReset() {
+    void testMachineSessionManagerPersistsSimulationAcrossPowerCycle() {
         ngc::MachineSessionManager worker;
+        require(worker.powerOn(), "Simulation should power on explicitly");
         ngc::ToolTable tools;
         worker.setTickMultiplier(1000);
 
@@ -2648,16 +2705,25 @@ G1 F60 X2
                     != afterSecond.activePresentation.modalGCodes.end(),
                 "subsequent commands should preserve G43 modal state");
 
-        require(worker.resetSimulation(), "idle simulation should reset");
-        const auto reset = worker.snapshot();
-        require(reset.status == ngc::SimulationStatus::Stopped, "reset simulation should report stopped");
-        requireNear(reset.machinePosition.x, 0.0, "reset simulation should restore the initial pose");
+        require(worker.powerOff(), "idle Simulation should power off");
+        require(worker.snapshot().powerState == ngc::MachinePowerState::Off,
+                "powered-off Simulation should publish its explicit lifecycle state");
+        require(worker.powerOn(), "Simulation should power on for a later epoch");
+        const auto afterPowerCycle = worker.snapshot();
+        require(afterPowerCycle.powerState == ngc::MachinePowerState::On,
+                "powered-on Simulation should publish its explicit lifecycle state");
+        requireNear(afterPowerCycle.machinePosition.x, 2.0,
+                    "a power cycle should preserve the persistent session position");
+        require(std::ranges::find(afterPowerCycle.activePresentation.modalGCodes, "G43")
+                    != afterPowerCycle.activePresentation.modalGCodes.end(),
+                "a power cycle should preserve persistent controller modal state");
         worker.join();
     }
 
     void testSimulationProgramElapsedTimeIsPlaybackSpeedIndependent() {
         const auto runAtMultiplier = [](const int multiplier) {
             ngc::MachineSessionManager worker;
+            require(worker.powerOn(), "Simulation should power on explicitly");
             ngc::ToolTable tools;
             worker.setTickMultiplier(multiplier);
             require(worker.start({ { "G1 F60 X0.01\n", "elapsed-time.ngc" } }, tools),
@@ -2757,6 +2823,7 @@ G1 F60 X2
 
     void testSimulationM0PublishesAlertAndResumes() {
         ngc::MachineSessionManager worker;
+        require(worker.powerOn(), "Simulation should power on explicitly");
         ngc::ToolTable tools;
         require(worker.start({{
                     "alert[\"Change the tool\"]\n"
@@ -4641,6 +4708,7 @@ G1 F60 X2
         const auto configuration = ngc::loadMachineConfiguration("machine.toml");
         require(configuration.has_value(), configuration ? "" : configuration.error());
         ngc::MachineSessionManager worker(*configuration);
+        require(worker.powerOn(), "Simulation should power on explicitly");
         ngc::ToolTable tools;
         const std::vector<std::tuple<std::string, std::string>> program {
             { "G1 F60 G53 X10\n", "feed-hold-worker.ngc" },
@@ -4712,6 +4780,7 @@ G1 F60 X2
         const auto configuration = ngc::loadMachineConfiguration("machine.toml");
         require(configuration.has_value(), configuration ? "" : configuration.error());
         ngc::MachineSessionManager worker(*configuration);
+        require(worker.powerOn(), "Simulation should power on explicitly");
         const std::vector<std::tuple<std::string, std::string>> program {
             { "G1 F60 G53 X10\n", "controlled-stop-worker.ngc" },
         };
@@ -4785,6 +4854,7 @@ G1 F60 X2
         const auto configuration = ngc::loadMachineConfiguration("machine.toml");
         require(configuration.has_value(), configuration ? "" : configuration.error());
         ngc::MachineSessionManager worker(*configuration);
+        require(worker.powerOn(), "Simulation should power on explicitly");
         ngc::ToolTable tools;
         const std::vector<std::tuple<std::string, std::string>> program {
             { "G38.3 F60 X10\n", "feed-hold-probe-worker.ngc" },
@@ -4840,6 +4910,7 @@ G1 F60 X2
         const auto configuration = ngc::loadMachineConfiguration("machine.toml");
         require(configuration.has_value(), configuration ? "" : configuration.error());
         ngc::MachineSessionManager worker(*configuration);
+        require(worker.powerOn(), "Simulation should power on explicitly");
         ngc::ToolTable tools;
         const std::vector<std::tuple<std::string, std::string>> program {
             { "G38.3 F200 X13\n", "feed-hold-probe-contact-worker.ngc" },
@@ -6645,6 +6716,7 @@ G1 F60 X2
         const auto configuration=fixtureMachineConfiguration();
         require(configuration.has_value(), configuration ? "" : configuration.error());
         ngc::MachineSessionManager worker(*configuration);
+        require(worker.powerOn(), "Simulation should power on explicitly");
         worker.setTickMultiplier(1000);
         auto snapshot = worker.snapshot();
         requireNear(snapshot.machinePosition.x, 0.0, "Simulation should start with X at zero");
@@ -6692,6 +6764,7 @@ G1 F60 X2
         configuration->simulation.schedulerPeriod =
             configuration->simulation.servoPeriod;
         ngc::MachineSessionManager worker(*configuration);
+        require(worker.powerOn(), "Simulation should power on explicitly");
         require(worker.home(), "controlled homing-stop regression should start homing");
 
         auto snapshot = worker.snapshot();
@@ -6730,6 +6803,7 @@ G1 F60 X2
         require(configuration.has_value(), configuration ? "" : configuration.error());
         configuration->simulation.schedulerPeriod = configuration->simulation.servoPeriod;
         ngc::MachineSessionManager worker(*configuration);
+        require(worker.powerOn(), "Simulation should power on explicitly");
 
         const auto axis = std::ranges::find(configuration->axes, ngc::Machine::Axis::Y,
                                             &ngc::AxisConfiguration::axis);
@@ -6782,6 +6856,7 @@ G1 F60 X2
         configuration->simulation.schedulerPeriod =
             configuration->simulation.servoPeriod;
         ngc::MachineSessionManager worker(*configuration);
+        require(worker.powerOn(), "Simulation should power on explicitly");
 
         const auto axis = std::ranges::find(configuration->axes, ngc::Machine::Axis::X,
                                             &ngc::AxisConfiguration::axis);
@@ -7124,7 +7199,7 @@ int main() {
         testSingleShortEntityClusterRetainsMidpointControl();
         test1002PreparedSliceBoundaries();
         testMdiToolChangeUsesAutoloadPrograms();
-        testMachineSessionManagerPersistsSimulationUntilReset();
+        testMachineSessionManagerPersistsSimulationAcrossPowerCycle();
         testSimulationProgramElapsedTimeIsPlaybackSpeedIndependent();
         testInterpreterStatusMessagesPreserveOrder();
         testAlertAndM0RequireExplicitProgramResume();
