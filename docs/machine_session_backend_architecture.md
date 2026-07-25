@@ -734,9 +734,12 @@ policy, synchronous service stepping, and mock-only timing and jerk diagnostics.
 Status: in progress. The backend-neutral power/activity vocabulary,
 `MachineSessionSnapshot`, optional Simulation diagnostics, and bounded owning
 `SessionCommand` queue are implemented. The `SimulationWorker` compatibility
-facade now queues program and homing starts through that command boundary.
-Interpreter, geometry, trajectory, homing, jogging, and the remaining operation
-coordination still need to move behind the session abstraction.
+facade now queues program and homing starts, jogging controls, feed hold,
+Resume, and Stop through that command boundary. Stop uses backend constrained
+braking, abandons the execution epoch only at rest, and reconciles canonical
+position to the stationary backend state. Interpreter, geometry, trajectory,
+homing, jogging, and the remaining operation coordination still need to move
+behind the session abstraction.
 
 - Move interpreter, geometry producer, trajectory driver, homing, jogging, and
   operation coordination into backend-neutral components.

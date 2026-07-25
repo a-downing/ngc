@@ -304,12 +304,14 @@ namespace ngc {
     struct DisableRequest { RequestId id = 0; };
     struct StartRequest { RequestId id = 0; EpochId epoch = 0; };
     struct FeedHoldRequest { RequestId id = 0; };
+    struct ControlledStopRequest { RequestId id = 0; };
     struct ResumeRequest { RequestId id = 0; EpochId epoch = 0; };
     struct AbortRequest { RequestId id = 0; };
     struct ResetRequest { RequestId id = 0; EpochId nextEpoch = 0; };
     struct SetJointPositionRequest { RequestId id = 0; JointMask joints = 0; JointVector position{}; };
     using ControlRequest = std::variant<EnableRequest, DisableRequest, StartRequest,
-                                        FeedHoldRequest, ResumeRequest, AbortRequest, ResetRequest,
+                                        FeedHoldRequest, ControlledStopRequest, ResumeRequest,
+                                        AbortRequest, ResetRequest,
                                         SetJointPositionRequest, StartContinuousJogRequest,
                                         StartIncrementalJogRequest, RenewJogLeaseRequest,
                                         SetContinuousJogVelocityRequest, StopJogRequest>;
@@ -360,7 +362,7 @@ namespace ngc {
         SpanId span;
         double parameter;
     };
-    enum class BackendHoldReason : std::uint8_t { StopBranch, FeedHold };
+    enum class BackendHoldReason : std::uint8_t { StopBranch, FeedHold, ControlledStop };
     struct BackendHeld { EpochId epoch; MotionState state; BackendHoldReason reason; };
     struct BackendFault { std::uint32_t code; };
     using ExecutionEvent = std::variant<ChunkAccepted, ChunkRejected, ChunkRetired, BranchSelected,

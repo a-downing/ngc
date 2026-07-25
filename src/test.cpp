@@ -3622,6 +3622,105 @@ G1 F60 X2
                 "mock servo telemetry should retain feed-resume acceleration samples");
     }
 
+    void testMockBackendControlledStopBrakesAndCannotResume() {
+        ngc::TrajectoryLimits limits;
+        limits.pathAcceleration = 4.0;
+        limits.axisAcceleration = ngc::position_t { 4.0, 4.0, 4.0, 4.0, 4.0, 4.0 };
+        ngc::MockMotionBackend backend(
+            ngc::FeedHoldConfiguration { 2.0, 10.0 }, limits);
+
+        ngc::PlanChunk chunk;
+        chunk.epoch = 27;
+        chunk.id = 51;
+        chunk.branch = 61;
+        require(chunk.normalMotion.push(linearSpan(301, 0.0, 10.0, 10.0)),
+                "controlled-stop normal span should fit");
+        require(chunk.stopTail.push(linearSpan(302, 10.0, 10.0, 1e-6)),
+                "controlled-stop tail should fit");
+        chunk.branchState = ngc::executionSpanEnd(chunk.normalMotion[0]);
+        chunk.stopState.position.x = 10.0;
+
+        ngc::PlanChunk queued;
+        queued.epoch = chunk.epoch;
+        queued.id = 52;
+        queued.predecessorBranch = chunk.branch;
+        queued.branch = 62;
+        require(queued.normalMotion.push(linearSpan(303, 10.0, 20.0, 10.0)),
+                "controlled-stop queued span should fit");
+        require(queued.stopTail.push(linearSpan(304, 20.0, 20.0, 1e-6)),
+                "controlled-stop queued tail should fit");
+        queued.branchState = ngc::executionSpanEnd(queued.normalMotion[0]);
+        queued.stopState.position.x = 20.0;
+
+        require(backend.tryPublish(chunk) == ngc::PublishResult::Published
+                    && backend.tryPublish(queued) == ngc::PublishResult::Published,
+                "controlled-stop horizon should publish");
+        require(backend.trySubmit(ngc::StartRequest { 1, chunk.epoch })
+                    == ngc::SubmitResult::Submitted,
+                "controlled-stop test should submit start");
+        backend.advanceTick(0.5, true);
+
+        ngc::ExecutionSnapshot snapshot;
+        while (backend.tryTakeSnapshot(snapshot)) { }
+        const auto stopStart = snapshot.commanded;
+        require(backend.trySubmit(ngc::ControlledStopRequest { 2 })
+                    == ngc::SubmitResult::Submitted,
+                "controlled-stop request should fit in the control channel");
+
+        bool sawHolding = false;
+        for (auto tick = 0; tick < 5000
+             && snapshot.state != ngc::BackendState::Held; ++tick) {
+            backend.advanceTick(0.001, true);
+            while (backend.tryTakeSnapshot(snapshot)) {
+                sawHolding = sawHolding
+                    || snapshot.state == ngc::BackendState::Holding;
+            }
+        }
+        require(sawHolding,
+                "controlled stop should expose physical braking through Holding");
+        require(snapshot.state == ngc::BackendState::Held,
+                "controlled stop should finish in the stationary backend state");
+        require(snapshot.commanded.position.x > stopStart.position.x
+                    && snapshot.commanded.position.x < 10.0,
+                "controlled stop should brake forward before the end of active motion");
+        require(std::abs(snapshot.commanded.velocity.x) <= 1e-12
+                    && std::abs(snapshot.commanded.acceleration.x) <= 1e-12,
+                "controlled stop should publish rest before completion");
+        require(snapshot.queuedExecutionItems == 0,
+                "controlled stop should discard the unpublished execution horizon at rest");
+
+        bool accepted = false;
+        bool sawControlledStop = false;
+        ngc::ExecutionEvent event;
+        while (backend.tryTakeEvent(event)) {
+            if (const auto *completed = std::get_if<ngc::RequestCompleted>(&event)) {
+                if (completed->request == 2) {
+                    accepted = completed->succeeded;
+                }
+            } else if (const auto *held = std::get_if<ngc::BackendHeld>(&event)) {
+                sawControlledStop =
+                    held->reason == ngc::BackendHoldReason::ControlledStop;
+            }
+        }
+        require(accepted && sawControlledStop,
+                "controlled stop should acknowledge its request and identify completion");
+
+        require(backend.trySubmit(ngc::ResumeRequest { 3, chunk.epoch })
+                    == ngc::SubmitResult::Submitted,
+                "post-stop resume should fit for rejection testing");
+        backend.advanceTick(0.0, true);
+        bool resumeRejected = false;
+        while (backend.tryTakeEvent(event)) {
+            if (const auto *completed = std::get_if<ngc::RequestCompleted>(&event)) {
+                if (completed->request == 3) {
+                    resumeRejected = !completed->succeeded;
+                }
+            }
+        }
+        require(resumeRejected,
+                "controlled stop should permanently reject resume for the abandoned epoch");
+    }
+
     void testMockBackendFeedHoldStopBranchIsFatal() {
         ngc::TrajectoryLimits limits;
         limits.pathAcceleration = 4.0;
@@ -3882,6 +3981,74 @@ G1 F60 X2
         require(snapshot.machinePosition.x >= heldPosition && snapshot.machinePosition.x < 10.0,
                 "feed resume should continue forward from the held path cursor");
         worker.stop();
+        worker.join();
+    }
+
+    void testSimulationWorkerStopBrakesAndAbandonsProgram() {
+        const auto configuration = ngc::loadMachineConfiguration("machine.toml");
+        require(configuration.has_value(), configuration ? "" : configuration.error());
+        SimulationWorker worker(*configuration);
+        const std::vector<std::tuple<std::string, std::string>> program {
+            { "G1 F60 G53 X10\n", "controlled-stop-worker.ngc" },
+        };
+        require(worker.start(program, {}, true),
+                "controlled-stop worker regression should start a program");
+
+        auto snapshot = worker.snapshot();
+        for (auto attempt = 0; attempt < 10000
+             && !(snapshot.status == ngc::SimulationStatus::Running
+                  && snapshot.trajectoryBackendVelocity > 1e-4); ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(snapshot.status == ngc::SimulationStatus::Running
+                    && snapshot.trajectoryBackendVelocity > 1e-4,
+                "controlled-stop worker regression should observe active motion");
+        const auto stopStart = snapshot.machinePosition.x;
+
+        worker.stop();
+        bool sawHolding =
+            worker.snapshot().status == ngc::SimulationStatus::Holding;
+        for (auto attempt = 0; attempt < 10000
+             && snapshot.status != ngc::SimulationStatus::Stopped
+             && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+            sawHolding = sawHolding
+                || snapshot.status == ngc::SimulationStatus::Holding;
+        }
+        require(sawHolding,
+                "session Stop should expose constrained braking before completion");
+        require(snapshot.status == ngc::SimulationStatus::Stopped,
+                std::format("session Stop should abandon the program at rest: {}",
+                            snapshot.error));
+        require(snapshot.machinePosition.x > stopStart
+                    && snapshot.machinePosition.x < 10.0,
+                "session Stop should retain the physical braking position");
+        require(snapshot.trajectoryBackendVelocity <= 1e-10
+                    && snapshot.trajectoryBackendAcceleration <= 1e-10,
+                "session Stop should publish Stopped only after reaching rest");
+        require(!worker.resume(),
+                "a stopped program epoch should not be resumable");
+
+        const auto stoppedPosition = snapshot.machinePosition.x;
+        require(worker.start(
+                    { { "G91 G1 F60 X1\n", "post-stop-worker.ngc" } }, {}, true),
+                "the powered session should accept a new program after Stop");
+        for (auto attempt = 0; attempt < 10000
+             && snapshot.status != ngc::SimulationStatus::Completed
+             && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(snapshot.status == ngc::SimulationStatus::Completed,
+                std::format("post-stop program should complete normally: {}",
+                            snapshot.error));
+        require(snapshot.machinePosition.x >= stoppedPosition + 1.0 - 1e-8,
+                std::format(
+                    "a new program should continue from the retained stopped position: "
+                    "stopped={} completed={}",
+                    stoppedPosition, snapshot.machinePosition.x));
         worker.join();
     }
 
@@ -5787,6 +5954,45 @@ G1 F60 X2
         worker.join();
     }
 
+    void testSimulationWorkerStopBrakesHomingAtRest() {
+        auto configuration = fixtureMachineConfiguration();
+        require(configuration.has_value(), configuration ? "" : configuration.error());
+        configuration->simulation.schedulerPeriod =
+            configuration->simulation.servoPeriod;
+        SimulationWorker worker(*configuration);
+        require(worker.home(), "controlled homing-stop regression should start homing");
+
+        auto snapshot = worker.snapshot();
+        for (auto attempt = 0; attempt < 5000
+             && !snapshot.hasActiveMotion
+             && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(snapshot.hasActiveMotion,
+                std::format("homing should begin moving before Stop: {}",
+                            snapshot.error));
+
+        worker.stop();
+        for (auto attempt = 0; attempt < 5000
+             && snapshot.status != ngc::SimulationStatus::Stopped
+             && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(snapshot.status == ngc::SimulationStatus::Stopped,
+                std::format("homing Stop should finish at rest: {}",
+                            snapshot.error));
+        for (const auto &joint : configuration->joints) {
+            require(std::abs(snapshot.joints.velocity[joint.id]) <= 1e-10
+                        && std::abs(snapshot.joints.acceleration[joint.id]) <= 1e-10,
+                    "homing Stop should publish every participating joint at rest");
+        }
+        require(snapshot.homedJoints == 0,
+                "stopping homing early must not mark unfinished joints as homed");
+        worker.join();
+    }
+
     void testSimulationWorkerJogsCoupledJointsBeforeHoming() {
         auto configuration=fixtureMachineConfiguration();
         require(configuration.has_value(), configuration ? "" : configuration.error());
@@ -5835,6 +6041,74 @@ G1 F60 X2
                 "pre-home coupled jogging should visibly move the simulated Y axis");
         requireNear(snapshot.joints.position[1], snapshot.joints.position[2],
                     "pre-home coupled Y jogging should keep both ball-screw joints together");
+        worker.join();
+    }
+
+    void testSimulationWorkerSessionStopBrakesJogAtRest() {
+        auto configuration = fixtureMachineConfiguration();
+        require(configuration.has_value(), configuration ? "" : configuration.error());
+        configuration->simulation.schedulerPeriod =
+            configuration->simulation.servoPeriod;
+        SimulationWorker worker(*configuration);
+
+        const auto axis = std::ranges::find(configuration->axes, ngc::Machine::Axis::X,
+                                            &ngc::AxisConfiguration::axis);
+        require(axis != configuration->axes.end(),
+                "controlled jog-stop regression should find configured X");
+        const auto joint = std::ranges::find(configuration->joints, axis->joints.front(),
+                                             &ngc::JointConfiguration::id);
+        require(joint != configuration->joints.end(),
+                "controlled jog-stop regression should find the X joint");
+        const ngc::StartContinuousJogRequest request {
+            .id = 300,
+            .jog = 400,
+            .target = {
+                ngc::JogTargetType::JointGroup,
+                ngc::AxisId::X,
+                static_cast<ngc::JointMask>(ngc::JointMask { 1 } << joint->id),
+            },
+            .signedVelocity = 0.5,
+            .limits = {
+                axis->maxVelocity,
+                configuration->jogging.acceleration,
+                configuration->jogging.jerk,
+            },
+            .stopLimits = {
+                axis->maxVelocity,
+                axis->maxAcceleration,
+                joint->maxJerk,
+            },
+            .leaseTicks = 10000,
+        };
+        require(worker.startJog(ngc::ControlRequest { request }),
+                "controlled jog-stop regression should start jogging");
+
+        auto snapshot = worker.snapshot();
+        for (auto attempt = 0; attempt < 5000
+             && std::abs(snapshot.joints.velocity[joint->id]) <= 1e-4
+             && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(std::abs(snapshot.joints.velocity[joint->id]) > 1e-4,
+                std::format("jog should begin moving before Stop: {}",
+                            snapshot.error));
+
+        worker.stop();
+        for (auto attempt = 0; attempt < 5000
+             && snapshot.status != ngc::SimulationStatus::Stopped
+             && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(snapshot.status == ngc::SimulationStatus::Stopped,
+                std::format("session Stop should finish jogging at rest: {}",
+                            snapshot.error));
+        require(snapshot.lastJogStopReason == ngc::JogStopReason::RequestedStop,
+                "session Stop should use the backend's constrained jog-stop path");
+        require(std::abs(snapshot.joints.velocity[joint->id]) <= 1e-10
+                    && std::abs(snapshot.joints.acceleration[joint->id]) <= 1e-10,
+                "session Stop should publish the jog joint at rest");
         worker.join();
     }
 
@@ -6100,10 +6374,12 @@ int main() {
         testIncrementalGeometryDefersAndDoesNotRebuildAnchorSection();
         testSimulationDriverFailureAppearsInGuiStatusStream();
         testMockBackendFeedHoldBrakesAlongActiveTrajectory();
+        testMockBackendControlledStopBrakesAndCannotResume();
         testMockBackendFeedHoldStopBranchIsFatal();
         testMockBackendFeedHoldPausesAndResumesProbeApproach();
         testMockBackendProbeContactDuringFeedHoldStopIsDetected();
         testSimulationWorkerFeedHoldReachesPausedAtRest();
+        testSimulationWorkerStopBrakesAndAbandonsProgram();
         testSimulationWorkerFeedHoldResumesProbeApproach();
         testSimulationWorkerProbeContactSupersedesFeedHold();
         test1001PreviewCompletesBoundedly();
@@ -6163,7 +6439,9 @@ int main() {
         testMockDiagnosticPositionsFollowServoPeriod();
         testMachineConfigurationLoadsTrajectoryLimits();
         testConfiguredHomingMovesFromPowerUpPosition();
+        testSimulationWorkerStopBrakesHomingAtRest();
         testSimulationWorkerJogsCoupledJointsBeforeHoming();
+        testSimulationWorkerSessionStopBrakesJogAtRest();
         testProbeCompilesAsBackendOwnedTriggeredMove();
         testDualScrewJointMoveStopsEachMotorOnItsOwnSwitch();
         testMotionWordSynchronizationPolicy();

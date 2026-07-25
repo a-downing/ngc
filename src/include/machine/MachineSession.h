@@ -1,8 +1,10 @@
 #pragma once
 
+#include <algorithm>
 #include <cstddef>
 #include <deque>
 #include <optional>
+#include <ranges>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -77,6 +79,16 @@ namespace ngc {
         [[nodiscard]] bool empty() const noexcept;
         [[nodiscard]] std::size_t size() const noexcept;
         [[nodiscard]] std::size_t capacity() const noexcept;
+
+        template<typename Predicate>
+        [[nodiscard]] bool anyOf(Predicate predicate) const {
+            return std::ranges::any_of(m_commands, std::move(predicate));
+        }
+
+        template<typename Predicate>
+        void eraseIf(Predicate predicate) {
+            std::erase_if(m_commands, std::move(predicate));
+        }
 
         template<typename Command>
         [[nodiscard]] bool contains() const noexcept {

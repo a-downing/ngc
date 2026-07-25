@@ -40,7 +40,6 @@ class SimulationWorker {
         return result;
     }
 
-    static constexpr std::size_t MAX_PENDING_JOG_CONTROLS = 16;
     mutable std::mutex m_mutex;
     std::condition_variable m_cv;
     std::thread m_thread;
@@ -70,6 +69,9 @@ class SimulationWorker {
     std::uint64_t m_toolTableRevision = 0;
     bool m_join = false;
     bool m_stop = false;
+    bool m_controlledStopInProgress = false;
+    bool m_controlledStopCompleted = false;
+    std::optional<ngc::position_t> m_controlledStopPosition;
     bool m_paused = false;
     bool m_programPaused = false;
     bool m_programResumeRequested = false;
@@ -82,7 +84,7 @@ class SimulationWorker {
     bool m_feedResumeInProgress = false;
     std::optional<ngc::RequestId> m_pendingFeedHoldRequest;
     std::optional<ngc::RequestId> m_pendingFeedResumeRequest;
-    std::deque<ngc::ControlRequest> m_jogControls;
+    std::optional<ngc::RequestId> m_pendingControlledStopRequest;
     std::optional<ngc::JogId> m_activeJog;
     ngc::JointMask m_homedJoints = 0;
     std::vector<ngc::AxisConfiguration> m_axes;
@@ -154,6 +156,9 @@ public:
             return false;
         }
         m_stop = false;
+        m_controlledStopInProgress = false;
+        m_controlledStopCompleted = false;
+        m_controlledStopPosition.reset();
         m_paused = false;
         m_programPaused = false;
         m_programResumeRequested = false;
@@ -164,6 +169,7 @@ public:
         m_feedResumeInProgress = false;
         m_pendingFeedHoldRequest.reset();
         m_pendingFeedResumeRequest.reset();
+        m_pendingControlledStopRequest.reset();
         m_snapshot.status = ngc::SimulationStatus::Running;
         m_snapshot.activity = ngc::SimulationActivity::Program;
         m_snapshot.operatorAlert.reset();
@@ -193,6 +199,10 @@ public:
             return false;
         }
         m_stop = false;
+        m_controlledStopInProgress = false;
+        m_controlledStopCompleted = false;
+        m_controlledStopPosition.reset();
+        m_pendingControlledStopRequest.reset();
         m_paused = false;
         m_snapshot.status = ngc::SimulationStatus::Running;
         m_snapshot.activity = ngc::SimulationActivity::Homing;
@@ -217,8 +227,15 @@ public:
         if (!jog || *jog == 0 || motionOwnedOrQueued()) {
             return false;
         }
+        if (!m_sessionCommands.tryPush(ngc::StartJog { request })) {
+            return false;
+        }
+        m_stop = false;
+        m_controlledStopInProgress = false;
+        m_controlledStopCompleted = false;
+        m_controlledStopPosition.reset();
+        m_pendingControlledStopRequest.reset();
         m_activeJog = *jog;
-        m_jogControls.push_back(request);
         m_snapshot.status = ngc::SimulationStatus::Running;
         m_snapshot.activity = ngc::SimulationActivity::Jogging;
         m_snapshot.jogging = true;
@@ -230,12 +247,11 @@ public:
     bool renewJog(const ngc::RequestId request, const ngc::JogId jog) {
         std::scoped_lock lock(m_mutex);
         if(!m_activeJog || *m_activeJog != jog) return false;
-        if(std::ranges::any_of(m_jogControls, [&](const auto &control) {
-            const auto *renewal = std::get_if<ngc::RenewJogLeaseRequest>(&control);
+        if(m_sessionCommands.anyOf([&](const auto &command) {
+            const auto *renewal = std::get_if<ngc::RenewJog>(&command);
             return renewal && renewal->jog == jog;
         })) return true;
-        if(m_jogControls.size() >= MAX_PENDING_JOG_CONTROLS) return false;
-        m_jogControls.emplace_back(ngc::RenewJogLeaseRequest { request, jog });
+        if (!m_sessionCommands.tryPush(ngc::RenewJog { request, jog })) return false;
         m_cv.notify_all();
         return true;
     }
@@ -243,15 +259,14 @@ public:
     bool setJogVelocity(const ngc::SetContinuousJogVelocityRequest &request) {
         std::scoped_lock lock(m_mutex);
         if(!m_activeJog || *m_activeJog != request.jog) return false;
-        std::erase_if(m_jogControls, [&](const auto &control) {
-            if(const auto *renewal = std::get_if<ngc::RenewJogLeaseRequest>(&control))
+        m_sessionCommands.eraseIf([&](const auto &command) {
+            if(const auto *renewal = std::get_if<ngc::RenewJog>(&command))
                 return renewal->jog == request.jog;
-            if(const auto *update = std::get_if<ngc::SetContinuousJogVelocityRequest>(&control))
-                return update->jog == request.jog;
+            if(const auto *update = std::get_if<ngc::SetJogVelocity>(&command))
+                return update->request.jog == request.jog;
             return false;
         });
-        if(m_jogControls.size() >= MAX_PENDING_JOG_CONTROLS) return false;
-        m_jogControls.emplace_back(request);
+        if (!m_sessionCommands.tryPush(ngc::SetJogVelocity { request })) return false;
         m_cv.notify_all();
         return true;
     }
@@ -286,18 +301,17 @@ public:
     bool stopJog(const ngc::RequestId request, const ngc::JogId jog) {
         std::scoped_lock lock(m_mutex);
         if(!m_activeJog || *m_activeJog != jog) return false;
-        std::erase_if(m_jogControls, [&](const auto &control) {
-            const auto *renewal = std::get_if<ngc::RenewJogLeaseRequest>(&control);
+        m_sessionCommands.eraseIf([&](const auto &command) {
+            const auto *renewal = std::get_if<ngc::RenewJog>(&command);
             if(renewal) return renewal->jog == jog;
-            const auto *update = std::get_if<ngc::SetContinuousJogVelocityRequest>(&control);
-            return update && update->jog == jog;
+            const auto *update = std::get_if<ngc::SetJogVelocity>(&command);
+            return update && update->request.jog == jog;
         });
-        if(std::ranges::any_of(m_jogControls, [&](const auto &control) {
-            const auto *stop = std::get_if<ngc::StopJogRequest>(&control);
+        if(m_sessionCommands.anyOf([&](const auto &command) {
+            const auto *stop = std::get_if<ngc::StopJog>(&command);
             return stop && stop->jog == jog;
         })) return true;
-        if(m_jogControls.size() >= MAX_PENDING_JOG_CONTROLS) return false;
-        m_jogControls.emplace_back(ngc::StopJogRequest { request, jog });
+        if (!m_sessionCommands.tryPush(ngc::StopJog { request, jog })) return false;
         m_cv.notify_all();
         return true;
     }
@@ -305,9 +319,9 @@ public:
     bool feedHold() {
         std::scoped_lock lock(m_mutex);
         if(!m_running || !m_programRunning || m_paused || m_feedHoldRequested
-           || m_feedHoldInProgress || m_feedHoldHeld || m_feedResumeInProgress) return false;
-        m_feedHoldRequested = true;
-        m_feedHoldInProgress = true;
+           || m_feedHoldInProgress || m_feedHoldHeld || m_feedResumeInProgress
+           || m_sessionCommands.contains<ngc::FeedHold>()) return false;
+        if (!m_sessionCommands.tryPush(ngc::FeedHold {})) return false;
         m_snapshot.status = ngc::SimulationStatus::Holding;
         m_cv.notify_all();
         return true;
@@ -317,9 +331,11 @@ public:
         if (!m_running || !m_programRunning || !m_paused) {
             return false;
         }
+        if (m_sessionCommands.contains<ngc::Resume>()) {
+            return false;
+        }
         if (m_programPaused) {
-            m_programResumeRequested = true;
-            m_paused = false;
+            if (!m_sessionCommands.tryPush(ngc::Resume {})) return false;
             m_snapshot.status = ngc::SimulationStatus::Running;
             m_snapshot.operatorAlert.reset();
             m_cv.notify_all();
@@ -328,9 +344,7 @@ public:
         if (!m_feedHoldHeld || m_feedResumeRequested || m_feedResumeInProgress) {
             return false;
         }
-        m_feedResumeRequested = true;
-        m_feedResumeInProgress = true;
-        m_paused = false;
+        if (!m_sessionCommands.tryPush(ngc::Resume {})) return false;
         m_snapshot.status = ngc::SimulationStatus::Running;
         m_cv.notify_all();
         return true;
@@ -338,19 +352,12 @@ public:
     void stop() {
         std::scoped_lock lock(m_mutex);
         if (motionOwnedOrQueued()) {
-            m_stop = true;
             m_sessionCommands.clear();
-            m_paused = false;
-            m_programPaused = false;
-            m_programResumeRequested = false;
-            m_feedHoldRequested = false;
-            m_feedHoldInProgress = false;
-            m_feedHoldHeld = false;
-            m_feedResumeRequested = false;
-            m_feedResumeInProgress = false;
-            m_pendingFeedHoldRequest.reset();
-            m_pendingFeedResumeRequest.reset();
+            (void)m_sessionCommands.tryPush(ngc::Stop {});
             m_snapshot.operatorAlert.reset();
+            if (m_running) {
+                m_snapshot.status = ngc::SimulationStatus::Holding;
+            }
             m_cv.notify_all();
         }
     }
@@ -710,6 +717,15 @@ private:
                 m_feedHoldHeld = true;
                 m_paused = true;
                 m_snapshot.status = ngc::SimulationStatus::Paused;
+            } else if (held->reason == ngc::BackendHoldReason::ControlledStop) {
+                m_pendingControlledStopRequest.reset();
+                m_controlledStopInProgress = false;
+                m_controlledStopCompleted = true;
+                m_snapshot.machinePosition = held->state.position;
+                m_controlledStopPosition = held->state.position;
+                m_snapshot.trajectoryBackendVelocity = 0.0;
+                m_snapshot.trajectoryBackendAcceleration = 0.0;
+                m_snapshot.hasActiveMotion = false;
             }
         } else if(const auto *completed = std::get_if<ngc::RequestCompleted>(&event)) {
             if(m_pendingFeedHoldRequest && completed->request == *m_pendingFeedHoldRequest
@@ -730,6 +746,16 @@ private:
                     m_running = false;
                     m_programRunning = false;
                 }
+            } else if(m_pendingControlledStopRequest
+                      && completed->request == *m_pendingControlledStopRequest
+                      && !completed->succeeded) {
+                m_pendingControlledStopRequest.reset();
+                m_controlledStopInProgress = false;
+                m_snapshot.status = ngc::SimulationStatus::Error;
+                m_snapshot.error =
+                    "motion backend rejected the controlled-stop request";
+                m_running = false;
+                m_programRunning = false;
             }
         }
     }
@@ -782,6 +808,10 @@ private:
     }
 
     void applyBackendSnapshot(const ngc::ExecutionSnapshot &backend) {
+        if (m_controlledStopCompleted
+            && backend.state != ngc::BackendState::Held) {
+            return;
+        }
         applyBackendObservation(m_snapshot, backend);
         if(m_feedResumeInProgress && backend.state == ngc::BackendState::Running
            && backend.executionRate >= 1.0 - 1e-10
@@ -865,12 +895,38 @@ private:
 
     bool homingMayContinue() {
         std::unique_lock lock(m_mutex);
-        while(m_paused && !m_stop && !m_join) {
-            m_snapshot.status = ngc::SimulationStatus::Paused;
-            m_cv.wait(lock, [&] { return !m_paused || m_stop || m_join; });
+        while (auto command = m_sessionCommands.tryPop()) {
+            if (std::holds_alternative<ngc::Stop>(*command)) {
+                m_stop = true;
+            }
         }
-        if(m_stop || m_join) {
+        if (m_join) {
+            m_stop = true;
+        }
+        if (m_stop && !m_controlledStopInProgress && !m_controlledStopCompleted) {
+            const auto request = m_nextFeedHoldRequest++;
+            if (!submitHomingControl(ngc::ControlledStopRequest { request })) {
+                m_snapshot.status = ngc::SimulationStatus::Error;
+                m_snapshot.activity = ngc::SimulationActivity::Idle;
+                m_snapshot.error =
+                    "motion backend control channel is full while stopping homing";
+                m_running = false;
+                return false;
+            }
+            m_pendingControlledStopRequest = request;
+            m_controlledStopInProgress = true;
+            m_snapshot.status = ngc::SimulationStatus::Holding;
+        }
+        while(m_paused && !m_stop && !m_join && m_sessionCommands.empty()) {
+            m_snapshot.status = ngc::SimulationStatus::Paused;
+            m_cv.wait(lock, [&] {
+                return !m_paused || m_stop || m_join
+                    || !m_sessionCommands.empty();
+            });
+        }
+        if(m_controlledStopCompleted) {
             m_stop = false;
+            m_controlledStopCompleted = false;
             m_running = false;
             m_snapshot.status = ngc::SimulationStatus::Stopped;
             m_snapshot.activity = ngc::SimulationActivity::Idle;
@@ -937,8 +993,31 @@ private:
             advanceServiceMotionPeriod();
             ngc::ExecutionEvent event;
             while (m_runtime.endpoint().tryTakeEvent(event)) {
-                if(const auto *completed = std::get_if<ngc::TriggeredJointMoveCompleted>(&event))
-                    if(completed->move == move.moveId) return *completed;
+                if(const auto *completed = std::get_if<ngc::TriggeredJointMoveCompleted>(&event)) {
+                    if(completed->move == move.moveId) {
+                        if (completed->status == ngc::TriggeredMoveStatus::Aborted) {
+                            std::scoped_lock lock(m_mutex);
+                            m_pendingControlledStopRequest.reset();
+                            m_controlledStopInProgress = false;
+                            m_controlledStopCompleted = true;
+                            m_running = false;
+                            m_snapshot.status = ngc::SimulationStatus::Stopped;
+                            m_snapshot.activity = ngc::SimulationActivity::Idle;
+                            m_snapshot.hasActiveMotion = false;
+                            m_session.machine().synchronizePosition(
+                                m_snapshot.machinePosition);
+                        }
+                        return *completed;
+                    }
+                }
+                if (const auto *completed = std::get_if<ngc::RequestCompleted>(&event)) {
+                    if (m_pendingControlledStopRequest
+                        && completed->request == *m_pendingControlledStopRequest
+                        && !completed->succeeded) {
+                        failHoming("motion backend rejected the controlled homing stop");
+                        return std::nullopt;
+                    }
+                }
                 if(const auto *fault = std::get_if<ngc::BackendFault>(&event)) {
                     failHoming("mock homing backend fault " + std::to_string(fault->code));
                     return std::nullopt;
@@ -1120,6 +1199,7 @@ private:
         m_snapshot.hasActiveMotion = false;
         m_homedJoints = allJoints;
         m_snapshot.homedJoints = m_homedJoints;
+        m_session.machine().synchronizePosition(m_snapshot.machinePosition);
         clearActiveTool();
     }
 
@@ -1131,7 +1211,7 @@ private:
         m_snapshot.hasActiveMotion = false;
         m_snapshot.jogging = false;
         m_activeJog.reset();
-        m_jogControls.clear();
+        m_sessionCommands.clear();
         m_running = false;
     }
 
@@ -1172,20 +1252,39 @@ private:
         m_runtime.advanceImmediate(0.0);
 
         bool finished = false;
-        bool abortSubmitted = false;
+        bool stopSubmitted = false;
+        bool sessionStopped = false;
         while(!finished) {
             std::deque<ngc::ControlRequest> controls;
             bool joining = false;
             {
                 std::scoped_lock lock(m_mutex);
                 joining = m_join;
-                if((m_stop || joining) && !abortSubmitted) {
-                    controls.emplace_back(ngc::AbortRequest { internalRequest-- });
-                    abortSubmitted = true;
-                    m_stop = false;
+                while (auto command = m_sessionCommands.tryPop()) {
+                    if (const auto *renew = std::get_if<ngc::RenewJog>(&*command)) {
+                        controls.emplace_back(
+                            ngc::RenewJogLeaseRequest { renew->request, renew->jog });
+                    } else if (const auto *update =
+                                   std::get_if<ngc::SetJogVelocity>(&*command)) {
+                        controls.emplace_back(update->request);
+                    } else if (const auto *stop = std::get_if<ngc::StopJog>(&*command)) {
+                        controls.emplace_back(
+                            ngc::StopJogRequest { stop->request, stop->jog });
+                        stopSubmitted = true;
+                    } else if (std::holds_alternative<ngc::Stop>(*command)
+                               && !stopSubmitted) {
+                        controls.emplace_back(
+                            ngc::StopJogRequest { internalRequest--, *m_activeJog });
+                        stopSubmitted = true;
+                        sessionStopped = true;
+                    }
                 }
-                controls.insert(controls.end(), m_jogControls.begin(), m_jogControls.end());
-                m_jogControls.clear();
+                if(joining && !stopSubmitted) {
+                    controls.emplace_back(
+                        ngc::StopJogRequest { internalRequest--, *m_activeJog });
+                    stopSubmitted = true;
+                    sessionStopped = true;
+                }
             }
             for(const auto &control : controls) {
                 if (m_runtime.endpoint().trySubmit(control)
@@ -1225,11 +1324,13 @@ private:
         std::scoped_lock lock(m_mutex);
         m_running = false;
         m_activeJog.reset();
-        m_snapshot.status = ngc::SimulationStatus::Completed;
+        m_snapshot.status = sessionStopped ? ngc::SimulationStatus::Stopped
+                                           : ngc::SimulationStatus::Completed;
         m_snapshot.activity = ngc::SimulationActivity::Idle;
         m_snapshot.jogging = false;
         m_snapshot.hasActiveMotion = false;
         m_snapshot.activeJogTarget.reset();
+        m_session.machine().synchronizePosition(m_snapshot.machinePosition);
         clearActiveTool();
     }
 
@@ -1255,19 +1356,10 @@ private:
         for(;;) {
             std::unique_lock lock(m_mutex);
             m_cv.wait(lock, [&] {
-                return m_join || !m_sessionCommands.empty() || !m_jogControls.empty();
+                return m_join || !m_sessionCommands.empty();
             });
             if (m_join) {
                 return;
-            }
-            if (!m_jogControls.empty()) {
-                auto request = std::move(m_jogControls.front());
-                m_jogControls.pop_front();
-                m_running = true;
-                m_stop = false;
-                lock.unlock();
-                runJogging(request);
-                continue;
             }
             auto command = m_sessionCommands.tryPop();
             if (!command) {
@@ -1278,6 +1370,22 @@ private:
                 m_stop = false;
                 lock.unlock();
                 runHoming();
+                continue;
+            }
+            if (auto *jog = std::get_if<ngc::StartJog>(&*command)) {
+                auto request = std::move(jog->request);
+                m_running = true;
+                m_stop = false;
+                lock.unlock();
+                runJogging(request);
+                continue;
+            }
+            if (std::holds_alternative<ngc::Stop>(*command)) {
+                m_snapshot.status = ngc::SimulationStatus::Stopped;
+                m_snapshot.activity = ngc::SimulationActivity::Idle;
+                continue;
+            }
+            if (!std::holds_alternative<ngc::StartProgram>(*command)) {
                 continue;
             }
             auto start = std::get<ngc::StartProgram>(std::move(*command));
@@ -1372,13 +1480,77 @@ private:
             for(;;) {
                 lock.lock();
                 applyLatestTimedBackendSnapshot();
-                if(m_join || m_stop) {
-                    const auto joining = m_join; m_stop = false; m_running = false; m_programRunning = false; m_snapshot.status = ngc::SimulationStatus::Stopped; m_snapshot.activity = ngc::SimulationActivity::Idle;
+                while (auto command = m_sessionCommands.tryPop()) {
+                    if (std::holds_alternative<ngc::Stop>(*command)) {
+                        m_stop = true;
+                        m_feedHoldRequested = false;
+                        m_feedResumeRequested = false;
+                        m_programResumeRequested = false;
+                        m_snapshot.status = ngc::SimulationStatus::Holding;
+                    } else if (std::holds_alternative<ngc::FeedHold>(*command)) {
+                        m_feedHoldRequested = true;
+                        m_feedHoldInProgress = true;
+                    } else if (std::holds_alternative<ngc::Resume>(*command)) {
+                        if (m_programPaused) {
+                            m_programResumeRequested = true;
+                            m_paused = false;
+                        } else if (m_feedHoldHeld) {
+                            m_feedResumeRequested = true;
+                            m_feedResumeInProgress = true;
+                            m_paused = false;
+                        }
+                    }
+                }
+                if (m_join) {
+                    m_stop = true;
+                }
+                if (m_stop && !m_controlledStopInProgress
+                    && !m_controlledStopCompleted && !m_feedHoldInProgress) {
+                    const auto alreadyStationary =
+                        m_snapshot.trajectoryBackendState == ngc::BackendState::Held
+                        && m_snapshot.trajectoryBackendVelocity <= 1e-10
+                        && m_snapshot.trajectoryBackendAcceleration <= 1e-10;
+                    if (m_programPaused || alreadyStationary) {
+                        m_controlledStopCompleted = true;
+                        m_controlledStopPosition = m_snapshot.machinePosition;
+                    } else {
+                        const auto request = m_nextFeedHoldRequest++;
+                        if (m_runtime.endpoint().trySubmit(
+                                ngc::ControlledStopRequest { request })
+                                != ngc::SubmitResult::Submitted) {
+                            m_snapshot.status = ngc::SimulationStatus::Error;
+                            m_snapshot.error =
+                                "motion backend control channel is full while requesting stop";
+                            m_running = false;
+                            m_programRunning = false;
+                        } else {
+                            m_pendingControlledStopRequest = request;
+                            m_controlledStopInProgress = true;
+                        }
+                    }
+                }
+                if(m_controlledStopCompleted) {
+                    const auto joining = m_join;
+                    m_stop = false;
+                    m_controlledStopCompleted = false;
+                    m_running = false;
+                    m_programRunning = false;
+                    m_paused = false;
+                    m_programPaused = false;
+                    m_feedHoldInProgress = false;
+                    m_feedHoldHeld = false;
+                    m_feedResumeInProgress = false;
+                    m_snapshot.status = ngc::SimulationStatus::Stopped;
+                    m_snapshot.activity = ngc::SimulationActivity::Idle;
                     copyTimingSnapshot();
                     lock.unlock();
                     m_runtime.endTimedExecution();
                     stopTimedSnapshotService();
                     joinGeometry(true);
+                    if (m_controlledStopPosition) {
+                        m_session.machine().synchronizePosition(
+                            *m_controlledStopPosition);
+                    }
                     m_session.stop();
                     {
                         std::scoped_lock statusLock(m_mutex);
@@ -1430,12 +1602,15 @@ private:
                     m_snapshot.status = ngc::SimulationStatus::Paused;
                     copyTimingSnapshot();
                     m_runtime.releaseRefillOpportunity();
-                    m_cv.wait(lock, [&] { return m_join || m_stop || !m_paused; });
+                    m_cv.wait(lock, [&] {
+                        return m_join || m_stop || !m_paused
+                            || !m_sessionCommands.empty();
+                    });
                     lock.unlock();
                     continue;
                 }
                 if(m_snapshot.status != ngc::SimulationStatus::Error)
-                    m_snapshot.status = m_feedHoldInProgress
+                    m_snapshot.status = (m_feedHoldInProgress || m_stop)
                         ? ngc::SimulationStatus::Holding : ngc::SimulationStatus::Running;
                 struct NrtRefillGuard {
                     ngc::InProcessSimulationRuntime &runtime;
@@ -1561,7 +1736,7 @@ private:
                     }
                     if(!pumped) break;
                     filled = true;
-                    if(m_join||m_stop||m_paused) break;
+                    if(m_join||m_stop||m_paused||!m_sessionCommands.empty()) break;
                 }
                 m_snapshot.trajectoryPlanning = m_driver.planningDiagnostics();
                 copyTimingSnapshot();
@@ -1604,7 +1779,10 @@ private:
                 nrtRefillGuard.release();
                 m_cv.wait_for(lock,
                               std::chrono::duration<double>(m_runtime.servoPeriod()),
-                              [&] { return m_join || m_stop || m_paused; });
+                              [&] {
+                                  return m_join || m_stop || m_paused
+                                      || !m_sessionCommands.empty();
+                              });
                 lock.unlock();
             }
         }

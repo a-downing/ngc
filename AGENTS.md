@@ -64,8 +64,9 @@ consumer is Preview or Simulation.
 The Phase-5 session foundation defines explicit backend-neutral power and
 activity state, `MachineSessionSnapshot`, optional Simulation diagnostics, and a
 bounded owning `SessionCommand` queue. The `SimulationWorker` compatibility
-facade queues program and homing starts through that boundary; remaining
-execution coordination has not yet moved into a complete `MachineSession`.
+facade queues program and homing starts, jogging controls, feed hold, Resume,
+and Stop through that boundary; remaining interpreter, geometry, trajectory,
+and operation coordination has not yet moved into a complete `MachineSession`.
 During timed program epochs, the facade's dedicated snapshot service is the
 sole consumer of backend execution snapshots and maintains a latest-value NRT
 observation independently of geometry and trajectory-planning work. GUI
@@ -208,6 +209,18 @@ Mock probing and homing policy stay outside `MotionBackend`. Synthetic mock inpu
 Jogging uses the bounded backend control/event channel, never generated G-code or `ExecutionItem`. Continuous jogs require renewal of a stable token before a fixed-tick dead-man lease expires; expiry and UI release request a constrained stop. Axis, coupled-joint-group, and individual-joint targets are mutually exclusive with other motion ownership. `SimulationWorker` is the sole NRT producer of mock jog controls; the GUI must not write directly to the backend. The backend lease remains authoritative if UI renewal stops.
 
 Program feed hold is backend-owned motion, not a frozen NRT scheduler or servo clock. A hold request begins on-path braking on the next servo tick by retiming the precomputed trajectory, reports `Holding` while moving, and reports `Paused` only after `BackendHeld` establishes zero velocity and acceleration. Resume from a feed hold retains the normal-branch execution cursor and ramps the reference execution rate back to one; it must not reconstruct geometry, reset span progress, or replay events. During an axis-space triggered probe approach, feed hold uses the executor's constrained-stop machinery while retaining the active `TriggeredMove`, target, and input transition; it must not report probe completion or select the probe branch. Continue sampling the probe input while feed-hold braking: a detected transition latches the servo-sampled trigger state, supersedes the feed hold, and completes the probe through its ordinary constrained-stop result. If no transition occurs, Resume regenerates the remaining approach from the held zero-PVA state. Reaching a stop branch while normal-path feed-hold braking or resume retiming remains active is a fatal backend condition, not permission to enter the stop tail or resume from it. The initial mock-only retimer constrains acceleration and its requested tangential braking/acceleration profile while retaining executed per-axis and aggregate jerk as diagnostics; it does not establish a production jerk guarantee.
+
+Session Stop is a controlled, non-resumable operation stop, not an immediate
+Simulation reset. Moving program and triggered motion must brake through the
+backend and report `Holding` until `BackendHeld` establishes rest; jogging and
+homing use their corresponding constrained axis- or joint-space stop. Only
+after reaching rest may the session discard the active execution epoch,
+unpublished geometry, and queued commands. Resume must reject that abandoned
+epoch. Reconcile the interpreter's canonical position to the backend's
+stationary position before another operation begins. If Stop arrives at an
+already-held zero-PVA boundary, it may abandon the operation without requesting
+new motion. Stop does not power off the session or discard homing, parameters,
+or the live tool table.
 
 `MockTrajectoryDiagnostics` and executed-servo jerk samples are mock-only. They record states actually calculated at the configured servo period and must not be reconstructed by the GUI or added to `MotionBackend`. Keep the executed time-domain jerk diagnostic distinct from the prepared cluster's full geometric jerk coefficient and from normal sharpness. Accelerated mock playback coordinates scheduler batches with NRT planning, publication, and presentation bookkeeping so the simulated clock cannot manufacture a queue-starvation stop while its sole producer is actively refilling the bounded horizon.
 

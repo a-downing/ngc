@@ -63,6 +63,10 @@ namespace ngc {
             m_workOffset = offset(*m_state.modeCoordSys);
         }
 
+        void synchronizePosition(const position_t &position) {
+            m_pos = position;
+        }
+
         template<typename Self> auto &workOffset(this Self &&self) { return std::forward<Self>(self).m_workOffset; }
         template<typename Self> auto &toolOffset(this Self &&self) { return std::forward<Self>(self).m_toolOffset; }
         ToolGeometry toolGeometry() const {
@@ -768,6 +772,9 @@ namespace ngc {
     Machine &Machine::operator=(Machine &&) noexcept = default;
 
     void Machine::beginProgramRun() { m_impl->beginProgramRun(); }
+    void Machine::synchronizePosition(const position_t &position) {
+        m_impl->synchronizePosition(position);
+    }
     const position_t &Machine::workOffset() const { return m_impl->workOffset(); }
     void Machine::setActiveWorkOffset(const Axis axis, const double value) {
         m_impl->setActiveWorkOffset(axis, value);

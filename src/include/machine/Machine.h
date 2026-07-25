@@ -43,6 +43,7 @@ namespace ngc {
         Machine &operator=(Machine &&) noexcept;
 
         void beginProgramRun();
+        void synchronizePosition(const position_t &position);
         const position_t &workOffset() const;
         void setActiveWorkOffset(Axis axis, double value);
         const position_t &toolOffset() const;

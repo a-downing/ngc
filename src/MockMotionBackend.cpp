@@ -98,6 +98,8 @@ namespace ngc {
         bool m_feedHolding = false;
         bool m_feedHeld = false;
         bool m_feedResuming = false;
+        bool m_controlledStopping = false;
+        bool m_controlledStopped = false;
         double m_executionRate = 1.0;
         double m_executionRateAcceleration = 0.0;
         double m_executionRateJerk = 0.0;
@@ -666,9 +668,25 @@ namespace ngc {
                 + scaled(referenceVelocity, m_executionRateJerk);
         }
 
+        void discardExecutionHorizon() {
+            if (m_active) {
+                release(*m_active);
+                m_active.reset();
+            }
+            std::uint8_t discarded;
+            while (m_plans.tryPop(discarded)) {
+                accountForDequeued(discarded);
+                release(discarded);
+            }
+            m_stopping = false;
+            m_span = 0;
+            m_nextMarker = 0;
+            m_spanElapsed = 0.0;
+        }
+
         void finishFeedHold() {
             m_feedHolding = false;
-            m_feedHeld = true;
+            m_feedHeld = !m_controlledStopping;
             m_executionRate = 0.0;
             m_executionRateAcceleration = 0.0;
             m_executionRateJerk = 0.0;
@@ -678,8 +696,15 @@ namespace ngc {
             m_snapshot.feedback = m_snapshot.commanded;
             m_snapshot.executionRate = 0.0;
             m_snapshot.executionRateAcceleration = 0.0;
+            if (m_controlledStopping) {
+                discardExecutionHorizon();
+                m_controlledStopping = false;
+                m_controlledStopped = true;
+            }
             emit(BackendHeld {
-                m_snapshot.epoch, m_snapshot.commanded, BackendHoldReason::FeedHold,
+                m_snapshot.epoch, m_snapshot.commanded,
+                m_controlledStopped ? BackendHoldReason::ControlledStop
+                                    : BackendHoldReason::FeedHold,
             });
         }
 
@@ -687,6 +712,7 @@ namespace ngc {
             m_feedHolding = false;
             m_feedHeld = false;
             m_feedResuming = false;
+            m_controlledStopping = false;
             m_snapshot.state = BackendState::Faulted;
             m_snapshot.faultCode = 5;
             emit(BackendFault { 5 });
@@ -1089,10 +1115,23 @@ namespace ngc {
             emit(ChunkRetired { move.epoch, move.id });
             m_snapshot.state = BackendState::Held;
             m_snapshot.lastBranch = move.branch;
-            emit(BackendHeld { move.epoch, stopped, BackendHoldReason::StopBranch });
             removeSyntheticInput(move.moveId);
             release(*m_active);
             m_active.reset();
+            if (m_controlledStopping) {
+                std::uint8_t discarded;
+                while (m_plans.tryPop(discarded)) {
+                    accountForDequeued(discarded);
+                    release(discarded);
+                }
+                m_controlledStopping = false;
+                m_controlledStopped = true;
+            }
+            emit(BackendHeld {
+                move.epoch, stopped,
+                m_controlledStopped ? BackendHoldReason::ControlledStop
+                                    : BackendHoldReason::StopBranch,
+            });
         }
 
         void finishTriggeredFeedHold() {
@@ -1236,15 +1275,18 @@ namespace ngc {
             return true;
         }
 
-        bool beginJointStop(const TriggeredJointMove &move, const JointId joint) {
+        bool beginJointStop(const TriggeredJointMove &move, const JointId joint,
+                            const bool triggered = true) {
             auto &runtime = m_jointRuntime[joint];
             runtime.stopping = true;
-            runtime.triggered = true;
+            runtime.triggered = triggered;
             runtime.elapsed = 0.0;
             runtime.triggerPosition = m_snapshot.commandedJoints.position[joint];
             runtime.triggerVelocity = m_snapshot.commandedJoints.velocity[joint];
             runtime.triggerAcceleration = m_snapshot.commandedJoints.acceleration[joint];
-            m_triggeredJoints |= JointMask{1} << joint;
+            if (triggered) {
+                m_triggeredJoints |= JointMask{1} << joint;
+            }
             if(std::abs(runtime.triggerVelocity) <= 1e-12
                && std::abs(runtime.triggerAcceleration) <= 1e-12) {
                 runtime.finished = true;
@@ -1285,8 +1327,10 @@ namespace ngc {
                 triggerState.velocity[joint] = runtime.triggerVelocity;
                 triggerState.acceleration[joint] = runtime.triggerAcceleration;
             }
-            const auto status = expectedTriggers != 0 && (m_triggeredJoints & expectedTriggers) == expectedTriggers
-                ? TriggeredMoveStatus::Triggered : TriggeredMoveStatus::ReachedTarget;
+            const auto status = m_controlledStopping
+                ? TriggeredMoveStatus::Aborted
+                : expectedTriggers != 0 && (m_triggeredJoints & expectedTriggers) == expectedTriggers
+                    ? TriggeredMoveStatus::Triggered : TriggeredMoveStatus::ReachedTarget;
             emit(TriggeredJointMoveCompleted { move.epoch, move.moveId, status, m_triggeredJoints,
                                                 triggerState, m_snapshot.commandedJoints });
             emit(BranchSelected { move.epoch, move.branch, BranchChoice::Stop, 0 });
@@ -1294,12 +1338,23 @@ namespace ngc {
             m_snapshot.state = BackendState::Held;
             m_snapshot.lastBranch = move.branch;
             m_snapshot.activeJoints = 0;
-            emit(BackendHeld {
-                move.epoch, m_snapshot.commanded, BackendHoldReason::StopBranch,
-            });
             removeSyntheticJointInputs(move.moveId);
             release(*m_active);
             m_active.reset();
+            if (m_controlledStopping) {
+                std::uint8_t discarded;
+                while (m_plans.tryPop(discarded)) {
+                    accountForDequeued(discarded);
+                    release(discarded);
+                }
+                m_controlledStopping = false;
+                m_controlledStopped = true;
+            }
+            emit(BackendHeld {
+                move.epoch, m_snapshot.commanded,
+                m_controlledStopped ? BackendHoldReason::ControlledStop
+                                    : BackendHoldReason::StopBranch,
+            });
         }
 
         void advanceTriggeredJoints(double &seconds) {
@@ -1381,6 +1436,8 @@ namespace ngc {
                         m_feedHolding = false;
                         m_feedHeld = false;
                         m_feedResuming = false;
+                        m_controlledStopping = false;
+                        m_controlledStopped = false;
                     } else if constexpr(std::same_as<T, StartRequest>) {
                         success = !m_jog;
                         if(success) {
@@ -1389,13 +1446,15 @@ namespace ngc {
                             m_feedHolding = false;
                             m_feedHeld = false;
                             m_feedResuming = false;
+                            m_controlledStopping = false;
+                            m_controlledStopped = false;
                             m_executionRate = 1.0;
                             m_executionRateAcceleration = 0.0;
                             m_executionRateJerk = 0.0;
                         }
                     } else if constexpr(std::same_as<T, ResumeRequest>) {
                         success = !m_jog && m_snapshot.state == BackendState::Held
-                            && value.epoch == m_snapshot.epoch;
+                            && value.epoch == m_snapshot.epoch && !m_controlledStopped;
                         if(success && m_feedHeld) {
                             if(m_active && !m_stopping
                                && std::holds_alternative<PlanChunk>(activeItem())) {
@@ -1443,6 +1502,55 @@ namespace ngc {
                                 m_snapshot.state = BackendState::Holding;
                             }
                         }
+                    } else if constexpr(std::same_as<T, ControlledStopRequest>) {
+                        if (m_jog) {
+                            success = beginJogStop(JogStopReason::RequestedStop);
+                        } else {
+                            const auto heldFromFeedHold =
+                                m_snapshot.state == BackendState::Held && m_feedHeld;
+                            success = (m_snapshot.state == BackendState::Running
+                                       || heldFromFeedHold)
+                                && !m_feedResuming && m_active.has_value();
+                            if (success) {
+                                m_controlledStopping = true;
+                                m_controlledStopped = false;
+                                if (heldFromFeedHold) {
+                                    finishFeedHold();
+                                } else if (std::holds_alternative<PlanChunk>(activeItem())) {
+                                    success = !m_stopping;
+                                    if (success) {
+                                        m_feedHolding = true;
+                                        m_feedHeld = false;
+                                    }
+                                } else if (std::holds_alternative<TriggeredMove>(activeItem())) {
+                                    success = !m_triggered.stopping
+                                        && beginTriggeredStop(
+                                            TriggeredMoveStatus::Aborted);
+                                } else if (std::holds_alternative<TriggeredJointMove>(
+                                               activeItem())) {
+                                    const auto &move =
+                                        std::get<TriggeredJointMove>(activeItem());
+                                    for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+                                        if ((move.joints & (JointMask{1} << joint)) == 0) {
+                                            continue;
+                                        }
+                                        if (!beginJointStop(move, joint, false)) {
+                                            success = false;
+                                            break;
+                                        }
+                                    }
+                                } else {
+                                    success = false;
+                                }
+                                if (success && !heldFromFeedHold) {
+                                    m_snapshot.state = BackendState::Holding;
+                                } else {
+                                    if (!success) {
+                                        m_controlledStopping = false;
+                                    }
+                                }
+                            }
+                        }
                     } else if constexpr(std::same_as<T, AbortRequest>) {
                         if(m_jog) success = beginJogStop(JogStopReason::Aborted);
                         else {
@@ -1451,6 +1559,8 @@ namespace ngc {
                             m_feedHolding = false;
                             m_feedHeld = false;
                             m_feedResuming = false;
+                            m_controlledStopping = false;
+                            m_controlledStopped = false;
                         }
                     } else if constexpr(std::same_as<T, ResetRequest>) {
                         if(m_jog) {
@@ -1473,6 +1583,8 @@ namespace ngc {
                         m_feedHolding = false;
                         m_feedHeld = false;
                         m_feedResuming = false;
+                        m_controlledStopping = false;
+                        m_controlledStopped = false;
                         m_executionRate = 1.0;
                         m_executionRateAcceleration = 0.0;
                         m_executionRateJerk = 0.0;
