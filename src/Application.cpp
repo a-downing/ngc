@@ -203,6 +203,7 @@ class ApplicationImpl final {
     bool m_enableOpenDialog = false;
     bool m_enableMemoryWindow = false;
     bool m_enableToolWindow = false;
+    bool m_enableSimulationDiagnostics = false;
     bool m_showClusterGeometricJerkComb = false;
     bool m_showExecutedJerkComb = true;
 
@@ -1935,18 +1936,6 @@ public:
         if(ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
             ImGui::SetTooltip("Fit the complete preview toolpath to the viewport (F).");
         ImGui::SameLine();
-        ImGui::Checkbox("Cluster jerk comb", &m_showClusterGeometricJerkComb);
-        if(ImGui::IsItemHovered())
-            ImGui::SetTooltip("Log-scaled |q'''| teeth on short-entity cluster splines.\n"
-                              "65 arc-length samples per planner piece. Red means the geometric\n"
-                              "jerk speed cap is below programmed feed; green means it is not.");
-        ImGui::SameLine();
-        ImGui::Checkbox("Executed jerk comb",&m_showExecutedJerkComb);
-        if(ImGui::IsItemHovered())
-            ImGui::SetTooltip("One tooth every 10 executed servo periods at the tool tip.\n"
-                              "Green is executed cubic path jerk; red is unused capacity.");
-
-        ImGui::SameLine();
         ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
         ImGui::SameLine();
         const auto startUnavailable = !compiledMode || m_programSource.empty() || !controls.canStart;
@@ -2044,6 +2033,10 @@ public:
             m_tools = m_simulation.toolTable();
             initToolTableStrings();
             m_enableToolWindow = true;
+        }
+        ImGui::SameLine();
+        if (ImGui::Button("Diagnostics")) {
+            m_enableSimulationDiagnostics = true;
         }
         ImGui::End();
     }
@@ -2499,121 +2492,283 @@ public:
         ImGui::End();
     }
 
+    static void renderMessage(const std::string_view source,
+                              const ngc::InterpreterStatusMessage &message) {
+        ImGui::TextDisabled("[%s]", std::string(source).c_str());
+        ImGui::SameLine();
+        switch (message.kind) {
+            case ngc::InterpreterStatusKind::Error:
+                ImGui::TextColored(ImVec4_Redish, "ERROR: %s", message.text.c_str());
+                break;
+            case ngc::InterpreterStatusKind::Alert:
+                ImGui::TextColored(
+                    ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
+                    "ALERT: %s", message.text.c_str());
+                break;
+            case ngc::InterpreterStatusKind::Print:
+                ImGui::TextColored(ImVec4_Blueish, "PRINT: %s", message.text.c_str());
+                break;
+        }
+    }
+
     void renderStatusBar(const ImGuiViewport &viewport, const ngc::SimulationSnapshot &simulation) {
         const auto y = viewport.Pos.y + viewport.Size.y - m_statusBarHeight;
         ImGui::SetNextWindowPos({ viewport.Pos.x, y });
         ImGui::SetNextWindowSize({ viewport.Size.x, m_statusBarHeight });
-        constexpr auto flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove
-            | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
+        constexpr auto flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize
+            | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoCollapse
+            | ImGuiWindowFlags_NoSavedSettings;
         ImGui::Begin("##status_bar", nullptr, flags);
 
-        const auto statusText = [&] {
-            switch(simulation.status) {
-                case ngc::SimulationStatus::Stopped: return "Stopped";
-                case ngc::SimulationStatus::Running: return "Running";
-                case ngc::SimulationStatus::Holding: return "Holding";
-                case ngc::SimulationStatus::Paused: return "Paused";
-                case ngc::SimulationStatus::Completed: return "Completed";
-                case ngc::SimulationStatus::Error: return "Error";
-            }
-            return "Unknown";
-        }();
-        const auto modalText = ngc::gui::machineModalText(simulation);
+        const auto faulted = simulation.powerState == ngc::MachinePowerState::Faulted
+            || simulation.machineActivity == ngc::MachineActivity::Faulted
+            || simulation.status == ngc::SimulationStatus::Error;
+        const auto summary = std::format("SIMULATION | {} | {} | {}",
+            ngc::gui::powerStateName(simulation.powerState),
+            ngc::gui::machineActivityName(simulation.machineActivity),
+            ngc::gui::programOperationName(simulation.programOperation));
+        if (faulted) {
+            ImGui::TextColored(ImVec4_Redish, "%s", summary.c_str());
+        } else {
+            ImGui::TextUnformatted(summary.c_str());
+        }
 
-        auto diagnosticText=std::format("Simulation: {}    MCS XYZ: {:.4f}, {:.4f}, {:.4f}",
-            statusText,simulation.machinePosition.x,simulation.machinePosition.y,
-            simulation.machinePosition.z);
-        const auto toolPose = ngc::simulationToolPose(simulation);
-        if(toolPose.geometry.number!=0) {
-            diagnosticText+=std::format("    Tool XYZ: {:.4f}, {:.4f}, {:.4f}",
-                toolPose.tipPosition.x,toolPose.tipPosition.y,
-                toolPose.tipPosition.z);
+        const auto modalText = ngc::gui::machineModalText(simulation);
+        if (!modalText.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("| %s", modalText.c_str());
         }
-        if(simulation.status != ngc::SimulationStatus::Stopped) {
-            const auto elapsed = std::max(simulation.programElapsedSeconds, 0.0);
-            const auto totalWholeSeconds = static_cast<std::uint64_t>(elapsed);
-            const auto hours = totalWholeSeconds / 3600;
-            const auto minutes = totalWholeSeconds / 60 % 60;
-            const auto seconds = elapsed - static_cast<double>(hours * 3600 + minutes * 60);
-            diagnosticText+=std::format(
-                "\nG-code elapsed {:.3f} s ({:02}:{:02}:{:06.3f})    Servo {:.3f} ms    "
-                "Scheduler {:.3f} ms ({} ticks) x{}    Ticks {}    Missed deadlines {}    "
-                "Max wake {:.1f} us    Max tick {:.1f} us",
-                elapsed,hours,minutes,seconds,simulation.servoPeriodSeconds*1000.0,
-                simulation.schedulerPeriodSeconds*1000.0,
-                simulation.servoTicksPerSchedulerPeriod, simulation.tickMultiplier,
-                simulation.servoTicks,simulation.deadlineMisses,
-                simulation.maximumWakeLatenessSeconds*1.0e6,
-                simulation.maximumTickExecutionSeconds * 1.0e6);
-            if(!simulation.trajectoryPlanningActivity.empty())
-                diagnosticText+=std::format("\nPlanning {:.3f} s: {}",
-                    simulation.trajectoryPlanningActivitySeconds,
-                    simulation.trajectoryPlanningActivity);
-            if(!simulation.trajectoryDriverActivity.empty())
-                diagnosticText+="\nTrajectory driver: "+simulation.trajectoryDriverActivity;
-            if(!simulation.trajectoryContinuousPlanSummary.empty())
-                diagnosticText+="\nContinuous plan: "+simulation.trajectoryContinuousPlanSummary;
-            const auto backendState=[](const ngc::BackendState state) {
-                switch(state) {
-                    case ngc::BackendState::Disabled: return "Disabled";
-                    case ngc::BackendState::Held: return "Held";
-                    case ngc::BackendState::Running: return "Running";
-                    case ngc::BackendState::Holding: return "Holding";
-                    case ngc::BackendState::Faulted: return "Faulted";
+        if (!simulation.statusMessages.empty()) {
+            ImGui::SameLine();
+            ImGui::TextDisabled("| Latest: %s", simulation.statusMessages.back().text.c_str());
+        }
+
+        const auto parserErrors = m_worker.parserErrors();
+        const auto previewMessages = m_worker.statusMessages();
+        ImGui::SeparatorText("Messages");
+        if (ImGui::BeginChild(
+                "##message_console", { 0.0f, 0.0f }, ImGuiChildFlags_Borders,
+                ImGuiWindowFlags_AlwaysVerticalScrollbar)) {
+            const auto wasAtBottom =
+                ImGui::GetScrollY() >= ImGui::GetScrollMaxY() - 1.0f;
+
+            if (!m_errorMessage.empty()) {
+                ImGui::TextColored(ImVec4_Redish, "[Operator] ERROR: %s", m_errorMessage.c_str());
+            }
+            if (!simulation.error.empty()) {
+                ImGui::TextColored(
+                    ImVec4_Redish, "[Simulation] MOTION ERROR: %s", simulation.error.c_str());
+            }
+            for (const auto &error : parserErrors) {
+                ImGui::TextColored(
+                    ImVec4_Redish, "[Preview] ERROR: %s", error.text().c_str());
+            }
+            for (const auto &message : previewMessages) {
+                renderMessage("Preview", message);
+            }
+            for (const auto &message : simulation.statusMessages) {
+                renderMessage("Simulation", message);
+            }
+
+            if (m_errorMessage.empty() && simulation.error.empty()
+                && parserErrors.empty() && previewMessages.empty()
+                && simulation.statusMessages.empty()) {
+                ImGui::TextDisabled("No messages.");
+            }
+            if (wasAtBottom) {
+                ImGui::SetScrollHereY(1.0f);
+            }
+        }
+        ImGui::EndChild();
+        ImGui::End();
+    }
+
+    void renderSimulationDiagnostics(const ngc::SimulationSnapshot &simulation) {
+        ImGui::SetNextWindowSize({ 760.0f, 620.0f }, ImGuiCond_FirstUseEver);
+        ImGui::SetNextWindowSizeConstraints({ 480.0f, 320.0f }, { FLT_MAX, FLT_MAX });
+
+        if (ImGui::Begin("Simulation Diagnostics", &m_enableSimulationDiagnostics)) {
+            if (ImGui::CollapsingHeader(
+                    "Visualization", ImGuiTreeNodeFlags_DefaultOpen)) {
+                ImGui::Checkbox(
+                    "Cluster geometric jerk comb", &m_showClusterGeometricJerkComb);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "Log-scaled |q'''| teeth on short-entity cluster splines.\n"
+                        "65 arc-length samples per planner piece. Red means the geometric\n"
+                        "jerk speed cap is below programmed feed; green means it is not.");
                 }
-                return "Unknown";
-            };
-            diagnosticText+=std::format(
-                "\nTrajectory backend: {} epoch={} chunk={} span={} progress={:.6f} "
-                "velocity={:.6g} acceleration={:.6g} rate={:.6f} rate-accel={:.6g} "
-                "branch={} fault={}\n"
-                "Committed normal motion: {:.6f} s (active {:.6f} s + queued {:.6f} s, "
-                "{} items)    Stop branch: {:.6f} s",
-                backendState(simulation.trajectoryBackendState),
-                simulation.trajectoryBackendEpoch,simulation.trajectoryBackendChunk,
-                simulation.trajectoryBackendSpan,simulation.trajectoryBackendSpanProgress,
-                simulation.trajectoryBackendVelocity,
-                simulation.trajectoryBackendAcceleration,
-                simulation.trajectoryBackendExecutionRate,
-                simulation.trajectoryBackendExecutionRateAcceleration,
-                simulation.trajectoryBackendLastBranch,simulation.trajectoryBackendFaultCode,
-                simulation.trajectoryBackendCommittedNormalSeconds,
-                simulation.trajectoryBackendActiveNormalRemainingSeconds,
-                simulation.trajectoryBackendQueuedNormalSeconds,
-                simulation.trajectoryBackendQueuedExecutionItems,
-                simulation.trajectoryBackendStopBranchSeconds);
-            if(!simulation.trajectoryBackendSpanDetail.empty())
-                diagnosticText+="\nActive execution span: "+simulation.trajectoryBackendSpanDetail;
-        }
-        if(!modalText.empty()) diagnosticText+="\nModal: "+modalText;
-        const auto diagnosticLines=1+std::ranges::count(diagnosticText,'\n');
-        const auto diagnosticHeight=ImGui::GetTextLineHeightWithSpacing()
-            *static_cast<float>(diagnosticLines)+2.0f*ImGui::GetStyle().FramePadding.y;
-        ImGui::InputTextMultiline("##simulation_diagnostics",diagnosticText.data(),
-            diagnosticText.size()+1,ImVec2(-1.0f,diagnosticHeight),
-            ImGuiInputTextFlags_ReadOnly);
-        ImGui::Separator();
-        if(!m_errorMessage.empty()) ImGui::TextColored(ImVec4_Redish, "ERROR: %s", m_errorMessage.c_str());
-        if(simulation.status == ngc::SimulationStatus::Error && !simulation.error.empty())
-            ImGui::TextColored(ImVec4_Redish, "MOTION ERROR: %s", simulation.error.c_str());
-        for(const auto &error : m_worker.parserErrors()) {
-            ImGui::TextColored(ImVec4_Redish, "ERROR: %s", error.text().c_str());
-        }
-        const auto renderInterpreterMessages = [](const auto &messages) {
-            for(const auto &message : messages) {
-                if(message.kind == ngc::InterpreterStatusKind::Error) {
-                    ImGui::TextColored(ImVec4_Redish, "ERROR: %s", message.text.c_str());
-                } else if (message.kind == ngc::InterpreterStatusKind::Alert) {
-                    ImGui::TextColored(
-                        ImVec4(1.0f, 0.75f, 0.2f, 1.0f),
-                        "ALERT: %s", message.text.c_str());
-                } else {
-                    ImGui::TextColored(ImVec4_Blueish, "PRINT: %s", message.text.c_str());
+                ImGui::Checkbox("Executed jerk comb", &m_showExecutedJerkComb);
+                if (ImGui::IsItemHovered()) {
+                    ImGui::SetTooltip(
+                        "One tooth every 10 executed servo periods at the tool tip.\n"
+                        "Green is executed path jerk; red is unused capacity.");
                 }
             }
-        };
-        renderInterpreterMessages(m_worker.statusMessages());
-        renderInterpreterMessages(simulation.statusMessages);
+
+            if (ImGui::CollapsingHeader(
+                    "Scheduler and servo", ImGuiTreeNodeFlags_DefaultOpen)) {
+                if (const auto &diagnostics = simulation.simulationDiagnostics) {
+                    const auto elapsed = std::max(diagnostics->programElapsedSeconds, 0.0);
+                    const auto totalWholeSeconds = static_cast<std::uint64_t>(elapsed);
+                    const auto hours = totalWholeSeconds / 3600;
+                    const auto minutes = totalWholeSeconds / 60 % 60;
+                    const auto seconds =
+                        elapsed - static_cast<double>(hours * 3600 + minutes * 60);
+                    ImGui::Text(
+                        "Program elapsed: %.3f s (%02llu:%02llu:%06.3f)",
+                        elapsed, static_cast<unsigned long long>(hours),
+                        static_cast<unsigned long long>(minutes), seconds);
+                    ImGui::Text(
+                        "Servo: %.3f ms | Scheduler: %.3f ms (%u ticks) | Playback: x%u",
+                        diagnostics->servoPeriodSeconds * 1000.0,
+                        diagnostics->schedulerPeriodSeconds * 1000.0,
+                        diagnostics->servoTicksPerSchedulerPeriod,
+                        diagnostics->tickMultiplier);
+                    ImGui::Text(
+                        "Servo ticks: %llu | Missed deadlines: %llu",
+                        static_cast<unsigned long long>(diagnostics->servoTicks),
+                        static_cast<unsigned long long>(diagnostics->deadlineMisses));
+                    ImGui::Text(
+                        "Last wake lateness: %.1f us | Maximum: %.1f us | "
+                        "Maximum tick: %.1f us",
+                        diagnostics->lastWakeLatenessSeconds * 1.0e6,
+                        diagnostics->maximumWakeLatenessSeconds * 1.0e6,
+                        diagnostics->maximumTickExecutionSeconds * 1.0e6);
+                    ImGui::Text(
+                        "Executed path jerk: %.6g", diagnostics->executedPathJerk);
+                } else {
+                    ImGui::TextDisabled(
+                        "Scheduler diagnostics are unavailable for this backend.");
+                }
+            }
+
+            if (ImGui::CollapsingHeader(
+                    "Geometry stream", ImGuiTreeNodeFlags_DefaultOpen)) {
+                const auto &geometry = simulation.geometryStream;
+                ImGui::Text(
+                    "Messages: %llu | Slices: %llu | Standalone commands: %llu | "
+                    "Continuous ends: %llu",
+                    static_cast<unsigned long long>(geometry.messagesPublished),
+                    static_cast<unsigned long long>(geometry.slicesPublished),
+                    static_cast<unsigned long long>(geometry.standaloneCommandsPublished),
+                    static_cast<unsigned long long>(geometry.continuousEndsPublished));
+                ImGui::Text(
+                    "Prepared: %.3f s path in %.3f s | Queue high-water: %zu | "
+                    "Maximum pieces: %zu",
+                    geometry.preparedSeconds, geometry.preparationSeconds,
+                    geometry.forwardQueueHighWater, geometry.maximumPreparedPieces);
+                ImGui::Text(
+                    "Maximum nominal slice: %.3f s | Retained-source high-water: %zu",
+                    geometry.maximumSliceNominalDuration,
+                    geometry.retainedSourceHighWater);
+                if (!geometry.lastFailure.empty()) {
+                    ImGui::TextColored(
+                        ImVec4_Redish, "Last failure: %s", geometry.lastFailure.c_str());
+                }
+            }
+
+            if (ImGui::CollapsingHeader(
+                    "Trajectory planning", ImGuiTreeNodeFlags_DefaultOpen)) {
+                const auto &planning = simulation.trajectoryPlanning;
+                if (!simulation.trajectoryPlanningActivity.empty()) {
+                    ImGui::Text(
+                        "Current activity (%.3f s): %s",
+                        simulation.trajectoryPlanningActivitySeconds,
+                        simulation.trajectoryPlanningActivity.c_str());
+                }
+                if (!simulation.trajectoryDriverActivity.empty()) {
+                    ImGui::Text(
+                        "Driver: %s", simulation.trajectoryDriverActivity.c_str());
+                }
+                if (!simulation.trajectoryContinuousPlanSummary.empty()) {
+                    ImGui::TextWrapped(
+                        "Continuous plan: %s",
+                        simulation.trajectoryContinuousPlanSummary.c_str());
+                }
+                if (!simulation.trajectoryContinuousCorrectionHistory.empty()) {
+                    ImGui::TextWrapped(
+                        "Correction history: %s",
+                        simulation.trajectoryContinuousCorrectionHistory.c_str());
+                }
+                ImGui::Text(
+                    "Commands: %llu | Chunks: %llu | Planned duration: %.6f s",
+                    static_cast<unsigned long long>(planning.commandsPlanned),
+                    static_cast<unsigned long long>(planning.planChunks),
+                    planning.plannedDuration);
+                ImGui::Text(
+                    "Continuous inputs: %llu | Exact stops: %llu | Windows: %llu | "
+                    "Commands blended: %llu",
+                    static_cast<unsigned long long>(planning.continuousModeInputs),
+                    static_cast<unsigned long long>(planning.continuousExactStops),
+                    static_cast<unsigned long long>(planning.blendedWindows),
+                    static_cast<unsigned long long>(planning.blendedCommands));
+                ImGui::Text(
+                    "Planning time last/max/total: %.6f / %.6f / %.6f s",
+                    planning.lastPlanningSeconds, planning.maximumPlanningSeconds,
+                    planning.totalPlanningSeconds);
+                ImGui::Text(
+                    "Maximum window commands: %zu | Normal spans: %u | Stop spans: %u",
+                    planning.maximumWindowCommands, planning.maximumNormalSpans,
+                    planning.maximumStopSpans);
+                ImGui::Text(
+                    "Rolling candidates: %llu | Suffix failures: %llu | "
+                    "Prefix failures: %llu | Search: %.6f s",
+                    static_cast<unsigned long long>(planning.rollingBoundaryCandidates),
+                    static_cast<unsigned long long>(planning.rollingSuffixProbeFailures),
+                    static_cast<unsigned long long>(planning.rollingPrefixProbeFailures),
+                    planning.rollingSearchSeconds);
+            }
+
+            if (ImGui::CollapsingHeader(
+                    "Backend execution", ImGuiTreeNodeFlags_DefaultOpen)) {
+                const auto backendState = [](const ngc::BackendState state) {
+                    switch (state) {
+                        case ngc::BackendState::Disabled: return "Disabled";
+                        case ngc::BackendState::Held: return "Held";
+                        case ngc::BackendState::Running: return "Running";
+                        case ngc::BackendState::Holding: return "Holding";
+                        case ngc::BackendState::Faulted: return "Faulted";
+                    }
+                    return "Unknown";
+                };
+                ImGui::Text(
+                    "State: %s | Epoch: %llu | Chunk: %llu | Span: %llu | "
+                    "Progress: %.6f",
+                    backendState(simulation.trajectoryBackendState),
+                    static_cast<unsigned long long>(simulation.trajectoryBackendEpoch),
+                    static_cast<unsigned long long>(simulation.trajectoryBackendChunk),
+                    static_cast<unsigned long long>(
+                        simulation.trajectoryBackendSpan),
+                    simulation.trajectoryBackendSpanProgress);
+                ImGui::Text(
+                    "Velocity: %.6g | Acceleration: %.6g | Rate: %.6f | "
+                    "Rate acceleration: %.6g",
+                    simulation.trajectoryBackendVelocity,
+                    simulation.trajectoryBackendAcceleration,
+                    simulation.trajectoryBackendExecutionRate,
+                    simulation.trajectoryBackendExecutionRateAcceleration);
+                ImGui::Text(
+                    "Normal motion: %.6f s committed (%.6f active + %.6f queued, "
+                    "%u items) | Stop branch: %.6f s",
+                    simulation.trajectoryBackendCommittedNormalSeconds,
+                    simulation.trajectoryBackendActiveNormalRemainingSeconds,
+                    simulation.trajectoryBackendQueuedNormalSeconds,
+                    simulation.trajectoryBackendQueuedExecutionItems,
+                    simulation.trajectoryBackendStopBranchSeconds);
+                ImGui::Text(
+                    "Last branch: %llu | Fault code: %u",
+                    static_cast<unsigned long long>(
+                        simulation.trajectoryBackendLastBranch),
+                    simulation.trajectoryBackendFaultCode);
+                if (!simulation.trajectoryBackendSpanDetail.empty()) {
+                    ImGui::TextWrapped(
+                        "Active execution span: %s",
+                        simulation.trajectoryBackendSpanDetail.c_str());
+                }
+            }
+        }
+
         ImGui::End();
     }
 
@@ -2717,6 +2872,9 @@ public:
         if(m_enableOpenDialog) renderOpenDialog();
         if(m_enableMemoryWindow) renderMemoryWindow();
         if(m_enableToolWindow) renderToolWindow(simulation);
+        if (m_enableSimulationDiagnostics) {
+            renderSimulationDiagnostics(simulation);
+        }
     }
 
     void processPendant(const ngc::SimulationSnapshot &simulation) {

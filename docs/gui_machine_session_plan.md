@@ -254,6 +254,17 @@ Acceptance criteria:
 
 ### Phase 5: Split operator status from engineering diagnostics
 
+Status: complete. The persistent status pane now presents a compact
+backend-neutral Simulation power, activity, and program-operation summary above
+a scrollable message console. Operator rejections, Preview parser failures, and
+the Preview and Simulation typed status streams remain visible, with each typed
+stream retaining its original order and failures emphasized. Scheduler,
+geometry-stream, trajectory-planning, backend execution, and correction-history
+details are available in a separate **Simulation Diagnostics** window.
+Simulation runtime timing reads the optional `SimulationDiagnostics`
+presentation, and the cluster geometric and executed jerk-comb controls have
+moved from the primary toolbar into that window.
+
 - Replace the diagnostic text block in the status bar with a concise operator
   summary.
 - Add a scrollable chronological message console.
