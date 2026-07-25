@@ -552,6 +552,51 @@ final_move_together = true
                 "queued program requests should retain their epoch inputs");
     }
 
+    void testMachineSessionOwnsPowerActivityAndExecutionEpoch() {
+        ngc::ExecutionCoordinator coordinator;
+        require(coordinator.powerState() == ngc::MachinePowerState::Off
+                    && coordinator.activity() == ngc::MachineActivity::Idle,
+                "a new execution coordinator should be powered off and idle");
+        require(!coordinator.beginActivity(ngc::MachineActivity::Program),
+                "a powered-off coordinator should reject motion activity");
+        require(coordinator.powerOn(),
+                "the execution coordinator should enter its powered lifetime");
+        require(!coordinator.powerOn(),
+                "power-on should not restart an already powered coordinator");
+        require(coordinator.beginActivity(ngc::MachineActivity::Mdi),
+                "the powered coordinator should accept an MDI activity");
+        require(!coordinator.powerOff(),
+                "power-off should reject an active execution epoch");
+        coordinator.finishActivity();
+        require(coordinator.powerOff(),
+                "an idle coordinator should end its powered lifetime");
+
+        ngc::MockMotionBackend backend;
+        ngc::MachineSession session(
+            UNIT, ngc::InterpretationMode::Simulation, backend, {});
+        require(session.powerOn(), "a machine session should power on explicitly");
+        auto epoch = session.beginExecutionEpoch(
+            ngc::StartProgram {
+                .programs = {{"G90\n", "<MDI>"}},
+                .preserveState = true,
+                .activity = ngc::MachineActivity::Mdi,
+            },
+            {}, {});
+        require(epoch.has_value(), epoch ? "" : epoch.error());
+        require(session.executionEpochActive(),
+                "MachineSession should own the prepared-geometry producer epoch");
+        require(session.coordinator().activity() == ngc::MachineActivity::Mdi,
+                "MachineSession should expose the active MDI operation");
+        (void)session.finishExecutionEpoch();
+        require(!session.executionEpochActive(),
+                "finishing an epoch should cancel and join prepared geometry");
+        session.coordinator().finishActivity();
+        require(session.coordinator().activity() == ngc::MachineActivity::Idle,
+                "completing operation coordination should return the session to idle");
+        require(session.powerOff(),
+                "the idle MachineSession should power off independently of Stop");
+    }
+
     void testSimulationSnapshotExposesMachineSessionState() {
         SimulationWorker worker;
         const auto snapshot = worker.snapshot();
@@ -6334,6 +6379,7 @@ int main() {
         testPersistentParameterCodec();
         testPersistentParameterFilesAreAtomicAndIsolated();
         testSessionCommandQueueIsBoundedAndOrdered();
+        testMachineSessionOwnsPowerActivityAndExecutionEpoch();
         testSimulationSnapshotExposesMachineSessionState();
         testInProcessSimulationRuntimePersistsAcrossTimedEpochs();
         testSimulationPersistsCoordinateSystemAtCompletion();

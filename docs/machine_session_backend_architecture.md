@@ -733,16 +733,18 @@ policy, synchronous service stepping, and mock-only timing and jerk diagnostics.
 
 Status: in progress. The backend-neutral power/activity vocabulary,
 `MachineSessionSnapshot`, optional Simulation diagnostics, and bounded owning
-`SessionCommand` queue are implemented. The `SimulationWorker` compatibility
-facade now queues program and homing starts, jogging controls, feed hold,
-Resume, and Stop through that command boundary. Stop uses backend constrained
-braking, abandons the execution epoch only at rest, and reconciles canonical
-position to the stationary backend state. Interpreter, geometry, trajectory,
-homing, jogging, and the remaining operation coordination still need to move
-behind the session abstraction.
+`SessionCommand` queue are implemented. `MachineSession` now owns the
+interpreter, prepared-geometry producer thread and channels, trajectory driver,
+presentation tracker, execution-epoch counter, and `ExecutionCoordinator`.
+The `SimulationWorker` compatibility facade queues program and homing starts,
+jogging controls, feed hold, Resume, and Stop through that command boundary.
+Stop uses backend constrained braking, abandons the execution epoch only at
+rest, and reconciles canonical position to the stationary backend state.
+Simulation runtime servicing, persistence boundaries, homing, jogging, and the
+remaining operation loop still need to move behind the session abstraction.
 
-- Move interpreter, geometry producer, trajectory driver, homing, jogging, and
-  operation coordination into backend-neutral components.
+- Move the remaining Simulation operation loop, persistence boundaries, homing,
+  and jogging into backend-neutral session components.
 - Replace boolean control flags with explicit power/activity state and queued
   NRT commands.
 - Make On/Off separate from Start/Stop.
