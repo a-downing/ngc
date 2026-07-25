@@ -7,6 +7,13 @@
 namespace ngc {
     struct BackendCapabilities { };
 
+    struct StationaryBackendState {
+        MotionState commanded;
+        MotionState feedback;
+        JointMotionState commandedJoints;
+        JointMotionState feedbackJoints;
+    };
+
     class BackendRuntime {
     public:
         virtual ~BackendRuntime() = default;
@@ -15,6 +22,10 @@ namespace ngc {
         virtual void start() = 0;
         virtual void stop() = 0;
         [[nodiscard]] virtual BackendCapabilities capabilities() const noexcept = 0;
+        [[nodiscard]] virtual bool restoreStationaryState(
+            const StationaryBackendState &) noexcept {
+            return false;
+        }
 
         [[nodiscard]] virtual bool prepareTriggeredJointMove(
             const TriggeredJointMove &) noexcept = 0;

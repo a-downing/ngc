@@ -84,8 +84,14 @@ requires the current generation-tagged `MachineControlAuthority`; stale or
 wrong-target commands and unsafe control transfers are rejected under the same
 manager lock used for admission. The production application still constructs
 only Simulation; an explicitly test-only in-process RealRun-mode host exercises
-dual-session routing without making Real available or substituting for a
-physical backend. `MachineSession`
+dual-session routing and validated Real-to-Simulation checkpoint import without
+making Real available or substituting for a physical backend. Checkpoint import
+requires powered, stationary, idle, homed, fault-free Real state and a
+powered-off idle Simulation session; it copies backend position/joints,
+homing, canonical modal and persistent parameter state, presentation, and the
+complete live tool table, then powers Simulation and advances generation-tagged
+control authority. Simulation changes are never copied back to Real.
+`MachineSession`
 owns homing and jogging runtime-service callback
 construction plus thread-safe live service observations. `BackendRuntime`
 provides the NRT service mechanics used by those controllers;

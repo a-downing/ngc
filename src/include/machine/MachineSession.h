@@ -73,6 +73,13 @@ namespace ngc {
         std::optional<std::string> persistenceError;
     };
 
+    struct MachineSessionCheckpoint {
+        Machine::Checkpoint controller;
+        StationaryBackendState backend;
+        JointMask homedJoints = 0;
+        MachinePresentationSnapshot presentation;
+    };
+
     struct StartProgram {
         std::vector<std::tuple<std::string, std::string>> programs;
         bool preserveState = false;
@@ -215,6 +222,10 @@ namespace ngc {
         [[nodiscard]] std::pair<ToolTable, std::uint64_t> toolTableSnapshot() const;
         [[nodiscard]] ParameterSnapshot parameterSnapshot() const;
         [[nodiscard]] bool controllerDataMutable() const noexcept;
+        [[nodiscard]] std::expected<MachineSessionCheckpoint, std::string>
+        checkpoint(const StationaryBackendState &backend) const;
+        [[nodiscard]] std::expected<void, std::string>
+        restoreCheckpoint(const MachineSessionCheckpoint &checkpoint);
         [[nodiscard]] std::expected<void, std::string>
         setToolTableStorePath(const std::filesystem::path &path);
         [[nodiscard]] std::expected<void, std::string>

@@ -13,6 +13,15 @@ namespace ngc {
         setActivePresentation(initial);
     }
 
+    void PresentationTracker::restoreStationarySnapshot(
+        const MachinePresentationSnapshot &snapshot) {
+        m_snapshot = snapshot;
+        m_snapshot.activePresentation.activeBlocks.clear();
+        m_snapshot.completedBlocks.clear();
+        m_snapshot.completedLineFlags.clear();
+        clearTracking();
+    }
+
     void PresentationTracker::clearTracking() {
         m_chunks.clear();
         m_markerPresentations.clear();

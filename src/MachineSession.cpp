@@ -1,5 +1,6 @@
 #include "machine/MachineSession.h"
 
+#include <cmath>
 #include <stdexcept>
 
 #include "memory/ParameterStore.h"
@@ -441,6 +442,116 @@ namespace ngc {
         return !executionEpochActive()
             && m_coordinator.activity() == MachineActivity::Idle
             && m_coordinator.commands().empty();
+    }
+
+    std::expected<MachineSessionCheckpoint, std::string> MachineSession::checkpoint(
+        const StationaryBackendState &backend) const {
+        if (m_coordinator.powerState() != MachinePowerState::On) {
+            return std::unexpected(
+                "a machine-session checkpoint requires a powered session");
+        }
+        if (!controllerDataMutable()) {
+            return std::unexpected(
+                "a machine-session checkpoint requires an idle session");
+        }
+
+        const auto finitePosition = [](const position_t &value) {
+            return std::isfinite(value.x) && std::isfinite(value.y)
+                && std::isfinite(value.z) && std::isfinite(value.a)
+                && std::isfinite(value.b) && std::isfinite(value.c);
+        };
+        const auto stationary = [&](const MotionState &state) {
+            return finitePosition(state.position) && finitePosition(state.velocity)
+                && finitePosition(state.acceleration)
+                && state.velocity.length() <= 1e-9
+                && state.acceleration.length() <= 1e-9;
+        };
+        if (!stationary(backend.commanded) || !stationary(backend.feedback)
+            || (backend.commanded.position - backend.feedback.position).length() > 1e-9) {
+            return std::unexpected(
+                "a machine-session checkpoint requires matching stationary axis state");
+        }
+        for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+            const auto commandedPosition = backend.commandedJoints.position[joint];
+            const auto feedbackPosition = backend.feedbackJoints.position[joint];
+            if (!std::isfinite(commandedPosition) || !std::isfinite(feedbackPosition)
+                || !std::isfinite(backend.commandedJoints.velocity[joint])
+                || !std::isfinite(backend.commandedJoints.acceleration[joint])
+                || !std::isfinite(backend.feedbackJoints.velocity[joint])
+                || !std::isfinite(backend.feedbackJoints.acceleration[joint])
+                || std::abs(backend.commandedJoints.velocity[joint]) > 1e-9
+                || std::abs(backend.commandedJoints.acceleration[joint]) > 1e-9
+                || std::abs(backend.feedbackJoints.velocity[joint]) > 1e-9
+                || std::abs(backend.feedbackJoints.acceleration[joint]) > 1e-9
+                || std::abs(commandedPosition - feedbackPosition) > 1e-9) {
+                return std::unexpected(
+                    "a machine-session checkpoint requires matching stationary joint state");
+            }
+        }
+
+        auto controller = m_interpreter.machine().checkpoint();
+        if ((controller.position - backend.commanded.position).length() > 1e-9) {
+            return std::unexpected(
+                "machine-session checkpoint canonical and backend positions disagree");
+        }
+
+        return MachineSessionCheckpoint {
+            .controller = std::move(controller),
+            .backend = backend,
+            .homedJoints = m_homedJoints,
+            .presentation = m_presentationTracker.snapshot(),
+        };
+    }
+
+    std::expected<void, std::string> MachineSession::restoreCheckpoint(
+        const MachineSessionCheckpoint &checkpoint) {
+        if (m_coordinator.powerState() != MachinePowerState::Off
+            || !controllerDataMutable()) {
+            return std::unexpected(
+                "checkpoint import requires a powered-off idle machine session");
+        }
+        if (const auto valid =
+                m_interpreter.machine().validateCheckpoint(checkpoint.controller);
+            !valid) {
+            return valid;
+        }
+        Machine staged(m_unit);
+        if (const auto restored = staged.restoreCheckpoint(checkpoint.controller);
+            !restored) {
+            return restored;
+        }
+        if (m_parameterStorePath) {
+            if (const auto saved = ngc::savePersistentParameters(
+                    *m_parameterStorePath, m_unit, staged.memory());
+                !saved) {
+                return std::unexpected(saved.error());
+            }
+        }
+        if (m_toolTableStorePath) {
+            if (const auto saved =
+                    checkpoint.controller.toolTable.save(*m_toolTableStorePath);
+                !saved) {
+                return std::unexpected(saved.error());
+            }
+        }
+        if (!m_runtime.restoreStationaryState(checkpoint.backend)) {
+            return std::unexpected(
+                "the backend runtime rejected stationary checkpoint state");
+        }
+
+        m_interpreter.stop();
+        if (const auto restored =
+                m_interpreter.machine().restoreCheckpoint(checkpoint.controller);
+            !restored) {
+            PANIC("validated machine-session checkpoint failed during live import");
+        }
+        m_homedJoints = checkpoint.homedJoints;
+        m_presentationTracker.restoreStationarySnapshot(checkpoint.presentation);
+        m_observedToolTable = checkpoint.controller.toolTable;
+        m_toolTableInitialized = true;
+        ++m_toolTableRevision;
+
+        return {};
     }
 
     bool MachineSession::setToolTable(const ToolTable &tools) {

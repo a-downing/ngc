@@ -166,6 +166,51 @@ namespace ngc {
              const std::vector<JointConfiguration> &joints)
             : m_axes(axes), m_joints(joints) { }
 
+        void restoreStationaryState(const StationaryBackendState &state) noexcept {
+            if (m_active) {
+                release(*m_active);
+            }
+            m_active.reset();
+
+            std::uint8_t plan;
+            while (m_plans.tryPop(plan)) {
+                release(plan);
+            }
+            ControlRequest control;
+            while (m_controls.tryPop(control)) { }
+            ExecutionEvent event;
+            while (m_events.tryPop(event)) { }
+            ExecutionSnapshot snapshot;
+            while (m_snapshots.tryPop(snapshot)) { }
+            SyntheticInputTransition input;
+            while (m_syntheticInputs.tryPop(input)) { }
+
+            m_pendingSyntheticInputs.size = 0;
+            m_jog.reset();
+            m_stopping = false;
+            m_span = 0;
+            m_nextMarker = 0;
+            m_spanElapsed = 0.0;
+            m_feedHolding = false;
+            m_feedHeld = false;
+            m_feedResuming = false;
+            m_controlledStopping = false;
+            m_controlledStopped = false;
+            m_executionRate = 1.0;
+            m_executionRateAcceleration = 0.0;
+            m_executionRateJerk = 0.0;
+            m_physicalElapsed = 0.0;
+            m_referenceElapsed = 0.0;
+            m_queuedNormalMotionNanoseconds.store(0, std::memory_order_release);
+            m_queuedExecutionItems.store(0, std::memory_order_release);
+            m_snapshot = {};
+            m_snapshot.state = BackendState::Disabled;
+            m_snapshot.commanded = state.commanded;
+            m_snapshot.feedback = state.feedback;
+            m_snapshot.commandedJoints = state.commandedJoints;
+            m_snapshot.feedbackJoints = state.feedbackJoints;
+        }
+
     private:
 
         JointMask axisJoints(const AxisId axis) const {
@@ -1779,6 +1824,10 @@ namespace ngc {
     SubmitResult MockMotionBackend::trySubmit(const ControlRequest &request) noexcept { return m_impl->submit(request); }
     bool MockMotionBackend::tryTakeEvent(ExecutionEvent &event) noexcept { return m_impl->takeEvent(event); }
     bool MockMotionBackend::tryTakeSnapshot(ExecutionSnapshot &snapshot) noexcept { return m_impl->takeSnapshot(snapshot); }
+    void MockMotionBackend::restoreStationaryState(
+        const StationaryBackendState &state) noexcept {
+        m_impl->restoreStationaryState(state);
+    }
     void MockMotionBackend::advance(const double seconds) { m_impl->advance(seconds); }
     bool MockMotionBackend::advanceTick(const double seconds, const bool publishSnapshot) {
         return m_impl->advanceTick(seconds,publishSnapshot);

@@ -41,6 +41,8 @@ namespace ngc {
         void start() override;
         void stop() override;
         [[nodiscard]] BackendCapabilities capabilities() const noexcept override;
+        [[nodiscard]] bool restoreStationaryState(
+            const StationaryBackendState &state) noexcept override;
         [[nodiscard]] bool prepareTriggeredJointMove(
             const TriggeredJointMove &move) noexcept override;
         void serviceImmediate() override;

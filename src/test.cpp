@@ -1134,6 +1134,215 @@ final_move_together = true
         manager.join();
     }
 
+    void testMachineSessionManagerBranchesRealIntoIsolatedSimulation() {
+        ngc::MachineSessionManager manager(
+            ngc::MachineSessionManager::inProcessDualSessionForTesting);
+        const auto simulationParameterPath =
+            std::filesystem::temp_directory_path()
+            / "ngc-real-branch-simulation-parameters.var";
+        const auto simulationToolPath =
+            std::filesystem::temp_directory_path()
+            / "ngc-real-branch-simulation-tools.txt";
+        std::filesystem::remove(simulationParameterPath);
+        std::filesystem::remove(simulationToolPath);
+        const auto initialSimulation = manager.state().authority;
+        require(manager.setPersistentParameterStorePath(
+                    initialSimulation, simulationParameterPath).has_value()
+                    && manager.setToolTableStorePath(
+                        initialSimulation, simulationToolPath).has_value(),
+                "checkpoint target should configure isolated Simulation stores");
+        const auto realAuthority =
+            manager.selectControlTarget(ngc::MachineControlTarget::Real);
+        require(realAuthority.has_value(),
+                realAuthority ? "" : realAuthority.error());
+        require(manager.powerOn(*realAuthority),
+                "checkpoint source Real session should power on");
+
+        ngc::ToolTable realTools;
+        realTools.set(1, {1, 0, 0, 2, 0, 0, 0, 0.5, "Real checkpoint tool"});
+        require(manager.setToolTable(*realAuthority, realTools),
+                "checkpoint source Real tool table should be initialized");
+        require(manager.start(
+                    *realAuthority,
+                    {{"G10 L2 P1 X7\nG54\nG0 X0.02\n", "real-checkpoint.ngc"}},
+                    realTools),
+                "checkpoint source Real program should start");
+
+        const auto activeBranch = manager.simulateFromReal(*realAuthority);
+        require(!activeBranch
+                    && activeBranch.error()
+                        == "Real-to-Simulation branching requires Real to be stationary and idle",
+                "checkpoint export must reject while Real owns motion");
+        require(manager.state().authority == *realAuthority,
+                "rejected checkpoint export must not transfer control");
+
+        auto realCompleted = manager.snapshot();
+        for (auto attempt = 0; attempt < 2000
+             && realCompleted.status != ngc::SimulationStatus::Completed
+             && realCompleted.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            realCompleted = manager.snapshot();
+        }
+        require(realCompleted.status == ngc::SimulationStatus::Completed,
+                realCompleted.error.empty() ? "checkpoint source program should complete"
+                                            : realCompleted.error);
+        const auto realPosition = realCompleted.machinePosition;
+        const auto realParameters = manager.parameterSnapshot();
+        requireNear(realParameters.at(ngc::Var::G54_X), 7.0,
+                    "checkpoint source should publish its persistent WCS value");
+
+        const auto simulationAuthority = manager.simulateFromReal(*realAuthority);
+        require(simulationAuthority.has_value(),
+                simulationAuthority ? "" : simulationAuthority.error());
+        require(simulationAuthority->target == ngc::MachineControlTarget::Simulation
+                    && simulationAuthority->generation == realAuthority->generation + 1,
+                "successful checkpoint import should power Simulation and advance authority");
+        const auto imported = manager.snapshots();
+        require(imported.real && imported.simulation
+                    && imported.real->powerState == ngc::MachinePowerState::On
+                    && imported.simulation->powerState == ngc::MachinePowerState::On,
+                "checkpoint import should leave Real powered and power Simulation on");
+        requireNear(imported.simulation->machinePosition.x, realPosition.x,
+                    "Simulation should begin at the stationary Real position");
+        require(manager.toolTable() == realTools,
+                "Simulation should receive a complete copy of the live Real tool table");
+        requireNear(manager.parameterSnapshot().at(ngc::Var::G54_X),
+                    realParameters.at(ngc::Var::G54_X),
+                    "Simulation should receive the complete persistent Real parameter bank");
+        ngc::ToolTable storedSimulationTools;
+        require(storedSimulationTools.load(simulationToolPath).has_value()
+                    && storedSimulationTools == realTools,
+                "checkpoint import should persist the complete copied Simulation tool table");
+        const auto storedSimulationParameters =
+            ngc::readFile(simulationParameterPath);
+        require(storedSimulationParameters.has_value()
+                    && storedSimulationParameters->find("\n5221 7\n")
+                        != std::string::npos,
+                "checkpoint import should persist the copied Simulation parameter bank");
+
+        auto simulationTools = realTools;
+        simulationTools.set(
+            1, {1, 0, 0, 3, 0, 0, 0, 0.75, "Simulation-only checkpoint tool"});
+        require(manager.setToolTable(*simulationAuthority, simulationTools),
+                "imported Simulation tool table should remain independently mutable");
+        const auto changedWorkCoordinate = manager.setActiveWorkCoordinate(
+            *simulationAuthority, ngc::Machine::Axis::X, 3.0);
+        require(changedWorkCoordinate.has_value(),
+                changedWorkCoordinate ? "" : changedWorkCoordinate.error());
+        require(manager.start(
+                    *simulationAuthority,
+                    {{"G91\nG0 X0.01\n", "<MDI>"}},
+                    simulationTools, true),
+                "imported Simulation should continue from checkpoint modal and position state");
+
+        auto simulationCompleted = manager.snapshot();
+        for (auto attempt = 0; attempt < 2000
+             && simulationCompleted.status != ngc::SimulationStatus::Completed
+             && simulationCompleted.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            simulationCompleted = manager.snapshot();
+        }
+        require(simulationCompleted.status == ngc::SimulationStatus::Completed,
+                simulationCompleted.error.empty()
+                    ? "checkpoint-derived Simulation MDI should complete"
+                    : simulationCompleted.error);
+        require(simulationCompleted.machinePosition.x > realPosition.x + 0.009,
+                "checkpoint-derived Simulation motion should evolve independently");
+        require(manager.parameterSnapshot().at(ngc::Var::G54_X)
+                    != realParameters.at(ngc::Var::G54_X),
+                "Simulation WCS mutation should change only its copied parameter bank");
+
+        require(manager.powerOff(*simulationAuthority),
+                "checkpoint-derived Simulation should power off before returning to Real");
+        const auto returnedReal =
+            manager.selectControlTarget(ngc::MachineControlTarget::Real);
+        require(returnedReal.has_value(),
+                returnedReal ? "" : returnedReal.error());
+        require(manager.toolTable() == realTools,
+                "returning to Real must discard Simulation tool-table mutations");
+        requireNear(manager.parameterSnapshot().at(ngc::Var::G54_X),
+                    realParameters.at(ngc::Var::G54_X),
+                    "returning to Real must expose its unchanged parameter bank");
+        const auto unchangedReal = manager.snapshot();
+        requireNear(unchangedReal.machinePosition.x, realPosition.x,
+                    "Simulation motion must not alter the stationary Real endpoint");
+
+        const auto refreshedSimulation = manager.simulateFromReal(*returnedReal);
+        require(refreshedSimulation.has_value(),
+                refreshedSimulation ? "" : refreshedSimulation.error());
+        require(manager.toolTable() == realTools,
+                "a new Real checkpoint should replace discarded Simulation tool changes");
+        requireNear(manager.parameterSnapshot().at(ngc::Var::G54_X),
+                    realParameters.at(ngc::Var::G54_X),
+                    "a new Real checkpoint should replace discarded Simulation parameter changes");
+        requireNear(manager.snapshot().machinePosition.x, realPosition.x,
+                    "a new Real checkpoint should refresh the Simulation endpoint");
+
+        require(manager.powerOff(*refreshedSimulation),
+                "refreshed Simulation should power off cleanly");
+        const auto finalReal =
+            manager.selectControlTarget(ngc::MachineControlTarget::Real);
+        require(finalReal.has_value(), finalReal ? "" : finalReal.error());
+        require(manager.powerOff(*finalReal),
+                "checkpoint source Real session should power off cleanly");
+        manager.join();
+        std::filesystem::remove(simulationParameterPath);
+        std::filesystem::remove(simulationToolPath);
+    }
+
+    void testMachineSessionCheckpointRequiresAndCopiesHoming() {
+        const auto configuration = fixtureMachineConfiguration();
+        require(configuration.has_value(), configuration ? "" : configuration.error());
+        ngc::MachineSessionManager manager(
+            ngc::MachineSessionManager::inProcessDualSessionForTesting,
+            *configuration);
+        const auto realAuthority =
+            manager.selectControlTarget(ngc::MachineControlTarget::Real);
+        require(realAuthority.has_value(), realAuthority ? "" : realAuthority.error());
+        require(manager.powerOn(*realAuthority),
+                "configured checkpoint source Real session should power on");
+        manager.setTickMultiplier(1000);
+
+        const auto unhomedBranch = manager.simulateFromReal(*realAuthority);
+        require(!unhomedBranch
+                    && unhomedBranch.error()
+                        == "Real-to-Simulation branching requires every configured Real joint to be homed",
+                "configured Real checkpoint should reject an unhomed source");
+        require(manager.home(*realAuthority),
+                "configured checkpoint source Real session should begin homing");
+        auto homedReal = manager.snapshot();
+        for (auto attempt = 0; attempt < 5000
+             && homedReal.status != ngc::SimulationStatus::Completed
+             && homedReal.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            homedReal = manager.snapshot();
+        }
+        require(homedReal.status == ngc::SimulationStatus::Completed,
+                homedReal.error.empty() ? "configured checkpoint homing should complete"
+                                        : homedReal.error);
+
+        const auto simulationAuthority = manager.simulateFromReal(*realAuthority);
+        require(simulationAuthority.has_value(),
+                simulationAuthority ? "" : simulationAuthority.error());
+        const auto homedSimulation = manager.snapshot();
+        require(homedSimulation.homedJoints == homedReal.homedJoints,
+                "checkpoint import should copy Real homed-joint confidence");
+        for (const auto &joint : configuration->joints) {
+            requireNear(homedSimulation.joints.position[joint.id],
+                        homedReal.joints.position[joint.id],
+                        "checkpoint import should copy each stationary Real joint position");
+        }
+
+        require(manager.powerOff(*simulationAuthority),
+                "homing-derived Simulation should power off cleanly");
+        const auto finalReal =
+            manager.selectControlTarget(ngc::MachineControlTarget::Real);
+        require(finalReal.has_value(), finalReal ? "" : finalReal.error());
+        require(manager.powerOff(*finalReal),
+                "configured checkpoint source Real should power off cleanly");
+        manager.join();
+    }
+
     void testMachineSessionManagerPublishesOwnedParameterSnapshot() {
         ngc::MachineSessionManager manager;
         const auto authority = manager.state().authority;
@@ -1799,6 +2008,56 @@ final_move_together = true
                     "a failed block must roll back its #5220 coordinate-system write");
         require(machine.state().modeCoordSys == ngc::GCCoord::G59_3,
                 "a failed block must restore its previous coordinate-system mode");
+    }
+
+    void testMachineCheckpointRestoresCanonicalState() {
+        ngc::Machine source(UNIT);
+        ngc::ToolTable tools;
+        tools.set(1, {1, 1.5, 0, 2.5, 0, 0, 0, 0.25, "Checkpoint tool"});
+        source.toolTable() = tools;
+        source.prepareToolChange(1);
+        static_cast<void>(execute(
+            source,
+            "G10 L2 P2 X4\nG55\nG43 H1\nG91\nF12\nS1000 M3\nG0 X2\n"));
+
+        const auto checkpoint = source.checkpoint();
+        require(checkpoint.physicalToolNumber == 1
+                    && checkpoint.state.modeCoordSys == ngc::GCCoord::G55
+                    && checkpoint.state.modeDistance == ngc::GCDist::G91
+                    && checkpoint.state.modeSpindle == ngc::MCSpindle::M3,
+                "machine checkpoint should capture physical tool and modal continuity");
+
+        ngc::Machine restored(UNIT);
+        const auto valid = restored.validateCheckpoint(checkpoint);
+        require(valid.has_value(), valid ? "" : valid.error());
+        const auto restoredCheckpoint = restored.restoreCheckpoint(checkpoint);
+        require(restoredCheckpoint.has_value(),
+                restoredCheckpoint ? "" : restoredCheckpoint.error());
+        require(restored.toolTable() == tools && restored.toolGeometry().number == 1,
+                "machine checkpoint should restore the complete live tool table and physical tool");
+        requireNear(restored.toolOffset().x, 1.5,
+                    "machine checkpoint should restore the exact applied tool offset");
+        requireNear(restored.memory().read(ngc::Var::G55_X), 4.0,
+                    "machine checkpoint should restore persistent WCS memory");
+        require(restored.state().modeCoordSys == ngc::GCCoord::G55
+                    && restored.state().modeDistance == ngc::GCDist::G91
+                    && restored.state().F == 12.0
+                    && restored.state().S == 1000.0,
+                "machine checkpoint should restore modal feed and spindle state");
+
+        const auto continuation = execute(restored, "G0 X1\n");
+        const auto *move = continuation.empty()
+            ? nullptr : std::get_if<ngc::MoveLine>(&continuation.back());
+        require(move != nullptr, "restored modal checkpoint should execute a continuation move");
+        requireNear(move->from().x, checkpoint.position.x,
+                    "checkpoint continuation should begin at the captured machine position");
+        requireNear(move->to().x, checkpoint.position.x + 1.0,
+                    "checkpoint continuation should retain incremental distance mode");
+
+        auto incomplete = checkpoint;
+        incomplete.persistentParameters.pop_back();
+        require(!restored.validateCheckpoint(incomplete),
+                "checkpoint validation should reject an incomplete persistent parameter bank");
     }
 
     void testInterpreterCancellationInterruptsEvaluation() {
@@ -7367,6 +7626,8 @@ int main() {
         testMachineSessionOwnsControllerDataPersistence();
         testMachineSessionManagerOwnsStandaloneSimulation();
         testMachineSessionManagerRoutesDualSessionControl();
+        testMachineSessionManagerBranchesRealIntoIsolatedSimulation();
+        testMachineSessionCheckpointRequiresAndCopiesHoming();
         testMachineSessionManagerPublishesOwnedParameterSnapshot();
         testMachineSessionViewDerivesOperatorControls();
         testInProcessSimulationRuntimePersistsAcrossTimedEpochs();
@@ -7386,6 +7647,7 @@ int main() {
         testFeedMotionRequiresFeedrate();
         testUnsupportedCodesProduceInterpreterErrors();
         testFailedBlockRollsBackMachineState();
+        testMachineCheckpointRestoresCanonicalState();
         testInterpreterCancellationInterruptsEvaluation();
         testPresentationTrackerActivatesMarkersInExecutionOrder();
         testPresentationTrackerDefersBlockCompletionAndResetsState();

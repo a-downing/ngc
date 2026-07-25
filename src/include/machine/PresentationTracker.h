@@ -63,6 +63,7 @@ namespace ngc {
 
     public:
         void reset(const TrajectoryCommandPresentation &initial = {});
+        void restoreStationarySnapshot(const MachinePresentationSnapshot &snapshot);
         void clearTracking();
         const MachinePresentationSnapshot &snapshot() const;
         void setActivePresentation(const TrajectoryCommandPresentation &presentation);

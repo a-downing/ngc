@@ -134,6 +134,126 @@ namespace ngc {
                 Var::COORDSYS,
                 static_cast<double>(coordsys(checkpoint.coordinateSystem)), true);
         }
+
+        Machine::Checkpoint checkpoint() const {
+            auto state = m_state;
+            state.resetModal();
+
+            return {
+                .position = m_pos,
+                .appliedToolOffset = m_toolOffset,
+                .state = std::move(state),
+                .physicalToolNumber = m_physicalToolNumber,
+                .persistentParameters = m_memory.persistentParameters(),
+                .toolTable = m_toolTable,
+            };
+        }
+
+        std::expected<void, std::string> validateCheckpoint(
+            const Machine::Checkpoint &checkpoint) const {
+            const auto finitePosition = [](const position_t &value) {
+                return std::isfinite(value.x) && std::isfinite(value.y)
+                    && std::isfinite(value.z) && std::isfinite(value.a)
+                    && std::isfinite(value.b) && std::isfinite(value.c);
+            };
+            const auto finiteOptional = [](const std::optional<double> &value) {
+                return !value || std::isfinite(*value);
+            };
+
+            if (!finitePosition(checkpoint.position)
+                || !finitePosition(checkpoint.appliedToolOffset)) {
+                return std::unexpected(
+                    "machine-session checkpoint contains a non-finite position");
+            }
+            if (const auto valid = checkpoint.state.valid(); !valid) {
+                return std::unexpected(
+                    "machine-session checkpoint has invalid modal state: "
+                    + std::string(valid.error()));
+            }
+            const std::array numericState {
+                &checkpoint.state.pathTolerance, &checkpoint.state.A, &checkpoint.state.B,
+                &checkpoint.state.C, &checkpoint.state.D, &checkpoint.state.F,
+                &checkpoint.state.H, &checkpoint.state.I, &checkpoint.state.J,
+                &checkpoint.state.K, &checkpoint.state.L, &checkpoint.state.P,
+                &checkpoint.state.Q, &checkpoint.state.R, &checkpoint.state.S,
+                &checkpoint.state.T, &checkpoint.state.X, &checkpoint.state.Y,
+                &checkpoint.state.Z,
+            };
+            if (!std::ranges::all_of(numericState, [&](const auto *value) {
+                    return finiteOptional(*value);
+                })) {
+                return std::unexpected(
+                    "machine-session checkpoint contains non-finite modal data");
+            }
+
+            const auto expectedParameters = m_memory.persistentParameters();
+            if (checkpoint.persistentParameters.size() != expectedParameters.size()) {
+                return std::unexpected(
+                    "machine-session checkpoint does not contain the complete persistent parameter bank");
+            }
+            for (std::size_t index = 0; index < expectedParameters.size(); ++index) {
+                if (checkpoint.persistentParameters[index].address
+                        != expectedParameters[index].address
+                    || !std::isfinite(checkpoint.persistentParameters[index].value)) {
+                    return std::unexpected(
+                        "machine-session checkpoint contains invalid persistent parameters");
+                }
+            }
+            const auto coordinateSystemAddress =
+                static_cast<std::uint32_t>(m_memory.deref(Var::COORDSYS));
+            const auto coordinateSystem = std::ranges::find(
+                checkpoint.persistentParameters, coordinateSystemAddress,
+                &Memory::PersistentParameter::address);
+            if (coordinateSystem == checkpoint.persistentParameters.end()
+                || coordinateSystem->value
+                    != static_cast<double>(coordsys(*checkpoint.state.modeCoordSys))) {
+                return std::unexpected(
+                    "machine-session checkpoint coordinate-system state is inconsistent");
+            }
+            for (const auto &[number, tool] : checkpoint.toolTable) {
+                if (number != tool.number || number <= 0
+                    || !std::isfinite(tool.x) || !std::isfinite(tool.y)
+                    || !std::isfinite(tool.z) || !std::isfinite(tool.a)
+                    || !std::isfinite(tool.b) || !std::isfinite(tool.c)
+                    || !std::isfinite(tool.diameter) || tool.diameter < 0.0
+                    || tool.comment.find_first_of("\r\n") != std::string::npos) {
+                    return std::unexpected(
+                        "machine-session checkpoint contains an invalid tool table");
+                }
+            }
+            if (checkpoint.physicalToolNumber < 0
+                || (checkpoint.physicalToolNumber != 0
+                    && !checkpoint.toolTable.get(checkpoint.physicalToolNumber))) {
+                return std::unexpected(
+                    "machine-session checkpoint references a missing physical tool");
+            }
+
+            return {};
+        }
+
+        std::expected<void, std::string> restoreCheckpoint(
+            const Machine::Checkpoint &checkpoint) {
+            if (const auto valid = validateCheckpoint(checkpoint); !valid) {
+                return valid;
+            }
+            const auto applied =
+                m_memory.applyPersistentParameters(checkpoint.persistentParameters);
+            if (!applied) {
+                PANIC("validated machine-session persistent parameters failed to apply");
+            }
+
+            m_memory.resetProgramStorage();
+            m_pos = checkpoint.position;
+            m_toolOffset = checkpoint.appliedToolOffset;
+            m_state = checkpoint.state;
+            m_physicalToolNumber = checkpoint.physicalToolNumber;
+            m_toolTable = checkpoint.toolTable;
+            m_workOffset = offset(*m_state.modeCoordSys);
+            m_pendingProbe.reset();
+
+            return {};
+        }
+
         template<typename Self> auto &memory(this Self &&self) { return std::forward<Self>(self).m_memory; }
 
         void setActiveWorkOffset(const Axis axis, const double value) {
@@ -789,6 +909,15 @@ namespace ngc {
     void Machine::restoreToolChangeModalCheckpoint(
         const ToolChangeModalCheckpoint &checkpoint) {
         m_impl->restoreToolChangeModalCheckpoint(checkpoint);
+    }
+    Machine::Checkpoint Machine::checkpoint() const { return m_impl->checkpoint(); }
+    std::expected<void, std::string> Machine::validateCheckpoint(
+        const Checkpoint &checkpoint) const {
+        return m_impl->validateCheckpoint(checkpoint);
+    }
+    std::expected<void, std::string> Machine::restoreCheckpoint(
+        const Checkpoint &checkpoint) {
+        return m_impl->restoreCheckpoint(checkpoint);
     }
     Memory &Machine::memory() { return m_impl->memory(); }
     const Memory &Machine::memory() const { return m_impl->memory(); }

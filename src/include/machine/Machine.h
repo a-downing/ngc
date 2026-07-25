@@ -34,6 +34,15 @@ namespace ngc {
             position_t appliedToolOffset;
         };
 
+        struct Checkpoint {
+            position_t position;
+            position_t appliedToolOffset;
+            GCodeState state;
+            int physicalToolNumber = 0;
+            std::vector<Memory::PersistentParameter> persistentParameters;
+            ToolTable toolTable;
+        };
+
         explicit Machine(Unit unit);
         ~Machine();
 
@@ -52,6 +61,11 @@ namespace ngc {
         void prepareToolChange(int toolNumber);
         ToolChangeModalCheckpoint captureToolChangeModalCheckpoint() const;
         void restoreToolChangeModalCheckpoint(const ToolChangeModalCheckpoint &checkpoint);
+        [[nodiscard]] Checkpoint checkpoint() const;
+        [[nodiscard]] std::expected<void, std::string>
+        validateCheckpoint(const Checkpoint &checkpoint) const;
+        [[nodiscard]] std::expected<void, std::string>
+        restoreCheckpoint(const Checkpoint &checkpoint);
         Memory &memory();
         const Memory &memory() const;
         ToolTable &toolTable();

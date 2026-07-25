@@ -2,7 +2,7 @@
 
 #include <memory>
 
-#include "machine/MotionBackend.h"
+#include "machine/BackendRuntime.h"
 #include "machine/MachineConfiguration.h"
 #include "machine/MockTrajectoryDiagnostics.h"
 
@@ -29,6 +29,7 @@ namespace ngc {
         SubmitResult trySubmit(const ControlRequest &request) noexcept override;
         bool tryTakeEvent(ExecutionEvent &event) noexcept override;
         bool tryTakeSnapshot(ExecutionSnapshot &snapshot) noexcept override;
+        void restoreStationaryState(const StationaryBackendState &state) noexcept;
 
         void advance(double seconds) override;
         // Fixed-tick simulation may decimate presentation snapshots while still

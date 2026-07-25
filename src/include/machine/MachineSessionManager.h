@@ -680,6 +680,82 @@ public:
         return !motionOwnedOrQueued() && m_machineSession.controllerDataMutable();
     }
 
+    std::expected<ngc::MachineSessionCheckpoint, std::string> checkpoint(
+            const MachineControlAuthority authority) const {
+        std::scoped_lock lock(m_mutex);
+        if (!hasControlAuthorityLocked(authority)) {
+            return std::unexpected(
+                "control has transferred or the request targets another session");
+        }
+        if (m_machineSession.coordinator().powerState() != ngc::MachinePowerState::On) {
+            return std::unexpected(
+                "Real-to-Simulation branching requires Real to be powered on");
+        }
+        if (motionOwnedOrQueued() || m_snapshot.hasActiveMotion
+            || m_snapshot.trajectoryBackendQueuedExecutionItems != 0
+            || m_snapshot.trajectoryBackendVelocity > 1e-9
+            || m_snapshot.trajectoryBackendAcceleration > 1e-9) {
+            return std::unexpected(
+                "Real-to-Simulation branching requires Real to be stationary and idle");
+        }
+        if (m_snapshot.status == ngc::SimulationStatus::Error
+            || m_snapshot.trajectoryBackendState == ngc::BackendState::Faulted
+            || m_snapshot.trajectoryBackendFaultCode != 0) {
+            return std::unexpected(
+                "Real-to-Simulation branching requires fault-free Real position confidence");
+        }
+
+        ngc::JointMask configuredJoints = 0;
+        for (const auto &joint : m_joints) {
+            configuredJoints |= ngc::JointMask {1} << joint.id;
+        }
+        if ((m_machineSession.homedJoints() & configuredJoints) != configuredJoints) {
+            return std::unexpected(
+                "Real-to-Simulation branching requires every configured Real joint to be homed");
+        }
+
+        const ngc::StationaryBackendState backend {
+            .commanded = {
+                .position = m_snapshot.machinePosition,
+            },
+            .feedback = {
+                .position = m_snapshot.machinePosition,
+            },
+            .commandedJoints = m_snapshot.joints,
+            .feedbackJoints = m_snapshot.joints,
+        };
+
+        return m_machineSession.checkpoint(backend);
+    }
+
+    std::expected<void, std::string> restoreCheckpoint(
+            const ngc::MachineSessionCheckpoint &checkpoint) {
+        std::scoped_lock lock(m_mutex);
+        if (m_machineSession.coordinator().powerState() != ngc::MachinePowerState::Off
+            || motionOwnedOrQueued()) {
+            return std::unexpected(
+                "Real-to-Simulation import requires Simulation to be powered off and idle");
+        }
+
+        auto restored = m_machineSession.restoreCheckpoint(checkpoint);
+        if (!restored) {
+            return restored;
+        }
+
+        m_snapshot = {};
+        copyRuntimeTimingSnapshot();
+        m_snapshot.powerState = ngc::MachinePowerState::Off;
+        m_snapshot.status = ngc::SimulationStatus::Stopped;
+        m_snapshot.activity = ngc::SimulationActivity::Idle;
+        m_snapshot.machineActivity = ngc::MachineActivity::Idle;
+        m_snapshot.machinePosition = checkpoint.backend.commanded.position;
+        m_snapshot.joints = checkpoint.backend.commandedJoints;
+        m_snapshot.homedJoints = checkpoint.homedJoints;
+        refreshParameterSnapshot();
+
+        return {};
+    }
+
     std::expected<void, std::string> setToolTableStorePath(
             const MachineControlAuthority authority, const std::filesystem::path &path) {
         std::scoped_lock lock(m_mutex);
@@ -934,6 +1010,7 @@ private:
             target.error = "mock motion backend fault " + std::to_string(backend.faultCode);
         }
         target.machinePosition = backend.commanded.position;
+        target.joints = backend.commandedJoints;
         target.commandProgress = backend.spanProgress;
         target.hasActiveMotion = (backend.state == ngc::BackendState::Running
                                   || backend.state == ngc::BackendState::Holding)
@@ -1557,6 +1634,13 @@ public:
           m_real(std::make_unique<detail::InProcessMachineSession>(
               unit, limits, timing, MachineControlTarget::Real)) {}
 
+    explicit MachineSessionManager(const InProcessDualSessionTestTag,
+                                   const ngc::MachineConfiguration &configuration)
+        : m_simulation(std::make_unique<detail::InProcessMachineSession>(
+              configuration, MachineControlTarget::Simulation)),
+          m_real(std::make_unique<detail::InProcessMachineSession>(
+              configuration, MachineControlTarget::Real)) {}
+
     ~MachineSessionManager() { join(); }
     MachineSessionManager(const MachineSessionManager &) = delete;
     MachineSessionManager &operator=(const MachineSessionManager &) = delete;
@@ -1590,6 +1674,47 @@ public:
         }
 
         m_controlAuthority.target = target;
+        ++m_controlAuthority.generation;
+
+        return m_controlAuthority;
+    }
+
+    std::expected<MachineControlAuthority, std::string> simulateFromReal(
+            const MachineControlAuthority authority) {
+        std::scoped_lock lock(m_mutex);
+        if (authority != m_controlAuthority
+            || authority.target != MachineControlTarget::Real) {
+            return std::unexpected(
+                "control has transferred or the request targets another session");
+        }
+        if (!m_real) {
+            return std::unexpected("the Real machine session is not configured");
+        }
+        if (!m_simulation) {
+            return std::unexpected("the Simulation machine session is not configured");
+        }
+        if (m_simulation->snapshot().powerState != ngc::MachinePowerState::Off
+            || !m_simulation->controllerDataMutable()) {
+            return std::unexpected(
+                "Real-to-Simulation import requires Simulation to be powered off and idle");
+        }
+
+        const auto checkpoint = m_real->checkpoint(localAuthority(*m_real));
+        if (!checkpoint) {
+            return std::unexpected(checkpoint.error());
+        }
+        if (const auto restored = m_simulation->restoreCheckpoint(*checkpoint);
+            !restored) {
+            return std::unexpected(restored.error());
+        }
+        if (const auto powered =
+                m_simulation->powerOn(localAuthority(*m_simulation));
+            !powered) {
+            return std::unexpected(
+                "Simulation failed to power on after checkpoint import");
+        }
+
+        m_controlAuthority.target = MachineControlTarget::Simulation;
         ++m_controlAuthority.generation;
 
         return m_controlAuthority;

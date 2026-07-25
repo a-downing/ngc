@@ -37,6 +37,18 @@ namespace ngc {
         return {};
     }
 
+    bool InProcessSimulationRuntime::restoreStationaryState(
+        const StationaryBackendState &state) noexcept {
+        std::scoped_lock lock(m_schedulerMutex);
+        if (m_started) {
+            return false;
+        }
+
+        m_backend.restoreStationaryState(state);
+
+        return true;
+    }
+
     bool InProcessSimulationRuntime::prepareTriggeredJointMove(
         const TriggeredJointMove &move) noexcept {
         for (const auto &trigger : move.triggers) {

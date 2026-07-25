@@ -817,16 +817,34 @@ fall back to the in-process test host.
 
 ### Phase 7: Add in-memory Real-to-Simulation branching
 
-- Define and validate `MachineSessionCheckpoint`.
-- Require a stationary, idle Real boundary.
-- Import live Real state into a Simulation session.
-- Copy Real parameters into Simulation's isolated parameter bank.
+Status: implemented at the backend-neutral manager and explicitly test-only
+dual-session boundary. `MachineSessionCheckpoint` captures validated stationary
+axis/joint state, homing, canonical position and modal state, persistent
+parameters, presentation, the physical tool and applied offset, and the
+complete live tool table. `MachineSessionManager::simulateFromReal()` requires
+powered, stationary, idle, homed, fault-free Real state and powered-off idle
+Simulation, persists the copied Simulation parameter and tool-table stores,
+restores the stopped Simulation runtime, powers Simulation, and advances
+generation-tagged control authority. Tests prove one-way state and motion
+isolation and prove that a later Real checkpoint discards prior Simulation
+changes. Production exposure remains blocked on a production Real session and
+physical backend; the application must not expose the test host.
+
+- Define and validate `MachineSessionCheckpoint`. Complete.
+- Require a stationary, idle Real boundary. Complete at the manager/test-host
+  boundary.
+- Import live Real state into a Simulation session. Complete at the
+  manager/test-host boundary.
+- Copy Real parameters into Simulation's isolated parameter bank. Complete.
 - Copy the complete live Real tool table into Simulation's isolated tool-table
-  store.
+  store. Complete.
 - Prove through tests that simulated programs, MDI, jogging, homing, WCS/tool
   changes, parameter writes, and tool calibration cannot reach or mutate Real.
+  Program/MDI motion, WCS/parameter, complete tool-table isolation, and
+  configured homing-state transfer are covered; post-branch homing, jogging,
+  and tool-calibration isolation scenarios remain.
 - Discard Simulation changes when returning to Real and refresh from a new Real
-  snapshot.
+  snapshot. Complete at the manager/test-host boundary.
 
 ### Phase 8: Add backend conformance tests
 

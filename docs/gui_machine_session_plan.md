@@ -305,11 +305,14 @@ Simulation authority and rejects unavailable Real selection without advancing
 that authority. The GUI now tags every target-dependent motion and
 controller-data operation with its current authority, and the manager rejects a
 stale generation or wrong target before admission. Concurrent production Real
-ownership, a live Real snapshot, and the Real-to-Simulation checkpoint remain
+ownership, a live Real snapshot, and the Real-to-Simulation checkpoint UI remain
 coupled to the corresponding production Real-session work. The manager's target
 router and dual-session snapshot API are covered with an explicitly test-only
 in-process RealRun-mode session; those tests exercise actual authority transfer
 and session-state isolation without making Real available in the application.
+The same boundary now implements and tests validated Real-to-Simulation
+checkpoint import, including authority advancement, copied canonical state and
+stores, one-way isolation, and refresh from a later Real checkpoint.
 
 Implement this phase with the corresponding Real-session manager work.
 
