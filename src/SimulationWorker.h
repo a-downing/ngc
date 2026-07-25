@@ -64,22 +64,6 @@ class SimulationWorker {
     std::vector<ngc::JointConfiguration> m_joints;
     std::uint32_t m_tickMultiplier = 1;
 
-    class ActivityCompletion {
-    public:
-        explicit ActivityCompletion(ngc::ExecutionCoordinator &coordinator)
-            : m_coordinator(coordinator) { }
-
-        ~ActivityCompletion() {
-            m_coordinator.finishActivity();
-        }
-
-        ActivityCompletion(const ActivityCompletion &) = delete;
-        ActivityCompletion &operator=(const ActivityCompletion &) = delete;
-
-    private:
-        ngc::ExecutionCoordinator &m_coordinator;
-    };
-
     [[nodiscard]] bool motionOwnedOrQueued() const noexcept {
         return m_running || !m_machineSession.coordinator().commands().empty()
             || m_machineSession.coordinator().activity() != ngc::MachineActivity::Idle
@@ -135,21 +119,17 @@ public:
         }
         const auto activity = std::get<1>(programs.back()) == "<MDI>"
             ? ngc::MachineActivity::Mdi : ngc::MachineActivity::Program;
-        if (!m_machineSession.coordinator().beginActivity(activity)) {
-            return false;
-        }
         if (!m_toolTableInitialized) {
             m_toolTable = tools;
             m_machineSession.interpreter().machine().toolTable() = tools;
             m_toolTableInitialized = true;
             ++m_toolTableRevision;
         }
-        if (!m_machineSession.coordinator().commands().tryPush(ngc::StartProgram {
+        if (!m_machineSession.queueProgram(ngc::StartProgram {
                 .programs = programs,
                 .preserveState = preserveState,
                 .activity = activity,
             })) {
-            m_machineSession.coordinator().finishActivity();
             return false;
         }
         m_stop = false;
@@ -178,11 +158,7 @@ public:
         if (motionOwnedOrQueued() || !m_machineSession.homingAvailable()) {
             return false;
         }
-        if (!m_machineSession.coordinator().beginActivity(ngc::MachineActivity::Homing)) {
-            return false;
-        }
-        if (!m_machineSession.coordinator().commands().tryPush(ngc::StartHoming {})) {
-            m_machineSession.coordinator().finishActivity();
+        if (!m_machineSession.queueHoming()) {
             return false;
         }
         m_stop = false;
@@ -209,11 +185,7 @@ public:
         if (!jog || *jog == 0 || motionOwnedOrQueued()) {
             return false;
         }
-        if (!m_machineSession.coordinator().beginActivity(ngc::MachineActivity::Jogging)) {
-            return false;
-        }
-        if (!m_machineSession.coordinator().commands().tryPush(ngc::StartJog { request })) {
-            m_machineSession.coordinator().finishActivity();
+        if (!m_machineSession.queueJog(request)) {
             return false;
         }
         m_stop = false;
@@ -973,18 +945,27 @@ private:
             if (m_join) {
                 return;
             }
-            auto command = m_machineSession.coordinator().commands().tryPop();
-            if (!command) {
+            auto dispatched = m_machineSession.dispatchNextOperation();
+            if (!dispatched) {
+                m_snapshot.status = ngc::SimulationStatus::Error;
+                m_snapshot.activity = ngc::SimulationActivity::Idle;
+                m_snapshot.error = dispatched.error();
+                m_running = false;
+                m_programRunning = false;
                 continue;
             }
-            if (std::holds_alternative<ngc::StartHoming>(*command)) {
+            if (!*dispatched) {
+                continue;
+            }
+            auto operation = std::move(**dispatched);
+            if (std::holds_alternative<ngc::StartHoming>(operation)) {
                 m_running = true;
                 m_stop = false;
                 lock.unlock();
                 runSessionHoming();
                 continue;
             }
-            if (auto *jog = std::get_if<ngc::StartJog>(&*command)) {
+            if (auto *jog = std::get_if<ngc::StartJog>(&operation)) {
                 auto request = std::move(jog->request);
                 m_running = true;
                 m_stop = false;
@@ -992,17 +973,15 @@ private:
                 runJogging(request);
                 continue;
             }
-            if (std::holds_alternative<ngc::Stop>(*command)) {
+            if (std::holds_alternative<ngc::Stop>(operation)) {
                 m_snapshot.status = ngc::SimulationStatus::Stopped;
                 m_snapshot.activity = ngc::SimulationActivity::Idle;
-                m_machineSession.coordinator().finishActivity();
                 continue;
             }
-            if (!std::holds_alternative<ngc::StartProgram>(*command)) {
+            if (!std::holds_alternative<ngc::StartProgram>(operation)) {
                 continue;
             }
-            auto start = std::get<ngc::StartProgram>(std::move(*command));
-            ActivityCompletion activityCompletion(m_machineSession.coordinator());
+            auto start = std::get<ngc::StartProgram>(std::move(operation));
             auto programs = std::move(start.programs);
             auto tools = m_toolTable;
             const auto preserve = start.preserveState;
@@ -1034,6 +1013,7 @@ private:
             const auto epochResult = m_machineSession.beginExecutionEpoch(
                 std::move(start), std::move(tools), startingPosition);
             if (!epochResult) {
+                joinGeometry();
                 lock.lock();
                 m_snapshot.status = ngc::SimulationStatus::Error;
                 m_snapshot.activity = ngc::SimulationActivity::Idle;

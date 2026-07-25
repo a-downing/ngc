@@ -148,6 +148,112 @@ namespace ngc {
         return m_coordinator.powerOff();
     }
 
+    bool MachineSession::queueProgram(StartProgram start) {
+        if (start.programs.empty()
+            || (start.activity != MachineActivity::Program
+                && start.activity != MachineActivity::Mdi)) {
+            return false;
+        }
+        if (!m_coordinator.beginActivity(start.activity)) {
+            return false;
+        }
+        if (!m_coordinator.commands().tryPush(std::move(start))) {
+            m_coordinator.finishActivity();
+
+            return false;
+        }
+
+        return true;
+    }
+
+    bool MachineSession::queueHoming() {
+        if (!homingAvailable() || !m_coordinator.beginActivity(MachineActivity::Homing)) {
+            return false;
+        }
+        if (!m_coordinator.commands().tryPush(StartHoming {})) {
+            m_coordinator.finishActivity();
+
+            return false;
+        }
+
+        return true;
+    }
+
+    bool MachineSession::queueJog(ControlRequest request) {
+        const auto startsJog = std::holds_alternative<StartContinuousJogRequest>(request)
+            || std::holds_alternative<StartIncrementalJogRequest>(request);
+        if (!startsJog || !m_joggingController
+            || !m_coordinator.beginActivity(MachineActivity::Jogging)) {
+            return false;
+        }
+        if (!m_coordinator.commands().tryPush(StartJog { std::move(request) })) {
+            m_coordinator.finishActivity();
+
+            return false;
+        }
+
+        return true;
+    }
+
+    std::expected<std::optional<DispatchedSessionOperation>, std::string>
+    MachineSession::dispatchNextOperation() {
+        while (auto command = m_coordinator.commands().tryPop()) {
+            if (auto *start = std::get_if<StartProgram>(&*command)) {
+                if (m_coordinator.activity() != start->activity) {
+                    m_coordinator.finishActivity();
+
+                    return std::unexpected(
+                        "queued program activity does not own the machine session");
+                }
+
+                return DispatchedSessionOperation { std::move(*start) };
+            }
+            if (auto *mdi = std::get_if<ExecuteMdi>(&*command)) {
+                if (m_coordinator.activity() != MachineActivity::Mdi) {
+                    m_coordinator.finishActivity();
+
+                    return std::unexpected(
+                        "queued MDI activity does not own the machine session");
+                }
+
+                return DispatchedSessionOperation {
+                    StartProgram {
+                        .programs = {{std::move(mdi->program), std::move(mdi->source)}},
+                        .preserveState = true,
+                        .activity = MachineActivity::Mdi,
+                    },
+                };
+            }
+            if (std::holds_alternative<StartHoming>(*command)) {
+                if (m_coordinator.activity() != MachineActivity::Homing) {
+                    m_coordinator.finishActivity();
+
+                    return std::unexpected(
+                        "queued homing activity does not own the machine session");
+                }
+
+                return DispatchedSessionOperation { StartHoming {} };
+            }
+            if (auto *jog = std::get_if<StartJog>(&*command)) {
+                if (m_coordinator.activity() != MachineActivity::Jogging) {
+                    m_coordinator.finishActivity();
+
+                    return std::unexpected(
+                        "queued jogging activity does not own the machine session");
+                }
+
+                return DispatchedSessionOperation { StartJog { std::move(jog->request) } };
+            }
+            if (std::holds_alternative<Stop>(*command)) {
+                m_coordinator.finishActivity();
+
+                return DispatchedSessionOperation { Stop {} };
+            }
+        }
+
+        return std::optional<DispatchedSessionOperation> {};
+    }
+
     ProgramOperationUpdate MachineSession::programOperationUpdate() const {
         ProgramOperationUpdate result;
         result.stoppedPosition = m_programExecution.stoppedPosition();
@@ -242,6 +348,10 @@ namespace ngc {
         while (m_geometryForward.tryPop(forward)) { }
         PreparedFeedbackMessage feedback;
         while (m_geometryFeedback.tryPop(feedback)) { }
+        if (m_coordinator.activity() == MachineActivity::Program
+            || m_coordinator.activity() == MachineActivity::Mdi) {
+            m_coordinator.finishActivity();
+        }
 
         return diagnostics;
     }

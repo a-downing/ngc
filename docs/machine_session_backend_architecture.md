@@ -745,8 +745,11 @@ pumping through one backend-neutral program operation service step. That step
 consumes queued controls, services backend events, applies presentation updates,
 pumps a bounded amount of prepared work, and reports a normalized operation
 outcome.
-The `SimulationWorker` compatibility facade queues program and homing starts,
-jogging controls, feed hold, Resume, and Stop through that command boundary.
+`MachineSession` also admits and dispatches queued program, MDI, homing, and
+jogging starts, validates their activity ownership, and releases Program/MDI
+activity when the execution epoch finishes. The `SimulationWorker`
+compatibility facade queues starts, jogging controls, feed hold, Resume, and
+Stop through that command boundary.
 Stop uses backend constrained braking, abandons the execution epoch only at
 rest, and reconciles canonical position to the stationary backend state.
 The homing controller owns fast search, clearance backoff, slow latch,
@@ -756,11 +759,11 @@ compatibility facade. The jogging controller owns backend initialization,
 token-matched controls, constrained Stop, event handling, and final axis/joint
 observation; `MachineSession` consumes and translates queued jog commands.
 Simulation supplies only service-clock and shutdown callbacks for jogging.
-Simulation runtime lifecycle servicing, persistence boundaries, and remaining
-operation dispatch still need to move behind the session abstraction.
+Simulation runtime lifecycle servicing and persistence boundaries still need to
+move behind the session abstraction.
 
-- Move the remaining Simulation operation loop and persistence boundaries into
-  backend-neutral session components.
+- Move the remaining Simulation runtime lifecycle and persistence boundaries
+  into backend-neutral session components.
 - Replace boolean control flags with explicit power/activity state and queued
   NRT commands.
 - Make On/Off separate from Start/Stop.

@@ -98,6 +98,12 @@ namespace ngc {
         Resume,
         Stop>;
 
+    using DispatchedSessionOperation = std::variant<
+        StartProgram,
+        StartHoming,
+        StartJog,
+        Stop>;
+
     class SessionCommandQueue {
     public:
         static constexpr std::size_t DEFAULT_CAPACITY = 32;
@@ -174,6 +180,11 @@ namespace ngc {
 
         [[nodiscard]] bool powerOn() noexcept;
         [[nodiscard]] bool powerOff() noexcept;
+        [[nodiscard]] bool queueProgram(StartProgram start);
+        [[nodiscard]] bool queueHoming();
+        [[nodiscard]] bool queueJog(ControlRequest request);
+        [[nodiscard]] std::expected<std::optional<DispatchedSessionOperation>, std::string>
+        dispatchNextOperation();
         [[nodiscard]] std::expected<GeometryEpoch, std::string> beginExecutionEpoch(
             StartProgram start, ToolTable tools, const position_t &startingPosition);
         [[nodiscard]] GeometryStreamDiagnostics finishExecutionEpoch();

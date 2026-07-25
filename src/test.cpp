@@ -576,12 +576,23 @@ final_move_together = true
         ngc::MachineSession session(
             UNIT, ngc::InterpretationMode::Simulation, backend, {});
         require(session.powerOn(), "a machine session should power on explicitly");
+        require(session.queueProgram(
+                    ngc::StartProgram {
+                        .programs = {{"G90\n", "<MDI>"}},
+                        .preserveState = true,
+                        .activity = ngc::MachineActivity::Mdi,
+                    }),
+                "MachineSession should admit an MDI operation");
+        auto dispatched = session.dispatchNextOperation();
+        require(dispatched.has_value() && *dispatched,
+                dispatched ? "MachineSession should dispatch its queued MDI operation"
+                           : dispatched.error());
+        auto *start = std::get_if<ngc::StartProgram>(&**dispatched);
+        require(start && start->activity == ngc::MachineActivity::Mdi
+                    && start->preserveState,
+                "session dispatch should retain MDI epoch inputs");
         auto epoch = session.beginExecutionEpoch(
-            ngc::StartProgram {
-                .programs = {{"G90\n", "<MDI>"}},
-                .preserveState = true,
-                .activity = ngc::MachineActivity::Mdi,
-            },
+            std::move(*start),
             {}, {});
         require(epoch.has_value(), epoch ? "" : epoch.error());
         require(session.executionEpochActive(),
@@ -634,9 +645,22 @@ final_move_together = true
                     && session.programExecution().state()
                         == ngc::ProgramExecutionState::Inactive,
                 "finishing an epoch should retire session-owned program execution control");
-        session.coordinator().finishActivity();
         require(session.coordinator().activity() == ngc::MachineActivity::Idle,
-                "completing operation coordination should return the session to idle");
+                "finishing an epoch should return operation coordination to idle");
+        require(session.queueProgram(
+                    ngc::StartProgram {
+                        .programs = {{"G0 X1\n", "cancel-before-dispatch.ngc"}},
+                    }),
+                "idle session should admit a later program operation");
+        session.coordinator().commands().clear();
+        require(session.coordinator().commands().tryPush(ngc::Stop {}),
+                "session should accept Stop in place of a queued start");
+        auto stopped = session.dispatchNextOperation();
+        require(stopped.has_value() && *stopped
+                    && std::holds_alternative<ngc::Stop>(**stopped)
+                    && session.coordinator().activity() == ngc::MachineActivity::Idle,
+                stopped ? "dispatching Stop should cancel queued operation ownership"
+                        : stopped.error());
         require(session.powerOff(),
                 "the idle MachineSession should power off independently of Stop");
     }
@@ -803,8 +827,6 @@ final_move_together = true
         session.configureHoming(
             configuration->axes, configuration->joints, configuration->homing);
         require(session.powerOn(), "jogging session should power on");
-        require(session.coordinator().beginActivity(ngc::MachineActivity::Jogging),
-                "powered session should grant jogging ownership");
 
         const auto axis = std::ranges::find(
             configuration->axes, ngc::Machine::Axis::Y,
@@ -838,6 +860,15 @@ final_move_together = true
             },
             .leaseTicks = 10000,
         };
+        require(session.queueJog(ngc::ControlRequest {request}),
+                "powered session should admit a jogging operation");
+        auto dispatched = session.dispatchNextOperation();
+        require(dispatched.has_value() && *dispatched,
+                dispatched ? "MachineSession should dispatch its queued jog"
+                           : dispatched.error());
+        auto *jog = std::get_if<ngc::StartJog>(&**dispatched);
+        require(jog,
+                "session dispatch should retain the admitted jog request");
         require(session.coordinator().commands().tryPush(ngc::Stop {}),
                 "session Stop should queue behind a started jog");
         const ngc::JoggingRuntimeCallbacks callbacks {
@@ -858,7 +889,7 @@ final_move_together = true
         };
 
         const auto jogging = session.runJogging(
-            startingPosition, ngc::ControlRequest {request}, callbacks);
+            startingPosition, jog->request, callbacks);
         require(jogging.has_value(), jogging ? "" : jogging.error());
         require(jogging->outcome == ngc::JoggingOutcome::Stopped
                     && jogging->stopReason == ngc::JogStopReason::RequestedStop,
@@ -870,6 +901,14 @@ final_move_together = true
                         && std::abs(jogging->observation.joints.acceleration[id]) <= 1e-10,
                     "session-owned jogging should return every participating joint at rest");
         }
+        require(session.queueHoming(),
+                "idle powered session should admit a later homing operation");
+        auto homingDispatch = session.dispatchNextOperation();
+        require(homingDispatch.has_value() && *homingDispatch
+                    && std::holds_alternative<ngc::StartHoming>(**homingDispatch),
+                homingDispatch ? "MachineSession should dispatch its queued homing operation"
+                               : homingDispatch.error());
+        session.coordinator().finishActivity();
         require(session.powerOff(), "idle jogging session should power off");
     }
 
