@@ -741,7 +741,10 @@ presentation tracker, execution-epoch counter, backend-neutral
 translates queued Feed Hold, Resume, and Stop commands into backend-neutral
 control requests and owns their acknowledgement and held-state transitions.
 `MachineSession` routes timed backend events and presentation-aware driver
-pumping through this controller.
+pumping through one backend-neutral program operation service step. That step
+consumes queued controls, services backend events, applies presentation updates,
+pumps a bounded amount of prepared work, and reports a normalized operation
+outcome.
 The `SimulationWorker` compatibility facade queues program and homing starts,
 jogging controls, feed hold, Resume, and Stop through that command boundary.
 Stop uses backend constrained braking, abandons the execution epoch only at
@@ -753,8 +756,8 @@ compatibility facade. The jogging controller owns backend initialization,
 token-matched controls, constrained Stop, event handling, and final axis/joint
 observation; `MachineSession` consumes and translates queued jog commands.
 Simulation supplies only service-clock and shutdown callbacks for jogging.
-Simulation runtime servicing, persistence boundaries, and the remaining
-program pumping loop still need to move behind the session abstraction.
+Simulation runtime lifecycle servicing, persistence boundaries, and remaining
+operation dispatch still need to move behind the session abstraction.
 
 - Move the remaining Simulation operation loop and persistence boundaries into
   backend-neutral session components.

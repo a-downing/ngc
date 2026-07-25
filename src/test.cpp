@@ -590,18 +590,41 @@ final_move_together = true
                     && session.programExecution().state()
                         == ngc::ProgramExecutionState::Running,
                 "MachineSession should own active Program/MDI execution control");
-        require(session.coordinator().commands().tryPush(ngc::Stop {}),
-                "the active session should accept a queued program Stop");
         ngc::ExecutionSnapshot stationary;
         stationary.epoch = *epoch;
         stationary.state = ngc::BackendState::Held;
         stationary.commanded.position.x = 0.25;
-        session.programExecution().service(stationary, false);
-        require(session.programExecution().state()
-                    == ngc::ProgramExecutionState::StopComplete
-                    && session.programExecution().stoppedPosition()
-                    && session.programExecution().stoppedPosition()->x == 0.25,
-                "session-owned Stop should complete immediately from a stationary backend state");
+        const auto deferred = session.serviceProgramOperation(
+            stationary, false, 4,
+            [] {
+                return false;
+            },
+            [](auto &&updatePresentation) {
+                updatePresentation();
+            },
+            [](const auto &) {},
+            [](const auto &, const auto &, const auto &, const auto) {},
+            [](const auto &) {});
+        require(deferred.state == ngc::ProgramOperationState::Running
+                    && deferred.workDeferred && deferred.pumped == 0,
+                "session program servicing should defer backend work at its runtime boundary");
+        require(session.coordinator().commands().tryPush(ngc::Stop {}),
+                "the active session should accept a queued program Stop");
+        const auto operation = session.serviceProgramOperation(
+            stationary, false, 0,
+            [] {
+                return true;
+            },
+            [](auto &&updatePresentation) {
+                updatePresentation();
+            },
+            [](const auto &) {},
+            [](const auto &, const auto &, const auto &, const auto) {},
+            [](const auto &) {});
+        require(operation.state == ngc::ProgramOperationState::StopComplete
+                    && operation.stoppedPosition
+                    && operation.stoppedPosition->x == 0.25,
+                "session-owned program servicing should complete Stop from a stationary backend");
         require(session.coordinator().activity() == ngc::MachineActivity::Mdi,
                 "MachineSession should expose the active MDI operation");
         (void)session.finishExecutionEpoch();

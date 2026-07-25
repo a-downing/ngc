@@ -70,7 +70,9 @@ state, backend-neutral `JoggingController`, `ExecutionCoordinator`, and
 backend-neutral `ProgramExecutionController`. The program controller owns
 queued Feed Hold, Resume, and Stop translation plus backend acknowledgement and
 held-state transitions; `MachineSession` routes timed backend events and
-presentation-aware driver pumping through it. The
+presentation-aware bounded driver pumping through one backend-neutral program
+operation service step and reports normalized running, held, stopped, completed,
+or failed outcomes. The
 `SimulationWorker` compatibility facade queues program and homing starts,
 jogging controls, feed hold, Resume, and Stop through that boundary; it still
 owns the Simulation runtime servicing callbacks, persistence boundaries,

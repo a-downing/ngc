@@ -148,6 +148,33 @@ namespace ngc {
         return m_coordinator.powerOff();
     }
 
+    ProgramOperationUpdate MachineSession::programOperationUpdate() const {
+        ProgramOperationUpdate result;
+        result.stoppedPosition = m_programExecution.stoppedPosition();
+        const auto controlState = m_programExecution.state();
+        const auto driverState = m_driver.state();
+        if (controlState == ProgramExecutionState::Error) {
+            result.state = ProgramOperationState::Error;
+            result.error = m_programExecution.error().value_or(
+                "machine-session program execution failed");
+        } else if (controlState == ProgramExecutionState::StopComplete) {
+            result.state = ProgramOperationState::StopComplete;
+        } else if (driverState == PreparedDriverState::Error) {
+            result.state = ProgramOperationState::Error;
+            result.error = m_driver.error().value_or(
+                "prepared trajectory execution failed");
+        } else if (driverState == PreparedDriverState::Completed) {
+            result.state = ProgramOperationState::Completed;
+        } else if (controlState == ProgramExecutionState::Paused
+                   || driverState == PreparedDriverState::ProgramPaused) {
+            result.state = ProgramOperationState::Paused;
+        } else if (controlState == ProgramExecutionState::Holding) {
+            result.state = ProgramOperationState::Holding;
+        }
+
+        return result;
+    }
+
     std::expected<GeometryEpoch, std::string> MachineSession::beginExecutionEpoch(
         StartProgram start, ToolTable tools, const position_t &startingPosition) {
         if (executionEpochActive()) {

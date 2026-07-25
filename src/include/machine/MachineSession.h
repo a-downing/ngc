@@ -39,6 +39,23 @@ namespace ngc {
         Faulted,
     };
 
+    enum class ProgramOperationState {
+        Running,
+        Holding,
+        Paused,
+        StopComplete,
+        Completed,
+        Error,
+    };
+
+    struct ProgramOperationUpdate {
+        ProgramOperationState state = ProgramOperationState::Running;
+        std::size_t pumped = 0;
+        bool workDeferred = false;
+        std::optional<position_t> stoppedPosition;
+        std::optional<std::string> error;
+    };
+
     struct StartProgram {
         std::vector<std::tuple<std::string, std::string>> programs;
         bool preserveState = false;
@@ -178,41 +195,104 @@ namespace ngc {
         [[nodiscard]] bool applyProgramPresentationUpdate();
         void completeProgramPresentation();
 
-        template<typename Observe>
-        void serviceProgramBackend(Observe &&observe) {
+        template<typename BackendWorkAllowed, typename WithPresentationLock, typename ObserveEvent,
+                 typename ObserveCommand, typename ObserveStatus>
+        ProgramOperationUpdate serviceProgramOperation(
+            const ExecutionSnapshot &snapshot, const bool shutdownRequested,
+            const std::size_t pumpLimit, BackendWorkAllowed &&backendWorkAllowed,
+            WithPresentationLock &&withPresentationLock,
+            ObserveEvent &&observeEvent, ObserveCommand &&observeCommand,
+            ObserveStatus &&observeStatus) {
+            m_programExecution.service(snapshot, shutdownRequested);
+            auto update = programOperationUpdate();
+            if (update.state == ProgramOperationState::Paused
+                || update.state == ProgramOperationState::StopComplete
+                || update.state == ProgramOperationState::Completed
+                || update.state == ProgramOperationState::Error) {
+                return update;
+            }
+            if (!backendWorkAllowed()) {
+                update.workDeferred = true;
+
+                return update;
+            }
+
             m_driver.serviceBackend([&](const ExecutionEvent &event) {
                 m_programExecution.observeBackendEvent(event);
-                if (const auto *accepted = std::get_if<ChunkAccepted>(&event)) {
-                    m_presentationTracker.observeChunkAccepted(*accepted);
-                } else if (const auto *marker = std::get_if<ExecutionMarkerReached>(&event)) {
-                    m_presentationTracker.observeMarkerReached(*marker);
-                } else if (const auto *retired = std::get_if<ChunkRetired>(&event)) {
-                    m_presentationTracker.observeChunkRetired(*retired);
-                }
-                observe(event);
+                withPresentationLock([&] {
+                    if (const auto *accepted = std::get_if<ChunkAccepted>(&event)) {
+                        m_presentationTracker.observeChunkAccepted(*accepted);
+                    } else if (const auto *marker =
+                                   std::get_if<ExecutionMarkerReached>(&event)) {
+                        m_presentationTracker.observeMarkerReached(*marker);
+                    } else if (const auto *retired = std::get_if<ChunkRetired>(&event)) {
+                        m_presentationTracker.observeChunkRetired(*retired);
+                    }
+                    observeEvent(event);
+                });
             });
-        }
+            withPresentationLock([&] {
+                (void)applyProgramPresentationUpdate();
+            });
+            m_programExecution.observeDriverState();
+            update = programOperationUpdate();
+            if (update.state == ProgramOperationState::Paused
+                || update.state == ProgramOperationState::StopComplete
+                || update.state == ProgramOperationState::Completed
+                || update.state == ProgramOperationState::Error) {
+                return update;
+            }
+            if (!backendWorkAllowed()) {
+                update.workDeferred = true;
 
-        template<typename WithPresentationLock, typename ObserveCommand, typename ObserveStatus>
-        bool pumpProgramOne(WithPresentationLock &&withPresentationLock,
-                            ObserveCommand &&observeCommand, ObserveStatus &&observeStatus) {
-            return m_driver.pumpOne(
-                [&](const MachineCommand &command, const ExecutionItem &item,
-                    const TrajectoryPlanningMetadata &,
-                    const TrajectoryCommandPresentation &presentation,
-                    const ExecutionMarkerId activationMarker) {
-                    withPresentationLock([&] {
-                        observeCommand(command, item, presentation, activationMarker);
-                        m_presentationTracker.observeCommand(
-                            command, item, presentation, activationMarker);
+                return update;
+            }
+            for (std::size_t fill = 0; fill < pumpLimit; ++fill) {
+                if (!backendWorkAllowed()) {
+                    update.workDeferred = true;
+                    break;
+                }
+                const auto pumped = m_driver.pumpOne(
+                    [&](const MachineCommand &command, const ExecutionItem &item,
+                        const TrajectoryPlanningMetadata &,
+                        const TrajectoryCommandPresentation &presentation,
+                        const ExecutionMarkerId activationMarker) {
+                        withPresentationLock([&] {
+                            observeCommand(command, item, presentation, activationMarker);
+                            m_presentationTracker.observeCommand(
+                                command, item, presentation, activationMarker);
+                        });
+                    },
+                    [&](const InterpreterBlockLifecycle &lifecycle) {
+                        withPresentationLock([&] {
+                            m_presentationTracker.observeLifecycle(lifecycle);
+                        });
+                    },
+                    [&](const InterpreterStatusMessage &status) {
+                        withPresentationLock([&] {
+                            observeStatus(status);
+                        });
                     });
-                },
-                [&](const InterpreterBlockLifecycle &lifecycle) {
-                    withPresentationLock([&] {
-                        m_presentationTracker.observeLifecycle(lifecycle);
-                    });
-                },
-                std::forward<ObserveStatus>(observeStatus));
+                withPresentationLock([&] {
+                    (void)applyProgramPresentationUpdate();
+                });
+                if (!pumped) {
+                    break;
+                }
+
+                ++update.pumped;
+                if (m_programExecution.stopRequested() || m_programExecution.paused()
+                    || !m_coordinator.commands().empty()) {
+                    break;
+                }
+            }
+
+            m_programExecution.observeDriverState();
+            auto finalUpdate = programOperationUpdate();
+            finalUpdate.pumped = update.pumped;
+            finalUpdate.workDeferred = update.workDeferred;
+
+            return finalUpdate;
         }
 
         template<typename Self> auto &interpreter(this Self &&self) {
@@ -236,6 +316,8 @@ namespace ngc {
         [[nodiscard]] const GeometryStreamProducer *geometryProducer() const noexcept;
 
     private:
+        [[nodiscard]] ProgramOperationUpdate programOperationUpdate() const;
+
         InterpreterSession m_interpreter;
         GeometryStreamPolicy m_geometryPolicy;
         PreparedGeometryForwardChannel m_geometryForward;
