@@ -104,7 +104,10 @@ target_link_libraries(imgui_main
         glm::glm-header-only)
 ngc_target_defaults(imgui_main)
 
-add_executable(ngc_tests src/test.cpp)
+add_executable(ngc_tests
+    src/BackendConformanceTests.cpp
+    src/test.cpp
+)
 target_include_directories(ngc_tests PRIVATE src)
 target_link_libraries(ngc_tests PRIVATE ngc_core glm::glm-header-only PathTempo::PathTempo)
 ngc_target_defaults(ngc_tests)

@@ -43,6 +43,7 @@
 #include "machine/MachineSessionManager.h"
 #include "Worker.h"
 #include "gui/MachineSessionView.h"
+#include "test/BackendConformance.h"
 
 namespace {
     constexpr double EPSILON = 1e-9;
@@ -5930,6 +5931,36 @@ G1 F60 X2
                 "prepared samples must retain the tangential curvature-squared jerk component");
     }
 
+    void testInProcessBackendConformance() {
+        const auto configuration = fixtureMachineConfiguration();
+        require(configuration.has_value(), configuration ? "" : configuration.error());
+
+        ngc::test::runBackendConformanceSuite({
+            .name = "InProcessSimulationRuntime",
+            .createRuntime = [configuration = *configuration] {
+                return std::make_unique<ngc::InProcessSimulationRuntime>(configuration);
+            },
+            .makeTriggeredJointMove = [] {
+                ngc::TriggeredJointMove move;
+                move.id = 1;
+                move.branch = 1;
+                move.moveId = 1;
+                move.joints = ngc::JointMask{1};
+                move.targetMode = ngc::JointTargetMode::Relative;
+                move.target[0] = 14.0;
+                move.limits.velocity[0] = 3.0;
+                move.limits.acceleration[0] = 5.0;
+                move.limits.jerk[0] = 100.0;
+                require(move.triggers.push({
+                            0, 1, ngc::InputCondition::Active, 0.010}),
+                        "backend conformance joint trigger should fit");
+                move.triggerRequired = true;
+
+                return move;
+            },
+        });
+    }
+
     void testPreparedLineJunctionRetainsExactEndpointCurvature() {
         const ngc::position_t first{-1.0644,13.9651,-0.4068730132094953,0,0,0};
         const ngc::position_t junction{-1.2583,13.2669,-0.4068730132094953,0,0,0};
@@ -7720,6 +7751,7 @@ int main() {
         testContinuousMarkerBoundPacketsExecuteWithoutIntermediateStops();
         testJogControlUsesBoundedBackendTransport();
         testMockBackendAdvancesOneFixedServoTick();
+        testInProcessBackendConformance();
         testExactStopPlannerCompilesLinesAndArcs();
         testInfiniteJerkTrajectoryTimeMatchesAnalyticLine();
         testExactStopPlannerEnforcesIndependentAxisLimits();

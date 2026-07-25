@@ -848,11 +848,24 @@ physical backend; the application must not expose the test host.
 
 ### Phase 8: Add backend conformance tests
 
+Status: in progress. A reusable target-driven backend conformance suite now
+runs against `InProcessSimulationRuntime` through only `BackendRuntime` and
+`MotionBackend`. It covers idempotent runtime lifecycle, stationary-state
+restore gating, enable/disable, repeated epochs, dependent publication and
+retirement, marker ordering, triggered joint motion, jogging lease expiry,
+controlled Stop, abort, bounded publication and control channels, and a fatal
+hold transition. Direct mock-only diagnostic tests remain alongside this suite.
+The second target remains blocked on the reusable production executor core;
+future executor and IPC runtimes must register with the same suite rather than
+forking its behavioral expectations.
+
 - Build a reusable behavioral suite for enable/disable, repeated epochs,
   publication and retirement, marker ordering, triggered moves, homing,
-  jogging leases, stop/abort, channel capacity, and faults.
+  jogging leases, stop/abort, channel capacity, and faults. Complete for the
+  current backend-neutral primitive coverage.
 - Run it against the in-process backend and later against the reusable
-  production executor core.
+  production executor core. Complete for the in-process backend; production
+  executor registration remains.
 
 ### Phase 9: Add the IPC skeleton
 
