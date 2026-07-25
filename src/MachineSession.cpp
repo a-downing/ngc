@@ -468,6 +468,16 @@ namespace ngc {
         return {m_interpreter.machine().toolTable(), m_toolTableRevision};
     }
 
+    ParameterSnapshot MachineSession::parameterSnapshot() const {
+        ParameterSnapshot result;
+        result.reserve(gVars.size());
+        for (const auto &[var, _name, _address, _flags, _value] : gVars) {
+            result.insert_or_assign(var, m_interpreter.machine().memory().read(var));
+        }
+
+        return result;
+    }
+
     std::expected<void, std::string> MachineSession::setToolTableStorePath(
         const std::filesystem::path &path) {
         if (!controllerDataMutable()) {

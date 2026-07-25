@@ -654,7 +654,7 @@ public:
             return;
         }
 
-        auto result = tools.save(m_toolTableStores.simulation);
+        auto result = m_simulation.saveToolTable(m_toolTableStores.simulation);
 
         if(!result) {
             if (m_simulation.setToolTable(previousTools)) {
@@ -2689,6 +2689,9 @@ public:
            && m_worker.setToolTable(simulationTools)) {
             m_tools = simulationTools;
             m_simulationToolTableRevision = toolTableRevision;
+            if (m_enableToolWindow) {
+                initToolTableStrings();
+            }
         }
         const auto &viewport = *ImGui::GetMainViewport();
         m_toolbarHeight = ImGui::GetFrameHeight() * 2.0f + ImGui::GetStyle().ItemSpacing.y
@@ -2713,7 +2716,7 @@ public:
 
         if(m_enableOpenDialog) renderOpenDialog();
         if(m_enableMemoryWindow) renderMemoryWindow();
-        if(m_enableToolWindow) renderToolWindow();
+        if(m_enableToolWindow) renderToolWindow(simulation);
     }
 
     void processPendant(const ngc::SimulationSnapshot &simulation) {
@@ -2798,11 +2801,26 @@ public:
         }
     }
 
-    void renderToolWindow() {
+    void renderToolWindow(const ngc::SimulationSnapshot &simulation) {
         ImGui::SetNextWindowSize({ 950.0f, 360.0f }, ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSizeConstraints({ 500.0f, 220.0f }, { FLT_MAX, FLT_MAX });
 
-        if(ImGui::Begin("Tool Table", &m_enableToolWindow)) {
+        if(ImGui::Begin("Simulation Tool Table", &m_enableToolWindow)) {
+            ImGui::TextUnformatted("Owner: Simulation");
+            ImGui::SameLine();
+            ImGui::TextDisabled(
+                "| Store: %s", m_toolTableStores.simulation.string().c_str());
+            const auto sessionMutable = m_simulation.controllerDataMutable();
+            const auto canEdit = m_simulationToolTableStoreReady && sessionMutable;
+            if (!canEdit) {
+                const auto reason = !m_simulationToolTableStoreReady
+                    ? std::string_view(
+                        "The Simulation tool-table store is unavailable; edits are disabled "
+                        "to preserve it.")
+                    : ngc::gui::controllerDataUnavailableReason(simulation);
+                ImGui::TextDisabled("Editing disabled: %s", std::string(reason).c_str());
+            }
+            ImGui::BeginDisabled(!canEdit);
             ImGui::PushStyleVar(ImGuiStyleVar_CellPadding, { 0, 0 });
             const auto tableHeight = -ImGui::GetFrameHeightWithSpacing();
 
@@ -2903,13 +2921,23 @@ public:
                     .comment = {},
                 });
             }
+            ImGui::EndDisabled();
         }
 
         ImGui::End();
     }
 
     void renderMemoryWindow() {
-        if(ImGui::Begin("System Parameters", &m_enableMemoryWindow)) {
+        if(ImGui::Begin("Simulation Parameters", &m_enableMemoryWindow)) {
+            ImGui::TextUnformatted("Owner: Simulation");
+            ImGui::SameLine();
+            ImGui::TextDisabled(
+                "| Store: %s", m_parameterStores.simulation.string().c_str());
+            if (!m_simulationParameterStoreReady) {
+                ImGui::TextDisabled(
+                    "Store unavailable: the existing file will not be overwritten.");
+            }
+            const auto parameters = m_simulation.parameterSnapshot();
             if(ImGui::BeginTable("", 4, ImGuiTableFlags_Borders | ImGuiTableFlags_RowBg)) {
                 ImGui::TableSetupColumn("Address");
                 ImGui::TableSetupColumn("Internal Name");
@@ -2936,7 +2964,7 @@ public:
                     ImGui::TextUnformatted(std::format("{}", name).c_str());
 
                     ImGui::TableSetColumnIndex(3);
-                    auto value = m_worker.read(var);
+                    const auto value = parameters.at(var);
                     ImGui::TextUnformatted(std::format("{}", value).c_str());
 
                     address++;

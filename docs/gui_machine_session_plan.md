@@ -28,8 +28,6 @@ largely presents Simulation as a one-shot execution job:
 - The status area mixes operator state, live coordinates, modal state,
   interpreter messages, planner internals, backend packet state, and
   Simulation scheduler diagnostics.
-- The System Parameters window reads the Preview worker's interpreter memory
-  instead of the Simulation session's persistent parameter bank.
 - Several GUI actions discard command rejection results rather than explaining
   why the requested operation was unavailable.
 
@@ -225,6 +223,17 @@ Acceptance criteria:
 - Preview and execution highlighting cannot be mistaken for one another.
 
 ### Phase 4: Correct parameter and tool-table ownership
+
+Status: complete. `MachineSession` now exports a read-only canonical parameter
+snapshot, while `MachineSessionManager` publishes a mutex-protected coherent
+copy refreshed at initialization, load, reset, and execution-epoch boundaries.
+The **Simulation Parameters** window reads that session-owned snapshot and
+identifies its isolated store. The **Simulation Tool Table** window identifies
+its owner and store, disables all editing while the session cannot accept
+controller-data changes or its store is unavailable, and explains the
+inhibition. Saving routes through the manager/session boundary. Focused tests
+cover program/MDI publication, Preview isolation, and controller-data edit
+inhibition.
 
 - Add a read-only, thread-safe parameter snapshot or lookup API at the
   machine-session manager boundary.

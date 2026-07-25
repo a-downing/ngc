@@ -767,6 +767,8 @@ final_move_together = true
         const auto activeWcs = session.interpreter().machine().memory().deref(ngc::Var::COORDSYS);
         require(session.interpreter().machine().memory().write(activeWcs, 9.0, true).has_value(),
                 "session persistence fixture should update its canonical parameter bank");
+        requireNear(session.parameterSnapshot().at(ngc::Var::COORDSYS), 9.0,
+                    "MachineSession should snapshot its owned canonical parameter bank");
 
         require(session.powerOn(), "controller-data session should power on");
         require(session.queueProgram(ngc::StartProgram {
@@ -936,6 +938,82 @@ final_move_together = true
                 "joining the manager should end its powered Simulation lifetime");
     }
 
+    void testMachineSessionManagerPublishesOwnedParameterSnapshot() {
+        ngc::MachineSessionManager manager;
+        const auto initial = manager.parameterSnapshot();
+        requireNear(initial.at(ngc::Var::G54_X), 0.0,
+                    "a new Simulation parameter snapshot should contain canonical defaults");
+
+        Worker preview(UNIT);
+        require(preview.compile({{"G10 L2 P1 X7\n", "parameter-preview.ngc"}}),
+                "parameter-isolation Preview should compile");
+        for (auto attempt = 0; attempt < 3000 && !preview.compiled(); ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(preview.compiled(), "parameter-isolation Preview compilation should finish");
+        const auto initialRevision = preview.lock([&] {
+            return preview.preparedPreview().revision;
+        });
+        require(preview.execute(), "parameter-isolation Preview should execute");
+        auto previewFinished = false;
+        for (auto attempt = 0; attempt < 3000; ++attempt) {
+            if (preview.lock([&] {
+                    return preview.preparedPreview().revision > initialRevision;
+                }) && !preview.busy()) {
+                previewFinished = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(previewFinished, "parameter-isolation Preview should finish");
+        requireNear(preview.read(ngc::Var::G54_X), 7.0,
+                    "Preview should retain its independent parameter mutation");
+        requireNear(manager.parameterSnapshot().at(ngc::Var::G54_X), 0.0,
+                    "Preview evaluation must not alter the Simulation parameter snapshot");
+        preview.join();
+
+        ngc::ToolTable tools;
+        require(manager.start({
+                    {"G10 L2 P1 X3\nG1 F60 X0.05\n", "<MDI>"},
+                }, tools, true),
+                "Simulation MDI should accept a parameter mutation");
+        require(!manager.controllerDataMutable(),
+                "an active MDI epoch should inhibit controller-data edits");
+        auto completed = manager.snapshot();
+        for (auto attempt = 0; attempt < 3000
+             && completed.status != ngc::SimulationStatus::Completed
+             && completed.status != ngc::SimulationStatus::Error; ++attempt) {
+            (void)manager.parameterSnapshot();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            completed = manager.snapshot();
+        }
+        require(completed.status == ngc::SimulationStatus::Completed,
+                completed.error.empty() ? "parameter-mutating MDI should complete"
+                                        : completed.error);
+        require(manager.controllerDataMutable(),
+                "an idle completed Simulation epoch should allow controller-data edits");
+        requireNear(manager.parameterSnapshot().at(ngc::Var::G54_X), 3.0,
+                    "the manager snapshot should publish the completed MDI parameter mutation");
+
+        require(manager.start({
+                    {"G10 L2 P1 X4\n", "parameter-program.ngc"},
+                }, tools, true),
+                "Simulation Program should accept a later parameter mutation");
+        completed = manager.snapshot();
+        for (auto attempt = 0; attempt < 3000
+             && completed.status != ngc::SimulationStatus::Completed
+             && completed.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            completed = manager.snapshot();
+        }
+        require(completed.status == ngc::SimulationStatus::Completed,
+                completed.error.empty() ? "parameter-mutating Program should complete"
+                                        : completed.error);
+        requireNear(manager.parameterSnapshot().at(ngc::Var::G54_X), 4.0,
+                    "the manager snapshot should publish the completed Program mutation");
+        manager.join();
+    }
+
     void testMachineSessionViewDerivesOperatorControls() {
         ngc::SimulationSnapshot snapshot;
         auto controls = ngc::gui::machineSessionControls(snapshot, true);
@@ -995,6 +1073,9 @@ final_move_together = true
         require(!controls.canStart && !controls.canHome && !controls.canJog
                     && !controls.canFeedHold && controls.canStop,
                 "homing should exclusively own motion-producing GUI controls");
+        require(ngc::gui::controllerDataUnavailableReason(snapshot)
+                    == "Homing currently owns the Simulation session.",
+                "controller-data inhibition should identify its Simulation motion owner");
 
         snapshot.status = ngc::SimulationStatus::Error;
         snapshot.machineActivity = ngc::MachineActivity::Faulted;
@@ -6988,6 +7069,7 @@ int main() {
         testMachineSessionOwnsPowerActivityAndExecutionEpoch();
         testMachineSessionOwnsControllerDataPersistence();
         testMachineSessionManagerOwnsStandaloneSimulation();
+        testMachineSessionManagerPublishesOwnedParameterSnapshot();
         testMachineSessionViewDerivesOperatorControls();
         testInProcessSimulationRuntimePersistsAcrossTimedEpochs();
         testHomingControllerOwnsBackendNeutralSequence();

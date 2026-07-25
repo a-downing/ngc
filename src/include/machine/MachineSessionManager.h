@@ -78,6 +78,7 @@ class MachineSessionManager {
     std::vector<ngc::AxisConfiguration> m_axes;
     std::vector<ngc::JointConfiguration> m_joints;
     std::uint32_t m_tickMultiplier = 1;
+    ngc::ParameterSnapshot m_parameterSnapshot;
     MachineControlAuthority m_controlAuthority {
         .target = MachineControlTarget::Simulation,
         .generation = 1,
@@ -99,6 +100,7 @@ public:
           m_limits(limits) {
         copyRuntimeTimingSnapshot();
         m_machineSession.presentationTracker().reset(sessionPresentation());
+        refreshParameterSnapshot();
         (void)m_machineSession.powerOn();
         m_snapshot.powerState = m_machineSession.coordinator().powerState();
         m_thread = std::thread(&MachineSessionManager::work, this);
@@ -117,6 +119,7 @@ public:
         m_machineSession.configureHoming(
             configuration.axes, configuration.joints, configuration.homing);
         clearActiveTool();
+        refreshParameterSnapshot();
         (void)m_machineSession.powerOn();
         m_snapshot.powerState = m_machineSession.coordinator().powerState();
         m_thread = std::thread(&MachineSessionManager::work, this);
@@ -199,6 +202,7 @@ public:
             return { SessionCommandRejection::MotionOwned };
         }
         m_machineSession.interpreter().machine().beginProgramRun();
+        refreshParameterSnapshot();
         m_snapshot = {};
         m_snapshot.powerState = ngc::MachinePowerState::On;
         copyRuntimeTimingSnapshot();
@@ -568,6 +572,18 @@ public:
         return m_machineSession.toolTableSnapshot();
     }
 
+    ngc::ParameterSnapshot parameterSnapshot() const {
+        std::scoped_lock lock(m_mutex);
+
+        return m_parameterSnapshot;
+    }
+
+    bool controllerDataMutable() const {
+        std::scoped_lock lock(m_mutex);
+
+        return !motionOwnedOrQueued() && m_machineSession.controllerDataMutable();
+    }
+
     std::expected<void, std::string> setToolTableStorePath(
         const std::filesystem::path &path) {
         std::scoped_lock lock(m_mutex);
@@ -606,6 +622,7 @@ public:
 
         auto loaded = m_machineSession.loadPersistentParameters(path);
         if (loaded) {
+            refreshParameterSnapshot();
             m_machineSession.presentationTracker().setActivePresentation(sessionPresentation());
         }
 
@@ -952,10 +969,15 @@ private:
         auto finished = m_machineSession.finishExecutionEpoch(outcome);
         if (active) {
             std::scoped_lock lock(m_mutex);
+            refreshParameterSnapshot();
             m_snapshot.geometryStream = std::move(finished.diagnostics);
         }
 
         return std::move(finished.persistenceError);
+    }
+
+    void refreshParameterSnapshot() {
+        m_parameterSnapshot = m_machineSession.parameterSnapshot();
     }
 
     void work() {

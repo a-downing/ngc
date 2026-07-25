@@ -13,6 +13,7 @@
 #include <string>
 #include <thread>
 #include <tuple>
+#include <unordered_map>
 #include <utility>
 #include <variant>
 #include <vector>
@@ -29,6 +30,8 @@
 #include "machine/ToolTable.h"
 
 namespace ngc {
+    using ParameterSnapshot = std::unordered_map<Var, double>;
+
     enum class MachinePowerState { Off, Starting, On, Stopping, Faulted };
     enum class MachineActivity {
         Idle,
@@ -210,6 +213,8 @@ namespace ngc {
         [[nodiscard]] bool toolTableInitialized() const noexcept;
         [[nodiscard]] ToolTable toolTable() const;
         [[nodiscard]] std::pair<ToolTable, std::uint64_t> toolTableSnapshot() const;
+        [[nodiscard]] ParameterSnapshot parameterSnapshot() const;
+        [[nodiscard]] bool controllerDataMutable() const noexcept;
         [[nodiscard]] std::expected<void, std::string>
         setToolTableStorePath(const std::filesystem::path &path);
         [[nodiscard]] std::expected<void, std::string>
@@ -362,7 +367,6 @@ namespace ngc {
 
     private:
         [[nodiscard]] ProgramOperationUpdate programOperationUpdate() const;
-        [[nodiscard]] bool controllerDataMutable() const noexcept;
         [[nodiscard]] std::expected<void, std::string> persistToolTableAtBoundary();
 
         Machine::Unit m_unit;

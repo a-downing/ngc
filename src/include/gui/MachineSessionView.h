@@ -221,4 +221,28 @@ namespace ngc::gui {
 
         return "The Simulation session is completing a queued operation.";
     }
+
+    inline std::string_view controllerDataUnavailableReason(
+            const SimulationSnapshot &snapshot) noexcept {
+        switch (snapshot.machineActivity) {
+            case MachineActivity::Program:
+                return "Program currently owns the Simulation session.";
+            case MachineActivity::Mdi:
+                return "MDI currently owns the Simulation session.";
+            case MachineActivity::Homing:
+                return "Homing currently owns the Simulation session.";
+            case MachineActivity::Jogging:
+                return "Jogging currently owns the Simulation session.";
+            case MachineActivity::Holding:
+                return "The Simulation session is completing a hold transition.";
+            case MachineActivity::Stopping:
+                return "The Simulation session is stopping.";
+            case MachineActivity::Faulted:
+                return "The Simulation session is faulted.";
+            case MachineActivity::Idle:
+                return "The Simulation session is completing a queued operation.";
+        }
+
+        return "The Simulation session cannot accept controller-data edits.";
+    }
 }
