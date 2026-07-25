@@ -54,14 +54,47 @@ namespace ngc {
     ExecutionCoordinator::ExecutionCoordinator(const std::size_t commandCapacity)
         : m_commands(commandCapacity) { }
 
-    bool ExecutionCoordinator::powerOn() noexcept {
+    bool ExecutionCoordinator::beginPowerOn() noexcept {
         auto expected = MachinePowerState::Off;
         if (!m_powerState.compare_exchange_strong(expected, MachinePowerState::Starting)) {
             return false;
         }
 
         m_activity.store(MachineActivity::Idle);
-        m_powerState.store(MachinePowerState::On);
+
+        return true;
+    }
+
+    void ExecutionCoordinator::completePowerOn() noexcept {
+        if (m_powerState.load() == MachinePowerState::Starting) {
+            m_powerState.store(MachinePowerState::On);
+        }
+    }
+
+    bool ExecutionCoordinator::beginPowerOff() noexcept {
+        if (m_powerState.load() != MachinePowerState::On
+            || m_activity.load() != MachineActivity::Idle
+            || !m_commands.empty()) {
+            return false;
+        }
+
+        m_powerState.store(MachinePowerState::Stopping);
+
+        return true;
+    }
+
+    void ExecutionCoordinator::completePowerOff() noexcept {
+        if (m_powerState.load() == MachinePowerState::Stopping) {
+            m_powerState.store(MachinePowerState::Off);
+        }
+    }
+
+    bool ExecutionCoordinator::powerOn() noexcept {
+        if (!beginPowerOn()) {
+            return false;
+        }
+
+        completePowerOn();
 
         return true;
     }
@@ -70,14 +103,11 @@ namespace ngc {
         if (m_powerState.load() == MachinePowerState::Off) {
             return true;
         }
-        if (m_powerState.load() != MachinePowerState::On
-            || m_activity.load() != MachineActivity::Idle
-            || !m_commands.empty()) {
+        if (!beginPowerOff()) {
             return false;
         }
 
-        m_powerState.store(MachinePowerState::Stopping);
-        m_powerState.store(MachinePowerState::Off);
+        completePowerOff();
 
         return true;
     }
@@ -123,29 +153,66 @@ namespace ngc {
     }
 
     MachineSession::MachineSession(const Machine::Unit unit, const InterpretationMode mode,
-                                   MotionBackend &backend, const TrajectoryLimits &limits,
+                                   BackendRuntime &runtime, const TrajectoryLimits &limits,
                                    GeometryStreamPolicy geometryPolicy)
         : m_interpreter(unit, mode),
           m_geometryPolicy(std::move(geometryPolicy)),
-          m_backend(backend),
-          m_driver(backend, m_geometryForward, m_geometryFeedback, m_geometryCancelled, limits),
-          m_programExecution(backend, m_driver, m_coordinator.commands()),
+          m_runtime(runtime),
+          m_backend(runtime.endpoint()),
+          m_driver(m_backend, m_geometryForward, m_geometryFeedback, m_geometryCancelled, limits),
+          m_programExecution(m_backend, m_driver, m_coordinator.commands()),
           m_limits(limits) { }
 
     MachineSession::~MachineSession() {
         (void)finishExecutionEpoch();
+        m_coordinator.commands().clear();
+        m_coordinator.finishActivity();
+        (void)powerOff();
     }
 
     bool MachineSession::powerOn() noexcept {
-        return m_coordinator.powerOn();
+        if (!m_coordinator.beginPowerOn()) {
+            return false;
+        }
+
+        try {
+            m_runtime.start();
+        } catch (...) {
+            try {
+                m_runtime.stop();
+            } catch (...) { }
+            m_coordinator.fault();
+
+            return false;
+        }
+
+        m_coordinator.completePowerOn();
+
+        return true;
     }
 
     bool MachineSession::powerOff() noexcept {
         if (executionEpochActive()) {
             return false;
         }
+        if (m_coordinator.powerState() == MachinePowerState::Off) {
+            return true;
+        }
+        if (!m_coordinator.beginPowerOff()) {
+            return false;
+        }
 
-        return m_coordinator.powerOff();
+        try {
+            m_runtime.stop();
+        } catch (...) {
+            m_coordinator.fault();
+
+            return false;
+        }
+
+        m_coordinator.completePowerOff();
+
+        return true;
     }
 
     bool MachineSession::queueProgram(StartProgram start) {

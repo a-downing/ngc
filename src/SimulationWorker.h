@@ -76,12 +76,11 @@ public:
                               const ngc::SimulationTiming timing = {})
         : m_unit(unit),
           m_runtime(limits, timing),
-          m_machineSession(unit, ngc::InterpretationMode::Simulation, m_runtime.endpoint(),
+          m_machineSession(unit, ngc::InterpretationMode::Simulation, m_runtime,
                            limits, geometryPolicy(limits)),
           m_limits(limits) {
         copyRuntimeTimingSnapshot();
         m_machineSession.presentationTracker().reset(sessionPresentation());
-        m_runtime.start();
         (void)m_machineSession.powerOn();
         m_snapshot.powerState = m_machineSession.coordinator().powerState();
         m_thread = std::thread(&SimulationWorker::work, this);
@@ -90,7 +89,7 @@ public:
         : m_unit(configuration.unit),
           m_runtime(configuration),
           m_machineSession(configuration.unit, ngc::InterpretationMode::Simulation,
-                           m_runtime.endpoint(), configuration.trajectory,
+                           m_runtime, configuration.trajectory,
                            geometryPolicy(configuration.trajectory)),
           m_limits(configuration.trajectory),
           m_axes(configuration.axes), m_joints(configuration.joints),
@@ -102,7 +101,6 @@ public:
             configuration.axes, configuration.joints, configuration.homing);
         m_snapshot.machinePosition = { 6.0, 6.0, -6.0, 0.0, 0.0, 0.0 };
         clearActiveTool();
-        m_runtime.start();
         (void)m_machineSession.powerOn();
         m_snapshot.powerState = m_machineSession.coordinator().powerState();
         m_thread = std::thread(&SimulationWorker::work, this);
@@ -512,7 +510,6 @@ public:
             m_cv.notify_all();
         }
         m_thread.join();
-        m_runtime.stop();
         {
             std::scoped_lock lock(m_mutex);
             m_machineSession.coordinator().finishActivity();

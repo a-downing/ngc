@@ -12,6 +12,7 @@
 #include <iterator>
 #include <limits>
 #include <numbers>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -45,6 +46,41 @@
 namespace {
     constexpr double EPSILON = 1e-9;
     constexpr ngc::Machine::Unit UNIT = ngc::Machine::Unit::Inch;
+
+    class CountingBackendRuntime final : public ngc::BackendRuntime {
+    public:
+        explicit CountingBackendRuntime(const bool failStart = false)
+            : m_failStart(failStart) { }
+
+        ngc::MotionBackend &endpoint() noexcept override {
+            return m_backend;
+        }
+
+        void start() override {
+            ++startCalls;
+            if (m_failStart) {
+                throw std::runtime_error("fixture runtime failed to start");
+            }
+            started = true;
+        }
+
+        void stop() override {
+            ++stopCalls;
+            started = false;
+        }
+
+        [[nodiscard]] ngc::BackendCapabilities capabilities() const noexcept override {
+            return {};
+        }
+
+        ngc::MockMotionBackend m_backend;
+        std::size_t startCalls = 0;
+        std::size_t stopCalls = 0;
+        bool started = false;
+
+    private:
+        bool m_failStart;
+    };
 
     constexpr std::string_view HELLO_FIXTURE=R"NGC(
 %
@@ -572,10 +608,13 @@ final_move_together = true
         require(coordinator.powerOff(),
                 "an idle coordinator should end its powered lifetime");
 
-        ngc::MockMotionBackend backend;
+        CountingBackendRuntime runtime;
+        auto *const endpoint = &runtime.endpoint();
         ngc::MachineSession session(
-            UNIT, ngc::InterpretationMode::Simulation, backend, {});
+            UNIT, ngc::InterpretationMode::Simulation, runtime, {});
         require(session.powerOn(), "a machine session should power on explicitly");
+        require(runtime.started && runtime.startCalls == 1,
+                "powering on a machine session should start its backend runtime once");
         require(session.queueProgram(
                     ngc::StartProgram {
                         .programs = {{"G90\n", "<MDI>"}},
@@ -663,6 +702,27 @@ final_move_together = true
                         : stopped.error());
         require(session.powerOff(),
                 "the idle MachineSession should power off independently of Stop");
+        require(!runtime.started && runtime.stopCalls == 1,
+                "powering off a machine session should stop its backend runtime once");
+        require(session.powerOff() && runtime.stopCalls == 1,
+                "repeated power-off should not stop an already stopped runtime again");
+        require(session.powerOn() && runtime.started && runtime.startCalls == 2
+                    && &runtime.endpoint() == endpoint,
+                "a later power cycle should reuse and restart the same backend runtime");
+        require(session.powerOff() && runtime.stopCalls == 2,
+                "the later power cycle should stop the reused runtime");
+
+        CountingBackendRuntime failingRuntime(true);
+        ngc::MachineSession failingSession(
+            UNIT, ngc::InterpretationMode::Simulation, failingRuntime, {});
+        require(!failingSession.powerOn()
+                    && failingSession.coordinator().powerState()
+                        == ngc::MachinePowerState::Faulted
+                    && failingSession.coordinator().activity()
+                        == ngc::MachineActivity::Faulted,
+                "a runtime start failure should fault the machine session");
+        require(failingRuntime.startCalls == 1 && failingRuntime.stopCalls == 1,
+                "a runtime start failure should attempt runtime cleanup exactly once");
     }
 
     void testSimulationSnapshotExposesMachineSessionState() {
@@ -822,7 +882,7 @@ final_move_together = true
         runtime.setTickMultiplier(1000);
         ngc::MachineSession session(
             configuration->unit, ngc::InterpretationMode::Simulation,
-            runtime.endpoint(), configuration->trajectory);
+            runtime, configuration->trajectory);
         session.configureJogging(configuration->axes, configuration->joints);
         session.configureHoming(
             configuration->axes, configuration->joints, configuration->homing);

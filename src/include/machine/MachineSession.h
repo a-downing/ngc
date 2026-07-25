@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "evaluator/InterpreterSession.h"
+#include "machine/BackendRuntime.h"
 #include "machine/GeometryStreamProducer.h"
 #include "machine/HomingController.h"
 #include "machine/JoggingController.h"
@@ -151,6 +152,10 @@ namespace ngc {
     public:
         explicit ExecutionCoordinator(std::size_t commandCapacity = SessionCommandQueue::DEFAULT_CAPACITY);
 
+        [[nodiscard]] bool beginPowerOn() noexcept;
+        void completePowerOn() noexcept;
+        [[nodiscard]] bool beginPowerOff() noexcept;
+        void completePowerOff() noexcept;
         [[nodiscard]] bool powerOn() noexcept;
         [[nodiscard]] bool powerOff() noexcept;
         [[nodiscard]] bool beginActivity(MachineActivity activity) noexcept;
@@ -172,7 +177,7 @@ namespace ngc {
 
     class MachineSession {
     public:
-        MachineSession(Machine::Unit unit, InterpretationMode mode, MotionBackend &backend,
+        MachineSession(Machine::Unit unit, InterpretationMode mode, BackendRuntime &runtime,
                        const TrajectoryLimits &limits, GeometryStreamPolicy geometryPolicy = {});
         ~MachineSession();
         MachineSession(const MachineSession &) = delete;
@@ -336,6 +341,7 @@ namespace ngc {
         std::atomic<bool> m_geometryCancelled { false };
         std::unique_ptr<GeometryStreamProducer> m_geometryProducer;
         std::thread m_geometryThread;
+        BackendRuntime &m_runtime;
         MotionBackend &m_backend;
         PreparedTrajectoryExecutionDriver m_driver;
         PresentationTracker m_presentationTracker;

@@ -31,6 +31,10 @@ namespace ngc {
         return m_backend;
     }
 
+    BackendCapabilities InProcessSimulationRuntime::capabilities() const noexcept {
+        return {};
+    }
+
     void InProcessSimulationRuntime::start() {
         std::scoped_lock lock(m_schedulerMutex);
         if (m_started) {
@@ -38,8 +42,8 @@ namespace ngc {
         }
 
         m_stopping.store(false, std::memory_order_release);
-        m_started = true;
         m_schedulerThread = std::thread(&InProcessSimulationRuntime::runScheduler, this);
+        m_started = true;
     }
 
     void InProcessSimulationRuntime::stop() {

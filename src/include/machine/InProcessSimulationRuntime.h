@@ -7,6 +7,7 @@
 #include <thread>
 #include <vector>
 
+#include "machine/BackendRuntime.h"
 #include "machine/MachineConfiguration.h"
 #include "machine/MockMotionBackend.h"
 
@@ -26,7 +27,7 @@ namespace ngc {
         std::uint32_t pacingError = 0;
     };
 
-    class InProcessSimulationRuntime {
+    class InProcessSimulationRuntime final : public BackendRuntime {
     public:
         explicit InProcessSimulationRuntime(const TrajectoryLimits &limits = {},
                                             const SimulationTiming &timing = {});
@@ -35,10 +36,11 @@ namespace ngc {
         InProcessSimulationRuntime(const InProcessSimulationRuntime &) = delete;
         InProcessSimulationRuntime &operator=(const InProcessSimulationRuntime &) = delete;
 
-        MotionBackend &endpoint() noexcept;
+        MotionBackend &endpoint() noexcept override;
 
-        void start();
-        void stop();
+        void start() override;
+        void stop() override;
+        [[nodiscard]] BackendCapabilities capabilities() const noexcept override;
         bool beginTimedExecution();
         void endTimedExecution();
         [[nodiscard]] bool timedExecutionActive() const noexcept;

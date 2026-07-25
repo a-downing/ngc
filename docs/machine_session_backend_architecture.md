@@ -750,6 +750,9 @@ jogging starts, validates their activity ownership, and releases Program/MDI
 activity when the execution epoch finishes. The `SimulationWorker`
 compatibility facade queues starts, jogging controls, feed hold, Resume, and
 Stop through that command boundary.
+`MachineSession` controls its `BackendRuntime` powered lifetime: On starts the
+runtime, idle Off stops it, and repeated power cycles reuse the same backend
+endpoint. Runtime startup or shutdown failure faults the session.
 Stop uses backend constrained braking, abandons the execution epoch only at
 rest, and reconciles canonical position to the stationary backend state.
 The homing controller owns fast search, clearance backoff, slow latch,
@@ -759,10 +762,10 @@ compatibility facade. The jogging controller owns backend initialization,
 token-matched controls, constrained Stop, event handling, and final axis/joint
 observation; `MachineSession` consumes and translates queued jog commands.
 Simulation supplies only service-clock and shutdown callbacks for jogging.
-Simulation runtime lifecycle servicing and persistence boundaries still need to
-move behind the session abstraction.
+Simulation-specific runtime servicing callbacks and persistence boundaries
+still need to move behind the session abstraction.
 
-- Move the remaining Simulation runtime lifecycle and persistence boundaries
+- Move the remaining Simulation runtime servicing and persistence boundaries
   into backend-neutral session components.
 - Replace boolean control flags with explicit power/activity state and queued
   NRT commands.

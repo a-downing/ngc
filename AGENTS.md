@@ -67,16 +67,19 @@ bounded owning `SessionCommand` queue. `MachineSession` owns the interpreter,
 prepared-geometry producer thread and channels, trajectory driver, presentation
 tracker, execution-epoch counter, backend-neutral `HomingController`, homed-joint
 state, backend-neutral `JoggingController`, `ExecutionCoordinator`, and
-backend-neutral `ProgramExecutionController`. The program controller owns
-queued Feed Hold, Resume, and Stop translation plus backend acknowledgement and
-held-state transitions; `MachineSession` routes timed backend events and
-presentation-aware bounded driver pumping through one backend-neutral program
-operation service step and reports normalized running, held, stopped, completed,
-or failed outcomes. It admits and dispatches queued program, MDI, homing, and
+backend-neutral `ProgramExecutionController`. It also controls the powered
+lifecycle of its `BackendRuntime`; On starts the runtime and an idle Off stops
+it, while execution epochs reuse the same backend endpoint. The program
+controller owns queued Feed Hold, Resume, and Stop translation plus backend
+acknowledgement and held-state transitions; `MachineSession` routes timed
+backend events and presentation-aware bounded driver pumping through one
+backend-neutral program operation service step and reports normalized running,
+held, stopped, completed, or failed outcomes. It admits and dispatches queued
+program, MDI, homing, and
 jogging starts, validates their activity ownership, and releases Program/MDI
 activity when the execution epoch finishes. The `SimulationWorker`
 compatibility facade queues starts, feed hold, Resume, and Stop through that
-boundary; it still owns the Simulation runtime servicing callbacks and
+boundary; it still owns the Simulation-specific runtime servicing callbacks and
 persistence boundaries. Synthetic homing input policy and
 service-clock advancement for homing and jogging remain in
 `InProcessSimulationRuntime`.
