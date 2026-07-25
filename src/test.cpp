@@ -1010,6 +1010,13 @@ final_move_together = true
                     == "another operation owns the controlled session",
                 "the GUI should translate structured command rejection details");
 
+        const std::string previewModalText = "G21 G90 G64";
+        snapshot.activePresentation.modalGCodes = {"G20", "G91", "G61"};
+        require(ngc::gui::machineModalText(snapshot) == "G20 G91 G61",
+                "machine modal presentation should use only the controlled session snapshot");
+        require(ngc::gui::machineModalText(snapshot) != previewModalText,
+                "Preview modal state must not affect machine modal presentation");
+
         snapshot.machinePosition = {10.0, 20.0, 30.0, 40.0, 50.0, 60.0};
         snapshot.activePresentation.workCoordinateSystem =
             ngc::WorkCoordinateSystem {"G55", {1.0, 2.0, 3.0, 4.0, 5.0, 6.0}};

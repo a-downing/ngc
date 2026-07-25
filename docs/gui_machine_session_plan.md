@@ -28,9 +28,6 @@ largely presents Simulation as a one-shot execution job:
 - The status area mixes operator state, live coordinates, modal state,
   interpreter messages, planner internals, backend packet state, and
   Simulation scheduler diagnostics.
-- Preview modal state is displayed as a fallback when the Simulation session
-  is stopped, obscuring the distinction between Preview inspection and the
-  persistent machine state.
 - The System Parameters window reads the Preview worker's interpreter memory
   instead of the Simulation session's persistent parameter bank.
 - Several GUI actions discard command rejection results rather than explaining
@@ -208,8 +205,13 @@ Acceptance criteria:
 
 ### Phase 3: Separate Preview from machine state
 
-- Stop falling back to Preview modal codes in the machine status area.
-- Give Preview its own modal/source inspection presentation when useful.
+Status: complete. The machine status area derives modal presentation only from
+the controlled Simulation session snapshot. Preview modal codes are not shown;
+Preview remains a geometry and source-selection workflow. Preview selection and
+machine execution retain distinct highlighting.
+
+- Display machine modal codes only from the controlled session snapshot.
+- Do not add a separate Preview modal-code presentation.
 - Ensure program highlighting clearly differentiates Preview selection from
   active or completed machine execution.
 - Keep prepared geometry shared between Preview and timed planning; this is a

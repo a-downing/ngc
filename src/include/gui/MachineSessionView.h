@@ -1,5 +1,6 @@
 #pragma once
 
+#include <string>
 #include <string_view>
 
 #include "machine/MachineSessionCommand.h"
@@ -52,6 +53,18 @@ namespace ngc::gui {
             .spindleDirection = snapshot.spindleDirection,
             .motionOwner = snapshot.machineActivity,
         };
+    }
+
+    inline std::string machineModalText(const MachineSessionSnapshot &snapshot) {
+        std::string result;
+        for (const auto &code : snapshot.activePresentation.modalGCodes) {
+            if (!result.empty()) {
+                result += ' ';
+            }
+            result += code;
+        }
+
+        return result;
     }
 
     constexpr std::string_view powerStateName(const MachinePowerState state) noexcept {

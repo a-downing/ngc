@@ -2518,17 +2518,7 @@ public:
             }
             return "Unknown";
         }();
-        auto modalGCodes = m_worker.lock([&] { return m_worker.machine().activeModalGCodes(); });
-        const auto simulationHasModalState = simulation.status != ngc::SimulationStatus::Stopped
-            && !simulation.activePresentation.modalGCodes.empty();
-        if(simulationHasModalState) {
-            modalGCodes = simulation.activePresentation.modalGCodes;
-        }
-        std::string modalText;
-        for(const auto &code : modalGCodes) {
-            if(!modalText.empty()) modalText += ' ';
-            modalText += code;
-        }
+        const auto modalText = ngc::gui::machineModalText(simulation);
 
         auto diagnosticText=std::format("Simulation: {}    MCS XYZ: {:.4f}, {:.4f}, {:.4f}",
             statusText,simulation.machinePosition.x,simulation.machinePosition.y,
