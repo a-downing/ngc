@@ -668,6 +668,7 @@ int main(const int argc, char **argv) {
     std::string lastPlan;
     auto lastReport=std::chrono::steady_clock::now();
     auto reportedWorstWindow=0.0;
+    auto automaticResumes=std::size_t{0};
     for(;;) {
         const auto snapshot=worker.snapshot();
         if(snapshot.trajectoryPlanning.maximumContinuousHorizonSeconds
@@ -735,6 +736,17 @@ int main(const int argc, char **argv) {
                     >=*stopAfterPlanPieces)) {
             break;
         }
+        if (snapshot.status == ngc::SimulationStatus::Paused) {
+            if (!worker.resume()) {
+                std::println(stderr,
+                    "diagnostic failed to resume paused program automatically");
+                break;
+            }
+            ++automaticResumes;
+            std::println("AUTO_RESUME {} t={:.6f}s",
+                automaticResumes, snapshot.programElapsedSeconds);
+            continue;
+        }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
     worker.stop();
@@ -756,12 +768,12 @@ int main(const int argc, char **argv) {
         finalSnapshot.trajectoryPlanning.maximumContinuousHorizonSeconds,
         geometrySeconds+plannerSeconds,finalSnapshot.servoTicks,finalSnapshot.error);
     std::println("rolling candidates={} suffix_failures={} prefix_failures={} "
-        "max_suffix_pieces={} rolling_search={:.6f}s",
+        "max_suffix_pieces={} rolling_search={:.6f}s automatic_resumes={}",
         finalSnapshot.trajectoryPlanning.rollingBoundaryCandidates,
         finalSnapshot.trajectoryPlanning.rollingSuffixProbeFailures,
         finalSnapshot.trajectoryPlanning.rollingPrefixProbeFailures,
         finalSnapshot.trajectoryPlanning.maximumRollingSuffixProbePieces,
-        finalSnapshot.trajectoryPlanning.rollingSearchSeconds);
+        finalSnapshot.trajectoryPlanning.rollingSearchSeconds, automaticResumes);
     if (quinticFailureExporter) {
         std::println("quintic_failure_export {}", quinticFailureExporter->summary());
     }

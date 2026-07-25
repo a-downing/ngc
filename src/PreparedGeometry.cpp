@@ -258,12 +258,16 @@ namespace ngc {
 
         std::shared_ptr<const PreparedCurve> splineCurve(std::vector<position_t> controls,
                                                          std::size_t degree,
-                                                         const std::size_t intervalsPerSpan) {
+                                                         const std::size_t intervalsPerSpan,
+                                                         const position_t startCurvature,
+                                                         const position_t endCurvature) {
             if(degree == 0 || controls.size() <= degree) return {};
             PreparedSplineCurve spline;
             spline.degree = degree;
             spline.controls = std::move(controls);
             spline.knots = openKnots(spline.controls.size(), degree);
+            spline.startCurvature = startCurvature;
+            spline.endCurvature = endCurvature;
             spline.derivatives[0] = derivativeSpline(
                 spline.degree, spline.controls, spline.knots);
             for(std::size_t order = 1; order < spline.derivatives.size(); ++order) {
@@ -608,7 +612,13 @@ namespace ngc {
             return tangentAtDistance(*entity.curve, distance, workspace);
         }
 
-        std::vector<position_t> curvatureMatchedSixControlBlend(
+        struct CurvatureMatchedBlend {
+            std::vector<position_t> controls;
+            position_t startCurvature{};
+            position_t endCurvature{};
+        };
+
+        CurvatureMatchedBlend curvatureMatchedSixControlBlend(
                                                 const SourceEntity &incoming,
                                                 const SourceEntity &outgoing,
                                                 const double incomingScale,
@@ -674,14 +684,18 @@ namespace ngc {
                     incomingHandle, outgoingHandle, incomingScale, outgoingScale);
             }
             return {
-                start,
-                start + scaled(startTangent, incomingHandle),
-                start + scaled(startTangent, incomingTangentDistance)
-                    + scaled(startCurvature, 3.0 * incomingHandle * incomingHandle),
-                end + scaled(endTangent, outgoingTangentDistance)
-                    + scaled(endCurvature, 3.0 * outgoingHandle * outgoingHandle),
-                end - scaled(endTangent, outgoingHandle),
-                end,
+                .controls = {
+                    start,
+                    start + scaled(startTangent, incomingHandle),
+                    start + scaled(startTangent, incomingTangentDistance)
+                        + scaled(startCurvature, 3.0 * incomingHandle * incomingHandle),
+                    end + scaled(endTangent, outgoingTangentDistance)
+                        + scaled(endCurvature, 3.0 * outgoingHandle * outgoingHandle),
+                    end - scaled(endTangent, outgoingHandle),
+                    end,
+                },
+                .startCurvature = startCurvature,
+                .endCurvature = endCurvature,
             };
         }
     }
@@ -746,6 +760,12 @@ namespace ngc {
                 const auto *reference = arcReference(curve, workspace);
                 return reference ? reference->curvatureAtDistance(distance) : position_t{};
             } else {
+                if(distance == 0.0 && value.startCurvature) {
+                    return *value.startCurvature;
+                }
+                if(distance == curve.length && value.endCurvature) {
+                    return *value.endCurvature;
+                }
                 const auto parameter = splineParameterAtDistance(curve, value, distance, workspace);
                 const auto first = derivativeAt(value, parameter, 1);
                 const auto second = derivativeAt(value, parameter, 2);
@@ -1020,8 +1040,9 @@ namespace ngc {
                 for(std::size_t entity = index + 1; entity < right; ++entity)
                     appendSourceFeed(entities[entity].length, entities[entity].feed);
                 appendSourceFeed(3.0 * rightScale, entities[right].feed);
-                auto controls = curvatureMatchedSixControlBlend(
+                auto blend = curvatureMatchedSixControlBlend(
                     entities[index], entities[right], leftScale, rightScale, workspace);
+                auto controls = std::move(blend.controls);
                 if(right > index + 1) {
                     std::vector<position_t> interior;
                     interior.reserve(right - index - 1);
@@ -1084,7 +1105,8 @@ namespace ngc {
                     controls = std::move(fitted->controls);
                 }
                 auto curve = splineCurve(std::move(controls), splineDegree,
-                    effort.lengthTableIntervalsPerKnotSpan);
+                    effort.lengthTableIntervalsPerKnotSpan,
+                    blend.startCurvature, blend.endCurvature);
                 if(!curve) return std::unexpected("short-entity cluster spline construction failed");
                 std::vector<PreparedActivationStation> activations;
                 const auto *preparedSpline=std::get_if<PreparedSplineCurve>(&curve->value);
@@ -1128,10 +1150,11 @@ namespace ngc {
             }
             const auto &incoming = entities[index];
             const auto &outgoing = entities[index + 1];
-            const auto controls = curvatureMatchedSixControlBlend(incoming, outgoing,
+            auto blend = curvatureMatchedSixControlBlend(incoming, outgoing,
                 sourceScale(incoming, blendScale), sourceScale(outgoing, blendScale), workspace);
-            auto curve = splineCurve(controls, 3,
-                effort.lengthTableIntervalsPerKnotSpan);
+            auto curve = splineCurve(std::move(blend.controls), 3,
+                effort.lengthTableIntervalsPerKnotSpan,
+                blend.startCurvature, blend.endCurvature);
             if(!curve) return std::unexpected("junction blend spline construction failed");
             if(auto added = addPiece(PreparedPieceKind::JunctionBlend, curve, 0.0, curve->length,
                                      (incoming.feed + outgoing.feed) / 2.0, outgoing.id,

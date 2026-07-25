@@ -4487,6 +4487,39 @@ G1 F60 X2
                 "prepared samples must retain the tangential curvature-squared jerk component");
     }
 
+    void testPreparedLineJunctionRetainsExactEndpointCurvature() {
+        const ngc::position_t first{-1.0644,13.9651,-0.4068730132094953,0,0,0};
+        const ngc::position_t junction{-1.2583,13.2669,-0.4068730132094953,0,0,0};
+        const ngc::position_t last{-1.0,10.5,-0.4068730132094953,0,0,0};
+        const auto lineRecord=[](const ngc::PreparedCommandId id,
+                                 const ngc::position_t &from,
+                                 const ngc::position_t &to) {
+            ngc::PreparedCommandRecord record;
+            record.id=id;
+            record.command=ngc::MoveLine{from,to,120.0,false};
+            return record;
+        };
+        const std::array<ngc::PreparedCommandRecord,2> records{
+            lineRecord(1,first,junction),lineRecord(2,junction,last),
+        };
+        const auto prepared=ngc::prepareContinuousGeometry(records,0.001,first);
+        require(prepared.has_value(),prepared?"":prepared.error());
+        require(prepared->pieces.size()==3
+                    &&prepared->pieces[1].kind==ngc::PreparedPieceKind::JunctionBlend,
+                "two long translated lines should produce one junction blend");
+
+        const auto &blend=prepared->pieces[1];
+        ngc::CurveEvaluationWorkspace workspace;
+        require(ngc::curvatureAtDistance(
+                    *blend.curve,blend.curveFrom,workspace).length()==0.0
+                &&ngc::curvatureAtDistance(
+                    *blend.curve,blend.curveTo,workspace).length()==0.0,
+                "a line-to-line junction blend must retain exact zero endpoint curvature");
+        require(blend.geometricSamples.front().curvature.length()==0.0
+                    &&blend.geometricSamples.back().curvature.length()==0.0,
+                "junction timing samples must retain exact source endpoint curvature");
+    }
+
     void testNoneSplineSmoothingPreservesCubicControls() {
         const std::vector<ngc::position_t> controls{
             {0.0,0.0,0.0,0.0,0.0,0.0},
@@ -6117,6 +6150,7 @@ int main() {
         testInfiniteJerkTrajectoryTimeMatchesAnalyticLine();
         testExactStopPlannerEnforcesIndependentAxisLimits();
         testPreparedArcJunctionMatchesSourceCurvature();
+        testPreparedLineJunctionRetainsExactEndpointCurvature();
         testNoneSplineSmoothingPreservesCubicControls();
         testClusterSplinePreparesKnotIntervalSamplesAndFeeds();
         testExecutionPolynomialEvaluation();

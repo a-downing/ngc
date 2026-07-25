@@ -89,6 +89,8 @@ namespace ngc {
         std::vector<position_t> controls;
         std::vector<double> knots;
         std::array<PreparedSplineDerivative, 3> derivatives;
+        std::optional<position_t> startCurvature;
+        std::optional<position_t> endCurvature;
         // Immutable construction-time arc-length table. It is a bracket only;
         // consumers still certify inverse queries against the curve.
         std::vector<double> parameters;
