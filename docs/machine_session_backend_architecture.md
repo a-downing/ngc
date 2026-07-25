@@ -736,7 +736,8 @@ Status: in progress. The backend-neutral power/activity vocabulary,
 `SessionCommand` queue are implemented. `MachineSession` now owns the
 interpreter, prepared-geometry producer thread and channels, trajectory driver,
 presentation tracker, execution-epoch counter, backend-neutral
-`HomingController`, homed-joint state, and `ExecutionCoordinator`.
+`HomingController`, homed-joint state, backend-neutral `JoggingController`, and
+`ExecutionCoordinator`.
 The `SimulationWorker` compatibility facade queues program and homing starts,
 jogging controls, feed hold, Resume, and Stop through that command boundary.
 Stop uses backend constrained braking, abandons the execution epoch only at
@@ -744,12 +745,15 @@ rest, and reconciles canonical position to the stationary backend state.
 The homing controller owns fast search, clearance backoff, slow latch,
 coordinate establishment, final-home motion, and controlled Stop. Simulation
 supplies synthetic switch preparation and service-clock callbacks through the
-compatibility facade. Simulation runtime servicing, persistence boundaries,
-jogging, and the remaining operation loop still need to move behind the session
-abstraction.
+compatibility facade. The jogging controller owns backend initialization,
+token-matched controls, constrained Stop, event handling, and final axis/joint
+observation; `MachineSession` consumes and translates queued jog commands.
+Simulation supplies only service-clock and shutdown callbacks for jogging.
+Simulation runtime servicing, persistence boundaries, and the remaining
+operation loop still need to move behind the session abstraction.
 
-- Move the remaining Simulation operation loop, persistence boundaries, and
-  jogging into backend-neutral session components.
+- Move the remaining Simulation operation loop and persistence boundaries into
+  backend-neutral session components.
 - Replace boolean control flags with explicit power/activity state and queued
   NRT commands.
 - Make On/Off separate from Start/Stop.

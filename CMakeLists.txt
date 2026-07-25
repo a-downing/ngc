@@ -38,6 +38,7 @@ add_library(ngc_core STATIC
         src/HomingController.cpp
         src/InfiniteJerkTrajectoryTime.cpp
         src/InProcessSimulationRuntime.cpp
+        src/JoggingController.cpp
         src/MachineSession.cpp
         src/MachineConfiguration.cpp
         src/PreparedGeometry.cpp

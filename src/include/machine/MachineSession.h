@@ -6,6 +6,7 @@
 #include <deque>
 #include <expected>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <ranges>
 #include <string>
@@ -18,6 +19,7 @@
 #include "evaluator/InterpreterSession.h"
 #include "machine/GeometryStreamProducer.h"
 #include "machine/HomingController.h"
+#include "machine/JoggingController.h"
 #include "machine/MotionBackend.h"
 #include "machine/PreparedTrajectoryExecutionDriver.h"
 #include "machine/PresentationTracker.h"
@@ -93,16 +95,19 @@ namespace ngc {
 
         template<typename Predicate>
         [[nodiscard]] bool anyOf(Predicate predicate) const {
+            std::scoped_lock lock(m_mutex);
             return std::ranges::any_of(m_commands, std::move(predicate));
         }
 
         template<typename Predicate>
         void eraseIf(Predicate predicate) {
+            std::scoped_lock lock(m_mutex);
             std::erase_if(m_commands, std::move(predicate));
         }
 
         template<typename Command>
         [[nodiscard]] bool contains() const noexcept {
+            std::scoped_lock lock(m_mutex);
             for (const auto &queued : m_commands) {
                 if (std::holds_alternative<Command>(queued)) {
                     return true;
@@ -113,6 +118,7 @@ namespace ngc {
         }
 
     private:
+        mutable std::mutex m_mutex;
         std::size_t m_capacity;
         std::deque<SessionCommand> m_commands;
     };
@@ -156,10 +162,15 @@ namespace ngc {
         void configureHoming(std::vector<AxisConfiguration> axes,
                              std::vector<JointConfiguration> joints,
                              HomingConfiguration homing);
+        void configureJogging(std::vector<AxisConfiguration> axes,
+                              std::vector<JointConfiguration> joints);
         [[nodiscard]] bool homingAvailable() const noexcept;
         [[nodiscard]] std::expected<HomingResult, std::string> runHoming(
             const position_t &startingPosition, const HomingRuntimeCallbacks &callbacks);
         [[nodiscard]] JointMask homedJoints() const noexcept;
+        [[nodiscard]] std::expected<JoggingResult, std::string> runJogging(
+            const position_t &startingPosition, const ControlRequest &firstRequest,
+            const JoggingRuntimeCallbacks &callbacks);
         void requestGeometryStop();
         [[nodiscard]] bool executionEpochActive() const noexcept;
         [[nodiscard]] GeometryEpoch nextEpoch() noexcept;
@@ -193,6 +204,7 @@ namespace ngc {
         PreparedTrajectoryExecutionDriver m_driver;
         PresentationTracker m_presentationTracker;
         std::unique_ptr<HomingController> m_homingController;
+        std::unique_ptr<JoggingController> m_joggingController;
         JointMask m_homedJoints = 0;
         ExecutionCoordinator m_coordinator;
         TrajectoryLimits m_limits;

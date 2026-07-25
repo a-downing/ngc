@@ -748,6 +748,88 @@ final_move_together = true
         }
     }
 
+    void testMachineSessionOwnsBackendNeutralJogging() {
+        const auto configuration = fixtureMachineConfiguration();
+        require(configuration.has_value(), configuration ? "" : configuration.error());
+        ngc::InProcessSimulationRuntime runtime(*configuration);
+        runtime.setTickMultiplier(1000);
+        ngc::MachineSession session(
+            configuration->unit, ngc::InterpretationMode::Simulation,
+            runtime.endpoint(), configuration->trajectory);
+        session.configureJogging(configuration->axes, configuration->joints);
+        session.configureHoming(
+            configuration->axes, configuration->joints, configuration->homing);
+        require(session.powerOn(), "jogging session should power on");
+        require(session.coordinator().beginActivity(ngc::MachineActivity::Jogging),
+                "powered session should grant jogging ownership");
+
+        const auto axis = std::ranges::find(
+            configuration->axes, ngc::Machine::Axis::Y,
+            &ngc::AxisConfiguration::axis);
+        require(axis != configuration->axes.end(),
+                "session jogging test should find configured Y");
+        ngc::JointMask joints = 0;
+        double stopJerk = std::numeric_limits<double>::infinity();
+        for (const auto id : axis->joints) {
+            joints |= ngc::JointMask {1} << id;
+            const auto joint = std::ranges::find(
+                configuration->joints, id, &ngc::JointConfiguration::id);
+            require(joint != configuration->joints.end(),
+                    "session jogging test should find each Y joint");
+            stopJerk = std::min(stopJerk, joint->maxJerk);
+        }
+        const ngc::StartContinuousJogRequest request {
+            .id = 600,
+            .jog = 601,
+            .target = {ngc::JogTargetType::JointGroup, ngc::AxisId::Y, joints},
+            .signedVelocity = 0.5,
+            .limits = {
+                axis->maxVelocity,
+                configuration->jogging.acceleration,
+                configuration->jogging.jerk,
+            },
+            .stopLimits = {
+                axis->maxVelocity,
+                axis->maxAcceleration,
+                stopJerk,
+            },
+            .leaseTicks = 10000,
+        };
+        require(session.coordinator().commands().tryPush(ngc::Stop {}),
+                "session Stop should queue behind a started jog");
+        const ngc::JoggingRuntimeCallbacks callbacks {
+            .shutdownRequested = [] {
+                return false;
+            },
+            .serviceImmediate = [&] {
+                runtime.advanceImmediate(0.0);
+            },
+            .advanceServiceMotionPeriod = [&] {
+                return runtime.advanceServiceMotionPeriod();
+            },
+            .waitForServiceMotion = [] { },
+            .observe = {},
+        };
+        const ngc::position_t startingPosition {
+            6.0, 6.0, -6.0, 0.0, 0.0, 0.0,
+        };
+
+        const auto jogging = session.runJogging(
+            startingPosition, ngc::ControlRequest {request}, callbacks);
+        require(jogging.has_value(), jogging ? "" : jogging.error());
+        require(jogging->outcome == ngc::JoggingOutcome::Stopped
+                    && jogging->stopReason == ngc::JogStopReason::RequestedStop,
+                "MachineSession should translate Stop into a token-matched constrained jog stop");
+        require(session.coordinator().activity() == ngc::MachineActivity::Idle,
+                "jog completion should release session motion ownership");
+        for (const auto id : axis->joints) {
+            require(std::abs(jogging->observation.joints.velocity[id]) <= 1e-10
+                        && std::abs(jogging->observation.joints.acceleration[id]) <= 1e-10,
+                    "session-owned jogging should return every participating joint at rest");
+        }
+        require(session.powerOff(), "idle jogging session should power off");
+    }
+
     void testToolTableLoadsFinalLineWithoutNewline() {
         const auto path = std::filesystem::temp_directory_path() / "ngc-tool-table-no-newline.txt";
         {
@@ -6464,6 +6546,7 @@ int main() {
         testSimulationSnapshotExposesMachineSessionState();
         testInProcessSimulationRuntimePersistsAcrossTimedEpochs();
         testHomingControllerOwnsBackendNeutralSequence();
+        testMachineSessionOwnsBackendNeutralJogging();
         testSimulationPersistsCoordinateSystemAtCompletion();
         testToolTableLoadsFinalLineWithoutNewline();
         testToolTableRejectsDuplicateToolNumbers();

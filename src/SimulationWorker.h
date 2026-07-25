@@ -128,6 +128,7 @@ public:
           m_tickMultiplier(1) {
         copyRuntimeTimingSnapshot();
         m_machineSession.presentationTracker().reset(sessionPresentation());
+        m_machineSession.configureJogging(configuration.axes, configuration.joints);
         m_machineSession.configureHoming(
             configuration.axes, configuration.joints, configuration.homing);
         m_snapshot.machinePosition = { 6.0, 6.0, -6.0, 0.0, 0.0, 0.0 };
@@ -883,63 +884,6 @@ private:
         m_machineSession.presentationTracker().clearActiveTool();
     }
 
-    void applyServiceBackendSnapshot(const ngc::ExecutionSnapshot &backend) {
-        m_snapshot.joints = backend.commandedJoints;
-        for(const auto &axis : m_axes) {
-            double sum = 0.0;
-            std::size_t count = 0;
-            for(const auto id : axis.joints) {
-                const auto *joint = configuredJoint(id);
-                if(!joint || std::abs(joint->coordinateScale) <= 1e-12) continue;
-                sum += backend.commandedJoints.position[id] / joint->coordinateScale;
-                ++count;
-            }
-            if(count != 0) axisComponent(m_snapshot.machinePosition, axis.axis) = sum / count;
-        }
-        m_snapshot.commandProgress = backend.spanProgress;
-        m_snapshot.hasActiveMotion = backend.state == ngc::BackendState::Running
-            && backend.activeJoints != 0;
-        clearActiveTool();
-    }
-
-    bool submitServiceControl(const ngc::ControlRequest &request) {
-        if (m_runtime.endpoint().trySubmit(request) != ngc::SubmitResult::Submitted) {
-            return false;
-        }
-        m_runtime.advanceImmediate(0.0);
-        return true;
-    }
-
-    void advanceServiceMotionPeriod() {
-        const auto ticks = m_runtime.advanceServiceMotionPeriod();
-
-        ngc::ExecutionSnapshot backendSnapshot;
-        while (m_runtime.endpoint().tryTakeSnapshot(backendSnapshot)) {
-            std::scoped_lock lock(m_mutex);
-            applyServiceBackendSnapshot(backendSnapshot);
-        }
-        std::scoped_lock lock(m_mutex);
-        m_snapshot.servoTicks += ticks;
-    }
-
-    bool setServiceJointPositions(const ngc::EpochId epoch, const ngc::JointMask joints,
-                                  const ngc::JointVector &positions, ngc::RequestId &requestId) {
-        const auto id = requestId++;
-        if(!submitServiceControl(ngc::SetJointPositionRequest { id, joints, positions })) return false;
-        bool succeeded = false;
-        ngc::ExecutionEvent event;
-        while (m_runtime.endpoint().tryTakeEvent(event))
-            if(const auto *completed = std::get_if<ngc::RequestCompleted>(&event))
-                if(completed->request == id) succeeded = completed->succeeded;
-        ngc::ExecutionSnapshot backendSnapshot;
-        while (m_runtime.endpoint().tryTakeSnapshot(backendSnapshot)) {
-            std::scoped_lock lock(m_mutex);
-            applyServiceBackendSnapshot(backendSnapshot);
-        }
-        (void)epoch;
-        return succeeded;
-    }
-
     void runSessionHoming() {
         ngc::position_t startingPosition;
         {
@@ -1033,135 +977,81 @@ private:
         clearActiveTool();
     }
 
-    void failJog(const std::string &message) {
-        std::scoped_lock lock(m_mutex);
-        m_snapshot.status = ngc::SimulationStatus::Error;
-        m_snapshot.activity = ngc::SimulationActivity::Idle;
-        m_snapshot.error = message;
-        m_snapshot.hasActiveMotion = false;
-        m_snapshot.jogging = false;
-        m_activeJog.reset();
-        m_machineSession.coordinator().commands().clear();
-        m_running = false;
-    }
-
     void runJogging(const ngc::ControlRequest &firstRequest) {
-        ActivityCompletion activityCompletion(m_machineSession.coordinator());
-        const auto epoch = m_machineSession.nextEpoch();
-        const auto firstRequestId = std::visit([](const auto &request) { return request.id; }, firstRequest);
-        ngc::RequestId internalRequest = std::numeric_limits<ngc::RequestId>::max() - 16;
-        ngc::JointMask allJoints = 0;
-        ngc::JointVector initial;
+        ngc::position_t startingPosition;
         {
             std::scoped_lock lock(m_mutex);
+            startingPosition = m_snapshot.machinePosition;
             m_snapshot.status = ngc::SimulationStatus::Running;
             m_snapshot.activity = ngc::SimulationActivity::Jogging;
             m_snapshot.error.clear();
             m_snapshot.jogging = true;
             m_snapshot.homedJoints = m_machineSession.homedJoints();
-            for(const auto &joint : m_joints) {
-                allJoints |= ngc::JointMask { 1 } << joint.id;
-                initial[joint.id] = axisComponent(m_snapshot.machinePosition, joint.axis)
-                    * joint.coordinateScale;
-            }
             std::visit([&](const auto &request) {
                 using T = std::decay_t<decltype(request)>;
-                if constexpr(std::same_as<T, ngc::StartContinuousJogRequest>
-                             || std::same_as<T, ngc::StartIncrementalJogRequest>)
+                if constexpr (std::same_as<T, ngc::StartContinuousJogRequest>
+                              || std::same_as<T, ngc::StartIncrementalJogRequest>) {
                     m_snapshot.activeJogTarget = request.target;
+                }
             }, firstRequest);
             clearActiveTool();
         }
 
-        if(!submitServiceControl(ngc::ResetRequest { internalRequest--, epoch })
-           || !submitServiceControl(ngc::EnableRequest { internalRequest-- })
-           || !setServiceJointPositions(epoch, allJoints, initial, internalRequest)
-           || m_runtime.endpoint().trySubmit(firstRequest) != ngc::SubmitResult::Submitted) {
-            failJog("failed to initialize the mock backend for jogging");
-            return;
-        }
-        m_runtime.advanceImmediate(0.0);
-
-        bool finished = false;
-        bool stopSubmitted = false;
-        bool sessionStopped = false;
-        while(!finished) {
-            std::deque<ngc::ControlRequest> controls;
-            bool joining = false;
-            {
+        const ngc::JoggingRuntimeCallbacks callbacks {
+            .shutdownRequested = [&] {
                 std::scoped_lock lock(m_mutex);
-                joining = m_join;
-                while (auto command = m_machineSession.coordinator().commands().tryPop()) {
-                    if (const auto *renew = std::get_if<ngc::RenewJog>(&*command)) {
-                        controls.emplace_back(
-                            ngc::RenewJogLeaseRequest { renew->request, renew->jog });
-                    } else if (const auto *update =
-                                   std::get_if<ngc::SetJogVelocity>(&*command)) {
-                        controls.emplace_back(update->request);
-                    } else if (const auto *stop = std::get_if<ngc::StopJog>(&*command)) {
-                        controls.emplace_back(
-                            ngc::StopJogRequest { stop->request, stop->jog });
-                        stopSubmitted = true;
-                    } else if (std::holds_alternative<ngc::Stop>(*command)
-                               && !stopSubmitted) {
-                        controls.emplace_back(
-                            ngc::StopJogRequest { internalRequest--, *m_activeJog });
-                        stopSubmitted = true;
-                        sessionStopped = true;
-                    }
+                if (m_join || m_stop) {
+                    m_snapshot.status = ngc::SimulationStatus::Holding;
                 }
-                if(joining && !stopSubmitted) {
-                    controls.emplace_back(
-                        ngc::StopJogRequest { internalRequest--, *m_activeJog });
-                    stopSubmitted = true;
-                    sessionStopped = true;
-                }
-            }
-            for(const auto &control : controls) {
-                if (m_runtime.endpoint().trySubmit(control)
-                    != ngc::SubmitResult::Submitted) {
-                    failJog("mock backend jog control channel is full");
-                    return;
-                }
-            }
 
-            advanceServiceMotionPeriod();
-
-            ngc::ExecutionEvent event;
-            while (m_runtime.endpoint().tryTakeEvent(event)) {
-                if(const auto *completed = std::get_if<ngc::RequestCompleted>(&event)) {
-                    if(!completed->succeeded && completed->request == firstRequestId) {
-                        failJog("mock backend rejected a jog control request");
-                        return;
-                    }
-                } else if(const auto *stopped = std::get_if<ngc::JogStopped>(&event)) {
-                    std::scoped_lock lock(m_mutex);
-                    if(m_activeJog && stopped->jog == *m_activeJog) {
-                        m_snapshot.lastJogStopReason = stopped->reason;
-                        finished = true;
-                    }
-                } else if(const auto *fault = std::get_if<ngc::BackendFault>(&event)) {
-                    failJog("mock jogging backend fault " + std::to_string(fault->code));
-                    return;
-                }
-            }
-            if (!finished) {
+                return m_join || m_stop;
+            },
+            .serviceImmediate = [&] {
+                m_runtime.advanceImmediate(0.0);
+            },
+            .advanceServiceMotionPeriod = [&] {
+                return m_runtime.advanceServiceMotionPeriod();
+            },
+            .waitForServiceMotion = [&] {
                 std::this_thread::sleep_for(
                     std::chrono::duration<double>(m_runtime.schedulerPeriod()));
-            }
-            if(joining && finished) break;
-        }
+            },
+            .observe = [&](const ngc::JoggingObservation &observation) {
+                std::scoped_lock lock(m_mutex);
+                m_snapshot.machinePosition = observation.machinePosition;
+                m_snapshot.joints = observation.joints;
+                m_snapshot.commandProgress = observation.commandProgress;
+                m_snapshot.hasActiveMotion = observation.hasActiveMotion;
+                m_snapshot.servoTicks = observation.servoTicks;
+                clearActiveTool();
+            },
+        };
+        const auto result =
+            m_machineSession.runJogging(startingPosition, firstRequest, callbacks);
 
         std::scoped_lock lock(m_mutex);
         m_running = false;
+        m_stop = false;
         m_activeJog.reset();
-        m_snapshot.status = sessionStopped ? ngc::SimulationStatus::Stopped
-                                           : ngc::SimulationStatus::Completed;
         m_snapshot.activity = ngc::SimulationActivity::Idle;
         m_snapshot.jogging = false;
         m_snapshot.hasActiveMotion = false;
         m_snapshot.activeJogTarget.reset();
-        m_machineSession.interpreter().machine().synchronizePosition(m_snapshot.machinePosition);
+        if (!result) {
+            m_snapshot.status = ngc::SimulationStatus::Error;
+            m_snapshot.error = result.error();
+            m_machineSession.coordinator().commands().clear();
+            clearActiveTool();
+            return;
+        }
+
+        m_snapshot.machinePosition = result->observation.machinePosition;
+        m_snapshot.joints = result->observation.joints;
+        m_snapshot.commandProgress = result->observation.commandProgress;
+        m_snapshot.servoTicks = result->observation.servoTicks;
+        m_snapshot.lastJogStopReason = result->stopReason;
+        m_snapshot.status = result->outcome == ngc::JoggingOutcome::Stopped
+            ? ngc::SimulationStatus::Stopped : ngc::SimulationStatus::Completed;
         clearActiveTool();
     }
 

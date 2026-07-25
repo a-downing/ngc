@@ -10,6 +10,7 @@ namespace ngc {
     }
 
     bool SessionCommandQueue::tryPush(SessionCommand command) {
+        std::scoped_lock lock(m_mutex);
         if (m_commands.size() >= m_capacity) {
             return false;
         }
@@ -20,6 +21,7 @@ namespace ngc {
     }
 
     std::optional<SessionCommand> SessionCommandQueue::tryPop() {
+        std::scoped_lock lock(m_mutex);
         if (m_commands.empty()) {
             return std::nullopt;
         }
@@ -31,14 +33,17 @@ namespace ngc {
     }
 
     void SessionCommandQueue::clear() noexcept {
+        std::scoped_lock lock(m_mutex);
         m_commands.clear();
     }
 
     bool SessionCommandQueue::empty() const noexcept {
+        std::scoped_lock lock(m_mutex);
         return m_commands.empty();
     }
 
     std::size_t SessionCommandQueue::size() const noexcept {
+        std::scoped_lock lock(m_mutex);
         return m_commands.size();
     }
 
@@ -218,6 +223,12 @@ namespace ngc {
             std::move(axes), std::move(joints), std::move(homing), m_backend);
     }
 
+    void MachineSession::configureJogging(std::vector<AxisConfiguration> axes,
+                                          std::vector<JointConfiguration> joints) {
+        m_joggingController = std::make_unique<JoggingController>(
+            std::move(axes), std::move(joints), m_backend);
+    }
+
     bool MachineSession::homingAvailable() const noexcept {
         return m_homingController && m_homingController->available();
     }
@@ -245,6 +256,50 @@ namespace ngc {
 
     JointMask MachineSession::homedJoints() const noexcept {
         return m_homedJoints;
+    }
+
+    std::expected<JoggingResult, std::string> MachineSession::runJogging(
+        const position_t &startingPosition, const ControlRequest &firstRequest,
+        const JoggingRuntimeCallbacks &callbacks) {
+        if (!m_joggingController) {
+            return std::unexpected("jogging is not configured");
+        }
+        if (m_coordinator.activity() != MachineActivity::Jogging) {
+            return std::unexpected("jogging does not own the machine session");
+        }
+
+        bool sessionStopRequested = false;
+        const auto nextControl = [&]() -> std::optional<ControlRequest> {
+            while (const auto command = m_coordinator.commands().tryPop()) {
+                if (const auto *renew = std::get_if<RenewJog>(&*command)) {
+                    return RenewJogLeaseRequest {renew->request, renew->jog};
+                }
+                if (const auto *update = std::get_if<SetJogVelocity>(&*command)) {
+                    return update->request;
+                }
+                if (const auto *stop = std::get_if<StopJog>(&*command)) {
+                    return StopJogRequest {stop->request, stop->jog};
+                }
+                if (std::holds_alternative<Stop>(*command)) {
+                    sessionStopRequested = true;
+                }
+            }
+
+            return std::nullopt;
+        };
+        auto controllerCallbacks = callbacks;
+        controllerCallbacks.shutdownRequested = [&] {
+            return sessionStopRequested
+                || (callbacks.shutdownRequested && callbacks.shutdownRequested());
+        };
+        const auto result = m_joggingController->run(
+            nextEpoch(), startingPosition, firstRequest, nextControl, controllerCallbacks);
+        if (result) {
+            m_interpreter.machine().synchronizePosition(result->observation.machinePosition);
+        }
+        m_coordinator.finishActivity();
+
+        return result;
     }
 
     void MachineSession::requestGeometryStop() {
