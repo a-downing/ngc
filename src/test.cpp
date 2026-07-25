@@ -548,10 +548,12 @@ final_move_together = true
         std::filesystem::remove(path);
 
         ngc::MachineSessionManager worker;
-        require(worker.powerOn(), "Simulation should power on explicitly");
-        require(worker.setPersistentParameterStorePath(path).has_value(),
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority), "Simulation should power on explicitly");
+        require(worker.setPersistentParameterStorePath(authority, path).has_value(),
                 "idle Simulation should accept its parameter-store path");
-        require(worker.start({{"G59.3\n", "persistent-coordinate-system.ngc"}}, {}),
+        require(worker.start(
+                    authority, {{"G59.3\n", "persistent-coordinate-system.ngc"}}, {}),
                 "coordinate-system persistence program should start");
 
         auto snapshot = worker.snapshot();
@@ -881,15 +883,77 @@ final_move_together = true
         require(manager.state().authority == state.authority,
                 "a rejected control-target change must not advance control authority");
 
+        const auto authority = state.authority;
+        auto staleAuthority = authority;
+        ++staleAuthority.generation;
+        const auto stalePowerOn = manager.powerOn(staleAuthority);
+        require(!stalePowerOn
+                    && stalePowerOn.rejection
+                        == ngc::SessionCommandRejection::StaleControlAuthority,
+                "a stale authority must be rejected before a power command changes state");
+        const std::array staleControls {
+            manager.powerOff(staleAuthority),
+            manager.feedHold(staleAuthority),
+            manager.resume(staleAuthority),
+            manager.stop(staleAuthority),
+        };
+        require(std::ranges::all_of(staleControls, [](const auto result) {
+                    return result.rejection
+                        == ngc::SessionCommandRejection::StaleControlAuthority;
+                }),
+                "stale authority must take precedence for every structured control command");
+        const auto staleStart =
+            manager.start(staleAuthority, {{"G0 X1\n", "stale.ngc"}}, {});
+        require(!staleStart
+                    && staleStart.rejection
+                        == ngc::SessionCommandRejection::StaleControlAuthority,
+                "a stale authority must be rejected before a program is queued");
+        const auto staleHome = manager.home(staleAuthority);
+        require(!staleHome
+                    && staleHome.rejection
+                        == ngc::SessionCommandRejection::StaleControlAuthority,
+                "a stale authority must be rejected before homing is queued");
+        const auto staleJog = manager.startJog(
+            staleAuthority, ngc::ControlRequest { ngc::StartIncrementalJogRequest {} });
+        require(!staleJog
+                    && staleJog.rejection
+                        == ngc::SessionCommandRejection::StaleControlAuthority,
+                "a stale authority must be rejected before jogging is queued");
+        require(!manager.setToolTable(staleAuthority, {})
+                    && !manager.setActiveWorkCoordinate(
+                        staleAuthority, ngc::Machine::Axis::X, 1.0)
+                    && !manager.saveToolTable(
+                        staleAuthority, std::filesystem::path("unused-stale-tools.txt"))
+                    && !manager.setToolTableStorePath(
+                        staleAuthority, std::filesystem::path("unused-stale-tools.txt"))
+                    && !manager.setPersistentParameterStorePath(
+                        staleAuthority, std::filesystem::path("unused-stale.var"))
+                    && !manager.loadPersistentParameters(
+                        staleAuthority, std::filesystem::path("unused-stale.var"))
+                    && !manager.savePersistentParameters(
+                        staleAuthority, std::filesystem::path("unused-stale.var")),
+                "stale authority must reject controller-data mutations");
+        auto wrongTargetAuthority = authority;
+        wrongTargetAuthority.target = ngc::MachineControlTarget::Real;
+        const auto wrongTargetStart =
+            manager.start(wrongTargetAuthority, {{"G0 X1\n", "wrong-target.ngc"}}, {});
+        require(!wrongTargetStart
+                    && wrongTargetStart.rejection
+                        == ngc::SessionCommandRejection::StaleControlAuthority,
+                "authority for another target must be rejected before admission");
+        require(manager.snapshot().powerState == ngc::MachinePowerState::Off,
+                "rejected stale commands must leave the controlled session unchanged");
+
         require(manager.snapshot().powerState == ngc::MachinePowerState::Off,
                 "a new manager should leave its persistent Simulation session powered off");
-        const auto unpoweredStart = manager.start({{"G0 X1\n", "unpowered.ngc"}}, {});
+        const auto unpoweredStart =
+            manager.start(authority, {{"G0 X1\n", "unpowered.ngc"}}, {});
         require(!unpoweredStart
                     && unpoweredStart.rejection
                         == ngc::SessionCommandRejection::SessionNotPowered,
                 "an unpowered manager should reject program start");
-        require(manager.powerOn(), "the manager should power Simulation on explicitly");
-        const auto duplicatePowerOn = manager.powerOn();
+        require(manager.powerOn(authority), "the manager should power Simulation on explicitly");
+        const auto duplicatePowerOn = manager.powerOn(authority);
         require(!duplicatePowerOn
                     && duplicatePowerOn.rejection
                         == ngc::SessionCommandRejection::SessionAlreadyPowered,
@@ -903,39 +967,39 @@ final_move_together = true
         require(snapshot.simulationDiagnostics
                     && snapshot.simulationDiagnostics->servoPeriodSeconds > 0.0,
                 "the generic session snapshot should attach Simulation-only diagnostics");
-        const auto emptyProgram = manager.start({}, {});
+        const auto emptyProgram = manager.start(authority, {}, {});
         require(!emptyProgram
                     && emptyProgram.rejection == ngc::SessionCommandRejection::EmptyProgram,
                 "an empty program rejection should retain its structured reason");
-        const auto unavailableHoming = manager.home();
+        const auto unavailableHoming = manager.home(authority);
         require(!unavailableHoming
                     && unavailableHoming.rejection
                         == ngc::SessionCommandRejection::HomingUnavailable,
                 "unconfigured homing should retain its structured rejection reason");
-        const auto inactiveFeedHold = manager.feedHold();
+        const auto inactiveFeedHold = manager.feedHold(authority);
         require(!inactiveFeedHold
                     && inactiveFeedHold.rejection
                         == ngc::SessionCommandRejection::ProgramNotRunning,
                 "Feed Hold without a program should report that no program is running");
-        const auto inactiveResume = manager.resume();
+        const auto inactiveResume = manager.resume(authority);
         require(!inactiveResume
                     && inactiveResume.rejection
                         == ngc::SessionCommandRejection::ProgramNotRunning,
                 "Resume without a program should report that no program is running");
-        const auto inactiveStop = manager.stop();
+        const auto inactiveStop = manager.stop(authority);
         require(!inactiveStop
                     && inactiveStop.rejection
                         == ngc::SessionCommandRejection::NoMotionOwner,
                 "Stop without a motion owner should retain its structured rejection reason");
         const auto invalidJog = manager.startJog(
-            ngc::ControlRequest { ngc::StartIncrementalJogRequest {} });
+            authority, ngc::ControlRequest { ngc::StartIncrementalJogRequest {} });
         require(!invalidJog
                     && invalidJog.rejection
                         == ngc::SessionCommandRejection::InvalidJogRequest,
                 "an invalid jog token should retain its structured rejection reason");
-        require(manager.start({{"G0 X0.01\n", "session-state.ngc"}}, {}),
+        require(manager.start(authority, {{"G0 X0.01\n", "session-state.ngc"}}, {}),
                 "the powered manager session should accept a program epoch");
-        const auto activePowerOff = manager.powerOff();
+        const auto activePowerOff = manager.powerOff(authority);
         require(!activePowerOff
                     && activePowerOff.rejection == ngc::SessionCommandRejection::MotionOwned,
                 "power-off should reject while a program owns motion");
@@ -952,15 +1016,16 @@ final_move_together = true
         require(completed.powerState == ngc::MachinePowerState::On
                     && completed.machineActivity == ngc::MachineActivity::Idle,
                 "program completion should return to the same powered idle session");
-        require(manager.powerOff(), "the idle manager should power Simulation off");
+        require(manager.powerOff(authority), "the idle manager should power Simulation off");
         require(manager.snapshot().powerState == ngc::MachinePowerState::Off,
                 "the manager should publish completed Simulation power-off");
-        const auto duplicatePowerOff = manager.powerOff();
+        const auto duplicatePowerOff = manager.powerOff(authority);
         require(!duplicatePowerOff
                     && duplicatePowerOff.rejection
                         == ngc::SessionCommandRejection::SessionAlreadyOff,
                 "powering off an already off session should retain its structured reason");
-        require(manager.powerOn(), "the persistent Simulation session should power on again");
+        require(manager.powerOn(authority),
+                "the persistent Simulation session should power on again");
         manager.join();
         require(manager.snapshot().powerState == ngc::MachinePowerState::Off,
                 "joining the manager should end its powered Simulation lifetime");
@@ -968,6 +1033,7 @@ final_move_together = true
 
     void testMachineSessionManagerPublishesOwnedParameterSnapshot() {
         ngc::MachineSessionManager manager;
+        const auto authority = manager.state().authority;
         const auto initial = manager.parameterSnapshot();
         requireNear(initial.at(ngc::Var::G54_X), 0.0,
                     "a new Simulation parameter snapshot should contain canonical defaults");
@@ -996,13 +1062,13 @@ final_move_together = true
         require(previewFinished, "parameter-isolation Preview should finish");
         requireNear(preview.read(ngc::Var::G54_X), 7.0,
                     "Preview should retain its independent parameter mutation");
-        require(manager.powerOn(), "parameter Simulation should power on explicitly");
+        require(manager.powerOn(authority), "parameter Simulation should power on explicitly");
         requireNear(manager.parameterSnapshot().at(ngc::Var::G54_X), 0.0,
                     "Preview evaluation must not alter the Simulation parameter snapshot");
         preview.join();
 
         ngc::ToolTable tools;
-        require(manager.start({
+        require(manager.start(authority, {
                     {"G10 L2 P1 X3\nG1 F60 X0.05\n", "<MDI>"},
                 }, tools, true),
                 "Simulation MDI should accept a parameter mutation");
@@ -1024,7 +1090,7 @@ final_move_together = true
         requireNear(manager.parameterSnapshot().at(ngc::Var::G54_X), 3.0,
                     "the manager snapshot should publish the completed MDI parameter mutation");
 
-        require(manager.start({
+        require(manager.start(authority, {
                     {"G10 L2 P1 X4\n", "parameter-program.ngc"},
                 }, tools, true),
                 "Simulation Program should accept a later parameter mutation");
@@ -1055,6 +1121,10 @@ final_move_together = true
                         managerState, ngc::MachineControlTarget::Real)
                         == "The Real machine session is not configured.",
                 "the session view should explain an unavailable Real control target");
+        require(ngc::gui::sessionCommandRejectionReason(
+                    ngc::SessionCommandRejection::StaleControlAuthority)
+                    == "control has transferred or the command targets another session",
+                "the session view should explain stale control authority");
         managerState.realAvailable = true;
         require(ngc::gui::controlTargetAvailable(
                     managerState, ngc::MachineControlTarget::Real)
@@ -1482,16 +1552,18 @@ final_move_together = true
                 "G10 L11 isolation fixture should create isolated tool tables");
 
         ngc::MachineSessionManager worker;
-        require(worker.powerOn(), "Simulation should power on explicitly");
-        require(worker.setToolTable(initial),
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority), "Simulation should power on explicitly");
+        require(worker.setToolTable(authority, initial),
                 "idle Simulation should accept its isolated tool table");
-        require(worker.setToolTableStorePath(paths.simulation).has_value(),
+        require(worker.setToolTableStorePath(authority, paths.simulation).has_value(),
                 "idle Simulation should accept its tool-table store path");
         constexpr std::string_view source =
             "G10 L2 P9 X0.01 Y0.02 Z0.03\n"
             "G53 G0 X0.1 Y0.2 Z0.3\n"
             "G10 L11 P1 X0 Y0 Z0\n";
-        require(worker.start({{std::string(source), "simulation-l11.ngc"}}, initial),
+        require(worker.start(
+                    authority, {{std::string(source), "simulation-l11.ngc"}}, initial),
                 "Simulation G10 L11 fixture should start");
 
         auto snapshot = worker.snapshot();
@@ -1787,10 +1859,11 @@ final_move_together = true
 
     void testMachineSessionManagerStartsSimulationPlayback() {
         ngc::MachineSessionManager worker;
-        require(worker.powerOn(), "Simulation should power on explicitly");
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority), "Simulation should power on explicitly");
         ngc::ToolTable tools;
         tools.set(1, { 1, 0, 0, 2, 0, 0, 0, 0.5, "simulation tool" });
-        require(worker.start({ {
+        require(worker.start(authority, { {
                     "sub _tool_change[#tool] { return 1 }\n"
                     "T1 M6\n"
                     "G1 F60 X1\n",
@@ -1844,7 +1917,8 @@ G57 G1 X0.6
 )NGC";
 
         ngc::MachineSessionManager worker;
-        require(worker.powerOn(), "Simulation should power on explicitly");
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority), "Simulation should power on explicitly");
         ngc::ToolTable tools;
         tools.set(1, {
             .number = 1,
@@ -1857,7 +1931,7 @@ G57 G1 X0.6
             .diameter = 0.25,
             .comment = "marker presentation tool",
         });
-        require(worker.start({
+        require(worker.start(authority, {
                     {std::string(TOOL_CHANGE), "presentation-tool-change.ngc"},
                     {std::string(MAIN), "presentation-main.ngc"},
                 }, tools),
@@ -1961,7 +2035,8 @@ G1 F60 X2
 )NGC";
 
         ngc::MachineSessionManager worker(*configuration);
-        require(worker.powerOn(), "Simulation should power on explicitly");
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority), "Simulation should power on explicitly");
         ngc::ToolTable tools;
         tools.set(2, {
             .number = 2,
@@ -1975,7 +2050,7 @@ G1 F60 X2
             .comment = "calibrated presentation tool",
         });
         worker.setTickMultiplier(10);
-        require(worker.start({
+        require(worker.start(authority, {
                     {*toolChange, "autoload/tool_change.ngc"},
                     {std::string(MAIN), "post-tool-change-motion.ngc"},
                 }, tools),
@@ -1991,7 +2066,7 @@ G1 F60 X2
         require(snapshot.status == ngc::SimulationStatus::Paused,
                 snapshot.error.empty() ? "tool change should pause for the operator"
                                        : snapshot.error);
-        require(worker.resume(), "tool-change Resume should release M0");
+        require(worker.resume(authority), "tool-change Resume should release M0");
 
         std::jthread competingSnapshotReader([&](const std::stop_token stop) {
             while (!stop.stop_requested()) {
@@ -2038,9 +2113,11 @@ G1 F60 X2
         auto tools=fixtureToolTable();
 
         ngc::MachineSessionManager worker;
-        require(worker.powerOn(), "Simulation should power on explicitly");
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority), "Simulation should power on explicitly");
         worker.setTickMultiplier(1000);
-        require(worker.start(fixturePrograms(std::move(main),"fixture/exact-stop.ngc"),tools),
+        require(worker.start(
+                    authority, fixturePrograms(std::move(main),"fixture/exact-stop.ngc"),tools),
                 "adaptive-pockets simulation should start");
 
         auto snapshot = worker.snapshot();
@@ -2070,10 +2147,11 @@ G1 F60 X2
         source+="G0 X9\n";
 
         ngc::MachineSessionManager worker;
-        require(worker.powerOn(), "Simulation should power on explicitly");
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority), "Simulation should power on explicitly");
         worker.setTickMultiplier(100);
         ngc::ToolTable tools;
-        require(worker.start({{source,"multi-packet-refill.ngc"}},tools),
+        require(worker.start(authority, {{source,"multi-packet-refill.ngc"}},tools),
                 "multi-packet refill simulation should start");
         auto snapshot=worker.snapshot();
         for(int attempt=0;attempt<10000&&snapshot.status!=ngc::SimulationStatus::Completed
@@ -2117,9 +2195,11 @@ G1 F60 X2
         for(int command=1;command<=COMMANDS;++command)
             source+=std::format("G1 F60 X{:.6f}\n",100.0+static_cast<double>(command)*0.001);
         ngc::MachineSessionManager worker;
-        require(worker.powerOn(), "Simulation should power on explicitly");
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority), "Simulation should power on explicitly");
         ngc::ToolTable tools;
-        require(worker.start({{source,"planning-snapshot-progress.ngc"}},tools),
+        require(worker.start(
+                    authority, {{source,"planning-snapshot-progress.ngc"}},tools),
                 "planning snapshot progress simulation should start");
         auto snapshot=worker.snapshot();
         auto maximumSnapshotSeconds=0.0;
@@ -2134,7 +2214,7 @@ G1 F60 X2
             if(snapshot.hasActiveMotion&&snapshot.machinePosition.x>0.01)
                 sawMotionDuringPlanning=true;
         }
-        worker.stop();
+        worker.stop(authority);
         worker.join();
         require(snapshot.status!=ngc::SimulationStatus::Error,snapshot.error);
         require(snapshot.trajectoryPlanning.continuousHorizons>0,
@@ -2363,9 +2443,10 @@ G1 F60 X2
         preview.join();
 
         ngc::MachineSessionManager simulation;
-        require(simulation.powerOn(), "Simulation should power on explicitly");
+        const auto authority = simulation.state().authority;
+        require(simulation.powerOn(authority), "Simulation should power on explicitly");
         simulation.setTickMultiplier(1000);
-        require(simulation.start({{source,"g64-rapid.ngc"}},tools),
+        require(simulation.start(authority, {{source,"g64-rapid.ngc"}},tools),
                 "G64 rapid simulation should start");
         auto snapshot=simulation.snapshot();
         for(int attempt=0;attempt<5000
@@ -2392,9 +2473,11 @@ G1 F60 X2
             "M30\n";
         ngc::ToolTable tools;
         ngc::MachineSessionManager simulation;
-        require(simulation.powerOn(), "Simulation should power on explicitly");
+        const auto authority = simulation.state().authority;
+        require(simulation.powerOn(authority), "Simulation should power on explicitly");
         simulation.setTickMultiplier(1000);
-        require(simulation.start({{source, "zero-length-chain-transition.ngc"}}, tools),
+        require(simulation.start(
+                    authority, {{source, "zero-length-chain-transition.ngc"}}, tools),
                 "zero-length chain transition simulation should start");
         auto snapshot = simulation.snapshot();
         for(int attempt = 0; attempt < 10000
@@ -2520,9 +2603,12 @@ G1 F60 X2
         ngc::MachineSessionManager worker(UNIT,{
             .pathAcceleration=0.0,.rapidSpeed=100.0,.arcChordTolerance=0.0001,.pathJerk=10.0,
         });
-        require(worker.powerOn(), "Simulation should power on explicitly");
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority), "Simulation should power on explicitly");
         ngc::ToolTable tools;
-        require(worker.start({{"G64 P0.01\nG1 F60 X1\nG1 Y1\n","simulation-error.ngc"}},tools),
+        require(worker.start(
+                    authority,
+                    {{"G64 P0.01\nG1 F60 X1\nG1 Y1\n","simulation-error.ngc"}},tools),
                 "simulation GUI error regression should start");
         auto snapshot=worker.snapshot();
         for(int attempt=0;attempt<3000&&snapshot.status!=ngc::SimulationStatus::Error;++attempt) {
@@ -2649,9 +2735,10 @@ G1 F60 X2
         auto tools=fixtureToolTable();
 
         ngc::MachineSessionManager worker;
-        require(worker.powerOn(), "Simulation should power on explicitly");
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority), "Simulation should power on explicitly");
         worker.setTickMultiplier(1000);
-        require(worker.start(fixturePrograms("T2 M6\n","<MDI>"),tools),
+        require(worker.start(authority, fixturePrograms("T2 M6\n","<MDI>"),tools),
                 "MDI tool change should start");
 
         auto snapshot = worker.snapshot();
@@ -2669,7 +2756,8 @@ G1 F60 X2
 
     void testMachineSessionManagerPersistsSimulationAcrossPowerCycle() {
         ngc::MachineSessionManager worker;
-        require(worker.powerOn(), "Simulation should power on explicitly");
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority), "Simulation should power on explicitly");
         ngc::ToolTable tools;
         worker.setTickMultiplier(1000);
 
@@ -2687,7 +2775,7 @@ G1 F60 X2
         tools.set(1, { .number = 1, .x = 0, .y = 0, .z = 0.5, .a = 0, .b = 0,
                        .c = 0, .diameter = 0.25, .comment = {} });
 
-        require(worker.start({ { "G0 X1\n", "<MDI>" } }, tools, true),
+        require(worker.start(authority, { { "G0 X1\n", "<MDI>" } }, tools, true),
                 "first persistent simulation command should start");
         const auto afterFirst = waitForCompletion("first persistent command should complete");
         requireNear(afterFirst.machinePosition.x, 1.0, "first persistent command should end at X1");
@@ -2701,7 +2789,7 @@ G1 F60 X2
         require(afterFirst.servoTicksPerSchedulerPeriod == 10,
                 "each scheduler wake should batch ten 1 ms servo ticks at 1x speed");
 
-        require(worker.start({ { "G43 H1\n", "<MDI>" } }, tools, true),
+        require(worker.start(authority, { { "G43 H1\n", "<MDI>" } }, tools, true),
                 "G43 persistent simulation command should start");
         const auto afterG43 = waitForCompletion("G43 persistent command should complete");
         require(std::ranges::find(afterG43.activePresentation.modalGCodes, "G43")
@@ -2714,7 +2802,7 @@ G1 F60 X2
                 "active tool compensation must remain distinct from physical "
                 "tool geometry");
 
-        require(worker.start({ { "G91 G0 X1\n", "<MDI>" } }, tools, true),
+        require(worker.start(authority, { { "G91 G0 X1\n", "<MDI>" } }, tools, true),
                 "second persistent simulation command should start");
         const auto afterSecond = waitForCompletion("second persistent command should complete");
         requireNear(afterSecond.machinePosition.x, 2.0,
@@ -2723,10 +2811,10 @@ G1 F60 X2
                     != afterSecond.activePresentation.modalGCodes.end(),
                 "subsequent commands should preserve G43 modal state");
 
-        require(worker.powerOff(), "idle Simulation should power off");
+        require(worker.powerOff(authority), "idle Simulation should power off");
         require(worker.snapshot().powerState == ngc::MachinePowerState::Off,
                 "powered-off Simulation should publish its explicit lifecycle state");
-        require(worker.powerOn(), "Simulation should power on for a later epoch");
+        require(worker.powerOn(authority), "Simulation should power on for a later epoch");
         const auto afterPowerCycle = worker.snapshot();
         require(afterPowerCycle.powerState == ngc::MachinePowerState::On,
                 "powered-on Simulation should publish its explicit lifecycle state");
@@ -2741,10 +2829,12 @@ G1 F60 X2
     void testSimulationProgramElapsedTimeIsPlaybackSpeedIndependent() {
         const auto runAtMultiplier = [](const int multiplier) {
             ngc::MachineSessionManager worker;
-            require(worker.powerOn(), "Simulation should power on explicitly");
+            const auto authority = worker.state().authority;
+            require(worker.powerOn(authority), "Simulation should power on explicitly");
             ngc::ToolTable tools;
             worker.setTickMultiplier(multiplier);
-            require(worker.start({ { "G1 F60 X0.01\n", "elapsed-time.ngc" } }, tools),
+            require(worker.start(
+                        authority, { { "G1 F60 X0.01\n", "elapsed-time.ngc" } }, tools),
                     "elapsed-time simulation should start");
 
             auto snapshot = worker.snapshot();
@@ -2841,9 +2931,10 @@ G1 F60 X2
 
     void testSimulationM0PublishesAlertAndResumes() {
         ngc::MachineSessionManager worker;
-        require(worker.powerOn(), "Simulation should power on explicitly");
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority), "Simulation should power on explicitly");
         ngc::ToolTable tools;
-        require(worker.start({{
+        require(worker.start(authority, {{
                     "alert[\"Change the tool\"]\n"
                     "M0\n"
                     "print[\"resumed\"]\n",
@@ -2872,7 +2963,7 @@ G1 F60 X2
                 }),
                 "post-M0 interpretation must remain blocked before Resume");
 
-        require(worker.resume(), "Resume should release a Simulation M0 pause");
+        require(worker.resume(authority), "Resume should release a Simulation M0 pause");
         snapshot = worker.snapshot();
         require(!snapshot.operatorAlert,
                 "Resume should dismiss the active operator alert");
@@ -4726,12 +4817,13 @@ G1 F60 X2
         const auto configuration = ngc::loadMachineConfiguration("machine.toml");
         require(configuration.has_value(), configuration ? "" : configuration.error());
         ngc::MachineSessionManager worker(*configuration);
-        require(worker.powerOn(), "Simulation should power on explicitly");
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority), "Simulation should power on explicitly");
         ngc::ToolTable tools;
         const std::vector<std::tuple<std::string, std::string>> program {
             { "G1 F60 G53 X10\n", "feed-hold-worker.ngc" },
         };
-        require(worker.start(program, tools, true),
+        require(worker.start(authority, program, tools, true),
                 "feed-hold worker regression should start a program");
 
         auto snapshot = worker.snapshot();
@@ -4745,7 +4837,8 @@ G1 F60 X2
                 && snapshot.trajectoryBackendVelocity > 1e-4,
                 "feed-hold worker regression should observe active program motion");
         const auto holdStart = snapshot.machinePosition.x;
-        require(worker.feedHold(), "active program motion should accept Feed Hold");
+        require(worker.feedHold(authority),
+                "active program motion should accept Feed Hold");
 
         snapshot = worker.snapshot();
         bool sawHolding = false;
@@ -4775,8 +4868,8 @@ G1 F60 X2
                 && snapshot.trajectoryBackendAcceleration <= 1e-10,
                 "the manager should publish Paused only at rest");
         const auto heldPosition = snapshot.machinePosition.x;
-        require(worker.resume(), "a completed feed hold should accept Resume");
-        require(!worker.feedHold(),
+        require(worker.resume(authority), "a completed feed hold should accept Resume");
+        require(!worker.feedHold(authority),
                 "a second feed hold should wait until resume restores normal execution rate");
         for(int attempt = 0; attempt < 10000
             && !(snapshot.status == ngc::SimulationStatus::Running
@@ -4790,7 +4883,7 @@ G1 F60 X2
                             snapshot.error));
         require(snapshot.machinePosition.x >= heldPosition && snapshot.machinePosition.x < 10.0,
                 "feed resume should continue forward from the held path cursor");
-        worker.stop();
+        worker.stop(authority);
         worker.join();
     }
 
@@ -4798,11 +4891,12 @@ G1 F60 X2
         const auto configuration = ngc::loadMachineConfiguration("machine.toml");
         require(configuration.has_value(), configuration ? "" : configuration.error());
         ngc::MachineSessionManager worker(*configuration);
-        require(worker.powerOn(), "Simulation should power on explicitly");
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority), "Simulation should power on explicitly");
         const std::vector<std::tuple<std::string, std::string>> program {
             { "G1 F60 G53 X10\n", "controlled-stop-worker.ngc" },
         };
-        require(worker.start(program, {}, true),
+        require(worker.start(authority, program, {}, true),
                 "controlled-stop worker regression should start a program");
 
         auto snapshot = worker.snapshot();
@@ -4817,7 +4911,7 @@ G1 F60 X2
                 "controlled-stop worker regression should observe active motion");
         const auto stopStart = snapshot.machinePosition.x;
 
-        worker.stop();
+        worker.stop(authority);
         require(worker.snapshot().programOperation
                     == ngc::ProgramOperationPresentation::Stopping,
                 "Stop should immediately expose the controlled-stop transition");
@@ -4844,12 +4938,12 @@ G1 F60 X2
         require(snapshot.trajectoryBackendVelocity <= 1e-10
                     && snapshot.trajectoryBackendAcceleration <= 1e-10,
                 "session Stop should publish Stopped only after reaching rest");
-        require(!worker.resume(),
+        require(!worker.resume(authority),
                 "a stopped program epoch should not be resumable");
 
         const auto stoppedPosition = snapshot.machinePosition.x;
         require(worker.start(
-                    { { "G91 G1 F60 X1\n", "post-stop-worker.ngc" } }, {}, true),
+                    authority, { { "G91 G1 F60 X1\n", "post-stop-worker.ngc" } }, {}, true),
                 "the powered session should accept a new program after Stop");
         for (auto attempt = 0; attempt < 10000
              && snapshot.status != ngc::SimulationStatus::Completed
@@ -4872,12 +4966,13 @@ G1 F60 X2
         const auto configuration = ngc::loadMachineConfiguration("machine.toml");
         require(configuration.has_value(), configuration ? "" : configuration.error());
         ngc::MachineSessionManager worker(*configuration);
-        require(worker.powerOn(), "Simulation should power on explicitly");
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority), "Simulation should power on explicitly");
         ngc::ToolTable tools;
         const std::vector<std::tuple<std::string, std::string>> program {
             { "G38.3 F60 X10\n", "feed-hold-probe-worker.ngc" },
         };
-        require(worker.start(program, tools, true),
+        require(worker.start(authority, program, tools, true),
                 "probe feed-hold worker regression should start");
 
         auto snapshot = worker.snapshot();
@@ -4894,7 +4989,7 @@ G1 F60 X2
         require(snapshot.trajectoryBackendSpan == 0,
                 "triggered probe motion should remain distinct from normal execution spans");
         const auto holdStart = snapshot.machinePosition.x;
-        require(worker.feedHold(), "moving probe approach should accept Feed Hold");
+        require(worker.feedHold(authority), "moving probe approach should accept Feed Hold");
         for(int attempt = 0; attempt < 10000
             && snapshot.status != ngc::SimulationStatus::Paused
             && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
@@ -4907,7 +5002,7 @@ G1 F60 X2
                 "probe feed hold should stop before the probe target");
         const auto heldPosition = snapshot.machinePosition.x;
 
-        require(worker.resume(), "held probe approach should accept Resume");
+        require(worker.resume(authority), "held probe approach should accept Resume");
         for(int attempt = 0; attempt < 10000
             && !(snapshot.status == ngc::SimulationStatus::Running
                  && snapshot.trajectoryBackendVelocity > 1e-4); ++attempt) {
@@ -4920,7 +5015,7 @@ G1 F60 X2
                             snapshot.error));
         require(snapshot.machinePosition.x >= heldPosition && snapshot.machinePosition.x < 10.0,
                 "resumed probe should continue toward its original target");
-        worker.stop();
+        worker.stop(authority);
         worker.join();
     }
 
@@ -4928,12 +5023,13 @@ G1 F60 X2
         const auto configuration = ngc::loadMachineConfiguration("machine.toml");
         require(configuration.has_value(), configuration ? "" : configuration.error());
         ngc::MachineSessionManager worker(*configuration);
-        require(worker.powerOn(), "Simulation should power on explicitly");
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority), "Simulation should power on explicitly");
         ngc::ToolTable tools;
         const std::vector<std::tuple<std::string, std::string>> program {
             { "G38.3 F200 X13\n", "feed-hold-probe-contact-worker.ngc" },
         };
-        require(worker.start(program, tools, true),
+        require(worker.start(authority, program, tools, true),
                 "probe-contact feed-hold worker regression should start");
 
         auto snapshot = worker.snapshot();
@@ -4949,7 +5045,7 @@ G1 F60 X2
                 && snapshot.machinePosition.x < 13.0,
                 std::format("probe should approach contact before the late feed hold: {}",
                             snapshot.error));
-        require(worker.feedHold(), "late probe feed hold should be accepted");
+        require(worker.feedHold(authority), "late probe feed hold should be accepted");
 
         bool sawPaused = false;
         for(int attempt = 0; attempt < 10000
@@ -6734,7 +6830,8 @@ G1 F60 X2
         const auto configuration=fixtureMachineConfiguration();
         require(configuration.has_value(), configuration ? "" : configuration.error());
         ngc::MachineSessionManager worker(*configuration);
-        require(worker.powerOn(), "Simulation should power on explicitly");
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority), "Simulation should power on explicitly");
         worker.setTickMultiplier(1000);
         auto snapshot = worker.snapshot();
         requireNear(snapshot.machinePosition.x, 0.0, "Simulation should start with X at zero");
@@ -6743,7 +6840,7 @@ G1 F60 X2
         requireNear(snapshot.machinePosition.a, 0.0, "Simulation should start with A at zero");
         requireNear(snapshot.machinePosition.b, 0.0, "Simulation should start with B at zero");
         requireNear(snapshot.machinePosition.c, 0.0, "Simulation should start with C at zero");
-        require(worker.home(), "configured simulated homing should start");
+        require(worker.home(authority), "configured simulated homing should start");
         for(int attempt = 0; attempt < 5000
             && snapshot.status != ngc::SimulationStatus::Completed
             && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
@@ -6782,8 +6879,10 @@ G1 F60 X2
         configuration->simulation.schedulerPeriod =
             configuration->simulation.servoPeriod;
         ngc::MachineSessionManager worker(*configuration);
-        require(worker.powerOn(), "Simulation should power on explicitly");
-        require(worker.home(), "controlled homing-stop regression should start homing");
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority), "Simulation should power on explicitly");
+        require(worker.home(authority),
+                "controlled homing-stop regression should start homing");
 
         auto snapshot = worker.snapshot();
         for (auto attempt = 0; attempt < 5000
@@ -6796,7 +6895,7 @@ G1 F60 X2
                 std::format("homing should begin moving before Stop: {}",
                             snapshot.error));
 
-        worker.stop();
+        worker.stop(authority);
         for (auto attempt = 0; attempt < 5000
              && snapshot.status != ngc::SimulationStatus::Stopped
              && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
@@ -6821,7 +6920,8 @@ G1 F60 X2
         require(configuration.has_value(), configuration ? "" : configuration.error());
         configuration->simulation.schedulerPeriod = configuration->simulation.servoPeriod;
         ngc::MachineSessionManager worker(*configuration);
-        require(worker.powerOn(), "Simulation should power on explicitly");
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority), "Simulation should power on explicitly");
 
         const auto axis = std::ranges::find(configuration->axes, ngc::Machine::Axis::Y,
                                             &ngc::AxisConfiguration::axis);
@@ -6845,7 +6945,7 @@ G1 F60 X2
             .stopLimits = { axis->maxVelocity, axis->maxAcceleration, jerk },
             .leaseTicks = 5,
         };
-        require(worker.startJog(ngc::ControlRequest { request }),
+        require(worker.startJog(authority, ngc::ControlRequest { request }),
                 "coupled Y jogging should be allowed before homing");
 
         auto snapshot = worker.snapshot();
@@ -6874,7 +6974,8 @@ G1 F60 X2
         configuration->simulation.schedulerPeriod =
             configuration->simulation.servoPeriod;
         ngc::MachineSessionManager worker(*configuration);
-        require(worker.powerOn(), "Simulation should power on explicitly");
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority), "Simulation should power on explicitly");
 
         const auto axis = std::ranges::find(configuration->axes, ngc::Machine::Axis::X,
                                             &ngc::AxisConfiguration::axis);
@@ -6905,7 +7006,7 @@ G1 F60 X2
             },
             .leaseTicks = 10000,
         };
-        require(worker.startJog(ngc::ControlRequest { request }),
+        require(worker.startJog(authority, ngc::ControlRequest { request }),
                 "controlled jog-stop regression should start jogging");
 
         auto snapshot = worker.snapshot();
@@ -6919,7 +7020,7 @@ G1 F60 X2
                 std::format("jog should begin moving before Stop: {}",
                             snapshot.error));
 
-        worker.stop();
+        worker.stop(authority);
         for (auto attempt = 0; attempt < 5000
              && snapshot.status != ngc::SimulationStatus::Stopped
              && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {

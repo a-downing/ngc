@@ -78,6 +78,11 @@ class MachineSessionManager {
             || m_activeJog.has_value();
     }
 
+    [[nodiscard]] bool hasControlAuthorityLocked(
+            const MachineControlAuthority authority) const noexcept {
+        return authority == m_controlAuthority;
+    }
+
 public:
     explicit MachineSessionManager(const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch,
                               const ngc::TrajectoryLimits limits = {},
@@ -142,8 +147,11 @@ public:
         return authority == m_controlAuthority;
     }
 
-    SessionCommandResult powerOn() {
+    SessionCommandResult powerOn(const MachineControlAuthority authority) {
         std::unique_lock lock(m_mutex);
+        if (!hasControlAuthorityLocked(authority)) {
+            return { SessionCommandRejection::StaleControlAuthority };
+        }
         const auto state = m_machineSession.coordinator().powerState();
         if (m_powerRequestActive) {
             return { SessionCommandRejection::PowerTransitionInProgress };
@@ -176,8 +184,11 @@ public:
         return result;
     }
 
-    SessionCommandResult powerOff() {
+    SessionCommandResult powerOff(const MachineControlAuthority authority) {
         std::unique_lock lock(m_mutex);
+        if (!hasControlAuthorityLocked(authority)) {
+            return { SessionCommandRejection::StaleControlAuthority };
+        }
         const auto state = m_machineSession.coordinator().powerState();
         if (m_powerRequestActive) {
             return { SessionCommandRejection::PowerTransitionInProgress };
@@ -213,9 +224,13 @@ public:
         return result;
     }
 
-    SessionCommandResult start(const std::vector<std::tuple<std::string, std::string>> &programs,
+    SessionCommandResult start(const MachineControlAuthority authority,
+                               const std::vector<std::tuple<std::string, std::string>> &programs,
                                const ngc::ToolTable &tools, const bool preserveState = false) {
         std::scoped_lock lock(m_mutex);
+        if (!hasControlAuthorityLocked(authority)) {
+            return { SessionCommandRejection::StaleControlAuthority };
+        }
         if (m_machineSession.coordinator().powerState() != ngc::MachinePowerState::On) {
             return { SessionCommandRejection::SessionNotPowered };
         }
@@ -248,8 +263,11 @@ public:
         return {};
     }
 
-    SessionCommandResult home() {
+    SessionCommandResult home(const MachineControlAuthority authority) {
         std::scoped_lock lock(m_mutex);
+        if (!hasControlAuthorityLocked(authority)) {
+            return { SessionCommandRejection::StaleControlAuthority };
+        }
         if (m_machineSession.coordinator().powerState() != ngc::MachinePowerState::On) {
             return { SessionCommandRejection::SessionNotPowered };
         }
@@ -276,7 +294,8 @@ public:
         return m_machineSession.homingAvailable();
     }
 
-    SessionCommandResult startJog(const ngc::ControlRequest &request) {
+    SessionCommandResult startJog(const MachineControlAuthority authority,
+                                  const ngc::ControlRequest &request) {
         const auto jog = std::visit([](const auto &value) -> std::optional<ngc::JogId> {
             using T = std::decay_t<decltype(value)>;
             if constexpr(std::same_as<T, ngc::StartContinuousJogRequest>
@@ -284,6 +303,9 @@ public:
             return std::nullopt;
         }, request);
         std::scoped_lock lock(m_mutex);
+        if (!hasControlAuthorityLocked(authority)) {
+            return { SessionCommandRejection::StaleControlAuthority };
+        }
         if (m_machineSession.coordinator().powerState() != ngc::MachinePowerState::On) {
             return { SessionCommandRejection::SessionNotPowered };
         }
@@ -307,8 +329,12 @@ public:
         return {};
     }
 
-    bool renewJog(const ngc::RequestId request, const ngc::JogId jog) {
+    bool renewJog(const MachineControlAuthority authority, const ngc::RequestId request,
+                  const ngc::JogId jog) {
         std::scoped_lock lock(m_mutex);
+        if (!hasControlAuthorityLocked(authority)) {
+            return false;
+        }
         if(!m_activeJog || *m_activeJog != jog) return false;
         if(m_machineSession.coordinator().commands().anyOf([&](const auto &command) {
             const auto *renewal = std::get_if<ngc::RenewJog>(&command);
@@ -319,8 +345,12 @@ public:
         return true;
     }
 
-    bool setJogVelocity(const ngc::SetContinuousJogVelocityRequest &request) {
+    bool setJogVelocity(const MachineControlAuthority authority,
+                        const ngc::SetContinuousJogVelocityRequest &request) {
         std::scoped_lock lock(m_mutex);
+        if (!hasControlAuthorityLocked(authority)) {
+            return false;
+        }
         if(!m_activeJog || *m_activeJog != request.jog) return false;
         m_machineSession.coordinator().commands().eraseIf([&](const auto &command) {
             if(const auto *renewal = std::get_if<ngc::RenewJog>(&command))
@@ -335,8 +365,13 @@ public:
     }
 
     std::expected<void, std::string>
-    setActiveWorkCoordinate(const ngc::Machine::Axis axis, const double workPosition) {
+    setActiveWorkCoordinate(const MachineControlAuthority authority,
+                            const ngc::Machine::Axis axis, const double workPosition) {
         std::scoped_lock lock(m_mutex);
+        if (!hasControlAuthorityLocked(authority)) {
+            return std::unexpected(
+                "control has transferred or the request targets another session");
+        }
         if (motionOwnedOrQueued()
             || m_snapshot.status == ngc::SimulationStatus::Error) {
             return std::unexpected("cannot change a work offset while motion owns the machine");
@@ -361,8 +396,12 @@ public:
         return {};
     }
 
-    bool stopJog(const ngc::RequestId request, const ngc::JogId jog) {
+    bool stopJog(const MachineControlAuthority authority, const ngc::RequestId request,
+                 const ngc::JogId jog) {
         std::scoped_lock lock(m_mutex);
+        if (!hasControlAuthorityLocked(authority)) {
+            return false;
+        }
         if(!m_activeJog || *m_activeJog != jog) return false;
         m_machineSession.coordinator().commands().eraseIf([&](const auto &command) {
             const auto *renewal = std::get_if<ngc::RenewJog>(&command);
@@ -379,8 +418,11 @@ public:
         return true;
     }
 
-    SessionCommandResult feedHold() {
+    SessionCommandResult feedHold(const MachineControlAuthority authority) {
         std::scoped_lock lock(m_mutex);
+        if (!hasControlAuthorityLocked(authority)) {
+            return { SessionCommandRejection::StaleControlAuthority };
+        }
         if (m_machineSession.coordinator().powerState() != ngc::MachinePowerState::On) {
             return { SessionCommandRejection::SessionNotPowered };
         }
@@ -409,8 +451,11 @@ public:
 
         return {};
     }
-    SessionCommandResult resume() {
+    SessionCommandResult resume(const MachineControlAuthority authority) {
         std::scoped_lock lock(m_mutex);
+        if (!hasControlAuthorityLocked(authority)) {
+            return { SessionCommandRejection::StaleControlAuthority };
+        }
         if (m_machineSession.coordinator().powerState() != ngc::MachinePowerState::On) {
             return { SessionCommandRejection::SessionNotPowered };
         }
@@ -444,8 +489,11 @@ public:
 
         return {};
     }
-    SessionCommandResult stop() {
+    SessionCommandResult stop(const MachineControlAuthority authority) {
         std::scoped_lock lock(m_mutex);
+        if (!hasControlAuthorityLocked(authority)) {
+            return { SessionCommandRejection::StaleControlAuthority };
+        }
         if (m_machineSession.coordinator().powerState() != ngc::MachinePowerState::On) {
             return { SessionCommandRejection::SessionNotPowered };
         }
@@ -594,9 +642,10 @@ public:
         return result;
     }
 
-    bool setToolTable(const ngc::ToolTable &tools) {
+    bool setToolTable(const MachineControlAuthority authority, const ngc::ToolTable &tools) {
         std::scoped_lock lock(m_mutex);
-        return !motionOwnedOrQueued() && m_machineSession.setToolTable(tools);
+        return hasControlAuthorityLocked(authority) && !motionOwnedOrQueued()
+            && m_machineSession.setToolTable(tools);
     }
 
     ngc::ToolTable toolTable() const {
@@ -624,8 +673,12 @@ public:
     }
 
     std::expected<void, std::string> setToolTableStorePath(
-        const std::filesystem::path &path) {
+            const MachineControlAuthority authority, const std::filesystem::path &path) {
         std::scoped_lock lock(m_mutex);
+        if (!hasControlAuthorityLocked(authority)) {
+            return std::unexpected(
+                "control has transferred or the request targets another session");
+        }
         if (motionOwnedOrQueued()) {
             return std::unexpected(
                 "cannot configure the tool-table store while motion owns the machine");
@@ -634,8 +687,12 @@ public:
     }
 
     std::expected<void, std::string> saveToolTable(
-        const std::filesystem::path &path) const {
+            const MachineControlAuthority authority, const std::filesystem::path &path) const {
         std::scoped_lock lock(m_mutex);
+        if (!hasControlAuthorityLocked(authority)) {
+            return std::unexpected(
+                "control has transferred or the request targets another session");
+        }
         if (motionOwnedOrQueued()) {
             return std::unexpected(
                 "cannot save the tool table while motion owns the machine");
@@ -645,16 +702,25 @@ public:
     }
 
     std::expected<void, std::string> setPersistentParameterStorePath(
-        const std::filesystem::path &path) {
+            const MachineControlAuthority authority, const std::filesystem::path &path) {
         std::scoped_lock lock(m_mutex);
+        if (!hasControlAuthorityLocked(authority)) {
+            return std::unexpected(
+                "control has transferred or the request targets another session");
+        }
         if (motionOwnedOrQueued()) {
             return std::unexpected(
                 "cannot configure persistent parameters while motion owns the machine");
         }
         return m_machineSession.setPersistentParameterStorePath(path);
     }
-    std::expected<void, std::string> loadPersistentParameters(const std::filesystem::path &path) {
+    std::expected<void, std::string> loadPersistentParameters(
+            const MachineControlAuthority authority, const std::filesystem::path &path) {
         std::scoped_lock lock(m_mutex);
+        if (!hasControlAuthorityLocked(authority)) {
+            return std::unexpected(
+                "control has transferred or the request targets another session");
+        }
         if (motionOwnedOrQueued()) {
             return std::unexpected("cannot load persistent parameters while motion owns the machine");
         }
@@ -668,8 +734,13 @@ public:
         return loaded;
     }
 
-    std::expected<void, std::string> savePersistentParameters(const std::filesystem::path &path) const {
+    std::expected<void, std::string> savePersistentParameters(
+            const MachineControlAuthority authority, const std::filesystem::path &path) const {
         std::scoped_lock lock(m_mutex);
+        if (!hasControlAuthorityLocked(authority)) {
+            return std::unexpected(
+                "control has transferred or the request targets another session");
+        }
         if (motionOwnedOrQueued()) {
             return std::unexpected("cannot save persistent parameters while motion owns the machine");
         }

@@ -148,6 +148,8 @@ namespace ngc::gui {
             const SessionCommandRejection rejection) noexcept {
         switch (rejection) {
             case SessionCommandRejection::None: return "the command was accepted";
+            case SessionCommandRejection::StaleControlAuthority:
+                return "control has transferred or the command targets another session";
             case SessionCommandRejection::SessionNotPowered:
                 return "the controlled session is not powered on";
             case SessionCommandRejection::SessionAlreadyPowered:

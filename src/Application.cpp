@@ -164,7 +164,8 @@ class ApplicationImpl final {
             return true;
         }
 
-        if (m_simulation.stopJog(m_nextJogRequest++, *m_uiContinuousJog)) {
+        if (m_simulation.stopJog(
+                m_controlAuthority, m_nextJogRequest++, *m_uiContinuousJog)) {
             m_uiContinuousJog.reset();
             return true;
         }
@@ -222,6 +223,7 @@ class ApplicationImpl final {
     std::vector<ngc::JointConfiguration> m_joints;
     Worker m_worker;
     ngc::MachineSessionManager m_simulation;
+    ngc::MachineControlAuthority m_controlAuthority;
     ngc::operator_control::JogController m_operatorJogController;
     ngc::operator_control::TouchOffController m_pendantTouchOffController;
     std::unique_ptr<ngc::pendant::vista_cnc_p2s::Manager> m_pendantManager;
@@ -490,6 +492,7 @@ public:
           m_pendantTouchOffController(configuration),
           m_simulatedRapidSpeed(configuration.trajectory.rapidSpeed),
           m_pathJerk(configuration.trajectory.pathJerk) {
+        m_controlAuthority = m_simulation.state().authority;
         if (!m_simulation.setSplineFitSolver(splineFitSolver)) {
             PANIC("new simulation worker rejected its spline smoothing mode");
         }
@@ -517,10 +520,10 @@ public:
                   !loadedTools) {
             m_errorMessage = loadedTools.error();
         } else if (!m_worker.setToolTable(m_tools)
-                  || !m_simulation.setToolTable(m_tools)) {
+                  || !m_simulation.setToolTable(m_controlAuthority, m_tools)) {
             m_errorMessage = "Simulation tool table was loaded, but could not be applied";
         } else if (auto configured = m_simulation.setToolTableStorePath(
-                      m_toolTableStores.simulation);
+                      m_controlAuthority, m_toolTableStores.simulation);
                   !configured) {
             m_errorMessage = configured.error();
         } else {
@@ -536,7 +539,7 @@ public:
                 m_parameterStores.simulation.string(), parameterStoreError.message());
         } else if (parameterStoreExists) {
             const auto loaded = m_simulation.loadPersistentParameters(
-                m_parameterStores.simulation);
+                m_controlAuthority, m_parameterStores.simulation);
             if (!loaded) {
                 m_errorMessage = loaded.error();
             } else {
@@ -544,7 +547,7 @@ public:
             }
         } else {
             const auto configured = m_simulation.setPersistentParameterStorePath(
-                m_parameterStores.simulation);
+                m_controlAuthority, m_parameterStores.simulation);
             if (!configured) {
                 m_errorMessage = configured.error();
             } else {
@@ -601,7 +604,7 @@ public:
         m_simulation.join();
         if (m_simulationParameterStoreReady) {
             const auto parametersSaved = m_simulation.savePersistentParameters(
-                m_parameterStores.simulation);
+                m_controlAuthority, m_parameterStores.simulation);
             if (!parametersSaved) {
                 m_errorMessage = parametersSaved.error();
                 std::println(stderr, "Failed to save Simulation parameters: {}", parametersSaved.error());
@@ -609,7 +612,7 @@ public:
         }
         if (m_simulationToolTableStoreReady) {
             const auto toolsSaved = m_simulation.saveToolTable(
-                m_toolTableStores.simulation);
+                m_controlAuthority, m_toolTableStores.simulation);
             if (!toolsSaved) {
                 m_errorMessage = toolsSaved.error();
                 std::println(stderr, "Failed to save Simulation tool table: {}", toolsSaved.error());
@@ -650,15 +653,16 @@ public:
         }
 
         const auto previousTools = m_simulation.toolTable();
-        if (!m_simulation.setToolTable(tools)) {
+        if (!m_simulation.setToolTable(m_controlAuthority, tools)) {
             m_errorMessage = "tool table cannot be saved while Simulation is busy";
             return;
         }
 
-        auto result = m_simulation.saveToolTable(m_toolTableStores.simulation);
+        auto result = m_simulation.saveToolTable(
+            m_controlAuthority, m_toolTableStores.simulation);
 
         if(!result) {
-            if (m_simulation.setToolTable(previousTools)) {
+            if (m_simulation.setToolTable(m_controlAuthority, previousTools)) {
                 m_errorMessage = result.error();
             } else {
                 m_errorMessage = std::format(
@@ -685,7 +689,7 @@ public:
             return;
         }
 
-        if (!m_simulation.setToolTable(tools)) {
+        if (!m_simulation.setToolTable(m_controlAuthority, tools)) {
             m_errorMessage = "tool table cannot be reloaded while Simulation is busy";
             return;
         }
@@ -1920,6 +1924,7 @@ public:
                             "{} control selection was rejected because {}.",
                             name, result.error());
                     } else {
+                        m_controlAuthority = *result;
                         m_errorMessage.clear();
                     }
                 }
@@ -1999,7 +2004,8 @@ public:
         ImGui::BeginDisabled(!powerAvailable);
         if (ImGui::Button(powerLabel)) {
             const auto result = powerOn
-                ? m_simulation.powerOn() : m_simulation.powerOff();
+                ? m_simulation.powerOn(m_controlAuthority)
+                : m_simulation.powerOff(m_controlAuthority);
             if (!result) {
                 reportRejectedSessionAction(
                     powerOn ? "Simulation power on" : "Simulation power off", result);
@@ -2023,7 +2029,8 @@ public:
         if(ImGui::Button("Start")) {
             m_simulation.setTickMultiplier(m_simulationTickMultiplier);
             m_simulation.setRapidSpeed(m_simulatedRapidSpeed);
-            const auto result = m_simulation.start(m_programSource, m_tools, true);
+            const auto result = m_simulation.start(
+                m_controlAuthority, m_programSource, m_tools, true);
             if (result) {
                 m_programPaneMode = ProgramPaneMode::Compiled;
                 m_errorMessage.clear();
@@ -2045,7 +2052,8 @@ public:
                 ? "Holding..." : "Feed Hold";
         ImGui::BeginDisabled(!feedControlAvailable);
         if(ImGui::Button(feedControlLabel)) {
-            const auto result = resume ? m_simulation.resume() : m_simulation.feedHold();
+            const auto result = resume ? m_simulation.resume(m_controlAuthority)
+                : m_simulation.feedHold(m_controlAuthority);
             if (!result) {
                 reportRejectedSessionAction(resume ? "Resume" : "Feed Hold", result);
             } else {
@@ -2058,7 +2066,7 @@ public:
         ImGui::SameLine();
         ImGui::BeginDisabled(!controls.canStop);
         if(ImGui::Button("Stop")) {
-            const auto result = m_simulation.stop();
+            const auto result = m_simulation.stop(m_controlAuthority);
             if (!result) {
                 reportRejectedSessionAction("Stop", result);
             } else {
@@ -2072,7 +2080,7 @@ public:
         ImGui::BeginDisabled(!controls.canHome);
         if(ImGui::Button("Home")) {
             m_simulation.setTickMultiplier(m_simulationTickMultiplier);
-            const auto result = m_simulation.home();
+            const auto result = m_simulation.home(m_controlAuthority);
             if (!result) {
                 reportRejectedSessionAction("Homing", result);
             } else {
@@ -2208,7 +2216,8 @@ public:
 
         m_simulation.setTickMultiplier(m_simulationTickMultiplier);
         m_simulation.setRapidSpeed(m_simulatedRapidSpeed);
-        const auto result = m_simulation.start(programs, m_tools, true);
+        const auto result = m_simulation.start(
+            m_controlAuthority, programs, m_tools, true);
         if(!result) {
             m_mdiInput = std::move(m_mdiHistory.back());
             m_mdiHistory.pop_back();
@@ -2426,7 +2435,8 @@ public:
                         .limits = limits, .stopLimits = stopLimits,
                         .travel = travel, .leaseTicks = leaseTicks,
                     };
-                    const auto result = m_simulation.startJog(ngc::ControlRequest { request });
+                    const auto result = m_simulation.startJog(
+                        m_controlAuthority, ngc::ControlRequest { request });
                     if(result) {
                         m_uiContinuousJog = jog;
                         m_lastJogRenewal = m_time;
@@ -2435,7 +2445,8 @@ public:
                         reportRejectedSessionAction("Continuous jog", result);
                     }
                 } else if(m_time - m_lastJogRenewal >= 0.005) {
-                    if(m_simulation.renewJog(m_nextJogRequest++, *m_uiContinuousJog)) {
+                    if(m_simulation.renewJog(
+                            m_controlAuthority, m_nextJogRequest++, *m_uiContinuousJog)) {
                         m_lastJogRenewal = m_time;
                     } else {
                         m_errorMessage =
@@ -2449,7 +2460,8 @@ public:
                     .velocity = limits.velocity * m_jogSpeedPercent / 100.0,
                     .limits = limits, .stopLimits = stopLimits, .travel = travel,
                 };
-                const auto result = m_simulation.startJog(ngc::ControlRequest { request });
+                const auto result = m_simulation.startJog(
+                    m_controlAuthority, ngc::ControlRequest { request });
                 if (!result) {
                     reportRejectedSessionAction("Incremental jog", result);
                 } else {
@@ -2547,7 +2559,7 @@ public:
             if(m_uiContinuousJog) {
                 requestContinuousJogStop("Stop motion", simulation);
             } else {
-                const auto result = m_simulation.stop();
+                const auto result = m_simulation.stop(m_controlAuthority);
                 if (!result) {
                     reportRejectedSessionAction("Stop motion", result);
                 } else {
@@ -2902,6 +2914,8 @@ public:
             m_previewAfterCompile = false;
         }
 
+        const auto managerState = m_simulation.state();
+        m_controlAuthority = managerState.authority;
         auto simulation = m_simulation.snapshot();
         processPendant(simulation);
         simulation = m_simulation.snapshot();
@@ -2926,7 +2940,7 @@ public:
             contentBottom,
         };
 
-        renderToolbar(viewport, simulation, m_simulation.state());
+        renderToolbar(viewport, simulation, managerState);
         renderProgramPane(viewport, simulation, contentBottom);
         if(m_showJogPane) renderJogPane(viewport, simulation, contentBottom);
         else if(m_uiContinuousJog) {
@@ -2977,13 +2991,16 @@ public:
                 if constexpr(std::same_as<T, ngc::StartIncrementalJogRequest>
                              || std::same_as<T, ngc::StartContinuousJogRequest>)
                     return static_cast<bool>(
-                        m_simulation.startJog(ngc::ControlRequest { request }));
+                        m_simulation.startJog(
+                            m_controlAuthority, ngc::ControlRequest { request }));
                 else if constexpr(std::same_as<T, ngc::SetContinuousJogVelocityRequest>)
-                    return m_simulation.setJogVelocity(request);
+                    return m_simulation.setJogVelocity(m_controlAuthority, request);
                 else if constexpr(std::same_as<T, ngc::RenewJogLeaseRequest>)
-                    return m_simulation.renewJog(request.id, request.jog);
+                    return m_simulation.renewJog(
+                        m_controlAuthority, request.id, request.jog);
                 else
-                    return m_simulation.stopJog(request.id, request.jog);
+                    return m_simulation.stopJog(
+                        m_controlAuthority, request.id, request.jog);
             }, *action);
             m_operatorJogController.submitted(*action, accepted);
         }
@@ -2993,7 +3010,7 @@ public:
             m_errorMessage = std::format("VistaCNC P2-S pendant: {}", *error);
         if(const auto commit = m_pendantTouchOffController.takeCommit()) {
             if(auto applied = m_simulation.setActiveWorkCoordinate(
-                    machineAxis(commit->axis), commit->workPosition); !applied)
+                    m_controlAuthority, machineAxis(commit->axis), commit->workPosition); !applied)
                 m_errorMessage = std::format(
                     "VistaCNC P2-S touch-off was not applied: {}", applied.error());
         }

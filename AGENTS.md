@@ -78,7 +78,10 @@ held, stopped, completed, or failed outcomes. It admits and dispatches queued
 program, MDI, homing, and
 jogging starts, validates their activity ownership, and releases Program/MDI
 activity when the execution epoch finishes. `MachineSessionManager` queues
-starts, feed hold, Resume, and Stop through that boundary. `MachineSession`
+starts, feed hold, Resume, and Stop through that boundary. Every target-dependent
+manager operation requires the current generation-tagged
+`MachineControlAuthority`; stale or wrong-target commands are rejected under
+the same manager lock used for admission. `MachineSession`
 owns homing and jogging runtime-service callback
 construction plus thread-safe live service observations. `BackendRuntime`
 provides the NRT service mechanics used by those controllers;

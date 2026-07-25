@@ -302,9 +302,12 @@ Simulation/Real selector and simultaneous session rows. Simulation is identified
 as the current control owner, while Real remains visible and disabled with a
 precise unavailable explanation. The manager already exposes generation-tagged
 Simulation authority and rejects unavailable Real selection without advancing
-that authority. Concurrent Real ownership, a live Real snapshot, command routing
-between sessions, and the Real-to-Simulation checkpoint remain coupled to the
-corresponding Real-session manager work.
+that authority. The GUI now tags every target-dependent motion and
+controller-data operation with its current authority, and the manager rejects a
+stale generation or wrong target before admission. Concurrent Real ownership, a
+live Real snapshot, command routing between sessions, and the
+Real-to-Simulation checkpoint remain coupled to the corresponding Real-session
+manager work.
 
 Implement this phase with the corresponding Real-session manager work.
 
@@ -313,7 +316,8 @@ Implement this phase with the corresponding Real-session manager work.
 - Display both sessions when Real remains powered while Simulation owns
   control.
 - Tag GUI commands with current control authority where required so stale
-  commands cannot reach a newly selected target.
+  commands cannot reach a newly selected target. Complete for the standalone
+  Simulation manager boundary.
 - Keep inactive Real safety, communication, E-stop, and fault state visible.
 - Add the explicit **Simulate from Real** checkpoint operation only after its
   quiescence and validation contract exists.
@@ -356,7 +360,8 @@ Add focused tests for:
 - Preview/session state separation;
 - tool-table ownership and edit inhibition;
 - unavailable Real selection;
-- stale control-authority rejection when multi-session control is implemented.
+- stale control-authority rejection at the standalone manager boundary and
+  across an actual target transfer when multi-session control is implemented.
 
 Retain manual GUI checks for layout, legibility, tooltip clarity, resizing, and
 fault prominence.

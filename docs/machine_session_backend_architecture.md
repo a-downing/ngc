@@ -792,8 +792,11 @@ Status: in progress. Standalone Simulation is application-owned through
 `MachineSessionManager`; the former `SimulationWorker` facade is removed. The
 manager exposes the available targets and generation-tagged Simulation control
 authority, and rejects selection of an unavailable Real target without
-advancing that authority. Optional concurrent Real ownership, dual-session
-snapshots, inactive-Real draining, and control transfer remain future work.
+advancing that authority. Every target-dependent manager operation validates
+that authority under its admission lock, and stale or wrong-target operations
+are rejected before changing session state or queued commands. Optional
+concurrent Real ownership, dual-session snapshots, inactive-Real draining, and
+control transfer remain future work.
 
 - Support standalone Simulation with no `[real_run]` configuration.
 - Support optional Real and Simulation sessions concurrently.

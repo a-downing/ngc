@@ -3,6 +3,7 @@
 namespace ngc {
     enum class SessionCommandRejection {
         None,
+        StaleControlAuthority,
         SessionNotPowered,
         SessionAlreadyPowered,
         SessionAlreadyOff,

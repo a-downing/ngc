@@ -603,6 +603,7 @@ int main(const int argc, char **argv) {
     }
 
     ngc::MachineSessionManager worker(*configuration);
+    const auto authority = worker.state().authority;
     worker.setTickMultiplier(multiplier);
     if(!worker.setSplineFitSolver(smoother)) {
         std::println(stderr,"simulation worker rejected the smoother selection");
@@ -653,11 +654,11 @@ int main(const int argc, char **argv) {
             return 1;
         }
     }
-    if (!worker.powerOn()) {
+    if (!worker.powerOn(authority)) {
         std::println(stderr, "simulation worker failed to power on");
         return 1;
     }
-    if(!worker.start(programs,tools,true)) {
+    if(!worker.start(authority,programs,tools,true)) {
         std::println(stderr,"simulation worker rejected the run");
         return 1;
     }
@@ -741,7 +742,7 @@ int main(const int argc, char **argv) {
             break;
         }
         if (snapshot.status == ngc::SimulationStatus::Paused) {
-            if (!worker.resume()) {
+            if (!worker.resume(authority)) {
                 std::println(stderr,
                     "diagnostic failed to resume paused program automatically");
                 break;
@@ -753,7 +754,7 @@ int main(const int argc, char **argv) {
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
-    worker.stop();
+    worker.stop(authority);
     worker.join();
     const auto finalSnapshot=worker.snapshot();
     const auto geometrySeconds=finalSnapshot.geometryStream.preparationSeconds;
