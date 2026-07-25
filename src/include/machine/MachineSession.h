@@ -23,6 +23,7 @@
 #include "machine/MotionBackend.h"
 #include "machine/PreparedTrajectoryExecutionDriver.h"
 #include "machine/PresentationTracker.h"
+#include "machine/ProgramExecutionController.h"
 #include "machine/ToolTable.h"
 
 namespace ngc {
@@ -174,6 +175,45 @@ namespace ngc {
         void requestGeometryStop();
         [[nodiscard]] bool executionEpochActive() const noexcept;
         [[nodiscard]] GeometryEpoch nextEpoch() noexcept;
+        [[nodiscard]] bool applyProgramPresentationUpdate();
+        void completeProgramPresentation();
+
+        template<typename Observe>
+        void serviceProgramBackend(Observe &&observe) {
+            m_driver.serviceBackend([&](const ExecutionEvent &event) {
+                m_programExecution.observeBackendEvent(event);
+                if (const auto *accepted = std::get_if<ChunkAccepted>(&event)) {
+                    m_presentationTracker.observeChunkAccepted(*accepted);
+                } else if (const auto *marker = std::get_if<ExecutionMarkerReached>(&event)) {
+                    m_presentationTracker.observeMarkerReached(*marker);
+                } else if (const auto *retired = std::get_if<ChunkRetired>(&event)) {
+                    m_presentationTracker.observeChunkRetired(*retired);
+                }
+                observe(event);
+            });
+        }
+
+        template<typename WithPresentationLock, typename ObserveCommand, typename ObserveStatus>
+        bool pumpProgramOne(WithPresentationLock &&withPresentationLock,
+                            ObserveCommand &&observeCommand, ObserveStatus &&observeStatus) {
+            return m_driver.pumpOne(
+                [&](const MachineCommand &command, const ExecutionItem &item,
+                    const TrajectoryPlanningMetadata &,
+                    const TrajectoryCommandPresentation &presentation,
+                    const ExecutionMarkerId activationMarker) {
+                    withPresentationLock([&] {
+                        observeCommand(command, item, presentation, activationMarker);
+                        m_presentationTracker.observeCommand(
+                            command, item, presentation, activationMarker);
+                    });
+                },
+                [&](const InterpreterBlockLifecycle &lifecycle) {
+                    withPresentationLock([&] {
+                        m_presentationTracker.observeLifecycle(lifecycle);
+                    });
+                },
+                std::forward<ObserveStatus>(observeStatus));
+        }
 
         template<typename Self> auto &interpreter(this Self &&self) {
             return std::forward<Self>(self).m_interpreter;
@@ -183,6 +223,9 @@ namespace ngc {
         }
         template<typename Self> auto &presentationTracker(this Self &&self) {
             return std::forward<Self>(self).m_presentationTracker;
+        }
+        template<typename Self> auto &programExecution(this Self &&self) {
+            return std::forward<Self>(self).m_programExecution;
         }
         template<typename Self> auto &coordinator(this Self &&self) {
             return std::forward<Self>(self).m_coordinator;
@@ -203,10 +246,11 @@ namespace ngc {
         MotionBackend &m_backend;
         PreparedTrajectoryExecutionDriver m_driver;
         PresentationTracker m_presentationTracker;
+        ExecutionCoordinator m_coordinator;
+        ProgramExecutionController m_programExecution;
         std::unique_ptr<HomingController> m_homingController;
         std::unique_ptr<JoggingController> m_joggingController;
         JointMask m_homedJoints = 0;
-        ExecutionCoordinator m_coordinator;
         TrajectoryLimits m_limits;
         GeometryEpoch m_nextEpoch = 1;
     };

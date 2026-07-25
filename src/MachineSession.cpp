@@ -129,6 +129,7 @@ namespace ngc {
           m_geometryPolicy(std::move(geometryPolicy)),
           m_backend(backend),
           m_driver(backend, m_geometryForward, m_geometryFeedback, m_geometryCancelled, limits),
+          m_programExecution(backend, m_driver, m_coordinator.commands()),
           m_limits(limits) { }
 
     MachineSession::~MachineSession() {
@@ -183,6 +184,7 @@ namespace ngc {
 
             return std::unexpected("motion backend control channel is full");
         }
+        m_programExecution.begin(epoch);
 
         m_geometryProducer = std::make_unique<GeometryStreamProducer>(
             m_interpreter, m_geometryForward, m_geometryFeedback, m_geometryCancelled,
@@ -208,6 +210,7 @@ namespace ngc {
             diagnostics = m_geometryProducer->diagnostics();
         }
         m_geometryProducer.reset();
+        m_programExecution.finish();
         PreparedForwardMessage forward;
         while (m_geometryForward.tryPop(forward)) { }
         PreparedFeedbackMessage feedback;
@@ -314,6 +317,20 @@ namespace ngc {
 
     GeometryEpoch MachineSession::nextEpoch() noexcept {
         return m_nextEpoch++;
+    }
+
+    bool MachineSession::applyProgramPresentationUpdate() {
+        auto presentation = m_driver.takePresentationUpdate();
+        if (!presentation) {
+            return false;
+        }
+        m_presentationTracker.setActivePresentation(*presentation);
+
+        return true;
+    }
+
+    void MachineSession::completeProgramPresentation() {
+        m_presentationTracker.completeDeferredBlocks();
     }
 
     const GeometryStreamProducer *MachineSession::geometryProducer() const noexcept {

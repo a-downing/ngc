@@ -57,27 +57,12 @@ class SimulationWorker {
     std::uint64_t m_toolTableRevision = 0;
     bool m_join = false;
     bool m_stop = false;
-    bool m_controlledStopInProgress = false;
-    bool m_controlledStopCompleted = false;
-    std::optional<ngc::position_t> m_controlledStopPosition;
-    bool m_paused = false;
-    bool m_programPaused = false;
-    bool m_programResumeRequested = false;
     bool m_running = false;
     bool m_programRunning = false;
-    bool m_feedHoldRequested = false;
-    bool m_feedHoldInProgress = false;
-    bool m_feedHoldHeld = false;
-    bool m_feedResumeRequested = false;
-    bool m_feedResumeInProgress = false;
-    std::optional<ngc::RequestId> m_pendingFeedHoldRequest;
-    std::optional<ngc::RequestId> m_pendingFeedResumeRequest;
-    std::optional<ngc::RequestId> m_pendingControlledStopRequest;
     std::optional<ngc::JogId> m_activeJog;
     std::vector<ngc::AxisConfiguration> m_axes;
     std::vector<ngc::JointConfiguration> m_joints;
     std::uint32_t m_tickMultiplier = 1;
-    ngc::RequestId m_nextFeedHoldRequest = ngc::RequestId { 1 } << 63;
 
     class ActivityCompletion {
     public:
@@ -168,20 +153,6 @@ public:
             return false;
         }
         m_stop = false;
-        m_controlledStopInProgress = false;
-        m_controlledStopCompleted = false;
-        m_controlledStopPosition.reset();
-        m_paused = false;
-        m_programPaused = false;
-        m_programResumeRequested = false;
-        m_feedHoldRequested = false;
-        m_feedHoldInProgress = false;
-        m_feedHoldHeld = false;
-        m_feedResumeRequested = false;
-        m_feedResumeInProgress = false;
-        m_pendingFeedHoldRequest.reset();
-        m_pendingFeedResumeRequest.reset();
-        m_pendingControlledStopRequest.reset();
         m_snapshot.status = ngc::SimulationStatus::Running;
         m_snapshot.activity = ngc::SimulationActivity::Program;
         m_snapshot.operatorAlert.reset();
@@ -215,11 +186,6 @@ public:
             return false;
         }
         m_stop = false;
-        m_controlledStopInProgress = false;
-        m_controlledStopCompleted = false;
-        m_controlledStopPosition.reset();
-        m_pendingControlledStopRequest.reset();
-        m_paused = false;
         m_snapshot.status = ngc::SimulationStatus::Running;
         m_snapshot.activity = ngc::SimulationActivity::Homing;
         m_snapshot.error.clear();
@@ -251,10 +217,6 @@ public:
             return false;
         }
         m_stop = false;
-        m_controlledStopInProgress = false;
-        m_controlledStopCompleted = false;
-        m_controlledStopPosition.reset();
-        m_pendingControlledStopRequest.reset();
         m_activeJog = *jog;
         m_snapshot.status = ngc::SimulationStatus::Running;
         m_snapshot.activity = ngc::SimulationActivity::Jogging;
@@ -338,8 +300,9 @@ public:
 
     bool feedHold() {
         std::scoped_lock lock(m_mutex);
-        if(!m_running || !m_programRunning || m_paused || m_feedHoldRequested
-           || m_feedHoldInProgress || m_feedHoldHeld || m_feedResumeInProgress
+        const auto &control = m_machineSession.programExecution();
+        if (!m_running || !m_programRunning || control.paused()
+           || control.feedHoldInProgress() || control.feedResumeInProgress()
            || m_machineSession.coordinator().commands().contains<ngc::FeedHold>()) return false;
         if (!m_machineSession.coordinator().commands().tryPush(ngc::FeedHold {})) return false;
         m_snapshot.status = ngc::SimulationStatus::Holding;
@@ -348,21 +311,19 @@ public:
     }
     bool resume() {
         std::scoped_lock lock(m_mutex);
-        if (!m_running || !m_programRunning || !m_paused) {
+        const auto &control = m_machineSession.programExecution();
+        if (!m_running || !m_programRunning || !control.paused()) {
             return false;
         }
         if (m_machineSession.coordinator().commands().contains<ngc::Resume>()) {
             return false;
         }
-        if (m_programPaused) {
+        if (control.programPaused()) {
             if (!m_machineSession.coordinator().commands().tryPush(ngc::Resume {})) return false;
             m_snapshot.status = ngc::SimulationStatus::Running;
             m_snapshot.operatorAlert.reset();
             m_cv.notify_all();
             return true;
-        }
-        if (!m_feedHoldHeld || m_feedResumeRequested || m_feedResumeInProgress) {
-            return false;
         }
         if (!m_machineSession.coordinator().commands().tryPush(ngc::Resume {})) return false;
         m_snapshot.status = ngc::SimulationStatus::Running;
@@ -430,7 +391,8 @@ public:
                 applyBackendObservation(result, *backend);
             }
         }
-        if (result.status == ngc::SimulationStatus::Paused && !m_programPaused
+        if (result.status == ngc::SimulationStatus::Paused
+            && !m_machineSession.programExecution().programPaused()
             && result.trajectoryBackendState != ngc::BackendState::Held) {
             result.status = ngc::SimulationStatus::Holding;
         }
@@ -455,7 +417,7 @@ public:
             result.machineActivity = ngc::MachineActivity::Faulted;
         } else if (result.status == ngc::SimulationStatus::Holding
                    || (result.status == ngc::SimulationStatus::Paused
-                       && !m_programPaused)) {
+                       && !m_machineSession.programExecution().programPaused())) {
             result.machineActivity = ngc::MachineActivity::Holding;
         } else {
             result.machineActivity = m_machineSession.coordinator().activity();
@@ -687,85 +649,26 @@ private:
         m_machineSession.presentationTracker().clearTracking();
     }
 
-    void observeLifecycle(const ngc::InterpreterBlockLifecycle &lifecycle) {
-        m_machineSession.presentationTracker().observeLifecycle(lifecycle);
-    }
-
     void observeCommand(const ngc::MachineCommand &command, const ngc::ExecutionItem &item,
                         const ngc::TrajectoryCommandPresentation &captured,
-                        const ngc::ExecutionMarkerId activationMarker) {
+                        const ngc::ExecutionMarkerId) {
         if(std::holds_alternative<ngc::ProbeMove>(command)) {
             const auto &move = std::get<ngc::TriggeredMove>(item);
             const auto contact = move.target + captured.tool.offset
                 - captured.activeToolOffset;
             (void)m_runtime.configureSyntheticInput(move.moveId, contact);
         }
-        m_machineSession.presentationTracker().observeCommand(
-            command, item, captured, activationMarker);
     }
 
     void observeBackendEvent(const ngc::ExecutionEvent &event) {
-        if(const auto *accepted = std::get_if<ngc::ChunkAccepted>(&event)) {
-            m_machineSession.presentationTracker().observeChunkAccepted(*accepted);
-        } else if (const auto *marker =
-                       std::get_if<ngc::ExecutionMarkerReached>(&event)) {
-            m_machineSession.presentationTracker().observeMarkerReached(*marker);
-        } else if(std::holds_alternative<ngc::TriggeredMoveCompleted>(event)) {
-            if(m_feedHoldInProgress) {
-                m_pendingFeedHoldRequest.reset();
-                m_feedHoldInProgress = false;
-                m_feedHoldHeld = false;
-                m_paused = false;
-                m_snapshot.status = ngc::SimulationStatus::Running;
-            }
-        } else if(const auto *retired = std::get_if<ngc::ChunkRetired>(&event)) {
-            m_machineSession.presentationTracker().observeChunkRetired(*retired);
-        } else if(const auto *held = std::get_if<ngc::BackendHeld>(&event)) {
+        if (const auto *held = std::get_if<ngc::BackendHeld>(&event)) {
             if(held->reason == ngc::BackendHoldReason::FeedHold) {
-                m_pendingFeedHoldRequest.reset();
-                m_feedHoldInProgress = false;
-                m_feedHoldHeld = true;
-                m_paused = true;
                 m_snapshot.status = ngc::SimulationStatus::Paused;
             } else if (held->reason == ngc::BackendHoldReason::ControlledStop) {
-                m_pendingControlledStopRequest.reset();
-                m_controlledStopInProgress = false;
-                m_controlledStopCompleted = true;
                 m_snapshot.machinePosition = held->state.position;
-                m_controlledStopPosition = held->state.position;
                 m_snapshot.trajectoryBackendVelocity = 0.0;
                 m_snapshot.trajectoryBackendAcceleration = 0.0;
                 m_snapshot.hasActiveMotion = false;
-            }
-        } else if(const auto *completed = std::get_if<ngc::RequestCompleted>(&event)) {
-            if(m_pendingFeedHoldRequest && completed->request == *m_pendingFeedHoldRequest
-               && !completed->succeeded) {
-                m_pendingFeedHoldRequest.reset();
-                m_feedHoldInProgress = false;
-                m_snapshot.status = ngc::SimulationStatus::Running;
-            } else if(m_pendingFeedResumeRequest
-                      && completed->request == *m_pendingFeedResumeRequest) {
-                m_pendingFeedResumeRequest.reset();
-                if(completed->succeeded) {
-                    m_feedHoldHeld = false;
-                    m_snapshot.status = ngc::SimulationStatus::Running;
-                } else {
-                    m_feedResumeInProgress = false;
-                    m_snapshot.status = ngc::SimulationStatus::Error;
-                    m_snapshot.error = "motion backend rejected the feed-resume request";
-                    m_running = false;
-                    m_programRunning = false;
-                }
-            } else if(m_pendingControlledStopRequest
-                      && completed->request == *m_pendingControlledStopRequest
-                      && !completed->succeeded) {
-                m_pendingControlledStopRequest.reset();
-                m_controlledStopInProgress = false;
-                m_snapshot.status = ngc::SimulationStatus::Error;
-                m_snapshot.error =
-                    "motion backend rejected the controlled-stop request";
-                m_running = false;
-                m_programRunning = false;
             }
         }
     }
@@ -818,16 +721,12 @@ private:
     }
 
     void applyBackendSnapshot(const ngc::ExecutionSnapshot &backend) {
-        if (m_controlledStopCompleted
+        if (m_machineSession.programExecution().state()
+                == ngc::ProgramExecutionState::StopComplete
             && backend.state != ngc::BackendState::Held) {
             return;
         }
         applyBackendObservation(m_snapshot, backend);
-        if(m_feedResumeInProgress && backend.state == ngc::BackendState::Running
-           && backend.executionRate >= 1.0 - 1e-10
-           && std::abs(backend.executionRateAcceleration) <= 1e-10) {
-            m_feedResumeInProgress = false;
-        }
     }
 
     void applyLatestTimedBackendSnapshot() {
@@ -1190,75 +1089,38 @@ private:
             for(;;) {
                 lock.lock();
                 applyLatestTimedBackendSnapshot();
-                while (auto command = m_machineSession.coordinator().commands().tryPop()) {
-                    if (std::holds_alternative<ngc::Stop>(*command)) {
-                        m_stop = true;
-                        m_feedHoldRequested = false;
-                        m_feedResumeRequested = false;
-                        m_programResumeRequested = false;
-                        m_snapshot.status = ngc::SimulationStatus::Holding;
-                    } else if (std::holds_alternative<ngc::FeedHold>(*command)) {
-                        m_feedHoldRequested = true;
-                        m_feedHoldInProgress = true;
-                    } else if (std::holds_alternative<ngc::Resume>(*command)) {
-                        if (m_programPaused) {
-                            m_programResumeRequested = true;
-                            m_paused = false;
-                        } else if (m_feedHoldHeld) {
-                            m_feedResumeRequested = true;
-                            m_feedResumeInProgress = true;
-                            m_paused = false;
-                        }
-                    }
+                auto backendObservation = latestTimedBackendSnapshot().value_or(
+                    ngc::ExecutionSnapshot {});
+                if (backendObservation.epoch == 0) {
+                    backendObservation.epoch = epoch;
+                    backendObservation.state = m_snapshot.trajectoryBackendState;
+                    backendObservation.commanded.position = m_snapshot.machinePosition;
                 }
-                if (m_join) {
-                    m_stop = true;
-                }
-                if (m_stop && !m_controlledStopInProgress
-                    && !m_controlledStopCompleted && !m_feedHoldInProgress) {
-                    const auto alreadyStationary =
-                        m_snapshot.trajectoryBackendState == ngc::BackendState::Held
-                        && m_snapshot.trajectoryBackendVelocity <= 1e-10
-                        && m_snapshot.trajectoryBackendAcceleration <= 1e-10;
-                    if (m_programPaused || alreadyStationary) {
-                        m_controlledStopCompleted = true;
-                        m_controlledStopPosition = m_snapshot.machinePosition;
-                    } else {
-                        const auto request = m_nextFeedHoldRequest++;
-                        if (m_runtime.endpoint().trySubmit(
-                                ngc::ControlledStopRequest { request })
-                                != ngc::SubmitResult::Submitted) {
-                            m_snapshot.status = ngc::SimulationStatus::Error;
-                            m_snapshot.error =
-                                "motion backend control channel is full while requesting stop";
-                            m_running = false;
-                            m_programRunning = false;
-                        } else {
-                            m_pendingControlledStopRequest = request;
-                            m_controlledStopInProgress = true;
-                        }
-                    }
-                }
-                if(m_controlledStopCompleted) {
-                    const auto joining = m_join;
-                    m_stop = false;
-                    m_controlledStopCompleted = false;
+                auto &programControl = m_machineSession.programExecution();
+                programControl.service(backendObservation, m_join);
+                if (programControl.state() == ngc::ProgramExecutionState::Error) {
+                    m_snapshot.status = ngc::SimulationStatus::Error;
+                    m_snapshot.activity = ngc::SimulationActivity::Idle;
+                    m_snapshot.error = programControl.error().value_or(
+                        "machine-session program execution failed");
                     m_running = false;
                     m_programRunning = false;
-                    m_paused = false;
-                    m_programPaused = false;
-                    m_feedHoldInProgress = false;
-                    m_feedHoldHeld = false;
-                    m_feedResumeInProgress = false;
+                }
+                if (programControl.state() == ngc::ProgramExecutionState::StopComplete) {
+                    const auto joining = m_join;
+                    const auto controlledStopPosition = programControl.stoppedPosition();
+                    m_stop = false;
+                    m_running = false;
+                    m_programRunning = false;
                     m_snapshot.status = ngc::SimulationStatus::Holding;
                     copyTimingSnapshot();
                     lock.unlock();
                     m_runtime.endTimedExecution();
                     stopTimedSnapshotService();
                     joinGeometry();
-                    if (m_controlledStopPosition) {
+                    if (controlledStopPosition) {
                         m_machineSession.interpreter().machine().synchronizePosition(
-                            *m_controlledStopPosition);
+                            *controlledStopPosition);
                     }
                     m_machineSession.interpreter().stop();
                     {
@@ -1272,58 +1134,27 @@ private:
                             m_snapshot.activity = ngc::SimulationActivity::Idle;
                         }
                     }
-                    if(joining) return;
+                    if (joining) {
+                        return;
+                    }
                     break;
                 }
-                if (m_programResumeRequested) {
-                    m_programResumeRequested = false;
-                    if (!m_machineSession.driver().resumeProgram()) {
-                        m_snapshot.status = ngc::SimulationStatus::Error;
-                        m_snapshot.error =
-                            "prepared trajectory driver rejected the M0 program resume";
-                        m_running = false;
-                        m_programRunning = false;
-                    } else {
-                        m_programPaused = false;
-                    }
-                }
-                if(m_feedHoldRequested) {
-                    m_feedHoldRequested = false;
-                    const auto request = m_nextFeedHoldRequest++;
-                    if (m_runtime.endpoint().trySubmit(ngc::FeedHoldRequest { request })
-                            != ngc::SubmitResult::Submitted) {
-                        m_snapshot.status = ngc::SimulationStatus::Error;
-                        m_snapshot.error = "motion backend control channel is full while requesting feed hold";
-                        m_running = false;
-                        m_programRunning = false;
-                    } else m_pendingFeedHoldRequest = request;
-                }
-                if(m_feedResumeRequested) {
-                    m_feedResumeRequested = false;
-                    const auto request = m_nextFeedHoldRequest++;
-                    if (m_runtime.endpoint().trySubmit(
-                            ngc::ResumeRequest { request, epoch })
-                            != ngc::SubmitResult::Submitted) {
-                        m_snapshot.status = ngc::SimulationStatus::Error;
-                        m_snapshot.error = "motion backend control channel is full while resuming feed";
-                        m_running = false;
-                        m_programRunning = false;
-                    } else m_pendingFeedResumeRequest = request;
-                }
-                if(m_paused) {
+                if (programControl.paused()) {
                     m_snapshot.status = ngc::SimulationStatus::Paused;
                     copyTimingSnapshot();
                     m_runtime.releaseRefillOpportunity();
                     m_cv.wait(lock, [&] {
-                        return m_join || m_stop || !m_paused
+                        return m_join
                             || !m_machineSession.coordinator().commands().empty();
                     });
                     lock.unlock();
                     continue;
                 }
-                if(m_snapshot.status != ngc::SimulationStatus::Error)
-                    m_snapshot.status = (m_feedHoldInProgress || m_stop)
+                if (m_snapshot.status != ngc::SimulationStatus::Error) {
+                    m_snapshot.status =
+                        programControl.state() == ngc::ProgramExecutionState::Holding
                         ? ngc::SimulationStatus::Holding : ngc::SimulationStatus::Running;
+                }
                 struct NrtRefillGuard {
                     ngc::InProcessSimulationRuntime &runtime;
                     bool enabled = false;
@@ -1347,10 +1178,9 @@ private:
                     std::this_thread::yield();
                     continue;
                 }
-                m_machineSession.driver().serviceBackend([&](const auto &event) { observeBackendEvent(event); });
-                if (auto presentation = m_machineSession.driver().takePresentationUpdate()) {
-                    applyActivePresentation(*presentation);
-                }
+                m_machineSession.serviceProgramBackend(
+                    [&](const auto &event) { observeBackendEvent(event); });
+                (void)m_machineSession.applyProgramPresentationUpdate();
                 if (m_runtime.executorBatchActive()) {
                     copyTimingSnapshot();
                     lock.unlock();
@@ -1360,9 +1190,8 @@ private:
                 applyLatestTimedBackendSnapshot();
                 copyTimingSnapshot();
                 auto state = m_machineSession.driver().state();
+                programControl.observeDriverState();
                 if (state == ngc::PreparedDriverState::ProgramPaused) {
-                    m_programPaused = true;
-                    m_paused = true;
                     m_snapshot.status = ngc::SimulationStatus::Paused;
                 }
                 const auto pacingError = m_runtime.snapshot().pacingError;
@@ -1370,6 +1199,13 @@ private:
                     m_snapshot.status = ngc::SimulationStatus::Error;
                     m_snapshot.activity = ngc::SimulationActivity::Idle;
                     m_snapshot.error = "Windows servo pacer failed with error " + std::to_string(pacingError);
+                    m_running = false;
+                    m_programRunning = false;
+                } else if (programControl.state() == ngc::ProgramExecutionState::Error) {
+                    m_snapshot.status = ngc::SimulationStatus::Error;
+                    m_snapshot.activity = ngc::SimulationActivity::Idle;
+                    m_snapshot.error = programControl.error().value_or(
+                        "machine-session program execution failed");
                     m_running = false;
                     m_programRunning = false;
                 } else if(m_snapshot.status == ngc::SimulationStatus::Error) {
@@ -1381,7 +1217,7 @@ private:
                     m_snapshot.activity = ngc::SimulationActivity::Idle;
                     m_snapshot.error = *m_machineSession.driver().error(); m_running = false; m_programRunning = false;
                 } else if(state == ngc::PreparedDriverState::Completed) {
-                    m_machineSession.presentationTracker().completeDeferredBlocks();
+                    m_machineSession.completeProgramPresentation();
                 }
                 if ((state == ngc::PreparedDriverState::Completed
                      || state == ngc::PreparedDriverState::Error)
@@ -1423,17 +1259,16 @@ private:
                 bool filled = false;
                 for(int fill = 0; fill < 64; ++fill) {
                     lock.unlock();
-                    const auto pumped=m_machineSession.driver().pumpOne(
-                        [&](const auto &command, const auto &chunk, const auto &,
+                    const auto pumped = m_machineSession.pumpProgramOne(
+                        [&](auto &&updatePresentation) {
+                            std::scoped_lock presentationLock(m_mutex);
+                            updatePresentation();
+                        },
+                        [&](const auto &command, const auto &chunk,
                             const auto &presentation,
                             const ngc::ExecutionMarkerId activationMarker) {
-                            std::scoped_lock presentationLock(m_mutex);
                             observeCommand(command, chunk, presentation,
                                 activationMarker);
-                        },
-                        [&](const auto &lifecycle) {
-                            std::scoped_lock presentationLock(m_mutex);
-                            observeLifecycle(lifecycle);
                         },
                         [&](const auto &status) {
                             std::scoped_lock presentationLock(m_mutex);
@@ -1443,12 +1278,13 @@ private:
                             }
                         });
                     lock.lock();
-                    if (auto presentation = m_machineSession.driver().takePresentationUpdate()) {
-                        applyActivePresentation(*presentation);
-                    }
+                    (void)m_machineSession.applyProgramPresentationUpdate();
                     if(!pumped) break;
                     filled = true;
-                    if(m_join||m_stop||m_paused||!m_machineSession.coordinator().commands().empty()) break;
+                    if (m_join || programControl.stopRequested() || programControl.paused()
+                        || !m_machineSession.coordinator().commands().empty()) {
+                        break;
+                    }
                 }
                 m_snapshot.trajectoryPlanning = m_machineSession.driver().planningDiagnostics();
                 copyTimingSnapshot();
@@ -1458,6 +1294,7 @@ private:
                     && m_machineSession.driver().hasUnpublishedRollingContinuation()
                     && !m_machineSession.driver().hasPendingPublication());
                 state = m_machineSession.driver().state();
+                programControl.observeDriverState();
                 if(state == ngc::PreparedDriverState::Error) {
                     m_snapshot.status = ngc::SimulationStatus::Error;
                     m_snapshot.activity = ngc::SimulationActivity::Idle;
@@ -1465,8 +1302,6 @@ private:
                     m_running = false;
                     m_programRunning = false;
                 } else if (state == ngc::PreparedDriverState::ProgramPaused) {
-                    m_programPaused = true;
-                    m_paused = true;
                     m_snapshot.status = ngc::SimulationStatus::Paused;
                 }
                 if(!m_running) {
@@ -1492,7 +1327,7 @@ private:
                 m_cv.wait_for(lock,
                               std::chrono::duration<double>(m_runtime.servoPeriod()),
                               [&] {
-                                  return m_join || m_stop || m_paused
+                                  return m_join || programControl.paused()
                                       || !m_machineSession.coordinator().commands().empty();
                               });
                 lock.unlock();

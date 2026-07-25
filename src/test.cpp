@@ -586,11 +586,31 @@ final_move_together = true
         require(epoch.has_value(), epoch ? "" : epoch.error());
         require(session.executionEpochActive(),
                 "MachineSession should own the prepared-geometry producer epoch");
+        require(session.programExecution().active()
+                    && session.programExecution().state()
+                        == ngc::ProgramExecutionState::Running,
+                "MachineSession should own active Program/MDI execution control");
+        require(session.coordinator().commands().tryPush(ngc::Stop {}),
+                "the active session should accept a queued program Stop");
+        ngc::ExecutionSnapshot stationary;
+        stationary.epoch = *epoch;
+        stationary.state = ngc::BackendState::Held;
+        stationary.commanded.position.x = 0.25;
+        session.programExecution().service(stationary, false);
+        require(session.programExecution().state()
+                    == ngc::ProgramExecutionState::StopComplete
+                    && session.programExecution().stoppedPosition()
+                    && session.programExecution().stoppedPosition()->x == 0.25,
+                "session-owned Stop should complete immediately from a stationary backend state");
         require(session.coordinator().activity() == ngc::MachineActivity::Mdi,
                 "MachineSession should expose the active MDI operation");
         (void)session.finishExecutionEpoch();
         require(!session.executionEpochActive(),
                 "finishing an epoch should cancel and join prepared geometry");
+        require(!session.programExecution().active()
+                    && session.programExecution().state()
+                        == ngc::ProgramExecutionState::Inactive,
+                "finishing an epoch should retire session-owned program execution control");
         session.coordinator().finishActivity();
         require(session.coordinator().activity() == ngc::MachineActivity::Idle,
                 "completing operation coordination should return the session to idle");

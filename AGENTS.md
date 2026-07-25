@@ -66,7 +66,11 @@ activity state, `MachineSessionSnapshot`, optional Simulation diagnostics, and a
 bounded owning `SessionCommand` queue. `MachineSession` owns the interpreter,
 prepared-geometry producer thread and channels, trajectory driver, presentation
 tracker, execution-epoch counter, backend-neutral `HomingController`, homed-joint
-state, backend-neutral `JoggingController`, and `ExecutionCoordinator`. The
+state, backend-neutral `JoggingController`, `ExecutionCoordinator`, and
+backend-neutral `ProgramExecutionController`. The program controller owns
+queued Feed Hold, Resume, and Stop translation plus backend acknowledgement and
+held-state transitions; `MachineSession` routes timed backend events and
+presentation-aware driver pumping through it. The
 `SimulationWorker` compatibility facade queues program and homing starts,
 jogging controls, feed hold, Resume, and Stop through that boundary; it still
 owns the Simulation runtime servicing callbacks, persistence boundaries,

@@ -41,6 +41,7 @@ add_library(ngc_core STATIC
         src/JoggingController.cpp
         src/MachineSession.cpp
         src/MachineConfiguration.cpp
+        src/ProgramExecutionController.cpp
         src/PreparedGeometry.cpp
         src/SplineReconstruction.cpp
         src/TrajectoryCompiler.cpp
