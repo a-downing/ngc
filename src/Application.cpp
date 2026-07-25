@@ -158,6 +158,26 @@ class ApplicationImpl final {
             ngc::gui::sessionCommandRejectionReason(result.rejection));
     }
 
+    bool requestContinuousJogStop(const std::string_view action,
+                                  const ngc::SimulationSnapshot &simulation) {
+        if (!m_uiContinuousJog) {
+            return true;
+        }
+
+        if (m_simulation.stopJog(m_nextJogRequest++, *m_uiContinuousJog)) {
+            m_uiContinuousJog.reset();
+            return true;
+        }
+        if (!simulation.jogging) {
+            m_uiContinuousJog.reset();
+            return true;
+        }
+
+        m_errorMessage = std::format(
+            "{} was rejected because the jog stop request could not be queued.", action);
+        return false;
+    }
+
     enum class ProgramPaneMode { Edit, Compiled };
     ProgramPaneMode m_programPaneMode = ProgramPaneMode::Edit;
     bool m_programDirty = false;
@@ -637,8 +657,13 @@ public:
         auto result = tools.save(m_toolTableStores.simulation);
 
         if(!result) {
-            (void)m_simulation.setToolTable(previousTools);
-            m_errorMessage = result.error();
+            if (m_simulation.setToolTable(previousTools)) {
+                m_errorMessage = result.error();
+            } else {
+                m_errorMessage = std::format(
+                    "{}; restoring the prior Simulation tool table was also rejected",
+                    result.error());
+            }
             return;
         }
 
@@ -2350,8 +2375,12 @@ public:
                         reportRejectedSessionAction("Continuous jog", result);
                     }
                 } else if(m_time - m_lastJogRenewal >= 0.005) {
-                    if(m_simulation.renewJog(m_nextJogRequest++, *m_uiContinuousJog))
+                    if(m_simulation.renewJog(m_nextJogRequest++, *m_uiContinuousJog)) {
                         m_lastJogRenewal = m_time;
+                    } else {
+                        m_errorMessage =
+                            "Continuous jog renewal was rejected because the request could not be queued.";
+                    }
                 }
             } else if(!m_continuousJog && clicked && enabled && !otherMotion && !simulation.jogging) {
                 const ngc::StartIncrementalJogRequest request {
@@ -2433,8 +2462,7 @@ public:
         }
 
         if(m_uiContinuousJog && (!heldThisFrame || !m_continuousJog || !m_showJogPane)) {
-            (void)m_simulation.stopJog(m_nextJogRequest++, *m_uiContinuousJog);
-            m_uiContinuousJog.reset();
+            requestContinuousJogStop("Continuous jog stop", simulation);
         }
 
         ImGui::Separator();
@@ -2457,10 +2485,14 @@ public:
         ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.65f, 0.08f, 0.08f, 1.0f));
         if(ImGui::Button("STOP MOTION", { -FLT_MIN, 0.0f })) {
             if(m_uiContinuousJog) {
-                (void)m_simulation.stopJog(m_nextJogRequest++, *m_uiContinuousJog);
-                m_uiContinuousJog.reset();
+                requestContinuousJogStop("Stop motion", simulation);
             } else {
-                m_simulation.stop();
+                const auto result = m_simulation.stop();
+                if (!result) {
+                    reportRejectedSessionAction("Stop motion", result);
+                } else {
+                    m_errorMessage.clear();
+                }
             }
         }
         ImGui::PopStyleColor();
@@ -2683,8 +2715,7 @@ public:
         renderProgramPane(viewport, simulation, contentBottom);
         if(m_showJogPane) renderJogPane(viewport, simulation, contentBottom);
         else if(m_uiContinuousJog) {
-            (void)m_simulation.stopJog(m_nextJogRequest++, *m_uiContinuousJog);
-            m_uiContinuousJog.reset();
+            requestContinuousJogStop("Continuous jog stop", simulation);
         }
         renderStatusBar(viewport, simulation);
         renderSplitters(viewport, contentBottom);
