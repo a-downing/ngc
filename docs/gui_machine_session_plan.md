@@ -156,13 +156,14 @@ find the corresponding toolbar button.
 
 Status: in progress. `gui/MachineSessionView.h` now provides the shared
 power/activity labels and command-availability derivation used by the toolbar,
-MDI, and jog controls. The main actions report state-race rejection, and the
+MDI, and jog controls. `MachineSessionManager` now returns structured rejection
+details for primary program, MDI, homing, jogging, feed-control, Stop, and reset
+requests, and the GUI reports their precise operator-facing reason. The
 derivation has focused core tests. `MachineSessionSnapshot` now exposes a
 backend-neutral program-operation presentation that distinguishes running,
 feed-hold acknowledgement, held, feed-resume acknowledgement, M0 pause,
 controlled Stop, and terminal outcomes; the toolbar labels and availability
-derive from that presentation. Structured rejection details remain to be
-implemented.
+derive from that presentation.
 
 - Add GUI-side helpers that derive labels, colors, and command availability
   from `MachinePowerState`, `MachineActivity`, backend state, and the

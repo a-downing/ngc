@@ -886,6 +886,36 @@ final_move_together = true
         require(snapshot.simulationDiagnostics
                     && snapshot.simulationDiagnostics->servoPeriodSeconds > 0.0,
                 "the generic session snapshot should attach Simulation-only diagnostics");
+        const auto emptyProgram = manager.start({}, {});
+        require(!emptyProgram
+                    && emptyProgram.rejection == ngc::SessionCommandRejection::EmptyProgram,
+                "an empty program rejection should retain its structured reason");
+        const auto unavailableHoming = manager.home();
+        require(!unavailableHoming
+                    && unavailableHoming.rejection
+                        == ngc::SessionCommandRejection::HomingUnavailable,
+                "unconfigured homing should retain its structured rejection reason");
+        const auto inactiveFeedHold = manager.feedHold();
+        require(!inactiveFeedHold
+                    && inactiveFeedHold.rejection
+                        == ngc::SessionCommandRejection::ProgramNotRunning,
+                "Feed Hold without a program should report that no program is running");
+        const auto inactiveResume = manager.resume();
+        require(!inactiveResume
+                    && inactiveResume.rejection
+                        == ngc::SessionCommandRejection::ProgramNotRunning,
+                "Resume without a program should report that no program is running");
+        const auto inactiveStop = manager.stop();
+        require(!inactiveStop
+                    && inactiveStop.rejection
+                        == ngc::SessionCommandRejection::NoMotionOwner,
+                "Stop without a motion owner should retain its structured rejection reason");
+        const auto invalidJog = manager.startJog(
+            ngc::ControlRequest { ngc::StartIncrementalJogRequest {} });
+        require(!invalidJog
+                    && invalidJog.rejection
+                        == ngc::SessionCommandRejection::InvalidJogRequest,
+                "an invalid jog token should retain its structured rejection reason");
         require(manager.start({{"G0 X0.01\n", "session-state.ngc"}}, {}),
                 "the powered manager session should accept a program epoch");
         auto completed = manager.snapshot();
@@ -975,6 +1005,10 @@ final_move_together = true
         require(ngc::gui::unavailableMotionReason(snapshot)
                     == "The Simulation session is faulted.",
                 "faulted sessions should explain why motion is unavailable");
+        require(ngc::gui::sessionCommandRejectionReason(
+                    ngc::SessionCommandRejection::MotionOwned)
+                    == "another operation owns the controlled session",
+                "the GUI should translate structured command rejection details");
     }
 
     void testInProcessSimulationRuntimePersistsAcrossTimedEpochs() {

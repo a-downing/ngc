@@ -18,6 +18,7 @@
 #include "machine/GeometryStreamProducer.h"
 #include "machine/InProcessSimulationRuntime.h"
 #include "machine/MachineConfiguration.h"
+#include "machine/MachineSessionCommand.h"
 #include "machine/MachineSession.h"
 #include "machine/PreparedTrajectoryExecutionDriver.h"
 #include "machine/SimulationPresentation.h"
@@ -154,24 +155,30 @@ public:
         return authority == m_controlAuthority;
     }
 
-    bool start(const std::vector<std::tuple<std::string, std::string>> &programs, const ngc::ToolTable &tools,
-               const bool preserveState = false) {
+    SessionCommandResult start(const std::vector<std::tuple<std::string, std::string>> &programs,
+                               const ngc::ToolTable &tools, const bool preserveState = false) {
         std::scoped_lock lock(m_mutex);
-        if (motionOwnedOrQueued() || programs.empty()) {
-            return false;
+        if (m_machineSession.coordinator().powerState() != ngc::MachinePowerState::On) {
+            return { SessionCommandRejection::SessionNotPowered };
+        }
+        if (motionOwnedOrQueued()) {
+            return { SessionCommandRejection::MotionOwned };
+        }
+        if (programs.empty()) {
+            return { SessionCommandRejection::EmptyProgram };
         }
         const auto activity = std::get<1>(programs.back()) == "<MDI>"
             ? ngc::MachineActivity::Mdi : ngc::MachineActivity::Program;
         if (!m_machineSession.toolTableInitialized()
             && !m_machineSession.setToolTable(tools)) {
-            return false;
+            return { SessionCommandRejection::ToolTableUnavailable };
         }
         if (!m_machineSession.queueProgram(ngc::StartProgram {
                 .programs = programs,
                 .preserveState = preserveState,
                 .activity = activity,
             })) {
-            return false;
+            return { SessionCommandRejection::CommandUnavailable };
         }
         m_stop = false;
         m_snapshot.status = ngc::SimulationStatus::Running;
@@ -179,36 +186,48 @@ public:
         m_snapshot.programOperation = ngc::ProgramOperationPresentation::Running;
         m_snapshot.operatorAlert.reset();
         m_cv.notify_all();
-        return true;
+
+        return {};
     }
 
-    bool resetSimulation() {
+    SessionCommandResult resetSimulation() {
         std::scoped_lock lock(m_mutex);
+        if (m_machineSession.coordinator().powerState() != ngc::MachinePowerState::On) {
+            return { SessionCommandRejection::SessionNotPowered };
+        }
         if (motionOwnedOrQueued()) {
-            return false;
+            return { SessionCommandRejection::MotionOwned };
         }
         m_machineSession.interpreter().machine().beginProgramRun();
         m_snapshot = {};
         m_snapshot.powerState = ngc::MachinePowerState::On;
         copyRuntimeTimingSnapshot();
         m_machineSession.presentationTracker().reset(sessionPresentation());
-        return true;
+
+        return {};
     }
 
-    bool home() {
+    SessionCommandResult home() {
         std::scoped_lock lock(m_mutex);
-        if (motionOwnedOrQueued() || !m_machineSession.homingAvailable()) {
-            return false;
+        if (m_machineSession.coordinator().powerState() != ngc::MachinePowerState::On) {
+            return { SessionCommandRejection::SessionNotPowered };
+        }
+        if (motionOwnedOrQueued()) {
+            return { SessionCommandRejection::MotionOwned };
+        }
+        if (!m_machineSession.homingAvailable()) {
+            return { SessionCommandRejection::HomingUnavailable };
         }
         if (!m_machineSession.queueHoming()) {
-            return false;
+            return { SessionCommandRejection::CommandUnavailable };
         }
         m_stop = false;
         m_snapshot.status = ngc::SimulationStatus::Running;
         m_snapshot.activity = ngc::SimulationActivity::Homing;
         m_snapshot.error.clear();
         m_cv.notify_all();
-        return true;
+
+        return {};
     }
 
     bool homingAvailable() const {
@@ -216,7 +235,7 @@ public:
         return m_machineSession.homingAvailable();
     }
 
-    bool startJog(const ngc::ControlRequest &request) {
+    SessionCommandResult startJog(const ngc::ControlRequest &request) {
         const auto jog = std::visit([](const auto &value) -> std::optional<ngc::JogId> {
             using T = std::decay_t<decltype(value)>;
             if constexpr(std::same_as<T, ngc::StartContinuousJogRequest>
@@ -224,11 +243,17 @@ public:
             return std::nullopt;
         }, request);
         std::scoped_lock lock(m_mutex);
-        if (!jog || *jog == 0 || motionOwnedOrQueued()) {
-            return false;
+        if (m_machineSession.coordinator().powerState() != ngc::MachinePowerState::On) {
+            return { SessionCommandRejection::SessionNotPowered };
+        }
+        if (!jog || *jog == 0) {
+            return { SessionCommandRejection::InvalidJogRequest };
+        }
+        if (motionOwnedOrQueued()) {
+            return { SessionCommandRejection::MotionOwned };
         }
         if (!m_machineSession.queueJog(request)) {
-            return false;
+            return { SessionCommandRejection::CommandUnavailable };
         }
         m_stop = false;
         m_activeJog = *jog;
@@ -237,7 +262,8 @@ public:
         m_snapshot.jogging = true;
         m_snapshot.lastJogStopReason.reset();
         m_cv.notify_all();
-        return true;
+
+        return {};
     }
 
     bool renewJog(const ngc::RequestId request, const ngc::JogId jog) {
@@ -312,55 +338,93 @@ public:
         return true;
     }
 
-    bool feedHold() {
+    SessionCommandResult feedHold() {
         std::scoped_lock lock(m_mutex);
+        if (m_machineSession.coordinator().powerState() != ngc::MachinePowerState::On) {
+            return { SessionCommandRejection::SessionNotPowered };
+        }
         const auto &control = m_machineSession.programExecution();
-        if (!m_running || !m_programRunning || control.paused()
-           || control.feedHoldInProgress() || control.feedResumeInProgress()
-           || m_machineSession.coordinator().commands().contains<ngc::FeedHold>()) return false;
-        if (!m_machineSession.coordinator().commands().tryPush(ngc::FeedHold {})) return false;
+        if (!m_running || !m_programRunning) {
+            return { SessionCommandRejection::ProgramNotRunning };
+        }
+        if (control.paused()) {
+            return { SessionCommandRejection::ProgramAlreadyPaused };
+        }
+        if (control.feedHoldInProgress()) {
+            return { SessionCommandRejection::FeedHoldInProgress };
+        }
+        if (control.feedResumeInProgress()) {
+            return { SessionCommandRejection::FeedResumeInProgress };
+        }
+        if (m_machineSession.coordinator().commands().contains<ngc::FeedHold>()) {
+            return { SessionCommandRejection::CommandAlreadyQueued };
+        }
+        if (!m_machineSession.coordinator().commands().tryPush(ngc::FeedHold {})) {
+            return { SessionCommandRejection::CommandQueueFull };
+        }
         m_snapshot.status = ngc::SimulationStatus::Holding;
         m_snapshot.programOperation = ngc::ProgramOperationPresentation::FeedHoldPending;
         m_cv.notify_all();
-        return true;
+
+        return {};
     }
-    bool resume() {
+    SessionCommandResult resume() {
         std::scoped_lock lock(m_mutex);
+        if (m_machineSession.coordinator().powerState() != ngc::MachinePowerState::On) {
+            return { SessionCommandRejection::SessionNotPowered };
+        }
         const auto &control = m_machineSession.programExecution();
-        if (!m_running || !m_programRunning || !control.paused()) {
-            return false;
+        if (!m_running || !m_programRunning) {
+            return { SessionCommandRejection::ProgramNotRunning };
+        }
+        if (!control.paused()) {
+            return { SessionCommandRejection::ProgramNotPaused };
         }
         if (m_machineSession.coordinator().commands().contains<ngc::Resume>()) {
-            return false;
+            return { SessionCommandRejection::CommandAlreadyQueued };
         }
         if (control.programPaused()) {
-            if (!m_machineSession.coordinator().commands().tryPush(ngc::Resume {})) return false;
+            if (!m_machineSession.coordinator().commands().tryPush(ngc::Resume {})) {
+                return { SessionCommandRejection::CommandQueueFull };
+            }
             m_snapshot.status = ngc::SimulationStatus::Running;
             m_snapshot.programOperation = ngc::ProgramOperationPresentation::Running;
             m_snapshot.operatorAlert.reset();
             m_cv.notify_all();
-            return true;
+
+            return {};
         }
-        if (!m_machineSession.coordinator().commands().tryPush(ngc::Resume {})) return false;
+        if (!m_machineSession.coordinator().commands().tryPush(ngc::Resume {})) {
+            return { SessionCommandRejection::CommandQueueFull };
+        }
         m_snapshot.status = ngc::SimulationStatus::Running;
         m_snapshot.programOperation = ngc::ProgramOperationPresentation::Resuming;
         m_cv.notify_all();
-        return true;
+
+        return {};
     }
-    void stop() {
+    SessionCommandResult stop() {
         std::scoped_lock lock(m_mutex);
-        if (motionOwnedOrQueued()) {
-            m_machineSession.coordinator().commands().clear();
-            (void)m_machineSession.coordinator().commands().tryPush(ngc::Stop {});
-            m_snapshot.operatorAlert.reset();
-            if (m_running) {
-                m_snapshot.status = ngc::SimulationStatus::Holding;
-            }
-            if (m_snapshot.activity == ngc::SimulationActivity::Program) {
-                m_snapshot.programOperation = ngc::ProgramOperationPresentation::Stopping;
-            }
-            m_cv.notify_all();
+        if (m_machineSession.coordinator().powerState() != ngc::MachinePowerState::On) {
+            return { SessionCommandRejection::SessionNotPowered };
         }
+        if (!motionOwnedOrQueued()) {
+            return { SessionCommandRejection::NoMotionOwner };
+        }
+        m_machineSession.coordinator().commands().clear();
+        if (!m_machineSession.coordinator().commands().tryPush(ngc::Stop {})) {
+            return { SessionCommandRejection::CommandQueueFull };
+        }
+        m_snapshot.operatorAlert.reset();
+        if (m_running) {
+            m_snapshot.status = ngc::SimulationStatus::Holding;
+        }
+        if (m_snapshot.activity == ngc::SimulationActivity::Program) {
+            m_snapshot.programOperation = ngc::ProgramOperationPresentation::Stopping;
+        }
+        m_cv.notify_all();
+
+        return {};
     }
     void setTickMultiplier(const int multiplier) {
         std::scoped_lock lock(m_mutex);

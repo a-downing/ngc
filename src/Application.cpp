@@ -152,9 +152,10 @@ class ApplicationImpl final {
         }
     }
 
-    void reportRejectedSessionAction(const std::string_view action) {
-        m_errorMessage = std::format(
-            "{} was rejected because the Simulation session state changed.", action);
+    void reportRejectedSessionAction(const std::string_view action,
+                                     const ngc::SessionCommandResult result) {
+        m_errorMessage = std::format("{} was rejected because {}.", action,
+            ngc::gui::sessionCommandRejectionReason(result.rejection));
     }
 
     enum class ProgramPaneMode { Edit, Compiled };
@@ -1928,11 +1929,12 @@ public:
         if(ImGui::Button("Start")) {
             m_simulation.setTickMultiplier(m_simulationTickMultiplier);
             m_simulation.setRapidSpeed(m_simulatedRapidSpeed);
-            if (m_simulation.start(m_programSource, m_tools, true)) {
+            const auto result = m_simulation.start(m_programSource, m_tools, true);
+            if (result) {
                 m_programPaneMode = ProgramPaneMode::Compiled;
                 m_errorMessage.clear();
             } else {
-                reportRejectedSessionAction("Program start");
+                reportRejectedSessionAction("Program start", result);
             }
         }
         ImGui::EndDisabled();
@@ -1949,9 +1951,9 @@ public:
                 ? "Holding..." : "Feed Hold";
         ImGui::BeginDisabled(!feedControlAvailable);
         if(ImGui::Button(feedControlLabel)) {
-            const auto accepted = resume ? m_simulation.resume() : m_simulation.feedHold();
-            if (!accepted) {
-                reportRejectedSessionAction(resume ? "Resume" : "Feed Hold");
+            const auto result = resume ? m_simulation.resume() : m_simulation.feedHold();
+            if (!result) {
+                reportRejectedSessionAction(resume ? "Resume" : "Feed Hold", result);
             } else {
                 m_errorMessage.clear();
             }
@@ -1961,7 +1963,14 @@ public:
                            "Feed Hold and Resume require a running or paused program.");
         ImGui::SameLine();
         ImGui::BeginDisabled(!controls.canStop);
-        if(ImGui::Button("Stop")) m_simulation.stop();
+        if(ImGui::Button("Stop")) {
+            const auto result = m_simulation.stop();
+            if (!result) {
+                reportRejectedSessionAction("Stop", result);
+            } else {
+                m_errorMessage.clear();
+            }
+        }
         ImGui::EndDisabled();
         unavailableTooltip(!controls.canStop, "No Simulation operation currently owns motion.");
 
@@ -1969,8 +1978,9 @@ public:
         ImGui::BeginDisabled(!controls.canHome);
         if(ImGui::Button("Home")) {
             m_simulation.setTickMultiplier(m_simulationTickMultiplier);
-            if (!m_simulation.home()) {
-                reportRejectedSessionAction("Homing");
+            const auto result = m_simulation.home();
+            if (!result) {
+                reportRejectedSessionAction("Homing", result);
             } else {
                 m_errorMessage.clear();
             }
@@ -1986,8 +1996,9 @@ public:
         ImGui::SameLine();
         ImGui::BeginDisabled(!controls.canReset);
         if(ImGui::Button("Reset Simulation")) {
-            if (!m_simulation.resetSimulation()) {
-                reportRejectedSessionAction("Simulation reset");
+            const auto result = m_simulation.resetSimulation();
+            if (!result) {
+                reportRejectedSessionAction("Simulation reset", result);
             } else {
                 m_errorMessage.clear();
             }
@@ -2112,10 +2123,11 @@ public:
 
         m_simulation.setTickMultiplier(m_simulationTickMultiplier);
         m_simulation.setRapidSpeed(m_simulatedRapidSpeed);
-        if(!m_simulation.start(programs, m_tools, true)) {
+        const auto result = m_simulation.start(programs, m_tools, true);
+        if(!result) {
             m_mdiInput = std::move(m_mdiHistory.back());
             m_mdiHistory.pop_back();
-            reportRejectedSessionAction("MDI");
+            reportRejectedSessionAction("MDI", result);
             return;
         }
 
@@ -2288,9 +2300,13 @@ public:
                         .limits = limits, .stopLimits = stopLimits,
                         .travel = travel, .leaseTicks = leaseTicks,
                     };
-                    if(m_simulation.startJog(ngc::ControlRequest { request })) {
+                    const auto result = m_simulation.startJog(ngc::ControlRequest { request });
+                    if(result) {
                         m_uiContinuousJog = jog;
                         m_lastJogRenewal = m_time;
+                        m_errorMessage.clear();
+                    } else {
+                        reportRejectedSessionAction("Continuous jog", result);
                     }
                 } else if(m_time - m_lastJogRenewal >= 0.005) {
                     if(m_simulation.renewJog(m_nextJogRequest++, *m_uiContinuousJog))
@@ -2303,7 +2319,12 @@ public:
                     .velocity = limits.velocity * m_jogSpeedPercent / 100.0,
                     .limits = limits, .stopLimits = stopLimits, .travel = travel,
                 };
-                (void)m_simulation.startJog(ngc::ControlRequest { request });
+                const auto result = m_simulation.startJog(ngc::ControlRequest { request });
+                if (!result) {
+                    reportRejectedSessionAction("Incremental jog", result);
+                } else {
+                    m_errorMessage.clear();
+                }
             }
         };
 
@@ -2665,7 +2686,8 @@ public:
                 using T = std::decay_t<decltype(request)>;
                 if constexpr(std::same_as<T, ngc::StartIncrementalJogRequest>
                              || std::same_as<T, ngc::StartContinuousJogRequest>)
-                    return m_simulation.startJog(ngc::ControlRequest { request });
+                    return static_cast<bool>(
+                        m_simulation.startJog(ngc::ControlRequest { request }));
                 else if constexpr(std::same_as<T, ngc::SetContinuousJogVelocityRequest>)
                     return m_simulation.setJogVelocity(request);
                 else if constexpr(std::same_as<T, ngc::RenewJogLeaseRequest>)

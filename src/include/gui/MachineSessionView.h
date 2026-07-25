@@ -2,6 +2,7 @@
 
 #include <string_view>
 
+#include "machine/MachineSessionCommand.h"
 #include "machine/SimulationPresentation.h"
 
 namespace ngc::gui {
@@ -55,6 +56,45 @@ namespace ngc::gui {
         }
 
         return "Unknown";
+    }
+
+    constexpr std::string_view sessionCommandRejectionReason(
+            const SessionCommandRejection rejection) noexcept {
+        switch (rejection) {
+            case SessionCommandRejection::None: return "the command was accepted";
+            case SessionCommandRejection::SessionNotPowered:
+                return "the controlled session is not powered on";
+            case SessionCommandRejection::MotionOwned:
+                return "another operation owns the controlled session";
+            case SessionCommandRejection::NoMotionOwner:
+                return "no operation currently owns motion";
+            case SessionCommandRejection::EmptyProgram:
+                return "the submitted program is empty";
+            case SessionCommandRejection::ToolTableUnavailable:
+                return "the session tool table could not be initialized";
+            case SessionCommandRejection::HomingUnavailable:
+                return "homing is not configured for the controlled session";
+            case SessionCommandRejection::InvalidJogRequest:
+                return "the jog request is invalid";
+            case SessionCommandRejection::ProgramNotRunning:
+                return "no program or MDI operation is running";
+            case SessionCommandRejection::ProgramAlreadyPaused:
+                return "the program is already paused";
+            case SessionCommandRejection::ProgramNotPaused:
+                return "the program is not paused";
+            case SessionCommandRejection::FeedHoldInProgress:
+                return "feed-hold acknowledgement is still pending";
+            case SessionCommandRejection::FeedResumeInProgress:
+                return "feed-resume acknowledgement is still pending";
+            case SessionCommandRejection::CommandAlreadyQueued:
+                return "the command is already queued";
+            case SessionCommandRejection::CommandQueueFull:
+                return "the session command queue is full";
+            case SessionCommandRejection::CommandUnavailable:
+                return "the controlled session cannot accept the command in its current state";
+        }
+
+        return "the command was rejected for an unknown reason";
     }
 
     constexpr std::string_view programOperationName(
