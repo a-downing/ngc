@@ -154,6 +154,12 @@ find the corresponding toolbar button.
 
 ### Phase 1: Centralize GUI session-state interpretation
 
+Status: in progress. `gui/MachineSessionView.h` now provides the shared
+power/activity labels and command-availability derivation used by the toolbar,
+MDI, and jog controls. The main actions report state-race rejection, and the
+derivation has focused core tests. Structured rejection details and a richer
+program-operation presentation remain to be implemented.
+
 - Add GUI-side helpers that derive labels, colors, and command availability
   from `MachinePowerState`, `MachineActivity`, backend state, and the
   program-operation presentation.
@@ -173,6 +179,10 @@ Acceptance criteria:
 - Every enabled primary action either succeeds or reports its rejection.
 
 ### Phase 2: Add the session header and operator DRO
+
+Status: in progress. The main toolbar now displays the selected control target,
+power state, machine activity, compatibility execution state, and homed-joint
+summary. The coordinate, tool, WCS, and spindle DRO remains to be implemented.
 
 - Display control target, power, activity, and homing summary.
 - Add machine, work, and tool-tip coordinates.

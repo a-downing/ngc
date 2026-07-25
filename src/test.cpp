@@ -42,6 +42,7 @@
 #include "path_tempo/Types.h"
 #include "machine/MachineSessionManager.h"
 #include "Worker.h"
+#include "gui/MachineSessionView.h"
 
 namespace {
     constexpr double EPSILON = 1e-9;
@@ -903,6 +904,58 @@ final_move_together = true
         manager.join();
         require(manager.snapshot().powerState == ngc::MachinePowerState::Off,
                 "joining the manager should end its powered Simulation lifetime");
+    }
+
+    void testMachineSessionViewDerivesOperatorControls() {
+        ngc::SimulationSnapshot snapshot;
+        auto controls = ngc::gui::machineSessionControls(snapshot, true);
+        require(!controls.powered && !controls.canStart && !controls.canHome
+                    && !controls.canJog && !controls.canStop,
+                "an unpowered session must reject motion-producing controls");
+        require(ngc::gui::powerStateName(snapshot.powerState) == "Off"
+                    && ngc::gui::machineActivityName(snapshot.machineActivity) == "Idle",
+                "session view should name power and activity independently");
+
+        snapshot.powerState = ngc::MachinePowerState::On;
+        controls = ngc::gui::machineSessionControls(snapshot, true);
+        require(controls.powered && controls.idle && controls.canStart
+                    && controls.canHome && controls.canJog && controls.canReset,
+                "a powered idle session should accept ordinary operator starts");
+
+        snapshot.status = ngc::SimulationStatus::Running;
+        snapshot.activity = ngc::SimulationActivity::Program;
+        controls = ngc::gui::machineSessionControls(snapshot, true);
+        require(!controls.idle && !controls.canStart && controls.canFeedHold
+                    && controls.canStop,
+                "a queued program must own the GUI before coordinator dispatch catches up");
+
+        snapshot.machineActivity = ngc::MachineActivity::Holding;
+        snapshot.status = ngc::SimulationStatus::Holding;
+        controls = ngc::gui::machineSessionControls(snapshot, true);
+        require(!controls.canFeedHold && !controls.canResume && controls.canStop,
+                "a feed-hold transition should allow Stop but not another hold or early Resume");
+
+        snapshot.status = ngc::SimulationStatus::Paused;
+        controls = ngc::gui::machineSessionControls(snapshot, true);
+        require(controls.canResume && controls.canStop,
+                "a paused program should expose Resume and Stop");
+
+        snapshot.status = ngc::SimulationStatus::Running;
+        snapshot.activity = ngc::SimulationActivity::Homing;
+        snapshot.machineActivity = ngc::MachineActivity::Homing;
+        controls = ngc::gui::machineSessionControls(snapshot, true);
+        require(!controls.canStart && !controls.canHome && !controls.canJog
+                    && !controls.canFeedHold && controls.canStop,
+                "homing should exclusively own motion-producing GUI controls");
+
+        snapshot.status = ngc::SimulationStatus::Error;
+        snapshot.machineActivity = ngc::MachineActivity::Faulted;
+        controls = ngc::gui::machineSessionControls(snapshot, true);
+        require(controls.canReset && !controls.canStop,
+                "a stationary faulted session should expose reset rather than Stop");
+        require(ngc::gui::unavailableMotionReason(snapshot)
+                    == "The Simulation session is faulted.",
+                "faulted sessions should explain why motion is unavailable");
     }
 
     void testInProcessSimulationRuntimePersistsAcrossTimedEpochs() {
@@ -6833,6 +6886,7 @@ int main() {
         testMachineSessionOwnsPowerActivityAndExecutionEpoch();
         testMachineSessionOwnsControllerDataPersistence();
         testMachineSessionManagerOwnsStandaloneSimulation();
+        testMachineSessionViewDerivesOperatorControls();
         testInProcessSimulationRuntimePersistsAcrossTimedEpochs();
         testHomingControllerOwnsBackendNeutralSequence();
         testMachineSessionOwnsBackendNeutralServiceOperations();

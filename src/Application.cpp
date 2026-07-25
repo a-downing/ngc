@@ -56,6 +56,7 @@
 #include "imgui_internal.h"
 #include "imgui_stdlib.h"
 #include "gui/imgui_custom.h"
+#include "gui/MachineSessionView.h"
 
 #include "utils.h"
 #include "machine/MachineSessionManager.h"
@@ -143,6 +144,17 @@ class ApplicationImpl final {
             result.completedLines = &completed->second;
         }
         return result;
+    }
+
+    static void unavailableTooltip(const bool unavailable, const std::string_view reason) {
+        if (unavailable && ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled)) {
+            ImGui::SetTooltip("%s", std::string(reason).c_str());
+        }
+    }
+
+    void reportRejectedSessionAction(const std::string_view action) {
+        m_errorMessage = std::format(
+            "{} was rejected because the Simulation session state changed.", action);
     }
 
     enum class ProgramPaneMode { Edit, Compiled };
@@ -1844,12 +1856,28 @@ public:
         if(appended) ImGui::SetClipboardText(clipboard.c_str());
     }
 
-    void renderToolbar(const ImGuiViewport &viewport, const ngc::SimulationSnapshot &simulation) {
+    void renderToolbar(const ImGuiViewport &viewport, const ngc::SimulationSnapshot &simulation,
+                       const ngc::MachineSessionManagerState &managerState) {
         ImGui::SetNextWindowPos(viewport.Pos);
         ImGui::SetNextWindowSize({ viewport.Size.x, m_toolbarHeight });
         constexpr auto flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove
             | ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoSavedSettings;
         ImGui::Begin("##toolbar", nullptr, flags);
+
+        const auto homingAvailable = m_simulation.homingAvailable();
+        const auto controls = ngc::gui::machineSessionControls(simulation, homingAvailable);
+        const auto target = managerState.authority.target == ngc::MachineControlTarget::Simulation
+            ? "Simulation" : "Real";
+        const auto homed = std::ranges::count_if(m_joints, [&](const auto &joint) {
+            return (simulation.homedJoints & (ngc::JointMask { 1 } << joint.id)) != 0;
+        });
+        ImGui::Text(
+            "Target: %s%s    Power: %s    Activity: %s    State: %s    Homed: %zu/%zu joints",
+            target, managerState.realAvailable ? "" : " (Real unavailable)",
+            ngc::gui::powerStateName(simulation.powerState).data(),
+            ngc::gui::machineActivityName(simulation.machineActivity).data(),
+            ngc::gui::simulationStatusName(simulation.status).data(),
+            static_cast<std::size_t>(homed), m_joints.size());
 
         if(ImGui::Button("Open G-code")) m_enableOpenDialog = true;
         ImGui::SameLine();
@@ -1892,51 +1920,79 @@ public:
             ImGui::SetTooltip("One tooth every 10 executed servo periods at the tool tip.\n"
                               "Green is executed cubic path jerk; red is unused capacity.");
 
-        const auto simulationActive = simulation.status == ngc::SimulationStatus::Running
-            || simulation.status == ngc::SimulationStatus::Holding
-            || simulation.status == ngc::SimulationStatus::Paused;
         ImGui::SameLine();
         ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
         ImGui::SameLine();
-        ImGui::BeginDisabled(!compiledMode || m_programSource.empty() || simulationActive);
-        if(ImGui::Button("Simulate")) {
+        const auto startUnavailable = !compiledMode || m_programSource.empty() || !controls.canStart;
+        ImGui::BeginDisabled(startUnavailable);
+        if(ImGui::Button("Start")) {
             m_simulation.setTickMultiplier(m_simulationTickMultiplier);
             m_simulation.setRapidSpeed(m_simulatedRapidSpeed);
-            m_simulation.start(m_programSource, m_tools, true);
-            m_programPaneMode = ProgramPaneMode::Compiled;
+            if (m_simulation.start(m_programSource, m_tools, true)) {
+                m_programPaneMode = ProgramPaneMode::Compiled;
+                m_errorMessage.clear();
+            } else {
+                reportRejectedSessionAction("Program start");
+            }
         }
         ImGui::EndDisabled();
+        if (!compiledMode || m_programSource.empty()) {
+            unavailableTooltip(startUnavailable, "Compile a non-empty program before starting.");
+        } else {
+            unavailableTooltip(startUnavailable, ngc::gui::unavailableMotionReason(simulation));
+        }
         ImGui::SameLine();
-        const auto feedControlAvailable = simulation.status == ngc::SimulationStatus::Paused
-            || (simulation.status == ngc::SimulationStatus::Running
-                && simulation.trajectoryBackendExecutionRate >= 1.0 - 1e-10);
+        const auto resume = controls.canResume;
+        const auto feedControlAvailable = controls.canFeedHold || resume;
+        const auto feedControlLabel = resume ? "Resume"
+            : simulation.status == ngc::SimulationStatus::Holding ? "Holding..." : "Feed Hold";
         ImGui::BeginDisabled(!feedControlAvailable);
-        if(ImGui::Button(simulation.status == ngc::SimulationStatus::Paused
-                         ? "Resume" : "Feed Hold")) {
-            if(simulation.status == ngc::SimulationStatus::Paused) (void)m_simulation.resume();
-            else (void)m_simulation.feedHold();
+        if(ImGui::Button(feedControlLabel)) {
+            const auto accepted = resume ? m_simulation.resume() : m_simulation.feedHold();
+            if (!accepted) {
+                reportRejectedSessionAction(resume ? "Resume" : "Feed Hold");
+            } else {
+                m_errorMessage.clear();
+            }
         }
         ImGui::EndDisabled();
+        unavailableTooltip(!feedControlAvailable,
+                           "Feed Hold and Resume require a running or paused program.");
         ImGui::SameLine();
-        ImGui::BeginDisabled(!simulationActive);
+        ImGui::BeginDisabled(!controls.canStop);
         if(ImGui::Button("Stop")) m_simulation.stop();
         ImGui::EndDisabled();
+        unavailableTooltip(!controls.canStop, "No Simulation operation currently owns motion.");
 
         ImGui::SameLine();
-        ImGui::BeginDisabled(simulationActive || !m_simulation.homingAvailable());
+        ImGui::BeginDisabled(!controls.canHome);
         if(ImGui::Button("Home")) {
             m_simulation.setTickMultiplier(m_simulationTickMultiplier);
-            m_simulation.home();
+            if (!m_simulation.home()) {
+                reportRejectedSessionAction("Homing");
+            } else {
+                m_errorMessage.clear();
+            }
         }
         ImGui::EndDisabled();
+        unavailableTooltip(!controls.canHome, homingAvailable
+            ? ngc::gui::unavailableMotionReason(simulation)
+            : "Homing is not configured for this Simulation session.");
 
         ImGui::SameLine();
         if(ImGui::Button(m_showJogPane ? "Hide Jog" : "Jog")) m_showJogPane = !m_showJogPane;
 
         ImGui::SameLine();
-        ImGui::BeginDisabled(simulationActive);
-        if(ImGui::Button("Reset Simulation")) m_simulation.resetSimulation();
+        ImGui::BeginDisabled(!controls.canReset);
+        if(ImGui::Button("Reset Simulation")) {
+            if (!m_simulation.resetSimulation()) {
+                reportRejectedSessionAction("Simulation reset");
+            } else {
+                m_errorMessage.clear();
+            }
+        }
         ImGui::EndDisabled();
+        unavailableTooltip(!controls.canReset, ngc::gui::unavailableMotionReason(simulation));
 
         ImGui::SameLine();
         ImGui::SetNextItemWidth(90.0f);
@@ -2058,7 +2114,7 @@ public:
         if(!m_simulation.start(programs, m_tools, true)) {
             m_mdiInput = std::move(m_mdiHistory.back());
             m_mdiHistory.pop_back();
-            m_errorMessage = "MDI simulation cannot start while another simulation is active";
+            reportRejectedSessionAction("MDI");
             return;
         }
 
@@ -2068,6 +2124,8 @@ public:
 
     void renderMdiTab(const ngc::SimulationSnapshot &simulation) {
         const auto lineState = sourceLineExecutionState(simulation, MDI_SOURCE_NAME);
+        const auto controls =
+            ngc::gui::machineSessionControls(simulation, m_simulation.homingAvailable());
 
         const auto inputHeight = ImGui::GetFrameHeightWithSpacing();
         if(ImGui::BeginChild("##mdi_history", { 0.0f, -inputHeight }, ImGuiChildFlags_Borders)) {
@@ -2089,16 +2147,14 @@ public:
         const auto buttonWidth = ImGui::CalcTextSize("Run").x + ImGui::GetStyle().FramePadding.x * 2.0f;
         ImGui::SetNextItemWidth(std::max(1.0f, ImGui::GetContentRegionAvail().x - buttonWidth
                                                - ImGui::GetStyle().ItemSpacing.x));
-        const auto simulationActive = simulation.status == ngc::SimulationStatus::Running
-            || simulation.status == ngc::SimulationStatus::Holding
-            || simulation.status == ngc::SimulationStatus::Paused;
-        ImGui::BeginDisabled(simulationActive);
+        ImGui::BeginDisabled(!controls.canStart);
         const auto submittedWithEnter = ImGui::InputText("##mdi_input", &m_mdiInput,
                                                          ImGuiInputTextFlags_EnterReturnsTrue);
         ImGui::SameLine();
         const auto submittedWithButton = ImGui::Button("Run");
         if(ImGui::IsItemHovered()) ImGui::SetTooltip("Run this block on the simulated machine.");
         ImGui::EndDisabled();
+        unavailableTooltip(!controls.canStart, ngc::gui::unavailableMotionReason(simulation));
         if(submittedWithEnter || submittedWithButton) submitMdiBlock();
     }
 
@@ -2196,10 +2252,9 @@ public:
         }
         ImGui::Separator();
 
-        const auto otherMotion = (simulation.status == ngc::SimulationStatus::Running
-                                  || simulation.status == ngc::SimulationStatus::Holding
-                                  || simulation.status == ngc::SimulationStatus::Paused)
-            && !simulation.jogging;
+        const auto controls =
+            ngc::gui::machineSessionControls(simulation, m_simulation.homingAvailable());
+        const auto otherMotion = !controls.canJog && !simulation.jogging;
         bool heldThisFrame = false;
         const auto leaseTicks = static_cast<std::uint32_t>(std::max(
             1.0, std::ceil(0.020 / m_simulationTiming.servoPeriod)
@@ -2214,6 +2269,14 @@ public:
             const auto held = ImGui::IsItemActive();
             const auto activated = ImGui::IsItemActivated();
             ImGui::EndDisabled();
+            if (!enabled) {
+                unavailableTooltip(true, "The selected axis or joint is not enabled for jogging.");
+            } else if (otherMotion) {
+                unavailableTooltip(true, ngc::gui::unavailableMotionReason(simulation));
+            } else {
+                unavailableTooltip(simulation.jogging && !m_uiContinuousJog,
+                                   "Another jog request currently owns motion.");
+            }
             if(m_continuousJog && held) {
                 heldThisFrame = true;
                 if(!m_uiContinuousJog && activated) {
@@ -2543,7 +2606,8 @@ public:
             m_simulationToolTableRevision = toolTableRevision;
         }
         const auto &viewport = *ImGui::GetMainViewport();
-        m_toolbarHeight = ImGui::GetFrameHeight() + ImGui::GetStyle().WindowPadding.y * 2.0f;
+        m_toolbarHeight = ImGui::GetFrameHeight() * 2.0f + ImGui::GetStyle().ItemSpacing.y
+            + ImGui::GetStyle().WindowPadding.y * 2.0f;
         const auto contentBottom = viewport.Pos.y + viewport.Size.y - m_statusBarHeight;
         m_viewportRect = {
             viewport.Pos.x + m_programPaneWidth,
@@ -2552,7 +2616,7 @@ public:
             contentBottom,
         };
 
-        renderToolbar(viewport, simulation);
+        renderToolbar(viewport, simulation, m_simulation.state());
         renderProgramPane(viewport, simulation, contentBottom);
         if(m_showJogPane) renderJogPane(viewport, simulation, contentBottom);
         else if(m_uiContinuousJog) {
