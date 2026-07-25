@@ -57,12 +57,34 @@ namespace ngc::gui {
         return "Unknown";
     }
 
+    constexpr std::string_view programOperationName(
+            const ProgramOperationPresentation operation) noexcept {
+        switch (operation) {
+            case ProgramOperationPresentation::Inactive: return "Inactive";
+            case ProgramOperationPresentation::Running: return "Running";
+            case ProgramOperationPresentation::FeedHoldPending: return "Feed hold pending";
+            case ProgramOperationPresentation::Held: return "Held";
+            case ProgramOperationPresentation::Resuming: return "Resuming";
+            case ProgramOperationPresentation::ProgramPaused: return "M0 pause";
+            case ProgramOperationPresentation::Stopping: return "Stopping";
+            case ProgramOperationPresentation::Completed: return "Completed";
+            case ProgramOperationPresentation::Stopped: return "Stopped";
+            case ProgramOperationPresentation::Failed: return "Failed";
+        }
+
+        return "Unknown";
+    }
+
     inline MachineSessionControls machineSessionControls(
             const SimulationSnapshot &snapshot, const bool homingAvailable) noexcept {
         const auto powered = snapshot.powerState == MachinePowerState::On;
-        const auto operationActive = snapshot.status == SimulationStatus::Running
-            || snapshot.status == SimulationStatus::Holding
-            || snapshot.status == SimulationStatus::Paused;
+        const auto operationActive =
+            snapshot.programOperation == ProgramOperationPresentation::Running
+            || snapshot.programOperation == ProgramOperationPresentation::FeedHoldPending
+            || snapshot.programOperation == ProgramOperationPresentation::Held
+            || snapshot.programOperation == ProgramOperationPresentation::Resuming
+            || snapshot.programOperation == ProgramOperationPresentation::ProgramPaused
+            || snapshot.programOperation == ProgramOperationPresentation::Stopping;
         const auto idle = snapshot.machineActivity == MachineActivity::Idle && !operationActive;
         const auto motionOwned = operationActive
             || snapshot.machineActivity == MachineActivity::Program
@@ -83,10 +105,11 @@ namespace ngc::gui {
             .canHome = powered && idle && homingAvailable,
             .canJog = powered && idle,
             .canFeedHold = powered && programActivity
-                && snapshot.status == SimulationStatus::Running
-                && snapshot.trajectoryBackendExecutionRate >= 1.0 - 1e-10,
+                && snapshot.programOperation == ProgramOperationPresentation::Running,
             .canResume = powered && programActivity
-                && snapshot.status == SimulationStatus::Paused,
+                && (snapshot.programOperation == ProgramOperationPresentation::Held
+                    || snapshot.programOperation
+                        == ProgramOperationPresentation::ProgramPaused),
             .canStop = powered && motionOwned,
             .canReset = powered && !operationActive
                 && (snapshot.machineActivity == MachineActivity::Idle

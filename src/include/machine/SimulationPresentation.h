@@ -34,6 +34,8 @@ namespace ngc {
     struct MachineSessionSnapshot {
         MachinePowerState powerState = MachinePowerState::Off;
         MachineActivity machineActivity = MachineActivity::Idle;
+        ProgramOperationPresentation programOperation =
+            ProgramOperationPresentation::Inactive;
         std::optional<SimulationDiagnostics> simulationDiagnostics;
         position_t machinePosition{};
         TrajectoryCommandPresentation activePresentation{};

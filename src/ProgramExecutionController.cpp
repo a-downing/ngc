@@ -305,6 +305,36 @@ namespace ngc {
         return m_stopRequested;
     }
 
+    ProgramOperationPresentation ProgramExecutionController::presentation() const {
+        std::scoped_lock lock(m_mutex);
+        if (m_state == ProgramExecutionState::Error) {
+            return ProgramOperationPresentation::Failed;
+        }
+        if (m_state == ProgramExecutionState::StopComplete) {
+            return ProgramOperationPresentation::Stopped;
+        }
+        if (m_state == ProgramExecutionState::Inactive) {
+            return ProgramOperationPresentation::Inactive;
+        }
+        if (m_stopRequested || m_controlledStopInProgress) {
+            return ProgramOperationPresentation::Stopping;
+        }
+        if (m_programPaused) {
+            return ProgramOperationPresentation::ProgramPaused;
+        }
+        if (m_feedHoldInProgress) {
+            return ProgramOperationPresentation::FeedHoldPending;
+        }
+        if (m_feedResumeInProgress) {
+            return ProgramOperationPresentation::Resuming;
+        }
+        if (m_feedHoldHeld) {
+            return ProgramOperationPresentation::Held;
+        }
+
+        return ProgramOperationPresentation::Running;
+    }
+
     std::optional<position_t> ProgramExecutionController::stoppedPosition() const {
         std::scoped_lock lock(m_mutex);
 

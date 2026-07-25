@@ -5,6 +5,7 @@
 #include <string>
 
 #include "machine/MotionBackend.h"
+#include "machine/ProgramOperationPresentation.h"
 
 namespace ngc {
     class PreparedTrajectoryExecutionDriver;
@@ -37,6 +38,7 @@ namespace ngc {
         [[nodiscard]] bool feedHoldInProgress() const;
         [[nodiscard]] bool feedResumeInProgress() const;
         [[nodiscard]] bool stopRequested() const;
+        [[nodiscard]] ProgramOperationPresentation presentation() const;
         [[nodiscard]] std::optional<position_t> stoppedPosition() const;
         [[nodiscard]] std::optional<std::string> error() const;
 

@@ -176,6 +176,7 @@ public:
         m_stop = false;
         m_snapshot.status = ngc::SimulationStatus::Running;
         m_snapshot.activity = ngc::SimulationActivity::Program;
+        m_snapshot.programOperation = ngc::ProgramOperationPresentation::Running;
         m_snapshot.operatorAlert.reset();
         m_cv.notify_all();
         return true;
@@ -319,6 +320,7 @@ public:
            || m_machineSession.coordinator().commands().contains<ngc::FeedHold>()) return false;
         if (!m_machineSession.coordinator().commands().tryPush(ngc::FeedHold {})) return false;
         m_snapshot.status = ngc::SimulationStatus::Holding;
+        m_snapshot.programOperation = ngc::ProgramOperationPresentation::FeedHoldPending;
         m_cv.notify_all();
         return true;
     }
@@ -334,12 +336,14 @@ public:
         if (control.programPaused()) {
             if (!m_machineSession.coordinator().commands().tryPush(ngc::Resume {})) return false;
             m_snapshot.status = ngc::SimulationStatus::Running;
+            m_snapshot.programOperation = ngc::ProgramOperationPresentation::Running;
             m_snapshot.operatorAlert.reset();
             m_cv.notify_all();
             return true;
         }
         if (!m_machineSession.coordinator().commands().tryPush(ngc::Resume {})) return false;
         m_snapshot.status = ngc::SimulationStatus::Running;
+        m_snapshot.programOperation = ngc::ProgramOperationPresentation::Resuming;
         m_cv.notify_all();
         return true;
     }
@@ -351,6 +355,9 @@ public:
             m_snapshot.operatorAlert.reset();
             if (m_running) {
                 m_snapshot.status = ngc::SimulationStatus::Holding;
+            }
+            if (m_snapshot.activity == ngc::SimulationActivity::Program) {
+                m_snapshot.programOperation = ngc::ProgramOperationPresentation::Stopping;
             }
             m_cv.notify_all();
         }
@@ -402,6 +409,23 @@ public:
         if (m_programRunning) {
             if (const auto backend = latestTimedBackendSnapshot()) {
                 applyBackendObservation(result, *backend);
+            }
+            const auto operation = m_machineSession.programExecution().presentation();
+            const auto queuedTransition =
+                (result.programOperation
+                    == ngc::ProgramOperationPresentation::FeedHoldPending
+                 && operation == ngc::ProgramOperationPresentation::Running)
+                || (result.programOperation
+                        == ngc::ProgramOperationPresentation::Resuming
+                    && operation == ngc::ProgramOperationPresentation::Held)
+                || (result.programOperation
+                        == ngc::ProgramOperationPresentation::Stopping
+                    && operation != ngc::ProgramOperationPresentation::Stopping
+                    && operation != ngc::ProgramOperationPresentation::Stopped
+                    && operation != ngc::ProgramOperationPresentation::Failed);
+            if (operation != ngc::ProgramOperationPresentation::Inactive
+                && !queuedTransition) {
+                result.programOperation = operation;
             }
         } else if (result.activity == ngc::SimulationActivity::Homing) {
             if (const auto observation = m_machineSession.homingObservation()) {
@@ -937,6 +961,7 @@ private:
             m_snapshot.maximumTickExecutionSeconds = 0.0;
             m_snapshot.status = ngc::SimulationStatus::Running;
             m_snapshot.activity = ngc::SimulationActivity::Program;
+            m_snapshot.programOperation = ngc::ProgramOperationPresentation::Running;
             lock.unlock();
 
             if(!preserve) {
@@ -951,6 +976,7 @@ private:
                 lock.lock();
                 m_snapshot.status = ngc::SimulationStatus::Error;
                 m_snapshot.activity = ngc::SimulationActivity::Idle;
+                m_snapshot.programOperation = ngc::ProgramOperationPresentation::Failed;
                 m_snapshot.error = epochResult.error();
                 m_running = false;
                 m_programRunning = false;
@@ -966,6 +992,7 @@ private:
                 lock.lock();
                 m_snapshot.status = ngc::SimulationStatus::Error;
                 m_snapshot.activity = ngc::SimulationActivity::Idle;
+                m_snapshot.programOperation = ngc::ProgramOperationPresentation::Failed;
                 m_snapshot.error = "Simulation servo scheduler failed to start";
                 m_running = false;
                 m_programRunning = false;
@@ -1055,9 +1082,13 @@ private:
                         }
                     });
                 lock.lock();
+                m_snapshot.programOperation =
+                    m_machineSession.programExecution().presentation();
                 if (operation.state == ngc::ProgramOperationState::Error) {
                     m_snapshot.status = ngc::SimulationStatus::Error;
                     m_snapshot.activity = ngc::SimulationActivity::Idle;
+                    m_snapshot.programOperation =
+                        ngc::ProgramOperationPresentation::Failed;
                     m_snapshot.error = operation.error.value_or(
                         "machine-session program execution failed");
                     m_running = false;
@@ -1086,10 +1117,14 @@ private:
                         m_snapshot.statusMessages = m_machineSession.interpreter().statusMessages();
                         if (persistenceError) {
                             m_snapshot.status = ngc::SimulationStatus::Error;
+                            m_snapshot.programOperation =
+                                ngc::ProgramOperationPresentation::Failed;
                             m_snapshot.error = *persistenceError;
                         } else {
                             m_snapshot.status = ngc::SimulationStatus::Stopped;
                             m_snapshot.activity = ngc::SimulationActivity::Idle;
+                            m_snapshot.programOperation =
+                                ngc::ProgramOperationPresentation::Stopped;
                         }
                     }
                     if (joining) {
@@ -1125,6 +1160,8 @@ private:
                 if(pacingError != 0) {
                     m_snapshot.status = ngc::SimulationStatus::Error;
                     m_snapshot.activity = ngc::SimulationActivity::Idle;
+                    m_snapshot.programOperation =
+                        ngc::ProgramOperationPresentation::Failed;
                     m_snapshot.error = "Windows servo pacer failed with error " + std::to_string(pacingError);
                     m_running = false;
                     m_programRunning = false;
@@ -1162,9 +1199,13 @@ private:
                             m_snapshot.activity = ngc::SimulationActivity::Idle;
                             if (persistenceError) {
                                 m_snapshot.status = ngc::SimulationStatus::Error;
+                                m_snapshot.programOperation =
+                                    ngc::ProgramOperationPresentation::Failed;
                                 m_snapshot.error = *persistenceError;
                             } else {
                                 m_snapshot.status = ngc::SimulationStatus::Completed;
+                                m_snapshot.programOperation =
+                                    ngc::ProgramOperationPresentation::Completed;
                             }
                         } else if (persistenceError && m_snapshot.error.empty()) {
                             m_snapshot.error = *persistenceError;

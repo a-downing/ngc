@@ -1872,11 +1872,11 @@ public:
             return (simulation.homedJoints & (ngc::JointMask { 1 } << joint.id)) != 0;
         });
         ImGui::Text(
-            "Target: %s%s    Power: %s    Activity: %s    State: %s    Homed: %zu/%zu joints",
+            "Target: %s%s    Power: %s    Activity: %s    Operation: %s    Homed: %zu/%zu joints",
             target, managerState.realAvailable ? "" : " (Real unavailable)",
             ngc::gui::powerStateName(simulation.powerState).data(),
             ngc::gui::machineActivityName(simulation.machineActivity).data(),
-            ngc::gui::simulationStatusName(simulation.status).data(),
+            ngc::gui::programOperationName(simulation.programOperation).data(),
             static_cast<std::size_t>(homed), m_joints.size());
 
         if(ImGui::Button("Open G-code")) m_enableOpenDialog = true;
@@ -1945,7 +1945,8 @@ public:
         const auto resume = controls.canResume;
         const auto feedControlAvailable = controls.canFeedHold || resume;
         const auto feedControlLabel = resume ? "Resume"
-            : simulation.status == ngc::SimulationStatus::Holding ? "Holding..." : "Feed Hold";
+            : simulation.programOperation == ngc::ProgramOperationPresentation::FeedHoldPending
+                ? "Holding..." : "Feed Hold";
         ImGui::BeginDisabled(!feedControlAvailable);
         if(ImGui::Button(feedControlLabel)) {
             const auto accepted = resume ? m_simulation.resume() : m_simulation.feedHold();

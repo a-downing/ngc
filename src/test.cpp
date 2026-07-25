@@ -924,6 +924,7 @@ final_move_together = true
 
         snapshot.status = ngc::SimulationStatus::Running;
         snapshot.activity = ngc::SimulationActivity::Program;
+        snapshot.programOperation = ngc::ProgramOperationPresentation::Running;
         controls = ngc::gui::machineSessionControls(snapshot, true);
         require(!controls.idle && !controls.canStart && controls.canFeedHold
                     && controls.canStop,
@@ -931,18 +932,35 @@ final_move_together = true
 
         snapshot.machineActivity = ngc::MachineActivity::Holding;
         snapshot.status = ngc::SimulationStatus::Holding;
+        snapshot.programOperation =
+            ngc::ProgramOperationPresentation::FeedHoldPending;
         controls = ngc::gui::machineSessionControls(snapshot, true);
         require(!controls.canFeedHold && !controls.canResume && controls.canStop,
                 "a feed-hold transition should allow Stop but not another hold or early Resume");
 
         snapshot.status = ngc::SimulationStatus::Paused;
+        snapshot.programOperation = ngc::ProgramOperationPresentation::Held;
         controls = ngc::gui::machineSessionControls(snapshot, true);
         require(controls.canResume && controls.canStop,
-                "a paused program should expose Resume and Stop");
+                "a held program should expose Resume and Stop");
+
+        snapshot.programOperation =
+            ngc::ProgramOperationPresentation::ProgramPaused;
+        controls = ngc::gui::machineSessionControls(snapshot, true);
+        require(controls.canResume && controls.canStop
+                    && ngc::gui::programOperationName(snapshot.programOperation)
+                        == "M0 pause",
+                "an M0 pause should be named distinctly and expose Resume and Stop");
+
+        snapshot.programOperation = ngc::ProgramOperationPresentation::Resuming;
+        controls = ngc::gui::machineSessionControls(snapshot, true);
+        require(!controls.canFeedHold && !controls.canResume && controls.canStop,
+                "a feed-resume transition should allow Stop but no competing feed control");
 
         snapshot.status = ngc::SimulationStatus::Running;
         snapshot.activity = ngc::SimulationActivity::Homing;
         snapshot.machineActivity = ngc::MachineActivity::Homing;
+        snapshot.programOperation = ngc::ProgramOperationPresentation::Inactive;
         controls = ngc::gui::machineSessionControls(snapshot, true);
         require(!controls.canStart && !controls.canHome && !controls.canJog
                     && !controls.canFeedHold && controls.canStop,
@@ -950,6 +968,7 @@ final_move_together = true
 
         snapshot.status = ngc::SimulationStatus::Error;
         snapshot.machineActivity = ngc::MachineActivity::Faulted;
+        snapshot.programOperation = ngc::ProgramOperationPresentation::Failed;
         controls = ngc::gui::machineSessionControls(snapshot, true);
         require(controls.canReset && !controls.canStop,
                 "a stationary faulted session should expose reset rather than Stop");
@@ -2611,6 +2630,9 @@ G1 F60 X2
         require(snapshot.status == ngc::SimulationStatus::Paused,
                 snapshot.error.empty() ? "M0 should pause Simulation"
                                        : snapshot.error);
+        require(snapshot.programOperation
+                    == ngc::ProgramOperationPresentation::ProgramPaused,
+                "M0 should have a distinct program-operation presentation");
         require(snapshot.operatorAlert == "Change the tool",
                 "Simulation should expose the active operator alert while paused");
         require(std::ranges::none_of(snapshot.statusMessages, [](const auto &status) {
@@ -4493,18 +4515,28 @@ G1 F60 X2
         const auto holdStart = snapshot.machinePosition.x;
         require(worker.feedHold(), "active program motion should accept Feed Hold");
 
+        snapshot = worker.snapshot();
         bool sawHolding = false;
+        bool sawFeedHoldPending = snapshot.programOperation
+            == ngc::ProgramOperationPresentation::FeedHoldPending;
         for(int attempt = 0; attempt < 10000
             && snapshot.status != ngc::SimulationStatus::Paused
             && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
             snapshot = worker.snapshot();
             sawHolding = sawHolding || snapshot.status == ngc::SimulationStatus::Holding;
+            sawFeedHoldPending = sawFeedHoldPending
+                || snapshot.programOperation
+                    == ngc::ProgramOperationPresentation::FeedHoldPending;
         }
         require(snapshot.status == ngc::SimulationStatus::Paused,
                 std::format("feed hold should reach Paused rather than freezing or failing: {}",
                             snapshot.error));
         require(sawHolding, "the manager should expose Holding while the backend brakes");
+        require(sawFeedHoldPending,
+                "the manager should expose the feed-hold acknowledgement transition");
+        require(snapshot.programOperation == ngc::ProgramOperationPresentation::Held,
+                "a completed feed hold should expose the held operation state");
         require(snapshot.machinePosition.x > holdStart && snapshot.machinePosition.x < 10.0,
                 "manager feed hold should stop forward on the active path");
         require(snapshot.trajectoryBackendVelocity <= 1e-10
@@ -4553,6 +4585,9 @@ G1 F60 X2
         const auto stopStart = snapshot.machinePosition.x;
 
         worker.stop();
+        require(worker.snapshot().programOperation
+                    == ngc::ProgramOperationPresentation::Stopping,
+                "Stop should immediately expose the controlled-stop transition");
         bool sawHolding =
             worker.snapshot().status == ngc::SimulationStatus::Holding;
         for (auto attempt = 0; attempt < 10000
@@ -4568,6 +4603,8 @@ G1 F60 X2
         require(snapshot.status == ngc::SimulationStatus::Stopped,
                 std::format("session Stop should abandon the program at rest: {}",
                             snapshot.error));
+        require(snapshot.programOperation == ngc::ProgramOperationPresentation::Stopped,
+                "a completed controlled Stop should retain its terminal operation outcome");
         require(snapshot.machinePosition.x > stopStart
                     && snapshot.machinePosition.x < 10.0,
                 "session Stop should retain the physical braking position");
