@@ -35,9 +35,11 @@ add_subdirectory(path_tempo)
 
 add_library(ngc_core STATIC
         src/ArcInterpolation.cpp
+        src/ExternalRealtimeRuntime.cpp
         src/HomingController.cpp
         src/InfiniteJerkTrajectoryTime.cpp
         src/InProcessSimulationRuntime.cpp
+        src/IpcPlatform.cpp
         src/JoggingController.cpp
         src/MachineSession.cpp
         src/MachineConfiguration.cpp
@@ -112,6 +114,17 @@ target_include_directories(ngc_tests PRIVATE src)
 target_link_libraries(ngc_tests PRIVATE ngc_core glm::glm-header-only PathTempo::PathTempo)
 ngc_target_defaults(ngc_tests)
 add_test(NAME ngc_tests COMMAND ngc_tests)
+
+add_executable(ngc_ipc_backend tools/ngc_ipc_backend.cpp)
+target_include_directories(ngc_ipc_backend PRIVATE src)
+target_link_libraries(ngc_ipc_backend PRIVATE ngc_core)
+ngc_target_defaults(ngc_ipc_backend)
+
+add_executable(ngc_ipc_tests src/IpcTests.cpp)
+target_include_directories(ngc_ipc_tests PRIVATE src)
+target_link_libraries(ngc_ipc_tests PRIVATE ngc_core)
+ngc_target_defaults(ngc_ipc_tests)
+add_test(NAME ngc_ipc_tests COMMAND ngc_ipc_tests $<TARGET_FILE:ngc_ipc_backend>)
 
 add_executable(ngc_simulation_diagnostic tools/ngc_simulation_diagnostic.cpp)
 target_include_directories(ngc_simulation_diagnostic PRIVATE src)

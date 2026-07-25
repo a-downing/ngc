@@ -803,9 +803,10 @@ Tests exercise concurrent Simulation and RealRun-mode session ownership through
 an explicitly test-only in-process Real host. They prove authority advancement,
 stale-command rejection across actual transfers, independent power and tool
 tables, and one-way motion isolation. Production still exposes Real as
-unavailable: `ExternalRealtimeRuntime`, Real configuration, inactive physical
-event draining, and live physical snapshots remain future work and must never
-fall back to the in-process test host.
+unavailable: Real configuration and `ExternalRealtimeRuntime` construction,
+inactive physical event draining, and live physical snapshots remain future
+work and must never fall back to the in-process test host. The transport-only
+`ExternalRealtimeRuntime` IPC skeleton is not a Real session or an executor.
 
 - Support standalone Simulation with no `[real_run]` configuration.
 - Support optional Real and Simulation sessions concurrently. Complete at the
@@ -869,11 +870,30 @@ forking its behavioral expectations.
 
 ### Phase 9: Add the IPC skeleton
 
+Status: implemented as a transport-only, non-hardware skeleton.
+`ExternalRealtimeRuntime` owns a platform shared-memory mapping, child-process
+lifecycle, and a bounded `MotionBackend` proxy. `ngc_ipc_backend` opens the same
+fixed layout as a separate process and acknowledges opaque execution and
+control records without importing `MockMotionBackend` or claiming production
+execution semantics. The connection validates ABI and payload layout,
+configuration and topology fingerprints, and session, epoch, and control
+authority generations before entering Running. Peer loss becomes a bounded
+backend fault after already-published peer events are drained, and an epoch
+interrupted by peer loss cannot be resumed after a fresh connection.
+
+The shared-memory storage and process layer has Windows and POSIX
+implementations, but this phase has only been built and exercised on the
+supported Windows development environment. Linux validation remains required
+before the IPC layer can support the production executor.
+
 - Implement fixed shared-memory rings and the physical `MotionBackend` proxy.
+  Complete for the transport skeleton.
 - Add ABI, topology, configuration, session, epoch, and authority handshakes.
-- Run a non-hardware backend process using the production IPC path.
+  Complete.
+- Run a non-hardware backend process using the production IPC path. Complete
+  with the transport-only peer.
 - Test peer death, stale generations, full channels, restart, and refusal to
-  resume interrupted epochs.
+  resume interrupted epochs. Complete on Windows.
 
 ### Phase 10: Extract and prove the production executor core
 

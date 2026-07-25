@@ -56,7 +56,12 @@ runtime and backend survive individual program epochs; timed scheduling is
 activated only for an active program epoch, while homing and jogging currently
 use runtime-owned synchronous service stepping. `MockMotionBackend` is a non-RT
 implementation of the production-shaped backend contract. There is no real-time
-executor, HAL component, or physical backend yet. Preserve the separation
+executor, HAL component, or physical backend yet. `ExternalRealtimeRuntime`
+implements the NRT side of the versioned shared-memory IPC boundary and owns a
+bounded `MotionBackend` proxy. The `ngc_ipc_backend` executable is a
+transport-only non-hardware peer used to prove handshakes, channel behavior,
+process lifecycle, and peer-loss handling; it is not a production executor and
+must not be exposed as Real. Preserve the separation
 between interpretation, geometry preparation, trajectory planning, execution,
 and hardware access. Never make geometry construction depend on whether the
 consumer is Preview or Simulation.
