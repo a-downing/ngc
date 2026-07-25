@@ -6389,15 +6389,18 @@ G1 F60 X2
         }
     }
 
-    void testConfiguredHomingMovesFromPowerUpPosition() {
+    void testConfiguredSimulationStartsAtZeroAndHomes() {
         const auto configuration=fixtureMachineConfiguration();
         require(configuration.has_value(), configuration ? "" : configuration.error());
         SimulationWorker worker(*configuration);
         worker.setTickMultiplier(1000);
         auto snapshot = worker.snapshot();
-        requireNear(snapshot.machinePosition.x, 6.0, "mock machine should power up at X6");
-        requireNear(snapshot.machinePosition.y, 6.0, "mock machine should power up at Y6");
-        requireNear(snapshot.machinePosition.z, -6.0, "mock machine should power up at Z-6");
+        requireNear(snapshot.machinePosition.x, 0.0, "Simulation should start with X at zero");
+        requireNear(snapshot.machinePosition.y, 0.0, "Simulation should start with Y at zero");
+        requireNear(snapshot.machinePosition.z, 0.0, "Simulation should start with Z at zero");
+        requireNear(snapshot.machinePosition.a, 0.0, "Simulation should start with A at zero");
+        requireNear(snapshot.machinePosition.b, 0.0, "Simulation should start with B at zero");
+        requireNear(snapshot.machinePosition.c, 0.0, "Simulation should start with C at zero");
         require(worker.home(), "configured simulated homing should start");
         for(int attempt = 0; attempt < 5000
             && snapshot.status != ngc::SimulationStatus::Completed
@@ -6514,7 +6517,7 @@ G1 F60 X2
                 "worker should expose backend lease expiry as the jog stop reason");
         require(snapshot.homedJoints == 0,
                 "joint jogging must not falsely mark the machine as homed");
-        require(snapshot.machinePosition.y > 6.0,
+        require(snapshot.machinePosition.y > 0.0,
                 "pre-home coupled jogging should visibly move the simulated Y axis");
         requireNear(snapshot.joints.position[1], snapshot.joints.position[2],
                     "pre-home coupled Y jogging should keep both ball-screw joints together");
@@ -6919,7 +6922,7 @@ int main() {
         testEndpointExactArcReferenceGeometryVariants();
         testMockDiagnosticPositionsFollowServoPeriod();
         testMachineConfigurationLoadsTrajectoryLimits();
-        testConfiguredHomingMovesFromPowerUpPosition();
+        testConfiguredSimulationStartsAtZeroAndHomes();
         testSimulationWorkerStopBrakesHomingAtRest();
         testSimulationWorkerJogsCoupledJointsBeforeHoming();
         testSimulationWorkerSessionStopBrakesJogAtRest();

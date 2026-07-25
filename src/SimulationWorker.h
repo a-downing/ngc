@@ -91,7 +91,6 @@ public:
         m_machineSession.configureJogging(configuration.axes, configuration.joints);
         m_machineSession.configureHoming(
             configuration.axes, configuration.joints, configuration.homing);
-        m_snapshot.machinePosition = { 6.0, 6.0, -6.0, 0.0, 0.0, 0.0 };
         clearActiveTool();
         (void)m_machineSession.powerOn();
         m_snapshot.powerState = m_machineSession.coordinator().powerState();
