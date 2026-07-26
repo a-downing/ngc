@@ -3,9 +3,13 @@
 #include <algorithm>
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
+
+#include <ruckig/ruckig.hpp>
 
 #include "machine/MotionBackend.h"
 #include "machine/SpscChannel.h"
@@ -16,9 +20,11 @@ namespace ngc {
         static constexpr std::size_t PLAN_CAPACITY = 8;
         static constexpr std::size_t CONTROL_CAPACITY = 16;
         static constexpr std::size_t EVENT_CAPACITY =
-            PLAN_CAPACITY * (MAX_EXECUTION_MARKERS_PER_CHUNK + 4)
+            PLAN_CAPACITY * (MAX_EXECUTION_MARKERS_PER_CHUNK + 5)
             + CONTROL_CAPACITY;
         static constexpr std::size_t SNAPSHOT_CAPACITY = 4;
+        static constexpr std::size_t DIGITAL_INPUT_CAPACITY =
+            std::numeric_limits<DigitalInputId>::max() + std::size_t{1};
 
         explicit ProductionExecutorCore(double servoPeriod);
 
@@ -32,23 +38,55 @@ namespace ngc {
 
         void restoreStationaryState(const MotionState &commanded,
                                     const MotionState &feedback = {}) noexcept;
+        // The hosting servo thread updates sampled input levels before
+        // servoTick(). Edge conditions compare the current sample with the
+        // preceding tick; hardware acquisition remains outside this core.
+        void setDigitalInputSample(DigitalInputId input, bool active) noexcept;
         void servoTick(bool publishSnapshot = true) noexcept;
         [[nodiscard]] double servoPeriod() const noexcept;
 
     private:
         struct PlanSlot {
             std::atomic<bool> occupied{false};
-            PlanChunk chunk{};
+            ExecutionItem item{};
             std::uint64_t normalMotionNanoseconds = 0;
         };
 
+        struct TriggeredRuntime {
+            position_t start{};
+            position_t direction{};
+            double length = 0.0;
+            double elapsed = 0.0;
+            bool stopping = false;
+            TriggeredMoveStatus completionStatus =
+                TriggeredMoveStatus::ReachedTarget;
+            MotionState stopOrigin{};
+            MotionState triggerState{};
+            ruckig::Trajectory<1> trajectory;
+        };
+
+        static bool validExecutionItem(const ExecutionItem &item) noexcept;
         static bool validPlanChunk(const PlanChunk &chunk) noexcept;
-        static std::uint64_t normalMotionNanoseconds(const PlanChunk &chunk) noexcept;
+        static bool validTriggeredMove(const TriggeredMove &move) noexcept;
+        static std::uint64_t normalMotionNanoseconds(const ExecutionItem &item) noexcept;
         static std::uint64_t secondsToNanoseconds(double seconds) noexcept;
+        static EpochId itemEpoch(const ExecutionItem &item) noexcept;
+        static ChunkId itemId(const ExecutionItem &item) noexcept;
+        static BranchSequence itemPredecessor(const ExecutionItem &item) noexcept;
 
         void serviceControls() noexcept;
         void activateNext() noexcept;
         void advanceActive(double seconds) noexcept;
+        void advancePlan(double &seconds) noexcept;
+        bool initializeTriggered() noexcept;
+        bool beginTriggeredStop(TriggeredMoveStatus status) noexcept;
+        void advanceTriggered(double &seconds) noexcept;
+        void completeTriggered(TriggeredMoveStatus status) noexcept;
+        void faultTriggered() noexcept;
+        [[nodiscard]] MotionState triggeredStateAt(
+            double elapsed, const position_t &origin) const noexcept;
+        [[nodiscard]] bool triggeredInputConditionMet(
+            const TriggeredMove &move) const noexcept;
         void completeSpan() noexcept;
         void selectContinuationOrStop() noexcept;
         void emitExecutionMarkersThrough(double parameter) noexcept;
@@ -62,6 +100,8 @@ namespace ngc {
 
         [[nodiscard]] PlanChunk &activeChunk() noexcept;
         [[nodiscard]] const PlanChunk &activeChunk() const noexcept;
+        [[nodiscard]] TriggeredMove &activeTriggeredMove() noexcept;
+        [[nodiscard]] const TriggeredMove &activeTriggeredMove() const noexcept;
         [[nodiscard]] const AxisPolynomialSpan &currentSpan() const noexcept;
 
         template<typename Spans>
@@ -92,6 +132,9 @@ namespace ngc {
         double m_spanElapsed = 0.0;
         std::uint32_t m_span = 0;
         std::uint32_t m_nextMarker = 0;
+        TriggeredRuntime m_triggered;
+        std::bitset<DIGITAL_INPUT_CAPACITY> m_digitalInputs;
+        std::bitset<DIGITAL_INPUT_CAPACITY> m_previousDigitalInputs;
         bool m_stopping = false;
         bool m_faultEventEmitted = false;
     };

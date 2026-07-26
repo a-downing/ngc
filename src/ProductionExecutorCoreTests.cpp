@@ -66,6 +66,30 @@ namespace {
         return chunk;
     }
 
+    ngc::TriggeredMove triggeredMove(
+        const ngc::EpochId epoch, const ngc::ChunkId id,
+        const ngc::BranchSequence predecessor,
+        const ngc::BranchSequence branch,
+        const ngc::TriggeredMoveId moveId, const double target,
+        const ngc::DigitalInputId input = 0,
+        const ngc::InputCondition condition =
+            ngc::InputCondition::RisingEdge) {
+        ngc::TriggeredMove move;
+        move.epoch = epoch;
+        move.id = id;
+        move.predecessorBranch = predecessor;
+        move.branch = branch;
+        move.moveId = moveId;
+        move.target.x = target;
+        move.limits.velocity.x = 0.5;
+        move.limits.acceleration.x = 1.0;
+        move.limits.jerk.x = 4.0;
+        move.input = input;
+        move.condition = condition;
+
+        return move;
+    }
+
     std::vector<ngc::ExecutionEvent> takeEvents(
         ngc::ProductionExecutorCore &core) {
         std::vector<ngc::ExecutionEvent> events;
@@ -254,6 +278,170 @@ namespace {
                 "proved stop tail did not finish held");
     }
 
+    void testTriggeredMoveReachesTargetAtRest() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        initialize(*core, 40);
+
+        const auto move = triggeredMove(40, 401, 0, 501, 601, 0.2);
+        require(core->tryPublish(ngc::ExecutionItem{move})
+                    == ngc::PublishResult::Published,
+                "triggered move was not published");
+        require(core->trySubmit(ngc::StartRequest{3, move.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "triggered move did not accept start");
+
+        std::vector<ngc::ExecutionEvent> events;
+        ngc::ExecutionSnapshot completed;
+        for (auto tick = 0; tick < 1'000; ++tick) {
+            core->servoTick();
+            auto current = takeEvents(*core);
+            events.insert(events.end(), current.begin(), current.end());
+            completed = latestSnapshot(*core);
+            if (completed.state == ngc::BackendState::Held) {
+                break;
+            }
+        }
+
+        const auto moves =
+            selectEvents<ngc::TriggeredMoveCompleted>(events);
+        require(moves.size() == 1 && moves[0].move == move.moveId
+                    && moves[0].status
+                        == ngc::TriggeredMoveStatus::ReachedTarget,
+                "untriggered move did not report target completion");
+        requireNear(moves[0].stoppedState.position.x, move.target.x,
+                    "triggered move did not reach its target");
+        requireNear(moves[0].stoppedState.velocity.x, 0.0,
+                    "target completion retained velocity");
+        requireNear(moves[0].stoppedState.acceleration.x, 0.0,
+                    "target completion retained acceleration");
+        require(completed.state == ngc::BackendState::Held
+                    && completed.lastBranch == move.branch,
+                "target completion did not establish the terminal hold");
+    }
+
+    void testSampledTriggerGeneratesConstrainedStop() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        initialize(*core, 50);
+
+        constexpr ngc::DigitalInputId input = 7;
+        const auto move = triggeredMove(
+            50, 501, 0, 601, 701, 1.0, input,
+            ngc::InputCondition::RisingEdge);
+        require(core->tryPublish(ngc::ExecutionItem{move})
+                    == ngc::PublishResult::Published,
+                "sampled-trigger move was not published");
+        require(core->trySubmit(ngc::StartRequest{3, move.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "sampled-trigger move did not accept start");
+
+        ngc::ExecutionSnapshot sampled;
+        for (auto tick = 0; tick < 1'000; ++tick) {
+            core->servoTick();
+            takeEvents(*core);
+            sampled = latestSnapshot(*core);
+            if (sampled.commanded.position.x >= 0.1) {
+                break;
+            }
+        }
+        require(sampled.commanded.position.x >= 0.1
+                    && sampled.commanded.velocity.x > 0.0,
+                "trigger fixture did not establish moving approach state");
+
+        core->setDigitalInputSample(input, true);
+        std::vector<ngc::ExecutionEvent> events;
+        ngc::ExecutionSnapshot completed;
+        auto previousAcceleration = sampled.commanded.acceleration.x;
+        for (auto tick = 0; tick < 1'000; ++tick) {
+            core->servoTick();
+            auto current = takeEvents(*core);
+            events.insert(events.end(), current.begin(), current.end());
+            completed = latestSnapshot(*core);
+            require(std::abs(completed.commanded.velocity.x)
+                        <= move.limits.velocity.x + 1e-9,
+                    "triggered stop exceeded its velocity limit");
+            require(std::abs(completed.commanded.acceleration.x)
+                        <= move.limits.acceleration.x + 1e-9,
+                    "triggered stop exceeded its acceleration limit");
+            require(std::abs(completed.commanded.acceleration.x
+                             - previousAcceleration)
+                        <= move.limits.jerk.x * core->servoPeriod() + 1e-9,
+                    "triggered stop exceeded its per-tick jerk limit");
+            previousAcceleration = completed.commanded.acceleration.x;
+            if (completed.state == ngc::BackendState::Held) {
+                break;
+            }
+        }
+
+        const auto moves =
+            selectEvents<ngc::TriggeredMoveCompleted>(events);
+        require(moves.size() == 1
+                    && moves[0].status == ngc::TriggeredMoveStatus::Triggered,
+                "sampled input edge did not complete the move as triggered");
+        requireNear(moves[0].triggerState.position.x,
+                    sampled.commanded.position.x,
+                    "trigger state did not match the servo-sampled position");
+        require(moves[0].triggerState.velocity.x > 0.0
+                    && moves[0].stoppedState.position.x
+                        > moves[0].triggerState.position.x
+                    && moves[0].stoppedState.position.x < move.target.x,
+                "triggered move did not retain contact and stopping states");
+        requireNear(moves[0].stoppedState.velocity.x, 0.0,
+                    "triggered stop retained velocity");
+        requireNear(moves[0].stoppedState.acceleration.x, 0.0,
+                    "triggered stop retained acceleration");
+    }
+
+    void testPlanContinuesIntoTriggeredMove() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        initialize(*core, 60);
+
+        const auto plan =
+            linearChunk(60, 601, 0, 701, 801, 0.0, 0.1, 0.1);
+        const auto move =
+            triggeredMove(60, 602, plan.branch, 702, 802, 0.3);
+        require(core->tryPublish(ngc::ExecutionItem{plan})
+                    == ngc::PublishResult::Published
+                    && core->tryPublish(ngc::ExecutionItem{move})
+                        == ngc::PublishResult::Published,
+                "plan-to-triggered horizon was not published");
+        require(core->trySubmit(ngc::StartRequest{3, plan.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "plan-to-triggered horizon did not accept start");
+
+        std::vector<ngc::ExecutionEvent> events;
+        ngc::ExecutionSnapshot completed;
+        for (auto tick = 0; tick < 1'000; ++tick) {
+            core->servoTick();
+            auto current = takeEvents(*core);
+            events.insert(events.end(), current.begin(), current.end());
+            completed = latestSnapshot(*core);
+            if (completed.state == ngc::BackendState::Held) {
+                break;
+            }
+        }
+
+        const auto branches = selectEvents<ngc::BranchSelected>(events);
+        require(branches.size() == 2
+                    && branches[0].branch == plan.branch
+                    && branches[0].choice == ngc::BranchChoice::Continue
+                    && branches[0].continuation == move.id
+                    && branches[1].branch == move.branch
+                    && branches[1].choice == ngc::BranchChoice::Stop,
+                "plan did not continue into the triggered item");
+        const auto retired = selectEvents<ngc::ChunkRetired>(events);
+        require(retired.size() == 2 && retired[0].chunk == plan.id
+                    && retired[1].chunk == move.id,
+                "plan-to-triggered items were not retired in order");
+        const auto moves =
+            selectEvents<ngc::TriggeredMoveCompleted>(events);
+        require(moves.size() == 1
+                    && moves[0].status
+                        == ngc::TriggeredMoveStatus::ReachedTarget,
+                "continued triggered move did not reach its target");
+        requireNear(completed.commanded.position.x, move.target.x,
+                    "continued triggered move stopped at the wrong position");
+    }
+
     void testBoundedAndExplicitlyUnsupportedInputs() {
         auto rejectedPeriod = false;
         try {
@@ -274,7 +462,15 @@ namespace {
         triggered.moveId = 1;
         require(core->tryPublish(ngc::ExecutionItem{triggered})
                     == ngc::PublishResult::Invalid,
-                "initial production core accepted an unsupported triggered move");
+                "executor accepted a triggered move with invalid limits");
+
+        ngc::TriggeredJointMove triggeredJoint;
+        triggeredJoint.epoch = 1;
+        triggeredJoint.id = 1;
+        triggeredJoint.moveId = 1;
+        require(core->tryPublish(ngc::ExecutionItem{triggeredJoint})
+                    == ngc::PublishResult::Invalid,
+                "initial production core accepted an unsupported joint move");
 
         auto scheduled =
             linearChunk(1, 1, 0, 1, 1, 0.0, 1.0, 1.0);
@@ -336,6 +532,9 @@ int main() {
         testFixedTickExecutionAndAccounting();
         testContinuationMarkersAndTerminalStop();
         testMismatchedContinuationStopsSafely();
+        testTriggeredMoveReachesTargetAtRest();
+        testSampledTriggerGeneratesConstrainedStop();
+        testPlanContinuesIntoTriggeredMove();
         testBoundedAndExplicitlyUnsupportedInputs();
     } catch (const std::exception &error) {
         std::cerr << "Production executor core test failure: "

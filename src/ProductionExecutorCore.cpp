@@ -30,6 +30,25 @@ namespace ngc {
                 && finitePosition(state.acceleration);
         }
 
+        double magnitude(const position_t &value) noexcept {
+            return std::sqrt(value.x * value.x + value.y * value.y
+                + value.z * value.z + value.a * value.a
+                + value.b * value.b + value.c * value.c);
+        }
+
+        double dot(const position_t &left, const position_t &right) noexcept {
+            return left.x * right.x + left.y * right.y
+                + left.z * right.z + left.a * right.a
+                + left.b * right.b + left.c * right.c;
+        }
+
+        position_t scaled(const position_t &value, const double scale) noexcept {
+            return {
+                value.x * scale, value.y * scale, value.z * scale,
+                value.a * scale, value.b * scale, value.c * scale,
+            };
+        }
+
         bool approximatelyEqual(const double actual,
                                 const double expected) noexcept {
             return std::abs(actual - expected)
@@ -47,8 +66,7 @@ namespace ngc {
 
     PublishResult ProductionExecutorCore::tryPublish(
         const ExecutionItem &item) noexcept {
-        const auto *chunk = std::get_if<PlanChunk>(&item);
-        if (chunk == nullptr || !validPlanChunk(*chunk)) {
+        if (!validExecutionItem(item)) {
             return PublishResult::Invalid;
         }
 
@@ -60,8 +78,8 @@ namespace ngc {
             }
 
             auto &slot = m_planSlots[index];
-            slot.chunk = *chunk;
-            slot.normalMotionNanoseconds = normalMotionNanoseconds(*chunk);
+            slot.item = item;
+            slot.normalMotionNanoseconds = normalMotionNanoseconds(item);
             m_queuedNormalMotionNanoseconds.fetch_add(
                 slot.normalMotionNanoseconds, std::memory_order_release);
             m_queuedExecutionItems.fetch_add(1, std::memory_order_release);
@@ -113,6 +131,11 @@ namespace ngc {
         m_faultEventEmitted = false;
     }
 
+    void ProductionExecutorCore::setDigitalInputSample(
+        const DigitalInputId input, const bool active) noexcept {
+        m_digitalInputs[input] = active;
+    }
+
     void ProductionExecutorCore::servoTick(const bool shouldPublishSnapshot) noexcept {
         serviceControls();
 
@@ -125,6 +148,8 @@ namespace ngc {
             }
         }
 
+        m_previousDigitalInputs = m_digitalInputs;
+
         if (shouldPublishSnapshot || m_snapshot.state == BackendState::Held
             || m_snapshot.state == BackendState::Faulted
             || m_snapshot.state == BackendState::Disabled) {
@@ -134,6 +159,18 @@ namespace ngc {
 
     double ProductionExecutorCore::servoPeriod() const noexcept {
         return m_servoPeriod;
+    }
+
+    bool ProductionExecutorCore::validExecutionItem(
+        const ExecutionItem &item) noexcept {
+        if (const auto *chunk = std::get_if<PlanChunk>(&item)) {
+            return validPlanChunk(*chunk);
+        }
+        if (const auto *move = std::get_if<TriggeredMove>(&item)) {
+            return validTriggeredMove(*move);
+        }
+
+        return false;
     }
 
     bool ProductionExecutorCore::validPlanChunk(
@@ -195,14 +232,64 @@ namespace ngc {
         return true;
     }
 
+    bool ProductionExecutorCore::validTriggeredMove(
+        const TriggeredMove &move) noexcept {
+        const auto validCondition = [&] {
+            switch (move.condition) {
+                case InputCondition::Active:
+                case InputCondition::Inactive:
+                case InputCondition::RisingEdge:
+                case InputCondition::FallingEdge: return true;
+            }
+
+            return false;
+        }();
+
+        return move.epoch != 0 && move.id != 0 && move.branch != 0
+            && move.moveId != 0 && finitePosition(move.target)
+            && std::isfinite(magnitude(move.limits.velocity))
+            && magnitude(move.limits.velocity) > 0.0
+            && std::isfinite(magnitude(move.limits.acceleration))
+            && magnitude(move.limits.acceleration) > 0.0
+            && std::isfinite(magnitude(move.limits.jerk))
+            && magnitude(move.limits.jerk) > 0.0
+            && validCondition;
+    }
+
     std::uint64_t ProductionExecutorCore::normalMotionNanoseconds(
-        const PlanChunk &chunk) noexcept {
+        const ExecutionItem &item) noexcept {
+        const auto *chunk = std::get_if<PlanChunk>(&item);
+        if (chunk == nullptr) {
+            return 0;
+        }
+
         auto seconds = 0.0;
-        for (const auto &span : chunk.normalMotion) {
+        for (const auto &span : chunk->normalMotion) {
             seconds += std::max(span.duration, 0.0);
         }
 
         return secondsToNanoseconds(seconds);
+    }
+
+    EpochId ProductionExecutorCore::itemEpoch(
+        const ExecutionItem &item) noexcept {
+        return std::visit([](const auto &value) {
+            return value.epoch;
+        }, item);
+    }
+
+    ChunkId ProductionExecutorCore::itemId(
+        const ExecutionItem &item) noexcept {
+        return std::visit([](const auto &value) {
+            return value.id;
+        }, item);
+    }
+
+    BranchSequence ProductionExecutorCore::itemPredecessor(
+        const ExecutionItem &item) noexcept {
+        return std::visit([](const auto &value) {
+            return value.predecessorBranch;
+        }, item);
     }
 
     std::uint64_t ProductionExecutorCore::secondsToNanoseconds(
@@ -283,9 +370,9 @@ namespace ngc {
         }
         accountForDequeued(index);
 
-        const auto &chunk = m_planSlots[index].chunk;
-        if (chunk.epoch != m_snapshot.epoch) {
-            emit(ChunkRejected{chunk.epoch, chunk.id});
+        const auto &item = m_planSlots[index].item;
+        if (itemEpoch(item) != m_snapshot.epoch) {
+            emit(ChunkRejected{itemEpoch(item), itemId(item)});
             release(index);
 
             return;
@@ -296,15 +383,37 @@ namespace ngc {
         m_span = 0;
         m_nextMarker = 0;
         m_spanElapsed = 0.0;
-        m_snapshot.activeChunk = chunk.id;
+        m_triggered = {};
+        m_snapshot.activeChunk = itemId(item);
         m_snapshot.activeSpan = 0;
-        emit(ChunkAccepted{chunk.epoch, chunk.id});
-        emitExecutionMarkersThrough(0.0);
+        emit(ChunkAccepted{itemEpoch(item), itemId(item)});
+        if (std::holds_alternative<PlanChunk>(item)) {
+            emitExecutionMarkersThrough(0.0);
+        } else if (std::holds_alternative<TriggeredMove>(item)
+                   && !initializeTriggered()) {
+            faultTriggered();
+        }
     }
 
     void ProductionExecutorCore::advanceActive(double seconds) noexcept {
         while (m_active.has_value() && seconds > 0.0
                && m_snapshot.state == BackendState::Running) {
+            const auto &item = m_planSlots[*m_active].item;
+            if (std::holds_alternative<PlanChunk>(item)) {
+                advancePlan(seconds);
+            } else if (std::holds_alternative<TriggeredMove>(item)) {
+                advanceTriggered(seconds);
+            } else {
+                fault(INVALID_EXECUTION_STATE_FAULT);
+            }
+        }
+    }
+
+    void ProductionExecutorCore::advancePlan(double &seconds) noexcept {
+        while (m_active.has_value() && seconds > 0.0
+               && m_snapshot.state == BackendState::Running
+               && std::holds_alternative<PlanChunk>(
+                   m_planSlots[*m_active].item)) {
             const auto &span = currentSpan();
             const auto remaining =
                 std::max(span.duration - m_spanElapsed, 0.0);
@@ -329,6 +438,185 @@ namespace ngc {
             }
             completeSpan();
         }
+    }
+
+    bool ProductionExecutorCore::initializeTriggered() noexcept {
+        const auto &move = activeTriggeredMove();
+        m_triggered = {};
+        m_triggered.start = m_snapshot.commanded.position;
+        const auto delta = move.target - m_triggered.start;
+        m_triggered.length = magnitude(delta);
+        if (m_triggered.length <= 1e-12) {
+            return true;
+        }
+        m_triggered.direction = scaled(delta, 1.0 / m_triggered.length);
+
+        ruckig::InputParameter<1> input;
+        input.current_position = {0.0};
+        input.current_velocity = {
+            dot(m_snapshot.commanded.velocity, m_triggered.direction),
+        };
+        input.current_acceleration = {
+            dot(m_snapshot.commanded.acceleration, m_triggered.direction),
+        };
+        input.target_position = {m_triggered.length};
+        input.target_velocity = {0.0};
+        input.target_acceleration = {0.0};
+        input.max_velocity = {magnitude(move.limits.velocity)};
+        input.max_acceleration = {magnitude(move.limits.acceleration)};
+        input.max_jerk = {magnitude(move.limits.jerk)};
+        ruckig::Ruckig<1> generator;
+
+        return generator.calculate(input, m_triggered.trajectory)
+            == ruckig::Result::Working;
+    }
+
+    bool ProductionExecutorCore::beginTriggeredStop(
+        const TriggeredMoveStatus status) noexcept {
+        const auto &move = activeTriggeredMove();
+        m_triggered.stopOrigin = m_snapshot.commanded;
+        m_triggered.triggerState = m_snapshot.commanded;
+        m_triggered.completionStatus = status;
+        m_triggered.stopping = true;
+        m_triggered.elapsed = 0.0;
+        const auto scalarVelocity =
+            dot(m_snapshot.commanded.velocity, m_triggered.direction);
+        const auto scalarAcceleration =
+            dot(m_snapshot.commanded.acceleration, m_triggered.direction);
+        if (std::abs(scalarVelocity) <= 1e-12
+            && std::abs(scalarAcceleration) <= 1e-12) {
+            return true;
+        }
+
+        ruckig::InputParameter<1> input;
+        input.control_interface = ruckig::ControlInterface::Velocity;
+        input.current_position = {0.0};
+        input.current_velocity = {scalarVelocity};
+        input.current_acceleration = {scalarAcceleration};
+        input.target_position = {0.0};
+        input.target_velocity = {0.0};
+        input.target_acceleration = {0.0};
+        input.max_velocity = {
+            std::max(magnitude(move.limits.velocity),
+                     std::abs(scalarVelocity)),
+        };
+        input.max_acceleration = {magnitude(move.limits.acceleration)};
+        input.max_jerk = {magnitude(move.limits.jerk)};
+        ruckig::Ruckig<1> generator;
+
+        return generator.calculate(input, m_triggered.trajectory)
+            == ruckig::Result::Working;
+    }
+
+    MotionState ProductionExecutorCore::triggeredStateAt(
+        const double elapsed, const position_t &origin) const noexcept {
+        double position = 0.0;
+        double velocity = 0.0;
+        double acceleration = 0.0;
+        m_triggered.trajectory.at_time(
+            elapsed, position, velocity, acceleration);
+
+        return {
+            origin + scaled(m_triggered.direction, position),
+            scaled(m_triggered.direction, velocity),
+            scaled(m_triggered.direction, acceleration),
+        };
+    }
+
+    bool ProductionExecutorCore::triggeredInputConditionMet(
+        const TriggeredMove &move) const noexcept {
+        const auto current = m_digitalInputs[move.input];
+        const auto previous = m_previousDigitalInputs[move.input];
+        switch (move.condition) {
+            case InputCondition::Active: return current;
+            case InputCondition::Inactive: return !current;
+            case InputCondition::RisingEdge: return current && !previous;
+            case InputCondition::FallingEdge: return !current && previous;
+        }
+
+        return false;
+    }
+
+    void ProductionExecutorCore::advanceTriggered(double &seconds) noexcept {
+        const auto move = activeTriggeredMove();
+        if (!m_triggered.stopping && triggeredInputConditionMet(move)) {
+            if (!beginTriggeredStop(TriggeredMoveStatus::Triggered)) {
+                faultTriggered();
+
+                return;
+            }
+            if (m_triggered.trajectory.get_duration() <= 1e-12) {
+                completeTriggered(TriggeredMoveStatus::Triggered);
+
+                return;
+            }
+        }
+
+        if (m_triggered.length <= 1e-12 && !m_triggered.stopping) {
+            m_snapshot.commanded.position = move.target;
+            m_snapshot.commanded.velocity = {};
+            m_snapshot.commanded.acceleration = {};
+            m_snapshot.feedback = m_snapshot.commanded;
+            completeTriggered(TriggeredMoveStatus::ReachedTarget);
+
+            return;
+        }
+
+        const auto duration = m_triggered.trajectory.get_duration();
+        const auto consumed =
+            std::min(seconds, std::max(duration - m_triggered.elapsed, 0.0));
+        m_triggered.elapsed += consumed;
+        const auto origin = m_triggered.stopping
+            ? m_triggered.stopOrigin.position : m_triggered.start;
+        m_snapshot.commanded = triggeredStateAt(m_triggered.elapsed, origin);
+        m_snapshot.feedback = m_snapshot.commanded;
+        m_snapshot.spanProgress = duration > 0.0
+            ? std::clamp(m_triggered.elapsed / duration, 0.0, 1.0) : 1.0;
+        seconds -= consumed;
+
+        if (m_triggered.elapsed + 1e-12 < duration) {
+            return;
+        }
+        if (m_triggered.stopping) {
+            m_snapshot.commanded.velocity = {};
+            m_snapshot.commanded.acceleration = {};
+            m_snapshot.feedback = m_snapshot.commanded;
+            completeTriggered(m_triggered.completionStatus);
+
+            return;
+        }
+
+        m_snapshot.commanded.position = move.target;
+        m_snapshot.commanded.velocity = {};
+        m_snapshot.commanded.acceleration = {};
+        m_snapshot.feedback = m_snapshot.commanded;
+        completeTriggered(TriggeredMoveStatus::ReachedTarget);
+    }
+
+    void ProductionExecutorCore::completeTriggered(
+        const TriggeredMoveStatus status) noexcept {
+        const auto move = activeTriggeredMove();
+        const auto stopped = m_snapshot.commanded;
+        const auto trigger = status == TriggeredMoveStatus::Triggered
+            ? m_triggered.triggerState : stopped;
+        emit(TriggeredMoveCompleted{
+            move.epoch, move.moveId, status, trigger, stopped,
+        });
+        emit(BranchSelected{
+            move.epoch, move.branch, BranchChoice::Stop, 0,
+        });
+        emit(ChunkRetired{move.epoch, move.id});
+        m_snapshot.state = BackendState::Held;
+        m_snapshot.lastBranch = move.branch;
+        emit(BackendHeld{
+            move.epoch, stopped, BackendHoldReason::StopBranch,
+        });
+        release(*m_active);
+        m_active.reset();
+    }
+
+    void ProductionExecutorCore::faultTriggered() noexcept {
+        fault(INVALID_EXECUTION_STATE_FAULT);
     }
 
     void ProductionExecutorCore::completeSpan() noexcept {
@@ -369,14 +657,14 @@ namespace ngc {
         }
 
         const auto currentIndex = *m_active;
-        const auto current = m_planSlots[currentIndex].chunk;
+        const auto current = activeChunk();
         if (hasContinuation) {
-            const auto &continuation = m_planSlots[continuationIndex].chunk;
-            if (continuation.epoch == current.epoch
-                && continuation.predecessorBranch == current.branch) {
+            const auto &continuation = m_planSlots[continuationIndex].item;
+            if (itemEpoch(continuation) == current.epoch
+                && itemPredecessor(continuation) == current.branch) {
                 emit(BranchSelected{
                     current.epoch, current.branch, BranchChoice::Continue,
-                    continuation.id,
+                    itemId(continuation),
                 });
                 emit(ChunkRetired{current.epoch, current.id});
                 m_active = continuationIndex;
@@ -385,15 +673,24 @@ namespace ngc {
                 m_span = 0;
                 m_nextMarker = 0;
                 m_spanElapsed = 0.0;
-                m_snapshot.activeChunk = continuation.id;
+                m_snapshot.activeChunk = itemId(continuation);
                 m_snapshot.activeSpan = 0;
-                emit(ChunkAccepted{continuation.epoch, continuation.id});
-                emitExecutionMarkersThrough(0.0);
+                emit(ChunkAccepted{
+                    itemEpoch(continuation), itemId(continuation),
+                });
+                if (std::holds_alternative<PlanChunk>(continuation)) {
+                    emitExecutionMarkersThrough(0.0);
+                } else if (std::holds_alternative<TriggeredMove>(continuation)
+                           && !initializeTriggered()) {
+                    faultTriggered();
+                }
 
                 return;
             }
 
-            emit(ChunkRejected{continuation.epoch, continuation.id});
+            emit(ChunkRejected{
+                itemEpoch(continuation), itemId(continuation),
+            });
             release(continuationIndex);
         }
 
@@ -470,6 +767,7 @@ namespace ngc {
         m_span = 0;
         m_nextMarker = 0;
         m_spanElapsed = 0.0;
+        m_triggered = {};
     }
 
     void ProductionExecutorCore::release(const std::uint8_t index) noexcept {
@@ -499,7 +797,9 @@ namespace ngc {
                     std::memory_order_acquire));
         m_snapshot.queuedExecutionItems =
             m_queuedExecutionItems.load(std::memory_order_acquire);
-        if (m_active.has_value()) {
+        if (m_active.has_value()
+            && std::holds_alternative<PlanChunk>(
+                m_planSlots[*m_active].item)) {
             const auto &chunk = activeChunk();
             if (m_stopping) {
                 m_snapshot.stopBranchRemainingSeconds =
@@ -520,11 +820,20 @@ namespace ngc {
     }
 
     PlanChunk &ProductionExecutorCore::activeChunk() noexcept {
-        return m_planSlots[*m_active].chunk;
+        return std::get<PlanChunk>(m_planSlots[*m_active].item);
     }
 
     const PlanChunk &ProductionExecutorCore::activeChunk() const noexcept {
-        return m_planSlots[*m_active].chunk;
+        return std::get<PlanChunk>(m_planSlots[*m_active].item);
+    }
+
+    TriggeredMove &ProductionExecutorCore::activeTriggeredMove() noexcept {
+        return std::get<TriggeredMove>(m_planSlots[*m_active].item);
+    }
+
+    const TriggeredMove &
+    ProductionExecutorCore::activeTriggeredMove() const noexcept {
+        return std::get<TriggeredMove>(m_planSlots[*m_active].item);
     }
 
     const AxisPolynomialSpan &

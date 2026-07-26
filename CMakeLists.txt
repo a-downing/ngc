@@ -55,7 +55,9 @@ add_library(ngc_core STATIC
         src/PresentationTracker.cpp
         src/ToolTable.cpp)
 target_include_directories(ngc_core PUBLIC src/include)
-target_link_libraries(ngc_core PRIVATE PathTempo::PathTempo ruckig::ruckig tomlplusplus::tomlplusplus)
+target_link_libraries(ngc_core
+    PUBLIC ruckig::ruckig
+    PRIVATE PathTempo::PathTempo tomlplusplus::tomlplusplus)
 ngc_target_defaults(ngc_core)
 
 add_library(ngc_operator STATIC

@@ -57,10 +57,14 @@ activated only for an active program epoch, while homing and jogging currently
 use runtime-owned synchronous service stepping. `MockMotionBackend` is a non-RT
 implementation of the production-shaped backend contract.
 `ProductionExecutorCore` is the initial platform-independent, fixed-period,
-allocation-free execution core for normal `PlanChunk` motion, stop branches,
-markers, retirement, snapshots, and faults. It does not yet execute triggered
-moves, jogging, homing, feed hold, or scheduled hardware events, and it is not
-yet hosted by the external process. There is no complete real-time executor,
+allocation-free execution core for normal `PlanChunk` motion, axis-space
+triggered moves, stop branches, markers, retirement, snapshots, and faults.
+Its hosting servo thread supplies sampled digital-input levels before each
+tick; the core detects configured levels or edges and generates the
+jerk-limited triggered stop without importing hardware acquisition or synthetic
+input policy. It does not yet execute triggered joint moves, jogging, homing,
+feed hold, controlled stop, or scheduled hardware events, and it is not yet
+hosted by the external process. There is no complete real-time executor,
 HAL component, or physical backend yet. `ExternalRealtimeRuntime`
 implements the NRT side of the versioned shared-memory IPC boundary and owns a
 bounded `MotionBackend` proxy. The `ngc_ipc_backend` executable is a
