@@ -8,11 +8,11 @@ Configure and build a Release tree from the repository root:
 
 ```bash
 git submodule update --init --recursive
-cmake -S . -B build-linux -G Ninja \
+cmake -S . -B build -G Ninja \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_C_COMPILER=clang \
     -DCMAKE_CXX_COMPILER=clang++
-cmake --build build-linux --parallel
+cmake --build build --parallel
 ```
 
 Run the core suite from the repository root because it loads `machine.toml`
@@ -20,8 +20,8 @@ and `tool_table.txt` relative to its working directory. Run the other tests
 through CTest:
 
 ```bash
-./build-linux/ngc_tests
-ctest --test-dir build-linux -E '^ngc_tests$' --output-on-failure
+./build/ngc_tests
+ctest --test-dir build -E '^ngc_tests$' --output-on-failure
 ```
 
 ## VistaCNC P2-S access
@@ -44,6 +44,6 @@ the existing hidraw node does not receive the updated permissions.
 Verify input and display transport with:
 
 ```bash
-./build-linux/vistacnc_p2s_probe
-./build-linux/vistacnc_p2s_probe --display "NGC     READY"
+./build/vistacnc_p2s_probe
+./build/vistacnc_p2s_probe --display "NGC     READY"
 ```

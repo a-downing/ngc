@@ -464,8 +464,9 @@ namespace {
                 configuration ? "" : configuration.error());
         require(configuration->realBackend.has_value(),
                 "IPC test machine configuration should enable Real");
-        configuration->realBackend->executable =
-            std::filesystem::absolute(peer);
+        require(configuration->realBackend->executable
+                    == std::filesystem::absolute(peer).lexically_normal(),
+                "repository Real backend path should select the built IPC executor");
 
         ngc::MachineSessionManager manager(*configuration);
         const auto initial = manager.state();
