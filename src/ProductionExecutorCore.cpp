@@ -54,6 +54,17 @@ namespace ngc {
             return std::abs(actual - expected)
                 <= 1e-12 * std::max(1.0, std::abs(expected));
         }
+
+        bool validInputCondition(const InputCondition condition) noexcept {
+            switch (condition) {
+                case InputCondition::Active:
+                case InputCondition::Inactive:
+                case InputCondition::RisingEdge:
+                case InputCondition::FallingEdge: return true;
+            }
+
+            return false;
+        }
     }
 
     ProductionExecutorCore::ProductionExecutorCore(const double servoPeriod)
@@ -169,6 +180,9 @@ namespace ngc {
         if (const auto *move = std::get_if<TriggeredMove>(&item)) {
             return validTriggeredMove(*move);
         }
+        if (const auto *move = std::get_if<TriggeredJointMove>(&item)) {
+            return validTriggeredJointMove(*move);
+        }
 
         return false;
     }
@@ -234,17 +248,6 @@ namespace ngc {
 
     bool ProductionExecutorCore::validTriggeredMove(
         const TriggeredMove &move) noexcept {
-        const auto validCondition = [&] {
-            switch (move.condition) {
-                case InputCondition::Active:
-                case InputCondition::Inactive:
-                case InputCondition::RisingEdge:
-                case InputCondition::FallingEdge: return true;
-            }
-
-            return false;
-        }();
-
         return move.epoch != 0 && move.id != 0 && move.branch != 0
             && move.moveId != 0 && finitePosition(move.target)
             && std::isfinite(magnitude(move.limits.velocity))
@@ -253,7 +256,56 @@ namespace ngc {
             && magnitude(move.limits.acceleration) > 0.0
             && std::isfinite(magnitude(move.limits.jerk))
             && magnitude(move.limits.jerk) > 0.0
-            && validCondition;
+            && validInputCondition(move.condition);
+    }
+
+    bool ProductionExecutorCore::validTriggeredJointMove(
+        const TriggeredJointMove &move) noexcept {
+        constexpr auto validJointMask =
+            static_cast<JointMask>((JointMask{1} << MAX_JOINTS) - 1);
+        if (move.epoch == 0 || move.id == 0 || move.branch == 0
+            || move.moveId == 0 || move.joints == 0
+            || (move.joints & ~validJointMask) != 0
+            || (move.targetMode != JointTargetMode::Absolute
+                && move.targetMode != JointTargetMode::Relative)) {
+            return false;
+        }
+
+        for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+            const auto mask = static_cast<JointMask>(JointMask{1} << joint);
+            if ((move.joints & mask) == 0) {
+                continue;
+            }
+            if (!std::isfinite(move.target[joint])
+                || !std::isfinite(move.limits.velocity[joint])
+                || move.limits.velocity[joint] <= 0.0
+                || !std::isfinite(move.limits.acceleration[joint])
+                || move.limits.acceleration[joint] <= 0.0
+                || !std::isfinite(move.limits.jerk[joint])
+                || move.limits.jerk[joint] <= 0.0) {
+                return false;
+            }
+        }
+
+        JointMask triggeredJoints = 0;
+        for (const auto &trigger : move.triggers) {
+            if (trigger.joint >= MAX_JOINTS
+                || !validInputCondition(trigger.condition)
+                || !std::isfinite(trigger.debounce)
+                || trigger.debounce < 0.0) {
+                return false;
+            }
+
+            const auto mask =
+                static_cast<JointMask>(JointMask{1} << trigger.joint);
+            if ((move.joints & mask) == 0
+                || (triggeredJoints & mask) != 0) {
+                return false;
+            }
+            triggeredJoints |= mask;
+        }
+
+        return !move.triggerRequired || triggeredJoints == move.joints;
     }
 
     std::uint64_t ProductionExecutorCore::normalMotionNanoseconds(
@@ -384,6 +436,8 @@ namespace ngc {
         m_nextMarker = 0;
         m_spanElapsed = 0.0;
         m_triggered = {};
+        m_triggeredJoints = {};
+        m_triggeredJointMask = 0;
         m_snapshot.activeChunk = itemId(item);
         m_snapshot.activeSpan = 0;
         emit(ChunkAccepted{itemEpoch(item), itemId(item)});
@@ -391,6 +445,9 @@ namespace ngc {
             emitExecutionMarkersThrough(0.0);
         } else if (std::holds_alternative<TriggeredMove>(item)
                    && !initializeTriggered()) {
+            faultTriggered();
+        } else if (std::holds_alternative<TriggeredJointMove>(item)
+                   && !initializeTriggeredJoints()) {
             faultTriggered();
         }
     }
@@ -403,6 +460,8 @@ namespace ngc {
                 advancePlan(seconds);
             } else if (std::holds_alternative<TriggeredMove>(item)) {
                 advanceTriggered(seconds);
+            } else if (std::holds_alternative<TriggeredJointMove>(item)) {
+                advanceTriggeredJoints(seconds);
             } else {
                 fault(INVALID_EXECUTION_STATE_FAULT);
             }
@@ -619,6 +678,243 @@ namespace ngc {
         fault(INVALID_EXECUTION_STATE_FAULT);
     }
 
+    bool ProductionExecutorCore::initializeTriggeredJoints() noexcept {
+        const auto &move = activeTriggeredJointMove();
+        m_triggeredJoints = {};
+        m_triggeredJointMask = 0;
+        m_snapshot.activeJoints = move.joints;
+        for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+            const auto mask = static_cast<JointMask>(JointMask{1} << joint);
+            if ((move.joints & mask) != 0
+                && !initializeTriggeredJoint(move, joint)) {
+                return false;
+            }
+        }
+
+        return true;
+    }
+
+    bool ProductionExecutorCore::initializeTriggeredJoint(
+        const TriggeredJointMove &move, const JointId joint) noexcept {
+        auto &runtime = m_triggeredJoints[joint];
+        runtime = {};
+        const auto &state = m_snapshot.commandedJoints;
+        runtime.target = move.targetMode == JointTargetMode::Relative
+            ? state.position[joint] + move.target[joint] : move.target[joint];
+        if (std::abs(runtime.target - state.position[joint]) <= 1e-12
+            && std::abs(state.velocity[joint]) <= 1e-12
+            && std::abs(state.acceleration[joint]) <= 1e-12) {
+            runtime.finished = true;
+
+            return true;
+        }
+
+        ruckig::InputParameter<1> input;
+        input.current_position = {state.position[joint]};
+        input.current_velocity = {state.velocity[joint]};
+        input.current_acceleration = {state.acceleration[joint]};
+        input.target_position = {runtime.target};
+        input.target_velocity = {0.0};
+        input.target_acceleration = {0.0};
+        input.max_velocity = {move.limits.velocity[joint]};
+        input.max_acceleration = {move.limits.acceleration[joint]};
+        input.max_jerk = {move.limits.jerk[joint]};
+        ruckig::Ruckig<1> generator;
+
+        return generator.calculate(input, runtime.trajectory)
+            == ruckig::Result::Working;
+    }
+
+    bool ProductionExecutorCore::beginTriggeredJointStop(
+        const TriggeredJointMove &move, const JointId joint) noexcept {
+        auto &runtime = m_triggeredJoints[joint];
+        const auto &state = m_snapshot.commandedJoints;
+        runtime.stopping = true;
+        runtime.triggerPosition = state.position[joint];
+        runtime.triggerVelocity = state.velocity[joint];
+        runtime.triggerAcceleration = state.acceleration[joint];
+        runtime.elapsed = 0.0;
+        m_triggeredJointMask |=
+            static_cast<JointMask>(JointMask{1} << joint);
+        if (std::abs(runtime.triggerVelocity) <= 1e-12
+            && std::abs(runtime.triggerAcceleration) <= 1e-12) {
+            runtime.finished = true;
+
+            return true;
+        }
+
+        ruckig::InputParameter<1> input;
+        input.control_interface = ruckig::ControlInterface::Velocity;
+        input.current_position = {runtime.triggerPosition};
+        input.current_velocity = {runtime.triggerVelocity};
+        input.current_acceleration = {runtime.triggerAcceleration};
+        input.target_position = {runtime.triggerPosition};
+        input.target_velocity = {0.0};
+        input.target_acceleration = {0.0};
+        input.max_velocity = {
+            std::max(move.limits.velocity[joint],
+                     std::abs(runtime.triggerVelocity)),
+        };
+        input.max_acceleration = {move.limits.acceleration[joint]};
+        input.max_jerk = {move.limits.jerk[joint]};
+        ruckig::Ruckig<1> generator;
+
+        return generator.calculate(input, runtime.trajectory)
+            == ruckig::Result::Working;
+    }
+
+    bool ProductionExecutorCore::triggeredJointInputQualified(
+        const JointTrigger &trigger,
+        TriggeredJointRuntime &runtime) noexcept {
+        const auto current =
+            static_cast<bool>(m_digitalInputs[trigger.input]);
+        const auto previous =
+            static_cast<bool>(m_previousDigitalInputs[trigger.input]);
+        const auto edgeCondition =
+            trigger.condition == InputCondition::RisingEdge
+            || trigger.condition == InputCondition::FallingEdge;
+        const auto conditionStarted = [&] {
+            switch (trigger.condition) {
+                case InputCondition::Active: return current;
+                case InputCondition::Inactive: return !current;
+                case InputCondition::RisingEdge: return current && !previous;
+                case InputCondition::FallingEdge: return !current && previous;
+            }
+
+            return false;
+        }();
+        const auto resultingLevel = [&] {
+            switch (trigger.condition) {
+                case InputCondition::Active:
+                case InputCondition::RisingEdge: return current;
+                case InputCondition::Inactive:
+                case InputCondition::FallingEdge: return !current;
+            }
+
+            return false;
+        }();
+
+        if (edgeCondition && conditionStarted) {
+            runtime.triggerPending = true;
+            runtime.debounceElapsed = 0.0;
+        } else if (!edgeCondition) {
+            runtime.triggerPending = conditionStarted;
+        }
+        if (!runtime.triggerPending || !resultingLevel) {
+            runtime.triggerPending = false;
+            runtime.debounceElapsed = 0.0;
+
+            return false;
+        }
+
+        runtime.debounceElapsed += m_servoPeriod;
+
+        return runtime.debounceElapsed + 1e-12 >= trigger.debounce;
+    }
+
+    void ProductionExecutorCore::advanceTriggeredJoints(
+        double &seconds) noexcept {
+        const auto move = activeTriggeredJointMove();
+        for (const auto &trigger : move.triggers) {
+            auto &runtime = m_triggeredJoints[trigger.joint];
+            if (!runtime.finished && !runtime.stopping
+                && triggeredJointInputQualified(trigger, runtime)
+                && !beginTriggeredJointStop(move, trigger.joint)) {
+                faultTriggered();
+
+                return;
+            }
+        }
+
+        for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+            const auto mask = static_cast<JointMask>(JointMask{1} << joint);
+            if ((move.joints & mask) == 0) {
+                continue;
+            }
+
+            auto &runtime = m_triggeredJoints[joint];
+            if (runtime.finished) {
+                continue;
+            }
+
+            const auto duration = runtime.trajectory.get_duration();
+            const auto consumed =
+                std::min(seconds, std::max(duration - runtime.elapsed, 0.0));
+            runtime.elapsed += consumed;
+            double position = 0.0;
+            double velocity = 0.0;
+            double acceleration = 0.0;
+            runtime.trajectory.at_time(
+                runtime.elapsed, position, velocity, acceleration);
+            m_snapshot.commandedJoints.position[joint] = position;
+            m_snapshot.commandedJoints.velocity[joint] = velocity;
+            m_snapshot.commandedJoints.acceleration[joint] = acceleration;
+            if (runtime.elapsed + 1e-12 < duration) {
+                continue;
+            }
+
+            if (!runtime.stopping) {
+                m_snapshot.commandedJoints.position[joint] = runtime.target;
+            }
+            m_snapshot.commandedJoints.velocity[joint] = 0.0;
+            m_snapshot.commandedJoints.acceleration[joint] = 0.0;
+            runtime.finished = true;
+        }
+        m_snapshot.feedbackJoints = m_snapshot.commandedJoints;
+        seconds = 0.0;
+
+        for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+            const auto mask = static_cast<JointMask>(JointMask{1} << joint);
+            if ((move.joints & mask) != 0
+                && !m_triggeredJoints[joint].finished) {
+                return;
+            }
+        }
+        completeTriggeredJoints();
+    }
+
+    void ProductionExecutorCore::completeTriggeredJoints() noexcept {
+        const auto move = activeTriggeredJointMove();
+        auto triggerState = m_snapshot.commandedJoints;
+        JointMask expectedTriggers = 0;
+        for (const auto &trigger : move.triggers) {
+            const auto mask =
+                static_cast<JointMask>(JointMask{1} << trigger.joint);
+            expectedTriggers |= mask;
+            if ((m_triggeredJointMask & mask) == 0) {
+                continue;
+            }
+
+            const auto &runtime = m_triggeredJoints[trigger.joint];
+            triggerState.position[trigger.joint] = runtime.triggerPosition;
+            triggerState.velocity[trigger.joint] = runtime.triggerVelocity;
+            triggerState.acceleration[trigger.joint] =
+                runtime.triggerAcceleration;
+        }
+        const auto status =
+            expectedTriggers != 0
+            && (m_triggeredJointMask & expectedTriggers) == expectedTriggers
+            ? TriggeredMoveStatus::Triggered
+            : TriggeredMoveStatus::ReachedTarget;
+        emit(TriggeredJointMoveCompleted{
+            move.epoch, move.moveId, status, m_triggeredJointMask,
+            triggerState, m_snapshot.commandedJoints,
+        });
+        emit(BranchSelected{
+            move.epoch, move.branch, BranchChoice::Stop, 0,
+        });
+        emit(ChunkRetired{move.epoch, move.id});
+        m_snapshot.state = BackendState::Held;
+        m_snapshot.lastBranch = move.branch;
+        m_snapshot.activeJoints = 0;
+        emit(BackendHeld{
+            move.epoch, m_snapshot.commanded,
+            BackendHoldReason::StopBranch,
+        });
+        release(*m_active);
+        m_active.reset();
+    }
+
     void ProductionExecutorCore::completeSpan() noexcept {
         m_spanElapsed = 0.0;
         ++m_span;
@@ -682,6 +978,10 @@ namespace ngc {
                     emitExecutionMarkersThrough(0.0);
                 } else if (std::holds_alternative<TriggeredMove>(continuation)
                            && !initializeTriggered()) {
+                    faultTriggered();
+                } else if (std::holds_alternative<TriggeredJointMove>(
+                               continuation)
+                           && !initializeTriggeredJoints()) {
                     faultTriggered();
                 }
 
@@ -768,6 +1068,9 @@ namespace ngc {
         m_nextMarker = 0;
         m_spanElapsed = 0.0;
         m_triggered = {};
+        m_triggeredJoints = {};
+        m_triggeredJointMask = 0;
+        m_snapshot.activeJoints = 0;
     }
 
     void ProductionExecutorCore::release(const std::uint8_t index) noexcept {
@@ -834,6 +1137,18 @@ namespace ngc {
     const TriggeredMove &
     ProductionExecutorCore::activeTriggeredMove() const noexcept {
         return std::get<TriggeredMove>(m_planSlots[*m_active].item);
+    }
+
+    TriggeredJointMove &
+    ProductionExecutorCore::activeTriggeredJointMove() noexcept {
+        return std::get<TriggeredJointMove>(
+            m_planSlots[*m_active].item);
+    }
+
+    const TriggeredJointMove &
+    ProductionExecutorCore::activeTriggeredJointMove() const noexcept {
+        return std::get<TriggeredJointMove>(
+            m_planSlots[*m_active].item);
     }
 
     const AxisPolynomialSpan &

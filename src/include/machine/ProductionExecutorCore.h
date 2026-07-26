@@ -65,9 +65,23 @@ namespace ngc {
             ruckig::Trajectory<1> trajectory;
         };
 
+        struct TriggeredJointRuntime {
+            double target = 0.0;
+            double elapsed = 0.0;
+            double debounceElapsed = 0.0;
+            double triggerPosition = 0.0;
+            double triggerVelocity = 0.0;
+            double triggerAcceleration = 0.0;
+            bool stopping = false;
+            bool finished = false;
+            bool triggerPending = false;
+            ruckig::Trajectory<1> trajectory;
+        };
+
         static bool validExecutionItem(const ExecutionItem &item) noexcept;
         static bool validPlanChunk(const PlanChunk &chunk) noexcept;
         static bool validTriggeredMove(const TriggeredMove &move) noexcept;
+        static bool validTriggeredJointMove(const TriggeredJointMove &move) noexcept;
         static std::uint64_t normalMotionNanoseconds(const ExecutionItem &item) noexcept;
         static std::uint64_t secondsToNanoseconds(double seconds) noexcept;
         static EpochId itemEpoch(const ExecutionItem &item) noexcept;
@@ -87,6 +101,15 @@ namespace ngc {
             double elapsed, const position_t &origin) const noexcept;
         [[nodiscard]] bool triggeredInputConditionMet(
             const TriggeredMove &move) const noexcept;
+        bool initializeTriggeredJoints() noexcept;
+        bool initializeTriggeredJoint(const TriggeredJointMove &move,
+                                      JointId joint) noexcept;
+        bool beginTriggeredJointStop(const TriggeredJointMove &move,
+                                     JointId joint) noexcept;
+        bool triggeredJointInputQualified(const JointTrigger &trigger,
+                                          TriggeredJointRuntime &runtime) noexcept;
+        void advanceTriggeredJoints(double &seconds) noexcept;
+        void completeTriggeredJoints() noexcept;
         void completeSpan() noexcept;
         void selectContinuationOrStop() noexcept;
         void emitExecutionMarkersThrough(double parameter) noexcept;
@@ -102,6 +125,9 @@ namespace ngc {
         [[nodiscard]] const PlanChunk &activeChunk() const noexcept;
         [[nodiscard]] TriggeredMove &activeTriggeredMove() noexcept;
         [[nodiscard]] const TriggeredMove &activeTriggeredMove() const noexcept;
+        [[nodiscard]] TriggeredJointMove &activeTriggeredJointMove() noexcept;
+        [[nodiscard]] const TriggeredJointMove &
+        activeTriggeredJointMove() const noexcept;
         [[nodiscard]] const AxisPolynomialSpan &currentSpan() const noexcept;
 
         template<typename Spans>
@@ -133,6 +159,8 @@ namespace ngc {
         std::uint32_t m_span = 0;
         std::uint32_t m_nextMarker = 0;
         TriggeredRuntime m_triggered;
+        std::array<TriggeredJointRuntime, MAX_JOINTS> m_triggeredJoints;
+        JointMask m_triggeredJointMask = 0;
         std::bitset<DIGITAL_INPUT_CAPACITY> m_digitalInputs;
         std::bitset<DIGITAL_INPUT_CAPACITY> m_previousDigitalInputs;
         bool m_stopping = false;

@@ -1,4 +1,5 @@
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -86,6 +87,29 @@ namespace {
         move.limits.jerk.x = 4.0;
         move.input = input;
         move.condition = condition;
+
+        return move;
+    }
+
+    ngc::TriggeredJointMove triggeredJointMove(
+        const ngc::EpochId epoch, const ngc::ChunkId id,
+        const ngc::BranchSequence predecessor,
+        const ngc::BranchSequence branch,
+        const ngc::TriggeredMoveId moveId) {
+        ngc::TriggeredJointMove move;
+        move.epoch = epoch;
+        move.id = id;
+        move.predecessorBranch = predecessor;
+        move.branch = branch;
+        move.moveId = moveId;
+        move.joints = ngc::JointMask{1} | ngc::JointMask{1} << 1;
+        move.target[0] = 0.5;
+        move.target[1] = 0.75;
+        for (ngc::JointId joint = 0; joint < 2; ++joint) {
+            move.limits.velocity[joint] = 0.5;
+            move.limits.acceleration[joint] = 1.0;
+            move.limits.jerk[joint] = 4.0;
+        }
 
         return move;
     }
@@ -442,6 +466,136 @@ namespace {
                     "continued triggered move stopped at the wrong position");
     }
 
+    void testTriggeredJointsStopIndependentlyAndRetainState() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        initialize(*core, 70);
+
+        constexpr ngc::DigitalInputId firstInput = 10;
+        constexpr ngc::DigitalInputId secondInput = 11;
+        auto move = triggeredJointMove(70, 701, 0, 801, 901);
+        move.triggerRequired = true;
+        require(move.triggers.push({
+                    0, firstInput, ngc::InputCondition::Active, 0.02,
+                }) && move.triggers.push({
+                    1, secondInput, ngc::InputCondition::RisingEdge, 0.0,
+                }),
+                "joint-trigger fixtures did not fit");
+        require(core->tryPublish(ngc::ExecutionItem{move})
+                    == ngc::PublishResult::Published,
+                "triggered joint move was not published");
+        require(core->trySubmit(ngc::StartRequest{3, move.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "triggered joint move did not accept start");
+
+        ngc::ExecutionSnapshot approaching;
+        for (auto tick = 0; tick < 1'000; ++tick) {
+            core->servoTick();
+            takeEvents(*core);
+            approaching = latestSnapshot(*core);
+            if (approaching.commandedJoints.position[0] >= 0.05) {
+                break;
+            }
+        }
+        require(approaching.state == ngc::BackendState::Running
+                    && approaching.activeJoints == move.joints
+                    && approaching.commandedJoints.velocity[0] > 0.0
+                    && approaching.commandedJoints.velocity[1] > 0.0,
+                "joint trigger fixture did not establish moving joint state");
+
+        core->setDigitalInputSample(firstInput, true);
+        core->setDigitalInputSample(secondInput, true);
+        std::vector<ngc::ExecutionEvent> events;
+        ngc::ExecutionSnapshot completed;
+        auto previousAcceleration = std::array{
+            approaching.commandedJoints.acceleration[0],
+            approaching.commandedJoints.acceleration[1],
+        };
+        for (auto tick = 0; tick < 1'000; ++tick) {
+            core->servoTick();
+            auto current = takeEvents(*core);
+            events.insert(events.end(), current.begin(), current.end());
+            completed = latestSnapshot(*core);
+            for (ngc::JointId joint = 0; joint < 2; ++joint) {
+                require(std::abs(completed.commandedJoints.velocity[joint])
+                            <= move.limits.velocity[joint] + 1e-9,
+                        "triggered joint exceeded its velocity limit");
+                require(std::abs(completed.commandedJoints.acceleration[joint])
+                            <= move.limits.acceleration[joint] + 1e-9,
+                        "triggered joint exceeded its acceleration limit");
+                require(std::abs(
+                            completed.commandedJoints.acceleration[joint]
+                            - previousAcceleration[joint])
+                            <= move.limits.jerk[joint]
+                                * core->servoPeriod() + 1e-9,
+                        "triggered joint exceeded its per-tick jerk limit");
+                previousAcceleration[joint] =
+                    completed.commandedJoints.acceleration[joint];
+            }
+            if (completed.state == ngc::BackendState::Held) {
+                break;
+            }
+        }
+
+        const auto completions =
+            selectEvents<ngc::TriggeredJointMoveCompleted>(events);
+        require(completions.size() == 1
+                    && completions[0].move == move.moveId
+                    && completions[0].status
+                        == ngc::TriggeredMoveStatus::Triggered
+                    && completions[0].triggeredJoints == move.joints,
+                "joint inputs did not complete every selected joint as triggered");
+        require(completions[0].triggerState.position[0]
+                    > completions[0].triggerState.position[1],
+                "debounced joint did not continue independently after the edge-triggered joint stopped");
+        for (ngc::JointId joint = 0; joint < 2; ++joint) {
+            requireNear(completions[0].stoppedState.velocity[joint], 0.0,
+                        "triggered joint retained velocity");
+            requireNear(completions[0].stoppedState.acceleration[joint], 0.0,
+                        "triggered joint retained acceleration");
+            require(completions[0].stoppedState.position[joint]
+                        > completions[0].triggerState.position[joint],
+                    "triggered joint did not execute its constrained stop");
+        }
+        require(completed.state == ngc::BackendState::Held
+                    && completed.activeJoints == 0
+                    && completed.lastBranch == move.branch,
+                "triggered joint completion did not establish a terminal hold");
+
+        const auto retainedPosition =
+            completed.commandedJoints.position[0];
+        initialize(*core, 71);
+        auto relative = triggeredJointMove(71, 702, 0, 802, 902);
+        relative.joints = ngc::JointMask{1};
+        relative.targetMode = ngc::JointTargetMode::Relative;
+        relative.target[0] = 0.1;
+        require(core->tryPublish(ngc::ExecutionItem{relative})
+                    == ngc::PublishResult::Published,
+                "relative triggered joint move was not published");
+        require(core->trySubmit(ngc::StartRequest{3, relative.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "relative triggered joint move did not accept start");
+
+        events.clear();
+        for (auto tick = 0; tick < 1'000; ++tick) {
+            core->servoTick();
+            auto current = takeEvents(*core);
+            events.insert(events.end(), current.begin(), current.end());
+            completed = latestSnapshot(*core);
+            if (completed.state == ngc::BackendState::Held) {
+                break;
+            }
+        }
+        const auto relativeCompletions =
+            selectEvents<ngc::TriggeredJointMoveCompleted>(events);
+        require(relativeCompletions.size() == 1
+                    && relativeCompletions[0].status
+                        == ngc::TriggeredMoveStatus::ReachedTarget,
+                "untriggered relative joint move did not reach its target");
+        requireNear(completed.commandedJoints.position[0],
+                    retainedPosition + relative.target[0],
+                    "relative joint target did not use retained joint state");
+    }
+
     void testBoundedAndExplicitlyUnsupportedInputs() {
         auto rejectedPeriod = false;
         try {
@@ -464,13 +618,25 @@ namespace {
                     == ngc::PublishResult::Invalid,
                 "executor accepted a triggered move with invalid limits");
 
-        ngc::TriggeredJointMove triggeredJoint;
-        triggeredJoint.epoch = 1;
-        triggeredJoint.id = 1;
-        triggeredJoint.moveId = 1;
+        auto triggeredJoint =
+            triggeredJointMove(1, 1, 0, 1, 1);
+        triggeredJoint.triggerRequired = true;
+        require(triggeredJoint.triggers.push({
+                    0, 1, ngc::InputCondition::Active, 0.0,
+                }),
+                "required joint trigger fixture did not fit");
         require(core->tryPublish(ngc::ExecutionItem{triggeredJoint})
                     == ngc::PublishResult::Invalid,
-                "initial production core accepted an unsupported joint move");
+                "executor accepted a required joint move with a missing trigger");
+
+        triggeredJoint.triggerRequired = false;
+        require(triggeredJoint.triggers.push({
+                    0, 2, ngc::InputCondition::Active, 0.0,
+                }),
+                "duplicate joint trigger fixture did not fit");
+        require(core->tryPublish(ngc::ExecutionItem{triggeredJoint})
+                    == ngc::PublishResult::Invalid,
+                "executor accepted duplicate triggers for one joint");
 
         auto scheduled =
             linearChunk(1, 1, 0, 1, 1, 0.0, 1.0, 1.0);
@@ -535,6 +701,7 @@ int main() {
         testTriggeredMoveReachesTargetAtRest();
         testSampledTriggerGeneratesConstrainedStop();
         testPlanContinuesIntoTriggeredMove();
+        testTriggeredJointsStopIndependentlyAndRetainState();
         testBoundedAndExplicitlyUnsupportedInputs();
     } catch (const std::exception &error) {
         std::cerr << "Production executor core test failure: "
