@@ -89,10 +89,16 @@ branch while feed-hold braking or resume retiming is active. For axis-space
 triggered moves, feed hold generates a constrained stop while retaining the
 target and input condition, continues sampling during braking, and regenerates
 the remaining approach on Resume. A sampled trigger during braking supersedes
-the feed hold and completes through the ordinary triggered-stop result. The
-core is not yet paired with
-`HomingController` through a production `BackendRuntime` host or hosted by the
-external process.
+the feed hold and completes through the ordinary triggered-stop result.
+`ProductionExecutorRuntime` is the production-shaped `BackendRuntime` host for
+the core. It derives fixed-capacity executor mappings and limits from typed
+machine configuration, owns fixed-period ticking and stopped-state synchronous
+service stepping, samples a fixed-size digital-input image before each tick,
+and applies the fixed-size output state afterward through an injected I/O
+boundary. Hardware acquisition and synthetic-input policy remain outside the
+runtime. The runtime is the second backend-conformance target and is paired
+end-to-end with `HomingController`. It is not yet hosted by the external
+process.
 There is no complete real-time executor,
 HAL component, or physical backend yet. `ExternalRealtimeRuntime`
 implements the NRT side of the versioned shared-memory IPC boundary and owns a

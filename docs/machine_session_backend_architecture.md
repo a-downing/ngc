@@ -849,25 +849,23 @@ physical backend; the application must not expose the test host.
 
 ### Phase 8: Add backend conformance tests
 
-Status: in progress. A reusable target-driven backend conformance suite now
-runs against `InProcessSimulationRuntime` through only `BackendRuntime` and
-`MotionBackend`. It covers idempotent runtime lifecycle, stationary-state
-restore gating, enable/disable, repeated epochs, dependent publication and
-retirement, marker ordering, triggered joint motion, jogging lease expiry,
-controlled Stop, abort, bounded publication and control channels, and a fatal
-hold transition. Direct mock-only diagnostic tests remain alongside this suite.
-The second target remains pending while the initial production executor core
-gains the complete backend-neutral primitive coverage required by the suite.
-Future executor and IPC runtimes must register with the same suite rather than
-forking its behavioral expectations.
+Status: implemented for the current runtime targets. A reusable target-driven
+backend conformance suite runs against both `InProcessSimulationRuntime` and
+`ProductionExecutorRuntime` through only `BackendRuntime` and `MotionBackend`.
+It covers idempotent runtime lifecycle, stationary-state restore gating,
+enable/disable, repeated epochs, dependent publication and retirement, marker
+ordering, triggered joint motion, jogging lease expiry, controlled Stop, abort,
+bounded publication and control channels, and a fatal hold transition. Direct
+mock-only diagnostic tests remain alongside this suite. Future IPC and physical
+runtimes must register with the same suite rather than forking its behavioral
+expectations.
 
 - Build a reusable behavioral suite for enable/disable, repeated epochs,
   publication and retirement, marker ordering, triggered moves, homing,
   jogging leases, stop/abort, channel capacity, and faults. Complete for the
   current backend-neutral primitive coverage.
 - Run it against the in-process backend and later against the reusable
-  production executor core. Complete for the in-process backend; production
-  executor registration remains.
+  production executor core. Complete through `ProductionExecutorRuntime`.
 
 ### Phase 9: Add the IPC skeleton
 
@@ -952,9 +950,19 @@ Abort, and faults establish the safe spindle output. Focused tests cover
 activation across spans and dependent chunks, hold/Resume, controlled Stop,
 Abort, Disable, and feed-retiming faults.
 
-The core is not yet connected to `ngc_ipc_backend` or registered as the second
-backend-conformance target. It is not yet paired with `HomingController`
-through a production `BackendRuntime` host.
+`ProductionExecutorRuntime` now hosts the core behind `BackendRuntime`. It
+derives fixed-capacity executor mappings and physical limits from typed machine
+configuration, owns fixed-period ticking and stopped-state synchronous service
+stepping, restores complete stationary axis and joint state only while stopped,
+samples a fixed-size digital-input image before every tick, and applies the
+fixed-size output state afterward through an injected I/O boundary. Hardware
+acquisition and synthetic-input policy remain outside the runtime. Lifecycle
+tests cover fixed-period progress, clean stop, and restore gating. The runtime
+is registered as the second backend-conformance target, and an end-to-end test
+runs `HomingController` through its production runtime callbacks.
+
+The runtime/core combination is not yet connected to `ngc_ipc_backend`; that
+executable remains the transport-only peer.
 
 - Factor reusable allocation-free execution mechanics without importing
   synthetic-input or mock-diagnostic policy.
@@ -963,7 +971,8 @@ through a production `BackendRuntime` host.
   `PlanChunk` motion, axis-space triggered moves, and scheduled spindle-output
   events.
 - Verify stop branches, triggered stops, jogging, homing, markers, and fault
-  transitions under the production executor.
+  transitions under the production executor. Complete for the current
+  backend-conformance scope and end-to-end homing sequence.
 
 ### Phase 11: Implement Mesa transport
 

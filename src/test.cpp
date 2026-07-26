@@ -11,6 +11,7 @@
 #include <iostream>
 #include <iterator>
 #include <limits>
+#include <mutex>
 #include <numbers>
 #include <stdexcept>
 #include <string>
@@ -32,6 +33,7 @@
 #include "machine/OwningSpscChannel.h"
 #include "machine/PreparedGeometry.h"
 #include "machine/PresentationTracker.h"
+#include "machine/ProductionExecutorRuntime.h"
 #include "machine/SpscChannel.h"
 #include "machine/SplineHandleOptimization.h"
 #include "machine/ToolTable.h"
@@ -95,6 +97,46 @@ namespace {
 
     private:
         bool m_failStart;
+    };
+
+    class ScheduledTriggerProductionExecutorIo final
+        : public ngc::ProductionExecutorIo {
+    public:
+        void sampleDigitalInputs(
+            ngc::ProductionExecutorDigitalInputs &inputs) noexcept override {
+            std::scoped_lock lock(m_mutex);
+            if (m_ticksUntilTrigger != 0 && --m_ticksUntilTrigger == 0) {
+                for (const auto &trigger : m_triggers) {
+                    m_inputs[trigger.input] =
+                        trigger.condition == ngc::InputCondition::Active
+                        || trigger.condition == ngc::InputCondition::RisingEdge;
+                }
+            }
+            inputs = m_inputs;
+        }
+
+        void applyOutputs(
+            const ngc::ProductionExecutorOutputState &) noexcept override { }
+
+        [[nodiscard]] bool prepareTriggeredJointMove(
+            const ngc::TriggeredJointMove &move) noexcept override {
+            std::scoped_lock lock(m_mutex);
+            m_triggers.assign(move.triggers.begin(), move.triggers.end());
+            m_ticksUntilTrigger = m_triggers.empty() ? 0 : 20;
+            for (const auto &trigger : m_triggers) {
+                m_inputs[trigger.input] =
+                    trigger.condition == ngc::InputCondition::Inactive
+                    || trigger.condition == ngc::InputCondition::FallingEdge;
+            }
+
+            return true;
+        }
+
+    private:
+        std::mutex m_mutex;
+        ngc::ProductionExecutorDigitalInputs m_inputs;
+        std::vector<ngc::JointTrigger> m_triggers;
+        std::uint32_t m_ticksUntilTrigger = 0;
     };
 
     constexpr std::string_view HELLO_FIXTURE=R"NGC(
@@ -1609,6 +1651,44 @@ final_move_together = true
         runtime.stop();
     }
 
+    void testProductionExecutorRuntimeOwnsFixedPeriodLifecycle() {
+        const auto configuration = fixtureMachineConfiguration();
+        require(configuration.has_value(), configuration ? "" : configuration.error());
+        ngc::ProductionExecutorRuntime runtime(*configuration);
+
+        runtime.start();
+        for (auto attempt = 0;
+             attempt < 1000 && runtime.servoTicks() < 2; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(runtime.started() && runtime.servoTicks() >= 2,
+                "production executor runtime should advance its fixed-period servo host");
+
+        ngc::StationaryBackendState stationary;
+        stationary.commanded.position.x = 0.25;
+        stationary.feedback = stationary.commanded;
+        stationary.commandedJoints.position[0] = 0.5;
+        stationary.feedbackJoints = stationary.commandedJoints;
+        require(!runtime.restoreStationaryState(stationary),
+                "running production executor runtime should reject state restoration");
+
+        runtime.stop();
+        const auto stoppedTicks = runtime.servoTicks();
+        std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        require(!runtime.started() && runtime.servoTicks() == stoppedTicks,
+                "stopped production executor runtime should stop its servo host");
+        require(runtime.restoreStationaryState(stationary),
+                "stopped production executor runtime should restore stationary state");
+        runtime.serviceImmediate();
+        ngc::ExecutionSnapshot snapshot;
+        require(runtime.endpoint().tryTakeSnapshot(snapshot),
+                "restored production executor runtime should publish a snapshot");
+        requireNear(snapshot.commanded.position.x, 0.25,
+                    "production runtime should restore commanded axis position");
+        requireNear(snapshot.commandedJoints.position[0], 0.5,
+                    "production runtime should restore commanded joint position");
+    }
+
     void testHomingControllerOwnsBackendNeutralSequence() {
         const auto configuration = fixtureMachineConfiguration();
         require(configuration.has_value(), configuration ? "" : configuration.error());
@@ -1687,6 +1767,53 @@ final_move_together = true
             requireNear(actual, expected,
                         "homing controller should finish each axis at configured home");
         }
+    }
+
+    void testProductionExecutorRuntimeRunsHomingController() {
+        const auto configuration = fixtureMachineConfiguration();
+        require(configuration.has_value(), configuration ? "" : configuration.error());
+        ngc::ProductionExecutorRuntime runtime(
+            *configuration,
+            std::make_unique<ScheduledTriggerProductionExecutorIo>());
+        ngc::HomingController controller(
+            configuration->axes, configuration->joints, configuration->homing,
+            runtime.endpoint());
+        const ngc::HomingRuntimeCallbacks callbacks {
+            .stopRequested = [] {
+                return false;
+            },
+            .prepareTriggeredMove = [&](const ngc::TriggeredJointMove &move) {
+                return runtime.prepareTriggeredJointMove(move);
+            },
+            .serviceImmediate = [&] {
+                runtime.serviceImmediate();
+            },
+            .advanceServiceMotionPeriod = [&] {
+                return runtime.advanceServiceMotionPeriod();
+            },
+            .waitForServiceMotion = [&] {
+                runtime.waitForServiceMotion();
+            },
+            .observe = {},
+        };
+        const ngc::position_t startingPosition {
+            6.0, 6.0, -6.0, 0.0, 0.0, 0.0,
+        };
+
+        const auto homing = controller.run(1, startingPosition, callbacks);
+        require(homing.has_value(), homing ? "" : homing.error());
+        require(homing->outcome == ngc::HomingOutcome::Completed,
+                "production executor runtime should complete backend-neutral homing");
+        ngc::JointMask configuredJoints = 0;
+        for (const auto &joint : configuration->joints) {
+            configuredJoints |= ngc::JointMask{1} << joint.id;
+            requireNear(
+                homing->observation.joints.position[joint.id],
+                joint.homing.homePosition * joint.coordinateScale,
+                "production executor runtime should finish a homed joint at home");
+        }
+        require(homing->homedJoints == configuredJoints,
+                "production executor runtime should report every configured joint homed");
     }
 
     void testMachineSessionOwnsBackendNeutralServiceOperations() {
@@ -5961,6 +6088,38 @@ G1 F60 X2
         });
     }
 
+    void testProductionExecutorBackendConformance() {
+        const auto configuration = fixtureMachineConfiguration();
+        require(configuration.has_value(), configuration ? "" : configuration.error());
+
+        ngc::test::runBackendConformanceSuite({
+            .name = "ProductionExecutorRuntime",
+            .createRuntime = [configuration = *configuration] {
+                return std::make_unique<ngc::ProductionExecutorRuntime>(
+                    configuration,
+                    std::make_unique<ScheduledTriggerProductionExecutorIo>());
+            },
+            .makeTriggeredJointMove = [] {
+                ngc::TriggeredJointMove move;
+                move.id = 1;
+                move.branch = 1;
+                move.moveId = 1;
+                move.joints = ngc::JointMask{1};
+                move.targetMode = ngc::JointTargetMode::Relative;
+                move.target[0] = 14.0;
+                move.limits.velocity[0] = 3.0;
+                move.limits.acceleration[0] = 5.0;
+                move.limits.jerk[0] = 100.0;
+                require(move.triggers.push({
+                            0, 1, ngc::InputCondition::Active, 0.010}),
+                        "production backend conformance joint trigger should fit");
+                move.triggerRequired = true;
+
+                return move;
+            },
+        });
+    }
+
     void testPreparedLineJunctionRetainsExactEndpointCurvature() {
         const ngc::position_t first{-1.0644,13.9651,-0.4068730132094953,0,0,0};
         const ngc::position_t junction{-1.2583,13.2669,-0.4068730132094953,0,0,0};
@@ -7662,7 +7821,9 @@ int main() {
         testMachineSessionManagerPublishesOwnedParameterSnapshot();
         testMachineSessionViewDerivesOperatorControls();
         testInProcessSimulationRuntimePersistsAcrossTimedEpochs();
+        testProductionExecutorRuntimeOwnsFixedPeriodLifecycle();
         testHomingControllerOwnsBackendNeutralSequence();
+        testProductionExecutorRuntimeRunsHomingController();
         testMachineSessionOwnsBackendNeutralServiceOperations();
         testSimulationPersistsCoordinateSystemAtCompletion();
         testToolTableLoadsFinalLineWithoutNewline();
@@ -7752,6 +7913,7 @@ int main() {
         testJogControlUsesBoundedBackendTransport();
         testMockBackendAdvancesOneFixedServoTick();
         testInProcessBackendConformance();
+        testProductionExecutorBackendConformance();
         testExactStopPlannerCompilesLinesAndArcs();
         testInfiniteJerkTrajectoryTimeMatchesAnalyticLine();
         testExactStopPlannerEnforcesIndependentAxisLimits();

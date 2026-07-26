@@ -90,11 +90,16 @@ namespace ngc {
         bool tryTakeSnapshot(ExecutionSnapshot &snapshot) noexcept override;
 
         void restoreStationaryState(const MotionState &commanded,
-                                    const MotionState &feedback = {}) noexcept;
+                                    const MotionState &feedback = {},
+                                    const JointMotionState &commandedJoints = {},
+                                    const JointMotionState &feedbackJoints = {}) noexcept;
+        void serviceImmediate() noexcept;
         // The hosting servo thread updates sampled input levels before
         // servoTick(). Edge conditions compare the current sample with the
         // preceding tick; hardware acquisition remains outside this core.
         void setDigitalInputSample(DigitalInputId input, bool active) noexcept;
+        void setDigitalInputSamples(
+            const std::bitset<DIGITAL_INPUT_CAPACITY> &inputs) noexcept;
         void servoTick(bool publishSnapshot = true) noexcept;
         [[nodiscard]] double servoPeriod() const noexcept;
         // The hosting servo thread reads this after servoTick() and maps it to

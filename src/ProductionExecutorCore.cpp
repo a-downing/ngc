@@ -291,7 +291,9 @@ namespace ngc {
     }
 
     void ProductionExecutorCore::restoreStationaryState(
-        const MotionState &commanded, const MotionState &feedback) noexcept {
+        const MotionState &commanded, const MotionState &feedback,
+        const JointMotionState &commandedJoints,
+        const JointMotionState &feedbackJoints) noexcept {
         discardExecution();
         if (m_jog.has_value()) {
             m_jog.reset();
@@ -308,15 +310,27 @@ namespace ngc {
         m_snapshot.state = BackendState::Disabled;
         m_snapshot.commanded = commanded;
         m_snapshot.feedback = feedback;
+        m_snapshot.commandedJoints = commandedJoints;
+        m_snapshot.feedbackJoints = feedbackJoints;
         m_planStop.reset();
         m_controlledStoppedEpoch = 0;
         m_outputState = {};
         m_faultEventEmitted = false;
     }
 
+    void ProductionExecutorCore::serviceImmediate() noexcept {
+        serviceControls();
+        publishSnapshot();
+    }
+
     void ProductionExecutorCore::setDigitalInputSample(
         const DigitalInputId input, const bool active) noexcept {
         m_digitalInputs[input] = active;
+    }
+
+    void ProductionExecutorCore::setDigitalInputSamples(
+        const std::bitset<DIGITAL_INPUT_CAPACITY> &inputs) noexcept {
+        m_digitalInputs = inputs;
     }
 
     void ProductionExecutorCore::servoTick(const bool shouldPublishSnapshot) noexcept {
