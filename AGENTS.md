@@ -97,8 +97,8 @@ service stepping, samples a fixed-size digital-input image before each tick,
 and applies the fixed-size output state afterward through an injected I/O
 boundary. Hardware acquisition and synthetic-input policy remain outside the
 runtime. The runtime is the second backend-conformance target and is paired
-end-to-end with `HomingController`. It is not yet hosted by the external
-process.
+end-to-end with `HomingController`. It is hosted by the external process for
+the configured Windows non-hardware Real target.
 There is no complete real-time executor,
 HAL component, or physical backend yet. `ExternalRealtimeRuntime`
 implements the NRT side of the versioned shared-memory IPC boundary and owns a
@@ -108,7 +108,10 @@ configuration during startup, hosts `ProductionExecutorRuntime`, and bridges
 bounded execution items, controls, events, and snapshots across the production
 IPC path. On Windows its ordinary scheduler thread and null I/O boundary prove
 functional executor and process behavior, not real-time latency or hardware
-safety. It must not be exposed as Real. Preserve the separation
+safety. `[real_backend]` configures this process as the application's selectable
+Real target for development without hardware; unavailable physical I/O
+operations must fail or use explicit peer-owned synthetic policy rather than
+falling back to `MockMotionBackend`. Preserve the separation
 between interpretation, geometry preparation, trajectory planning, execution,
 and hardware access. Never make geometry construction depend on whether the
 consumer is Preview or Simulation.
@@ -134,10 +137,13 @@ per-session hosts behind a target router and queues starts, feed hold, Resume,
 and Stop through the selected boundary. Every target-dependent manager operation
 requires the current generation-tagged `MachineControlAuthority`; stale or
 wrong-target commands and unsafe control transfers are rejected under the same
-manager lock used for admission. The production application still constructs
-only Simulation; an explicitly test-only in-process RealRun-mode host exercises
-dual-session routing and validated Real-to-Simulation checkpoint import without
-making Real available or substituting for a physical backend. Checkpoint import
+manager lock used for admission. The production application constructs
+Simulation through `InProcessSimulationRuntime` and, when `[real_backend]` is
+present, constructs Real through `ExternalRealtimeRuntime`. `SessionBackendRuntime`
+keeps mock-only accelerated pacing, diagnostics, and synthetic inputs on the
+Simulation branch while forwarding the Real branch to the external process.
+An explicitly test-only in-process RealRun-mode host remains available for
+deterministic routing and checkpoint tests. Checkpoint import
 requires powered, stationary, idle, homed, fault-free Real state and a
 powered-off idle Simulation session; it copies backend position/joints,
 homing, canonical modal and persistent parameter state, presentation, and the
@@ -160,7 +166,7 @@ During timed program epochs, the facade's dedicated snapshot service is the
 sole consumer of backend execution snapshots and maintains a latest-value NRT
 observation independently of geometry and trajectory-planning work. GUI
 snapshots overlay that observation so presentation position cannot stall while
-the mock runtime continues executing.
+the selected runtime continues executing.
 
 The intended evolution toward persistent Simulation and Real machine sessions, isolated parameter persistence, Real-to-Simulation branching, and a separate Mesa physical-backend executable is documented in [Machine sessions, persistent Simulation, and the physical backend](docs/machine_session_backend_architecture.md). Treat its remaining session and backend phases as a design and implementation roadmap, not as a description of functionality that already exists.
 

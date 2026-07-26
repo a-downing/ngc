@@ -749,6 +749,8 @@ namespace ngc {
                         m_outputState = {};
                     }
                 } else if constexpr (std::same_as<T, ResetRequest>) {
+                    const auto enabled =
+                        m_snapshot.state != BackendState::Disabled;
                     if (m_jog.has_value()) {
                         abandonJog(JogStopReason::Aborted);
                     }
@@ -758,6 +760,8 @@ namespace ngc {
                     const auto commandedJoints = m_snapshot.commandedJoints;
                     const auto feedbackJoints = m_snapshot.feedbackJoints;
                     m_snapshot = {};
+                    m_snapshot.state = enabled
+                        ? BackendState::Held : BackendState::Disabled;
                     m_snapshot.epoch = value.nextEpoch;
                     m_snapshot.commanded = commanded;
                     m_snapshot.feedback = feedback;

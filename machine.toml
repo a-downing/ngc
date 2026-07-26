@@ -21,6 +21,10 @@ servo_period = 0.001
 # seconds between Windows mock-executor scheduler wakes (100 Hz)
 scheduler_period = 0.01
 
+[real_backend]
+type = "ipc_executor"
+executable = "build/ngc_ipc_backend.exe"
+
 [feed_hold]
 # Experimental mock-backend on-path feed hold. These bound the requested
 # tangential braking profile; full and per-axis executed jerk are diagnostic.

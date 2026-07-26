@@ -218,7 +218,11 @@ class ApplicationImpl final {
     ngc::ToolTableStorePaths m_toolTableStores;
     bool m_simulationParameterStoreReady = false;
     bool m_simulationToolTableStoreReady = false;
+    bool m_realParameterStoreReady = false;
+    bool m_realToolTableStoreReady = false;
     std::uint64_t m_simulationToolTableRevision = 0;
+    ngc::MachineControlTarget m_toolTableRevisionTarget =
+        ngc::MachineControlTarget::Simulation;
     std::vector<ngc::AxisConfiguration> m_axes;
     std::vector<ngc::JointConfiguration> m_joints;
     Worker m_worker;
@@ -555,6 +559,73 @@ public:
             }
         }
 
+        if (m_simulation.state().realAvailable) {
+            const auto realAuthority =
+                m_simulation.selectControlTarget(
+                    ngc::MachineControlTarget::Real);
+            if (!realAuthority) {
+                m_errorMessage = realAuthority.error();
+            } else {
+                m_controlAuthority = *realAuthority;
+                ngc::ToolTable realTools;
+                if (auto loaded = realTools.load(m_toolTableStores.real);
+                    !loaded) {
+                    m_errorMessage = loaded.error();
+                } else if (!m_simulation.setToolTable(
+                               m_controlAuthority, realTools)) {
+                    m_errorMessage =
+                        "Real tool table was loaded, but could not be applied";
+                } else if (auto configured =
+                               m_simulation.setToolTableStorePath(
+                                   m_controlAuthority,
+                                   m_toolTableStores.real);
+                           !configured) {
+                    m_errorMessage = configured.error();
+                } else {
+                    m_realToolTableStoreReady = true;
+                }
+
+                std::error_code realParameterError;
+                const auto realParametersExist = std::filesystem::exists(
+                    m_parameterStores.real, realParameterError);
+                if (realParameterError) {
+                    m_errorMessage = std::format(
+                        "failed to inspect Real parameter store '{}': {}",
+                        m_parameterStores.real.string(),
+                        realParameterError.message());
+                } else if (realParametersExist) {
+                    const auto loaded =
+                        m_simulation.loadPersistentParameters(
+                            m_controlAuthority,
+                            m_parameterStores.real);
+                    if (!loaded) {
+                        m_errorMessage = loaded.error();
+                    } else {
+                        m_realParameterStoreReady = true;
+                    }
+                } else {
+                    const auto configured =
+                        m_simulation.setPersistentParameterStorePath(
+                            m_controlAuthority,
+                            m_parameterStores.real);
+                    if (!configured) {
+                        m_errorMessage = configured.error();
+                    } else {
+                        m_realParameterStoreReady = true;
+                    }
+                }
+
+                const auto simulationAuthority =
+                    m_simulation.selectControlTarget(
+                        ngc::MachineControlTarget::Simulation);
+                if (!simulationAuthority) {
+                    m_errorMessage = simulationAuthority.error();
+                } else {
+                    m_controlAuthority = *simulationAuthority;
+                }
+            }
+        }
+
         if(m_pendantConfiguration.enabled) {
             switch(m_pendantConfiguration.driver) {
                 case ngc::PendantDriver::VistaCncP2s: {
@@ -592,6 +663,31 @@ public:
         m_scrollDelta += delta;
     }
 
+    [[nodiscard]] std::filesystem::path activeParameterStore() const {
+        return m_controlAuthority.target == ngc::MachineControlTarget::Real
+            ? m_parameterStores.real : m_parameterStores.simulation;
+    }
+
+    [[nodiscard]] std::filesystem::path activeToolTableStore() const {
+        return m_controlAuthority.target == ngc::MachineControlTarget::Real
+            ? m_toolTableStores.real : m_toolTableStores.simulation;
+    }
+
+    [[nodiscard]] bool activeParameterStoreReady() const noexcept {
+        return m_controlAuthority.target == ngc::MachineControlTarget::Real
+            ? m_realParameterStoreReady : m_simulationParameterStoreReady;
+    }
+
+    [[nodiscard]] bool activeToolTableStoreReady() const noexcept {
+        return m_controlAuthority.target == ngc::MachineControlTarget::Real
+            ? m_realToolTableStoreReady : m_simulationToolTableStoreReady;
+    }
+
+    [[nodiscard]] std::string_view activeTargetName() const noexcept {
+        return m_controlAuthority.target == ngc::MachineControlTarget::Real
+            ? std::string_view("Real") : std::string_view("Simulation");
+    }
+
     void terminate() {
         if(m_pendantManager) m_pendantManager->stop();
         m_stopPreviewVisibilityRequested.store(true, std::memory_order_release);
@@ -602,21 +698,54 @@ public:
         m_previewVisibilityCv.notify_one();
         if(m_previewVisibilityThread.joinable()) m_previewVisibilityThread.join();
         m_simulation.join();
-        if (m_simulationParameterStoreReady) {
-            const auto parametersSaved = m_simulation.savePersistentParameters(
-                m_controlAuthority, m_parameterStores.simulation);
-            if (!parametersSaved) {
-                m_errorMessage = parametersSaved.error();
-                std::println(stderr, "Failed to save Simulation parameters: {}", parametersSaved.error());
+        const auto saveStores = [&](const ngc::MachineControlTarget target,
+                                    const bool parametersReady,
+                                    const bool toolsReady,
+                                    const std::filesystem::path &parameterPath,
+                                    const std::filesystem::path &toolPath) {
+            const auto authority = m_simulation.selectControlTarget(target);
+            if (!authority) {
+                m_errorMessage = authority.error();
+                std::println(
+                    stderr, "Failed to select {} while saving stores: {}",
+                    ngc::gui::controlTargetName(target), authority.error());
+                return;
             }
-        }
-        if (m_simulationToolTableStoreReady) {
-            const auto toolsSaved = m_simulation.saveToolTable(
-                m_controlAuthority, m_toolTableStores.simulation);
-            if (!toolsSaved) {
-                m_errorMessage = toolsSaved.error();
-                std::println(stderr, "Failed to save Simulation tool table: {}", toolsSaved.error());
+            m_controlAuthority = *authority;
+            if (parametersReady) {
+                const auto saved = m_simulation.savePersistentParameters(
+                    m_controlAuthority, parameterPath);
+                if (!saved) {
+                    m_errorMessage = saved.error();
+                    std::println(
+                        stderr, "Failed to save {} parameters: {}",
+                        ngc::gui::controlTargetName(target), saved.error());
+                }
             }
+            if (toolsReady) {
+                const auto saved = m_simulation.saveToolTable(
+                    m_controlAuthority, toolPath);
+                if (!saved) {
+                    m_errorMessage = saved.error();
+                    std::println(
+                        stderr, "Failed to save {} tool table: {}",
+                        ngc::gui::controlTargetName(target), saved.error());
+                }
+            }
+        };
+        saveStores(
+            ngc::MachineControlTarget::Simulation,
+            m_simulationParameterStoreReady,
+            m_simulationToolTableStoreReady,
+            m_parameterStores.simulation,
+            m_toolTableStores.simulation);
+        if (m_simulation.state().realAvailable) {
+            saveStores(
+                ngc::MachineControlTarget::Real,
+                m_realParameterStoreReady,
+                m_realToolTableStoreReady,
+                m_parameterStores.real,
+                m_toolTableStores.real);
         }
         m_worker.join();
         if(m_glDeleteBuffers) {
@@ -654,19 +783,19 @@ public:
 
         const auto previousTools = m_simulation.toolTable();
         if (!m_simulation.setToolTable(m_controlAuthority, tools)) {
-            m_errorMessage = "tool table cannot be saved while Simulation is busy";
+            m_errorMessage = "tool table cannot be saved while the controlled session is busy";
             return;
         }
 
         auto result = m_simulation.saveToolTable(
-            m_controlAuthority, m_toolTableStores.simulation);
+            m_controlAuthority, activeToolTableStore());
 
         if(!result) {
             if (m_simulation.setToolTable(m_controlAuthority, previousTools)) {
                 m_errorMessage = result.error();
             } else {
                 m_errorMessage = std::format(
-                    "{}; restoring the prior Simulation tool table was also rejected",
+                    "{}; restoring the prior tool table was also rejected",
                     result.error());
             }
             return;
@@ -682,7 +811,7 @@ public:
 
     void reloadToolTable() {
         ngc::ToolTable tools;
-        const auto result = tools.load(m_toolTableStores.simulation);
+        const auto result = tools.load(activeToolTableStore());
 
         if(!result) {
             m_errorMessage = result.error();
@@ -690,7 +819,7 @@ public:
         }
 
         if (!m_simulation.setToolTable(m_controlAuthority, tools)) {
-            m_errorMessage = "tool table cannot be reloaded while Simulation is busy";
+            m_errorMessage = "tool table cannot be reloaded while the controlled session is busy";
             return;
         }
         if (!m_worker.setToolTable(tools)) {
@@ -1888,7 +2017,8 @@ public:
     }
 
     void renderToolbar(const ImGuiViewport &viewport, const ngc::SimulationSnapshot &simulation,
-                       const ngc::MachineSessionManagerState &managerState) {
+                       const ngc::MachineSessionManagerState &managerState,
+                       const ngc::MachineSessionManagerSnapshots &sessions) {
         ImGui::SetNextWindowPos(viewport.Pos);
         ImGui::SetNextWindowSize({ viewport.Size.x, m_toolbarHeight });
         constexpr auto flags = ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove
@@ -1898,9 +2028,6 @@ public:
         const auto homingAvailable = m_simulation.homingAvailable();
         const auto controls = ngc::gui::machineSessionControls(simulation, homingAvailable);
         const auto target = ngc::gui::controlTargetName(managerState.authority.target);
-        const auto homed = std::ranges::count_if(m_joints, [&](const auto &joint) {
-            return (simulation.homedJoints & (ngc::JointMask { 1 } << joint.id)) != 0;
-        });
 
         ImGui::AlignTextToFramePadding();
         ImGui::TextUnformatted("Control target:");
@@ -1940,23 +2067,40 @@ public:
 
         const auto simulationControlled =
             managerState.authority.target == ngc::MachineControlTarget::Simulation;
-        ImGui::Text(
-            "SIMULATION%s | Power: %s | Activity: %s | Operation: %s | Homed: %zu/%zu joints",
-            simulationControlled ? " [CONTROL]" : "",
-            ngc::gui::powerStateName(simulation.powerState).data(),
-            ngc::gui::machineActivityName(simulation.machineActivity).data(),
-            ngc::gui::programOperationName(simulation.programOperation).data(),
-            static_cast<std::size_t>(homed), m_joints.size());
+        const auto sessionRow = [&](const std::string_view name,
+                                    const ngc::MachineSessionSnapshot *snapshot,
+                                    const bool controlled) {
+            if (!snapshot) {
+                ImGui::TextDisabled("%s | Unavailable", name.data());
+                return;
+            }
+            const auto sessionHomed = std::ranges::count_if(
+                m_joints, [&](const auto &joint) {
+                    return (snapshot->homedJoints
+                            & (ngc::JointMask { 1 } << joint.id)) != 0;
+                });
+            ImGui::Text(
+                "%s%s | Power: %s | Activity: %s | Operation: %s | Homed: %zu/%zu joints",
+                name.data(), controlled ? " [CONTROL]" : "",
+                ngc::gui::powerStateName(snapshot->powerState).data(),
+                ngc::gui::machineActivityName(snapshot->machineActivity).data(),
+                ngc::gui::programOperationName(snapshot->programOperation).data(),
+                static_cast<std::size_t>(sessionHomed), m_joints.size());
+        };
+        const auto *simulationSession = sessions.simulation
+            ? static_cast<const ngc::MachineSessionSnapshot *>(
+                  &*sessions.simulation)
+            : nullptr;
+        const auto *realSession = sessions.real
+            ? &*sessions.real : nullptr;
+        sessionRow("SIMULATION", simulationSession, simulationControlled);
         ImGui::SameLine();
         ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
         ImGui::SameLine();
-        if (managerState.realAvailable) {
-            ImGui::TextUnformatted(
-                managerState.authority.target == ngc::MachineControlTarget::Real
-                    ? "REAL [CONTROL] | Snapshot pending"
-                    : "REAL | Snapshot pending");
-        } else {
-            ImGui::TextDisabled("REAL | Unavailable");
+        sessionRow(
+            "REAL", realSession,
+            managerState.authority.target == ngc::MachineControlTarget::Real);
+        if (!managerState.realAvailable) {
             unavailableTooltip(true,
                 ngc::gui::unavailableControlTargetReason(
                     managerState, ngc::MachineControlTarget::Real));
@@ -2008,7 +2152,7 @@ public:
                 : m_simulation.powerOff(m_controlAuthority);
             if (!result) {
                 reportRejectedSessionAction(
-                    powerOn ? "Simulation power on" : "Simulation power off", result);
+                    powerOn ? "Machine power on" : "Machine power off", result);
             } else {
                 m_errorMessage.clear();
             }
@@ -2016,12 +2160,12 @@ public:
         ImGui::EndDisabled();
         if (simulation.powerState == ngc::MachinePowerState::Starting
             || simulation.powerState == ngc::MachinePowerState::Stopping) {
-            unavailableTooltip(true, "The Simulation power transition is in progress.");
+            unavailableTooltip(true, "The controlled machine power transition is in progress.");
         } else if (simulation.powerState == ngc::MachinePowerState::Faulted) {
-            unavailableTooltip(true, "The Simulation session is faulted.");
+            unavailableTooltip(true, "The controlled machine session is faulted.");
         } else {
             unavailableTooltip(!powerAvailable,
-                "Stop the active operation before powering off Simulation.");
+                "Stop the active operation before powering off the controlled machine.");
         }
         ImGui::SameLine();
         const auto startUnavailable = !compiledMode || m_programSource.empty() || !controls.canStart;
@@ -2096,11 +2240,16 @@ public:
         if(ImGui::Button(m_showJogPane ? "Hide Jog" : "Jog")) m_showJogPane = !m_showJogPane;
 
         ImGui::SameLine();
+        ImGui::BeginDisabled(!simulationControlled);
         ImGui::SetNextItemWidth(90.0f);
         if(ImGui::InputInt("Speed multiplier", &m_simulationTickMultiplier, 1, 10)) {
             m_simulationTickMultiplier = std::clamp(m_simulationTickMultiplier, 1, 1000);
             m_simulation.setTickMultiplier(m_simulationTickMultiplier);
         }
+        ImGui::EndDisabled();
+        unavailableTooltip(
+            !simulationControlled,
+            "Accelerated playback is available only for Simulation.");
         ImGui::SameLine();
         if(ImGui::Button("Parameters")) m_enableMemoryWindow = true;
         ImGui::SameLine();
@@ -2110,9 +2259,14 @@ public:
             m_enableToolWindow = true;
         }
         ImGui::SameLine();
+        ImGui::BeginDisabled(!simulation.simulationDiagnostics.has_value());
         if (ImGui::Button("Diagnostics")) {
             m_enableSimulationDiagnostics = true;
         }
+        ImGui::EndDisabled();
+        unavailableTooltip(
+            !simulation.simulationDiagnostics.has_value(),
+            "Mock scheduler diagnostics are available only for Simulation.");
         ImGui::End();
     }
 
@@ -2919,12 +3073,15 @@ public:
         auto simulation = m_simulation.snapshot();
         processPendant(simulation);
         simulation = m_simulation.snapshot();
+        const auto sessions = m_simulation.snapshots();
         const auto [simulationTools, toolTableRevision] =
             m_simulation.toolTableSnapshot();
-        if (toolTableRevision != m_simulationToolTableRevision
+        if ((managerState.authority.target != m_toolTableRevisionTarget
+             || toolTableRevision != m_simulationToolTableRevision)
            && m_worker.setToolTable(simulationTools)) {
             m_tools = simulationTools;
             m_simulationToolTableRevision = toolTableRevision;
+            m_toolTableRevisionTarget = managerState.authority.target;
             if (m_enableToolWindow) {
                 initToolTableStrings();
             }
@@ -2940,7 +3097,7 @@ public:
             contentBottom,
         };
 
-        renderToolbar(viewport, simulation, managerState);
+        renderToolbar(viewport, simulation, managerState, sessions);
         renderProgramPane(viewport, simulation, contentBottom);
         if(m_showJogPane) renderJogPane(viewport, simulation, contentBottom);
         else if(m_uiContinuousJog) {
@@ -3047,17 +3204,20 @@ public:
         ImGui::SetNextWindowSize({ 950.0f, 360.0f }, ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSizeConstraints({ 500.0f, 220.0f }, { FLT_MAX, FLT_MAX });
 
-        if(ImGui::Begin("Simulation Tool Table", &m_enableToolWindow)) {
-            ImGui::TextUnformatted("Owner: Simulation");
+        if (ImGui::Begin("Machine Tool Table", &m_enableToolWindow)) {
+            const auto target = activeTargetName();
+            const auto store = activeToolTableStore();
+            ImGui::Text("Owner: %s", target.data());
             ImGui::SameLine();
             ImGui::TextDisabled(
-                "| Store: %s", m_toolTableStores.simulation.string().c_str());
+                "| Store: %s", store.string().c_str());
             const auto sessionMutable = m_simulation.controllerDataMutable();
-            const auto canEdit = m_simulationToolTableStoreReady && sessionMutable;
+            const auto storeReady = activeToolTableStoreReady();
+            const auto canEdit = storeReady && sessionMutable;
             if (!canEdit) {
-                const auto reason = !m_simulationToolTableStoreReady
+                const auto reason = !storeReady
                     ? std::string_view(
-                        "The Simulation tool-table store is unavailable; edits are disabled "
+                        "The selected tool-table store is unavailable; edits are disabled "
                         "to preserve it.")
                     : ngc::gui::controllerDataUnavailableReason(simulation);
                 ImGui::TextDisabled("Editing disabled: %s", std::string(reason).c_str());
@@ -3170,12 +3330,14 @@ public:
     }
 
     void renderMemoryWindow() {
-        if(ImGui::Begin("Simulation Parameters", &m_enableMemoryWindow)) {
-            ImGui::TextUnformatted("Owner: Simulation");
+        if (ImGui::Begin("Machine Parameters", &m_enableMemoryWindow)) {
+            const auto target = activeTargetName();
+            const auto store = activeParameterStore();
+            ImGui::Text("Owner: %s", target.data());
             ImGui::SameLine();
             ImGui::TextDisabled(
-                "| Store: %s", m_parameterStores.simulation.string().c_str());
-            if (!m_simulationParameterStoreReady) {
+                "| Store: %s", store.string().c_str());
+            if (!activeParameterStoreReady()) {
                 ImGui::TextDisabled(
                     "Store unavailable: the existing file will not be overwritten.");
             }

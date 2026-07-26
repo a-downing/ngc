@@ -788,8 +788,9 @@ and synthetic homing-switch preparation.
 
 ### Phase 6: Introduce `MachineSessionManager`
 
-Status: in progress. Standalone Simulation is application-owned through
-`MachineSessionManager`; the former `SimulationWorker` facade is removed.
+Status: implemented through the configured non-hardware Real checkpoint.
+Simulation and Real are application-owned through `MachineSessionManager`; the
+former `SimulationWorker` facade is removed.
 The Simulation execution loop and its state now live in a per-session host
 owned behind the manager's target router. The manager exposes available
 targets, generation-tagged control authority, target-routed controller data,
@@ -800,20 +801,21 @@ and transfer is rejected unless both the current and destination sessions are
 stationary and idle.
 
 Tests exercise concurrent Simulation and RealRun-mode session ownership through
-an explicitly test-only in-process Real host. They prove authority advancement,
+both an explicitly test-only in-process Real host and the configured
+`ExternalRealtimeRuntime` process path. They prove authority advancement,
 stale-command rejection across actual transfers, independent power and tool
-tables, and one-way motion isolation. Production still exposes Real as
-unavailable: Real configuration and `ExternalRealtimeRuntime` construction,
-inactive physical event draining, and live physical snapshots remain future
-work and must never fall back to the in-process test host. The
-`ExternalRealtimeRuntime` path and its Windows non-hardware executor peer are
-not a Real session or a physical backend.
+tables, one-way motion isolation, and a complete Real program epoch through
+shared memory and `ProductionExecutorCore`. `[real_backend]` makes the Windows
+non-hardware peer selectable as Real in the application. It is not a physical
+backend: inactive safety state, hardware I/O, watchdog behavior, and Linux
+real-time validation remain future work, and Real must never fall back to the
+in-process test host or `MockMotionBackend`.
 
 - Support standalone Simulation with no `[real_run]` configuration.
-- Support optional Real and Simulation sessions concurrently. Complete at the
-  manager ownership and test boundary; production Real construction remains.
-- Add active-control-target routing and visible dual-session state. Complete at
-  the manager API and test boundary; the GUI still has no live Real session.
+- Support optional Real and Simulation sessions concurrently. Complete for the
+  configured Windows IPC executor.
+- Add active-control-target routing and visible dual-session state. Complete
+  for the configured Windows IPC executor.
 - Add generation-tagged control authority.
 - Keep inactive physical Real events and snapshots drained and faults visible.
 
@@ -829,8 +831,10 @@ Simulation, persists the copied Simulation parameter and tool-table stores,
 restores the stopped Simulation runtime, powers Simulation, and advances
 generation-tagged control authority. Tests prove one-way state and motion
 isolation and prove that a later Real checkpoint discards prior Simulation
-changes. Production exposure remains blocked on a production Real session and
-physical backend; the application must not expose the test host.
+changes. Application exposure is available through the configured external
+Real session. The explicit Simulate-from-Real GUI action and physical
+commissioning remain future work; the application must not expose the
+in-process test host.
 
 - Define and validate `MachineSessionCheckpoint`. Complete.
 - Require a stationary, idle Real boundary. Complete at the manager/test-host
@@ -973,7 +977,10 @@ IPC tests execute a timed `PlanChunk` through the child process and verify
 executor-generated acceptance, marker crossing, terminal stop selection,
 retirement, snapshots, feed hold, Resume, and Abort in addition to handshake,
 capacity, restart, and peer-loss behavior. The executable remains non-real-time,
-uses null I/O, and must not be exposed as Real.
+uses null I/O, and is exposed as the configured Real development target without
+claiming physical hardware availability. The session runtime sends explicit
+Enable and Disable controls at Real power boundaries, and executor epoch Reset
+retains an already-enabled held state.
 
 - Factor reusable allocation-free execution mechanics without importing
   synthetic-input or mock-diagnostic policy.

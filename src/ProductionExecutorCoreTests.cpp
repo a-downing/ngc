@@ -325,6 +325,26 @@ namespace {
                 "activated chunk remained in the queued count");
     }
 
+    void testEnabledResetRetainsPoweredHeldState() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        initialize(*core, 10);
+
+        require(core->trySubmit(ngc::ResetRequest{3, 11})
+                    == ngc::SubmitResult::Submitted,
+                "enabled reset did not fit");
+        core->servoTick();
+        const auto events = takeEvents(*core);
+        const auto snapshot = latestSnapshot(*core);
+        const auto requests =
+            selectEvents<ngc::RequestCompleted>(events);
+        require(requests.size() == 1 && requests[0].request == 3
+                    && requests[0].succeeded,
+                "enabled reset was not acknowledged");
+        require(snapshot.state == ngc::BackendState::Held
+                    && snapshot.epoch == 11,
+                "epoch reset should retain the executor's enabled held state");
+    }
+
     void testContinuationMarkersAndTerminalStop() {
         auto core = std::make_unique<ngc::ProductionExecutorCore>(0.25);
         initialize(*core, 20);
@@ -2399,6 +2419,7 @@ int main() {
 
     try {
         testFixedTickExecutionAndAccounting();
+        testEnabledResetRetainsPoweredHeldState();
         testContinuationMarkersAndTerminalStop();
         testScheduledSpindleEventsFollowExecutionCursor();
         testAbortSuppressesFutureScheduledEvents();

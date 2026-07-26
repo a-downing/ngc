@@ -1,6 +1,7 @@
 #include <chrono>
 #include <cmath>
 #include <filesystem>
+#include <format>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -10,6 +11,8 @@
 
 #include "machine/ExternalRealtimeRuntime.h"
 #include "machine/IpcProtocol.h"
+#include "machine/MachineConfiguration.h"
+#include "machine/MachineSessionManager.h"
 
 namespace {
     using namespace std::chrono_literals;
@@ -380,6 +383,76 @@ namespace {
         runtime.stop();
     }
 
+    void testConfiguredRealSessionRunsThroughIpcExecutor(
+        const std::filesystem::path &peer) {
+        auto configuration = ngc::loadMachineConfiguration("machine.toml");
+        require(configuration.has_value(),
+                configuration ? "" : configuration.error());
+        require(configuration->realBackend.has_value(),
+                "IPC test machine configuration should enable Real");
+        configuration->realBackend->executable =
+            std::filesystem::absolute(peer);
+
+        ngc::MachineSessionManager manager(*configuration);
+        const auto initial = manager.state();
+        require(initial.simulationAvailable && initial.realAvailable,
+                "configured IPC backend should expose Simulation and Real");
+        const auto realAuthority =
+            manager.selectControlTarget(ngc::MachineControlTarget::Real);
+        require(realAuthority.has_value(),
+                realAuthority ? "" : realAuthority.error());
+        const auto temporaryToolStore =
+            std::filesystem::temp_directory_path()
+            / "ngc_ipc_real_session_tools.txt";
+        const auto temporaryParameterStore =
+            std::filesystem::temp_directory_path()
+            / "ngc_ipc_real_session_parameters.var";
+        std::error_code cleanupError;
+        std::filesystem::remove(temporaryToolStore, cleanupError);
+        cleanupError.clear();
+        std::filesystem::remove(temporaryParameterStore, cleanupError);
+        require(manager.setToolTableStorePath(
+                    *realAuthority, temporaryToolStore).has_value()
+                    && manager.setPersistentParameterStorePath(
+                        *realAuthority,
+                        temporaryParameterStore).has_value(),
+                "configured IPC Real test should isolate persistent stores");
+        require(manager.powerOn(*realAuthority),
+                "configured IPC Real session should power on");
+        const auto powered = manager.snapshot();
+        require(powered.powerState == ngc::MachinePowerState::On
+                    && !powered.simulationDiagnostics.has_value(),
+                "IPC Real session should be powered without mock diagnostics");
+
+        require(manager.start(
+                    *realAuthority,
+                    {{"G0 X0.01\n", "ipc-real-session.ngc"}},
+                    {}),
+                "configured IPC Real session should accept a program");
+        auto completed = manager.snapshot();
+        for (auto attempt = 0; attempt < 10'000
+             && completed.status != ngc::SimulationStatus::Completed
+             && completed.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(1ms);
+            completed = manager.snapshot();
+        }
+        require(completed.status == ngc::SimulationStatus::Completed,
+                completed.error.empty()
+                    ? "configured IPC Real program should complete"
+                    : completed.error);
+        require(std::abs(completed.machinePosition.x - 0.01) < 1e-9,
+                std::format(
+                    "configured IPC Real program should report its executed "
+                    "position, got {}", completed.machinePosition.x));
+        require(manager.powerOff(*realAuthority),
+                "configured IPC Real session should power off");
+        manager.join();
+        cleanupError.clear();
+        std::filesystem::remove(temporaryToolStore, cleanupError);
+        cleanupError.clear();
+        std::filesystem::remove(temporaryParameterStore, cleanupError);
+    }
+
     void testExternalRuntimeRejectsStaleHandshake(
         const std::filesystem::path &peer) {
         auto options = configuration(peer);
@@ -495,6 +568,7 @@ int main(const int argc, char **argv) {
         testProtocolLayoutAndBoundedRings();
         testExternalRuntimeExecutesThroughProductionCore(peer);
         testExternalRuntimeFeedHoldAndResume(peer);
+        testConfiguredRealSessionRunsThroughIpcExecutor(peer);
         testExternalRuntimeRejectsStaleHandshake(peer);
         testExternalRuntimeRejectsInvalidExecutorConfiguration(peer);
         testExternalRuntimeReportsBackpressure(peer);

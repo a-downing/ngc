@@ -8,15 +8,18 @@
 #include <cstdint>
 #include <deque>
 #include <expected>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <ranges>
+#include <stdexcept>
 #include <thread>
 #include <tuple>
 #include <string>
 #include <vector>
 
 #include "machine/GeometryStreamProducer.h"
+#include "machine/ExternalRealtimeRuntime.h"
 #include "machine/InProcessSimulationRuntime.h"
 #include "machine/MachineControl.h"
 #include "machine/MachineConfiguration.h"
@@ -31,7 +34,215 @@ namespace ngc {
 
 namespace detail {
 
-class InProcessMachineSession {
+class SessionBackendRuntime final : public ngc::BackendRuntime {
+    static ngc::ExternalRealtimeRuntimeConfiguration externalConfiguration(
+            const ngc::MachineConfiguration &configuration) {
+        const auto &backend = *configuration.realBackend;
+        const ngc::IpcIdentity identity{
+            .configurationFingerprint = 1,
+            .topologyFingerprint = 1,
+            .sessionGeneration = 1,
+            .epochGeneration = 1,
+            .authorityGeneration = 1,
+        };
+
+        return {
+            .peerExecutable = backend.executable,
+            .identity = identity,
+            .peerExpectedIdentity = identity,
+            .peerArguments = {
+                "--machine-configuration",
+                backend.machineConfiguration.string(),
+            },
+        };
+    }
+
+public:
+    explicit SessionBackendRuntime(
+            const ngc::TrajectoryLimits &limits,
+            const ngc::SimulationTiming &timing)
+        : m_runtime(std::make_unique<ngc::InProcessSimulationRuntime>(
+              limits, timing)),
+          m_simulation(static_cast<ngc::InProcessSimulationRuntime *>(
+              m_runtime.get())),
+          m_servoPeriod(timing.servoPeriod) { }
+
+    SessionBackendRuntime(
+            const ngc::MachineConfiguration &configuration,
+            const bool external)
+        : m_runtime(external
+              ? std::unique_ptr<ngc::BackendRuntime>(
+                    std::make_unique<ngc::ExternalRealtimeRuntime>(
+                        externalConfiguration(configuration)))
+              : std::unique_ptr<ngc::BackendRuntime>(
+                    std::make_unique<ngc::InProcessSimulationRuntime>(
+                        configuration))),
+          m_simulation(external ? nullptr
+                                : static_cast<ngc::InProcessSimulationRuntime *>(
+                                      m_runtime.get())),
+          m_external(external),
+          m_servoPeriod(configuration.simulation.servoPeriod) { }
+
+    ngc::MotionBackend &endpoint() noexcept override {
+        return m_runtime->endpoint();
+    }
+
+    void start() override {
+        m_runtime->start();
+        if (m_external && !submitControlAndWait(ngc::EnableRequest{
+                std::numeric_limits<ngc::RequestId>::max()})) {
+            m_runtime->stop();
+            throw std::runtime_error(
+                "external executor rejected backend enable");
+        }
+    }
+
+    void stop() override {
+        if (m_external) {
+            static_cast<void>(submitControlAndWait(ngc::DisableRequest{
+                std::numeric_limits<ngc::RequestId>::max() - 1}));
+        }
+        m_runtime->stop();
+    }
+
+    [[nodiscard]] ngc::BackendCapabilities capabilities() const noexcept override {
+        return m_runtime->capabilities();
+    }
+
+    [[nodiscard]] bool restoreStationaryState(
+            const ngc::StationaryBackendState &state) noexcept override {
+        return m_runtime->restoreStationaryState(state);
+    }
+
+    [[nodiscard]] bool prepareTriggeredJointMove(
+            const ngc::TriggeredJointMove &move) noexcept override {
+        return m_runtime->prepareTriggeredJointMove(move);
+    }
+
+    void serviceImmediate() override {
+        m_runtime->serviceImmediate();
+    }
+
+    [[nodiscard]] std::uint64_t advanceServiceMotionPeriod() override {
+        return m_runtime->advanceServiceMotionPeriod();
+    }
+
+    void waitForServiceMotion() override {
+        m_runtime->waitForServiceMotion();
+    }
+
+    bool beginTimedExecution() {
+        return m_simulation ? m_simulation->beginTimedExecution() : true;
+    }
+
+    void endTimedExecution() {
+        if (m_simulation) {
+            m_simulation->endTimedExecution();
+        }
+    }
+
+    void setTickMultiplier(const int multiplier) noexcept {
+        if (m_simulation) {
+            m_simulation->setTickMultiplier(multiplier);
+        }
+    }
+
+    [[nodiscard]] std::uint32_t tickMultiplier() const noexcept {
+        return m_simulation ? m_simulation->tickMultiplier() : 1;
+    }
+
+    [[nodiscard]] double servoPeriod() const noexcept {
+        return m_servoPeriod;
+    }
+
+    [[nodiscard]] ngc::SimulationRuntimeSnapshot snapshot() const noexcept {
+        if (m_simulation) {
+            return m_simulation->snapshot();
+        }
+
+        ngc::SimulationRuntimeSnapshot result;
+        result.servoPeriodSeconds = m_servoPeriod;
+        result.schedulerPeriodSeconds = m_servoPeriod;
+        result.servoTicksPerSchedulerPeriod = 1;
+
+        return result;
+    }
+
+    [[nodiscard]] bool executorBatchActive() const noexcept {
+        return m_simulation && m_simulation->executorBatchActive();
+    }
+
+    void setNrtRefillActive(const bool active) noexcept {
+        if (m_simulation) {
+            m_simulation->setNrtRefillActive(active);
+        }
+    }
+
+    void releaseRefillOpportunity() noexcept {
+        if (m_simulation) {
+            m_simulation->releaseRefillOpportunity();
+        }
+    }
+
+    void setRollingSupplyActive(const bool active) noexcept {
+        if (m_simulation) {
+            m_simulation->setRollingSupplyActive(active);
+        }
+    }
+
+    bool configureSyntheticInput(
+            const ngc::TriggeredMoveId move,
+            const ngc::position_t &position) noexcept {
+        return m_simulation
+            && m_simulation->configureSyntheticInput(move, position);
+    }
+
+    std::vector<ngc::ExecutedJerkSample> takeExecutedJerkSamples() {
+        return m_simulation
+            ? m_simulation->takeExecutedJerkSamples()
+            : std::vector<ngc::ExecutedJerkSample>{};
+    }
+
+    [[nodiscard]] bool simulationDiagnosticsAvailable() const noexcept {
+        return m_simulation != nullptr;
+    }
+
+private:
+    bool submitControlAndWait(const ngc::ControlRequest &request) {
+        const auto requestId = std::visit([](const auto &value) {
+            return value.id;
+        }, request);
+        if (m_runtime->endpoint().trySubmit(request)
+            != ngc::SubmitResult::Submitted) {
+            return false;
+        }
+
+        const auto deadline = std::chrono::steady_clock::now()
+            + std::chrono::seconds(2);
+        while (std::chrono::steady_clock::now() < deadline) {
+            ngc::ExecutionEvent event;
+            while (m_runtime->endpoint().tryTakeEvent(event)) {
+                if (const auto *completed =
+                        std::get_if<ngc::RequestCompleted>(&event);
+                    completed != nullptr
+                    && completed->request == requestId) {
+                    return completed->succeeded;
+                }
+            }
+            m_runtime->serviceImmediate();
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        return false;
+    }
+
+    std::unique_ptr<ngc::BackendRuntime> m_runtime;
+    ngc::InProcessSimulationRuntime *m_simulation = nullptr;
+    bool m_external = false;
+    double m_servoPeriod = 0.001;
+};
+
+class MachineSessionHost {
     static ngc::GeometryStreamPolicy geometryPolicy(const ngc::TrajectoryLimits &limits) {
         ngc::GeometryStreamPolicy result;
         result.splineVelocityLimits={
@@ -52,7 +263,7 @@ class InProcessMachineSession {
     std::thread m_timedSnapshotThread;
     bool m_stopTimedSnapshotService = false;
     std::optional<ngc::ExecutionSnapshot> m_latestTimedBackendSnapshot;
-    ngc::InProcessSimulationRuntime m_runtime;
+    SessionBackendRuntime m_runtime;
     ngc::MachineSession m_machineSession;
     ngc::TrajectoryLimits m_limits;
     ngc::SimulationSnapshot m_snapshot;
@@ -87,7 +298,7 @@ class InProcessMachineSession {
     }
 
 public:
-    explicit InProcessMachineSession(const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch,
+    explicit MachineSessionHost(const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch,
                               const ngc::TrajectoryLimits limits = {},
                               const ngc::SimulationTiming timing = {},
                               const MachineControlTarget target = MachineControlTarget::Simulation)
@@ -101,11 +312,13 @@ public:
         copyRuntimeTimingSnapshot();
         m_machineSession.presentationTracker().reset(sessionPresentation());
         refreshParameterSnapshot();
-        m_thread = std::thread(&InProcessMachineSession::work, this);
+        m_thread = std::thread(&MachineSessionHost::work, this);
     }
-    explicit InProcessMachineSession(const ngc::MachineConfiguration &configuration,
-                                     const MachineControlTarget target = MachineControlTarget::Simulation)
-        : m_runtime(configuration),
+    explicit MachineSessionHost(
+            const ngc::MachineConfiguration &configuration,
+            const MachineControlTarget target = MachineControlTarget::Simulation,
+            const bool useConfiguredRealBackend = false)
+        : m_runtime(configuration, useConfiguredRealBackend),
           m_machineSession(configuration.unit,
                            target == MachineControlTarget::Simulation
                                ? ngc::InterpretationMode::Simulation
@@ -122,11 +335,11 @@ public:
             configuration.axes, configuration.joints, configuration.homing);
         clearActiveTool();
         refreshParameterSnapshot();
-        m_thread = std::thread(&InProcessMachineSession::work, this);
+        m_thread = std::thread(&MachineSessionHost::work, this);
     }
-    ~InProcessMachineSession() { join(); }
-    InProcessMachineSession(const InProcessMachineSession &) = delete;
-    InProcessMachineSession &operator=(const InProcessMachineSession &) = delete;
+    ~MachineSessionHost() { join(); }
+    MachineSessionHost(const MachineSessionHost &) = delete;
+    MachineSessionHost &operator=(const MachineSessionHost &) = delete;
 
     MachineSessionManagerState state() const {
         std::scoped_lock lock(m_mutex);
@@ -610,19 +823,23 @@ public:
             && result.trajectoryBackendState != ngc::BackendState::Held) {
             result.status = ngc::SimulationStatus::Holding;
         }
-        result.simulationDiagnostics = ngc::SimulationDiagnostics {
-            .servoPeriodSeconds = result.servoPeriodSeconds,
-            .schedulerPeriodSeconds = result.schedulerPeriodSeconds,
-            .servoTicksPerSchedulerPeriod = result.servoTicksPerSchedulerPeriod,
-            .tickMultiplier = result.tickMultiplier,
-            .servoTicks = result.servoTicks,
-            .programElapsedSeconds = result.programElapsedSeconds,
-            .executedPathJerk = result.executedPathJerk,
-            .deadlineMisses = result.deadlineMisses,
-            .lastWakeLatenessSeconds = result.lastWakeLatenessSeconds,
-            .maximumWakeLatenessSeconds = result.maximumWakeLatenessSeconds,
-            .maximumTickExecutionSeconds = result.maximumTickExecutionSeconds,
-        };
+        if (m_runtime.simulationDiagnosticsAvailable()) {
+            result.simulationDiagnostics = ngc::SimulationDiagnostics {
+                .servoPeriodSeconds = result.servoPeriodSeconds,
+                .schedulerPeriodSeconds = result.schedulerPeriodSeconds,
+                .servoTicksPerSchedulerPeriod = result.servoTicksPerSchedulerPeriod,
+                .tickMultiplier = result.tickMultiplier,
+                .servoTicks = result.servoTicks,
+                .programElapsedSeconds = result.programElapsedSeconds,
+                .executedPathJerk = result.executedPathJerk,
+                .deadlineMisses = result.deadlineMisses,
+                .lastWakeLatenessSeconds = result.lastWakeLatenessSeconds,
+                .maximumWakeLatenessSeconds = result.maximumWakeLatenessSeconds,
+                .maximumTickExecutionSeconds = result.maximumTickExecutionSeconds,
+            };
+        } else {
+            result.simulationDiagnostics.reset();
+        }
         if (!m_powerRequestActive) {
             result.powerState = m_machineSession.coordinator().powerState();
         }
@@ -1007,7 +1224,7 @@ private:
         }
         if(backend.state == ngc::BackendState::Faulted) {
             target.status = ngc::SimulationStatus::Error;
-            target.error = "mock motion backend fault " + std::to_string(backend.faultCode);
+            target.error = "motion backend fault " + std::to_string(backend.faultCode);
         }
         target.machinePosition = backend.commanded.position;
         target.joints = backend.commandedJoints;
@@ -1293,13 +1510,13 @@ private:
             if (!m_runtime.beginTimedExecution()) {
                 (void)joinGeometry(ngc::ExecutionEpochOutcome::Abandoned);
                 m_machineSession.interpreter().reportError(
-                    "in-process Simulation runtime failed to start timed execution");
+                    "machine-session runtime failed to start timed execution");
                 m_machineSession.interpreter().stop();
                 lock.lock();
                 m_snapshot.status = ngc::SimulationStatus::Error;
                 m_snapshot.activity = ngc::SimulationActivity::Idle;
                 m_snapshot.programOperation = ngc::ProgramOperationPresentation::Failed;
-                m_snapshot.error = "Simulation servo scheduler failed to start";
+                m_snapshot.error = "machine-session executor failed to start";
                 m_running = false;
                 m_programRunning = false;
                 lock.unlock();
@@ -1346,9 +1563,9 @@ private:
                 const auto joining = m_join;
                 const auto backendWorkAllowed = !m_runtime.executorBatchActive();
                 struct NrtRefillGuard {
-                    ngc::InProcessSimulationRuntime &runtime;
+                    SessionBackendRuntime &runtime;
                     bool enabled = false;
-                    NrtRefillGuard(ngc::InProcessSimulationRuntime &value, const bool enable)
+                    NrtRefillGuard(SessionBackendRuntime &value, const bool enable)
                         : runtime(value), enabled(enable) {
                         if (enabled) {
                             runtime.setNrtRefillActive(true);
@@ -1561,24 +1778,24 @@ public:
 
 private:
     mutable std::mutex m_mutex;
-    std::unique_ptr<detail::InProcessMachineSession> m_simulation;
-    std::unique_ptr<detail::InProcessMachineSession> m_real;
+    std::unique_ptr<detail::MachineSessionHost> m_simulation;
+    std::unique_ptr<detail::MachineSessionHost> m_real;
     MachineControlAuthority m_controlAuthority {
         .target = MachineControlTarget::Simulation,
         .generation = 1,
     };
 
-    [[nodiscard]] detail::InProcessMachineSession *sessionLocked(
+    [[nodiscard]] detail::MachineSessionHost *sessionLocked(
             const MachineControlTarget target) {
         return target == MachineControlTarget::Simulation ? m_simulation.get() : m_real.get();
     }
 
-    [[nodiscard]] const detail::InProcessMachineSession *sessionLocked(
+    [[nodiscard]] const detail::MachineSessionHost *sessionLocked(
             const MachineControlTarget target) const {
         return target == MachineControlTarget::Simulation ? m_simulation.get() : m_real.get();
     }
 
-    [[nodiscard]] detail::InProcessMachineSession *controlledSessionLocked(
+    [[nodiscard]] detail::MachineSessionHost *controlledSessionLocked(
             const MachineControlAuthority authority) {
         if (authority != m_controlAuthority) {
             return nullptr;
@@ -1587,7 +1804,7 @@ private:
         return sessionLocked(authority.target);
     }
 
-    [[nodiscard]] const detail::InProcessMachineSession *controlledSessionLocked(
+    [[nodiscard]] const detail::MachineSessionHost *controlledSessionLocked(
             const MachineControlAuthority authority) const {
         if (authority != m_controlAuthority) {
             return nullptr;
@@ -1596,16 +1813,16 @@ private:
         return sessionLocked(authority.target);
     }
 
-    [[nodiscard]] detail::InProcessMachineSession &controlledSessionLocked() {
+    [[nodiscard]] detail::MachineSessionHost &controlledSessionLocked() {
         return *sessionLocked(m_controlAuthority.target);
     }
 
-    [[nodiscard]] const detail::InProcessMachineSession &controlledSessionLocked() const {
+    [[nodiscard]] const detail::MachineSessionHost &controlledSessionLocked() const {
         return *sessionLocked(m_controlAuthority.target);
     }
 
     static MachineControlAuthority localAuthority(
-            const detail::InProcessMachineSession &session) {
+            const detail::MachineSessionHost &session) {
         return session.state().authority;
     }
 
@@ -1618,27 +1835,31 @@ public:
     explicit MachineSessionManager(const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch,
                                    const ngc::TrajectoryLimits limits = {},
                                    const ngc::SimulationTiming timing = {})
-        : m_simulation(std::make_unique<detail::InProcessMachineSession>(
+        : m_simulation(std::make_unique<detail::MachineSessionHost>(
               unit, limits, timing)) {}
 
     explicit MachineSessionManager(const ngc::MachineConfiguration &configuration)
         : m_simulation(
-              std::make_unique<detail::InProcessMachineSession>(configuration)) {}
+              std::make_unique<detail::MachineSessionHost>(configuration)),
+          m_real(configuration.realBackend
+              ? std::make_unique<detail::MachineSessionHost>(
+                    configuration, MachineControlTarget::Real, true)
+              : nullptr) {}
 
     explicit MachineSessionManager(const InProcessDualSessionTestTag,
                                    const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch,
                                    const ngc::TrajectoryLimits limits = {},
                                    const ngc::SimulationTiming timing = {})
-        : m_simulation(std::make_unique<detail::InProcessMachineSession>(
+        : m_simulation(std::make_unique<detail::MachineSessionHost>(
               unit, limits, timing, MachineControlTarget::Simulation)),
-          m_real(std::make_unique<detail::InProcessMachineSession>(
+          m_real(std::make_unique<detail::MachineSessionHost>(
               unit, limits, timing, MachineControlTarget::Real)) {}
 
     explicit MachineSessionManager(const InProcessDualSessionTestTag,
                                    const ngc::MachineConfiguration &configuration)
-        : m_simulation(std::make_unique<detail::InProcessMachineSession>(
+        : m_simulation(std::make_unique<detail::MachineSessionHost>(
               configuration, MachineControlTarget::Simulation)),
-          m_real(std::make_unique<detail::InProcessMachineSession>(
+          m_real(std::make_unique<detail::MachineSessionHost>(
               configuration, MachineControlTarget::Real)) {}
 
     ~MachineSessionManager() { join(); }

@@ -3,6 +3,7 @@
 #include <expected>
 #include <cstdint>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -111,6 +112,11 @@ namespace ngc {
         std::vector<HomingGroupConfiguration> groups;
     };
 
+    struct RealBackendConfiguration {
+        std::filesystem::path executable;
+        std::filesystem::path machineConfiguration;
+    };
+
     struct MachineConfiguration {
         Machine::Unit unit = Machine::Unit::Inch;
         std::vector<Machine::Axis> coordinates;
@@ -126,6 +132,7 @@ namespace ngc {
         HomingConfiguration homing;
         ParameterStorePaths parameterStores;
         ToolTableStorePaths toolTableStores;
+        std::optional<RealBackendConfiguration> realBackend;
     };
 
     std::expected<MachineConfiguration, std::string>

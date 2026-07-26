@@ -7304,6 +7304,18 @@ G1 F60 X2
                     && configuration->toolTableStores.real
                         != configuration->toolTableStores.simulation,
                 "machine configuration should provide isolated typed tool-table paths");
+        const auto repositoryConfiguration =
+            ngc::loadMachineConfiguration("machine.toml");
+        require(repositoryConfiguration.has_value(),
+                repositoryConfiguration
+                    ? "" : repositoryConfiguration.error());
+        require(repositoryConfiguration->realBackend.has_value()
+                    && repositoryConfiguration->realBackend->executable.filename()
+                        == "ngc_ipc_backend.exe"
+                    && repositoryConfiguration->realBackend
+                           ->machineConfiguration.filename()
+                        == "machine.toml",
+                "machine configuration should enable the external IPC Real backend");
 
         require(!configuration->coordinates.empty(),
                 "machine configuration should load at least one logical coordinate");

@@ -163,6 +163,9 @@ namespace ngc {
             const auto *probing = document["probing"].as_table();
             const auto *joints = document["joints"].as_array();
             const auto *homing = document["homing"].as_table();
+            const auto *realBackendNode = document.get("real_backend");
+            const auto *realBackend =
+                realBackendNode ? realBackendNode->as_table() : nullptr;
             const auto *parameterStoreNode = document.get("parameter_store");
             const auto *parameterStores = parameterStoreNode ? parameterStoreNode->as_table() : nullptr;
             const auto *toolTableStoreNode = document.get("tool_table_store");
@@ -179,6 +182,10 @@ namespace ngc {
             if(!joints || joints->empty())
                 return std::unexpected(configurationError(path, "joints", "must be a non-empty array of tables"));
             if(!homing) return std::unexpected(configurationError(path, "homing", "missing table"));
+            if (realBackendNode && !realBackend) {
+                return std::unexpected(configurationError(
+                    path, "real_backend", "must be a table", realBackendNode));
+            }
             if (parameterStoreNode && !parameterStores) {
                 return std::unexpected(configurationError(
                     path, "parameter_store", "must be a table", parameterStoreNode));
@@ -196,11 +203,42 @@ namespace ngc {
 
                 return path.parent_path() / configured;
             };
+            const auto resolveConfigurationPath =
+                [&](const std::filesystem::path &configured) {
+                    if (configured.is_absolute()) {
+                        return configured;
+                    }
+
+                    return std::filesystem::absolute(
+                        path.parent_path() / configured).lexically_normal();
+                };
             result.parameterStores.real = resolveStorePath(result.parameterStores.real);
             result.parameterStores.simulation = resolveStorePath(result.parameterStores.simulation);
             result.toolTableStores.legacy = resolveStorePath(result.toolTableStores.legacy);
             result.toolTableStores.real = resolveStorePath(result.toolTableStores.real);
             result.toolTableStores.simulation = resolveStorePath(result.toolTableStores.simulation);
+            if (realBackend) {
+                const auto backend = requiredString(
+                    *realBackend, "type", path);
+                if (!backend) {
+                    return std::unexpected(backend.error());
+                }
+                if (*backend != "ipc_executor") {
+                    return std::unexpected(configurationError(
+                        path, "real_backend.type",
+                        "must be ipc_executor", realBackend->get("type")));
+                }
+                const auto executable = requiredString(
+                    *realBackend, "executable", path);
+                if (!executable) {
+                    return std::unexpected(executable.error());
+                }
+                result.realBackend = RealBackendConfiguration{
+                    .executable = resolveConfigurationPath(*executable),
+                    .machineConfiguration =
+                        std::filesystem::absolute(path).lexically_normal(),
+                };
+            }
             if (parameterStores) {
                 if (const auto configured = parameterStores->get("real")) {
                     const auto value = configured->value<std::string>();

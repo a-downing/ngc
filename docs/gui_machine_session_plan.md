@@ -11,12 +11,12 @@ exists. Completed claims must be verified against the current code and tests.
 
 ## Current mismatch
 
-The application owns Simulation through `MachineSessionManager`, presents its
-backend-neutral power and activity state, and exposes the powered-session
-lifecycle explicitly. Phases 1 through 6 are complete. The remaining mismatch
-is multi-session control: Simulation is still the only available target, and
-there is no Real-session snapshot, control transfer, or Real-to-Simulation
-checkpoint operation.
+The application owns Simulation and the configured non-hardware Real session
+through `MachineSessionManager`, presents their backend-neutral power and
+activity state, and exposes the powered-session lifecycle explicitly. Phases 1
+through 6 are complete. The remaining mismatch is physical status and
+checkpoint presentation: the Windows Real target has null I/O, and there is no
+Real-to-Simulation checkpoint operation in the GUI.
 
 ## Target operator model
 
@@ -297,22 +297,18 @@ Acceptance criteria:
 
 ### Phase 7: Prepare for Real and control transfer
 
-Status: in progress. The standalone application now presents an explicit
-Simulation/Real selector and simultaneous session rows. Simulation is identified
-as the current control owner, while Real remains visible and disabled with a
-precise unavailable explanation. The manager already exposes generation-tagged
-Simulation authority and rejects unavailable Real selection without advancing
-that authority. The GUI now tags every target-dependent motion and
-controller-data operation with its current authority, and the manager rejects a
-stale generation or wrong target before admission. Concurrent production Real
-ownership, a live Real snapshot, and the Real-to-Simulation checkpoint UI remain
-coupled to the corresponding production Real-session work. The manager's target
-router and dual-session snapshot API are covered with an explicitly test-only
-in-process RealRun-mode session; those tests exercise actual authority transfer
-and session-state isolation without making Real available in the application.
-The same boundary now implements and tests validated Real-to-Simulation
-checkpoint import, including authority advancement, copied canonical state and
-stores, one-way isolation, and refresh from a later Real checkpoint.
+Status: in progress. The standalone application presents an explicit
+Simulation/Real selector and simultaneous live session rows. `[real_backend]`
+enables Real through `ExternalRealtimeRuntime` and `ngc_ipc_backend`; selecting
+and powering Real runs program motion through the production IPC and executor
+path. The GUI tags target-dependent motion and controller-data operations with
+current authority, switches live tool-table ownership and isolated stores with
+the target, and rejects stale generations or wrong targets before admission.
+Mock scheduler diagnostics and accelerated playback remain Simulation-only.
+The manager's target router and checkpoint boundary remain covered by the
+explicit in-process test host, while IPC tests cover a complete configured Real
+program epoch. Physical safety/I/O state and the Real-to-Simulation checkpoint
+UI remain unfinished.
 
 Implement this phase with the corresponding Real-session manager work.
 
@@ -324,8 +320,8 @@ Implement this phase with the corresponding Real-session manager work.
   commands cannot reach a newly selected target. Complete for the standalone
   Simulation manager boundary and dual-session manager tests.
 - Keep inactive Real safety, communication, E-stop, and fault state visible.
-- Add the explicit **Simulate from Real** checkpoint operation only after its
-  quiescence and validation contract exists.
+- Add the explicit **Simulate from Real** checkpoint operation. Its quiescence
+  and validation contract already exists at the manager boundary.
 
 Acceptance criteria:
 
@@ -376,7 +372,8 @@ fault prominence.
 
 This plan does not:
 
-- make Real functionality appear implemented before a physical backend exists;
+- claim that the selectable non-hardware Real target is a commissioned physical
+  backend;
 - move geometry construction into the GUI;
 - give Preview a separate geometry implementation;
 - place diagnostics or presentation objects into the RT-facing backend;
