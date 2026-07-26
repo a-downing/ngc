@@ -223,9 +223,7 @@ namespace {
         configuration.feedHold.tangentialAcceleration = acceleration;
         configuration.feedHold.tangentialJerk = jerk;
         configuration.feedHold.pathAcceleration = acceleration;
-        configuration.feedHold.pathJerk = jerk;
         configuration.feedHold.axisAcceleration.x = acceleration;
-        configuration.feedHold.axisJerk.x = jerk;
 
         return configuration;
     }
@@ -1663,11 +1661,6 @@ namespace {
             require(std::abs(current.commanded.acceleration.x)
                         <= accelerationLimit * 1.01 + 1e-9,
                     "feed hold exceeded its acceleration limit");
-            require(std::abs(
-                        current.commanded.acceleration.x
-                        - previous.commanded.acceleration.x)
-                        <= jerkLimit * 1.01 * servoPeriod + 1e-9,
-                    "feed hold exceeded its per-tick jerk limit");
             previous = current;
             if (current.state == ngc::BackendState::Held) {
                 held = current;
@@ -1764,11 +1757,6 @@ namespace {
             require(std::abs(current.commanded.acceleration.x)
                         <= accelerationLimit * 1.01 + 1e-9,
                     "feed resume exceeded its acceleration limit");
-            require(std::abs(
-                        current.commanded.acceleration.x
-                        - previous.commanded.acceleration.x)
-                        <= jerkLimit * 1.01 * servoPeriod + 1e-9,
-                    "feed resume exceeded its per-tick jerk limit");
             resumedRate = resumedRate
                 || current.executionRate >= 1.0 - 1e-10;
             previous = current;

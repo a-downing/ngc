@@ -26,18 +26,11 @@ namespace ngc {
         // bound the requested on-path braking and resume profile.
         double tangentialAcceleration = 0.0;
         double tangentialJerk = 0.0;
-        // Aggregate and per-axis physical limits remain the final authority.
+        // Aggregate and per-axis acceleration remain hard limits. The
+        // tangential jerk shapes the scalar rate profile; full coupled and
+        // per-axis jerk remain diagnostic rather than feasibility limits.
         double pathAcceleration = std::numeric_limits<double>::infinity();
-        double pathJerk = std::numeric_limits<double>::infinity();
         position_t axisAcceleration = {
-            std::numeric_limits<double>::infinity(),
-            std::numeric_limits<double>::infinity(),
-            std::numeric_limits<double>::infinity(),
-            std::numeric_limits<double>::infinity(),
-            std::numeric_limits<double>::infinity(),
-            std::numeric_limits<double>::infinity(),
-        };
-        position_t axisJerk = {
             std::numeric_limits<double>::infinity(),
             std::numeric_limits<double>::infinity(),
             std::numeric_limits<double>::infinity(),
@@ -197,16 +190,9 @@ namespace ngc {
             const position_t &referenceVelocity,
             const position_t &referenceAcceleration,
             double &lower, double &upper) const noexcept;
-        bool feedRetimingJerkInterval(
-            const ExecutionPolynomialEvaluation &reference,
-            double &lower, double &upper) const noexcept;
         double feedRetimingReferenceAdvance(double physicalSeconds) noexcept;
         [[nodiscard]] MotionState retimedState(
             const ExecutionPolynomialEvaluation &reference) const noexcept;
-        [[nodiscard]] position_t retimedJerk(
-            const ExecutionPolynomialEvaluation &reference) const noexcept;
-        [[nodiscard]] bool validRetimedDynamics(
-            const MotionState &state, const position_t &jerk) const noexcept;
         void finishFeedHold() noexcept;
         void resetFeedRetiming() noexcept;
         void faultFeedRetimingAtStopBranch() noexcept;

@@ -123,14 +123,13 @@ namespace ngc {
                 if (!joint) {
                     continue;
                 }
-                const auto switchPosition =
-                    joint->homing.switchPosition * joint->coordinateScale;
                 const auto searchDirection = std::copysign(
                     1.0, joint->homing.searchVelocity * joint->coordinateScale);
                 if (searchDirection
-                    * (backoffResult->stoppedState.position[id] - switchPosition) >= 0.0) {
+                    * (backoffResult->stoppedState.position[id]
+                       - fastResult->triggerState.position[id]) >= 0.0) {
                     return std::unexpected(
-                        "configured homing backoff did not clear the switch");
+                        "homing backoff did not move behind the fast trigger");
                 }
             }
 

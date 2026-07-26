@@ -1,3 +1,4 @@
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <filesystem>
@@ -383,6 +384,79 @@ namespace {
         runtime.stop();
     }
 
+    void testExternalRuntimeFakesTriggeredJointInput(
+        const std::filesystem::path &peer) {
+        ngc::ExternalRealtimeRuntime runtime(configuration(peer));
+        runtime.start();
+
+        constexpr ngc::EpochId epoch = 19;
+        require(runtime.endpoint().trySubmit(ngc::ResetRequest{51, epoch})
+                    == ngc::SubmitResult::Submitted,
+                "triggered-joint IPC reset should fit");
+        require(waitForRequest(runtime, 51).succeeded,
+                "triggered-joint IPC reset should succeed");
+        require(runtime.endpoint().trySubmit(ngc::EnableRequest{52})
+                    == ngc::SubmitResult::Submitted,
+                "triggered-joint IPC enable should fit");
+        require(waitForRequest(runtime, 52).succeeded,
+                "triggered-joint IPC enable should succeed");
+
+        ngc::TriggeredJointMove move;
+        move.epoch = epoch;
+        move.id = 53;
+        move.branch = 54;
+        move.moveId = 55;
+        move.joints = ngc::JointMask{1};
+        move.targetMode = ngc::JointTargetMode::Relative;
+        move.target[0] = 2.0;
+        move.limits.velocity[0] = 2.0;
+        move.limits.acceleration[0] = 5.0;
+        move.limits.jerk[0] = 100.0;
+        require(move.triggers.push({
+                    0, 1, ngc::InputCondition::Active, 0.0,
+                }),
+                "triggered-joint IPC fixture should fit its input");
+        move.triggerRequired = true;
+
+        require(runtime.endpoint().tryPublish(move)
+                    == ngc::PublishResult::Published,
+                "triggered-joint IPC move should fit");
+        require(runtime.endpoint().trySubmit(ngc::StartRequest{56, epoch})
+                    == ngc::SubmitResult::Submitted,
+                "triggered-joint IPC start should fit");
+        require(waitForRequest(runtime, 56).succeeded,
+                "triggered-joint IPC start should succeed");
+
+        std::optional<ngc::TriggeredJointMoveCompleted> completed;
+        const auto deadline = std::chrono::steady_clock::now() + 3s;
+        while (!completed.has_value()
+               && std::chrono::steady_clock::now() < deadline) {
+            ngc::ExecutionSnapshot snapshot;
+            while (runtime.endpoint().tryTakeSnapshot(snapshot)) { }
+            ngc::ExecutionEvent event;
+            while (runtime.endpoint().tryTakeEvent(event)) {
+                if (const auto *result =
+                        std::get_if<ngc::TriggeredJointMoveCompleted>(&event)) {
+                    completed = *result;
+                }
+            }
+            std::this_thread::sleep_for(1ms);
+        }
+
+        require(completed.has_value(),
+                "temporary IPC joint input should complete the triggered move");
+        require(completed->status == ngc::TriggeredMoveStatus::Triggered
+                    && completed->triggeredJoints == ngc::JointMask{1},
+                "temporary IPC joint input should report the selected joint");
+        require(completed->triggerState.position[0] >= 0.5
+                    && completed->stoppedState.position[0]
+                        < move.target[0],
+                "temporary IPC joint input should trigger 0.5 units after "
+                "the relative move starts and stop short of its target");
+
+        runtime.stop();
+    }
+
     void testConfiguredRealSessionRunsThroughIpcExecutor(
         const std::filesystem::path &peer) {
         auto configuration = ngc::loadMachineConfiguration("machine.toml");
@@ -424,6 +498,67 @@ namespace {
                     && !powered.simulationDiagnostics.has_value(),
                 "IPC Real session should be powered without mock diagnostics");
 
+        require(manager.home(*realAuthority),
+                "configured IPC Real session should accept homing");
+        auto homed = manager.snapshot();
+        for (auto attempt = 0; attempt < 30'000
+             && homed.status != ngc::SimulationStatus::Completed
+             && homed.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(1ms);
+            homed = manager.snapshot();
+        }
+        require(homed.status == ngc::SimulationStatus::Completed,
+                homed.error.empty()
+                    ? "configured IPC Real homing should complete"
+                    : homed.error);
+        require(static_cast<std::size_t>(std::popcount(homed.homedJoints))
+                    == configuration->joints.size(),
+                "configured IPC Real homing should mark every joint homed");
+
+        require(manager.start(
+                    *realAuthority,
+                    {{"G1 F120 X10\n", "ipc-real-feed-hold.ngc"}},
+                    {}),
+                "configured IPC Real session should accept feed-hold motion");
+        auto moving = manager.snapshot();
+        for (auto attempt = 0; attempt < 10'000
+             && moving.trajectoryBackendVelocity <= 0.01
+             && moving.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(1ms);
+            moving = manager.snapshot();
+        }
+        require(moving.status != ngc::SimulationStatus::Error
+                    && moving.trajectoryBackendVelocity > 0.01,
+                moving.error.empty()
+                    ? "configured IPC Real motion should begin before Feed Hold"
+                    : moving.error);
+        require(manager.feedHold(*realAuthority),
+                "configured IPC Real motion should accept Feed Hold");
+        auto feedHeld = manager.snapshot();
+        for (auto attempt = 0; attempt < 10'000
+             && feedHeld.status != ngc::SimulationStatus::Paused
+             && feedHeld.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(1ms);
+            feedHeld = manager.snapshot();
+        }
+        require(feedHeld.status == ngc::SimulationStatus::Paused,
+                feedHeld.error.empty()
+                    ? "configured IPC Real Feed Hold should reach Paused"
+                    : feedHeld.error);
+        require(manager.resume(*realAuthority),
+                "configured IPC Real Feed Hold should accept Resume");
+        auto resumed = manager.snapshot();
+        for (auto attempt = 0; attempt < 10'000
+             && resumed.status != ngc::SimulationStatus::Completed
+             && resumed.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(1ms);
+            resumed = manager.snapshot();
+        }
+        require(resumed.status == ngc::SimulationStatus::Completed,
+                resumed.error.empty()
+                    ? "configured IPC Real resumed motion should complete"
+                    : resumed.error);
+
         require(manager.start(
                     *realAuthority,
                     {{"G0 X0.01\n", "ipc-real-session.ngc"}},
@@ -444,6 +579,29 @@ namespace {
                 std::format(
                     "configured IPC Real program should report its executed "
                     "position, got {}", completed.machinePosition.x));
+
+        require(manager.start(
+                    *realAuthority,
+                    {{"G38.3 F60 X2\n", "ipc-real-probe.ngc"}},
+                    {}),
+                "configured IPC Real session should accept a probe");
+        completed = manager.snapshot();
+        for (auto attempt = 0; attempt < 10'000
+             && completed.status != ngc::SimulationStatus::Completed
+             && completed.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(1ms);
+            completed = manager.snapshot();
+        }
+        require(completed.status == ngc::SimulationStatus::Completed,
+                completed.error.empty()
+                    ? "configured IPC Real probe should complete"
+                    : completed.error);
+        require(completed.machinePosition.x >= 1.5
+                    && completed.machinePosition.x < 2.0,
+                std::format(
+                    "temporary IPC probe input should trigger 0.5 inches "
+                    "before the target and stop short of it, got {}",
+                    completed.machinePosition.x));
 
         constexpr std::string_view toolChange = R"NGC(
 sub _tool_change[#tool_number] {
@@ -634,6 +792,7 @@ int main(const int argc, char **argv) {
         testProtocolLayoutAndBoundedRings();
         testExternalRuntimeExecutesThroughProductionCore(peer);
         testExternalRuntimeFeedHoldAndResume(peer);
+        testExternalRuntimeFakesTriggeredJointInput(peer);
         testConfiguredRealSessionRunsThroughIpcExecutor(peer);
         testExternalRuntimeRejectsStaleHandshake(peer);
         testExternalRuntimeRejectsInvalidExecutorConfiguration(peer);

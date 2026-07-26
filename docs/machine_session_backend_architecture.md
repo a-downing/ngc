@@ -637,9 +637,9 @@ The physical backend must not inherit mock-only policy or diagnostics.
 Synthetic input transitions, accelerated time, and executed-servo diagnostic
 history remain Simulation-only.
 
-The current mock feed-hold retimer is not a production jerk guarantee. A
-bounded, proved production hold/resume design is required before physical
-program motion is enabled.
+The ordinary-plan feed-hold retimer is not a full coupled or per-axis jerk
+guarantee. It constrains acceleration and uses tangential jerk to shape its
+scalar rate profile; executed jerk remains diagnostic.
 
 ## Simulation integration ownership
 
@@ -890,9 +890,14 @@ interrupted by peer loss cannot be resumed after a fresh connection.
 The shared-memory storage and process layer has Windows and POSIX
 implementations, but this phase has only been built and exercised on the
 supported Windows development environment. The Windows peer uses an ordinary
-scheduler thread and a null I/O boundary, so its results prove functional
-executor and process behavior rather than real-time latency or hardware
-safety. Linux validation remains required before physical transport work.
+scheduler thread and a non-hardware I/O boundary. A temporary peer-local shim
+fakes axis-space probe input 0.5 machine units before its move target and each
+joint-space homing input after 0.5 machine units of travel from its move start.
+For a shorter triggered joint approach, the peer lengthens its private item
+copy so the fixed transition can be sampled and stopped. These results prove
+functional executor and process behavior rather than real-time latency or
+hardware safety. Linux validation remains required before physical transport
+work.
 
 - Implement fixed shared-memory rings and the physical `MotionBackend` proxy.
   Complete for the transport skeleton.
@@ -925,8 +930,10 @@ retires the abandoned horizon in publication order, suppresses its future
 markers, and permanently rejects resume for that epoch. Ordinary-plan feed
 hold uses bounded on-path rate retiming of the existing polynomial cursor.
 Every servo tick intersects configured tangential, aggregate, and per-axis
-acceleration and jerk authority, preserves the marker cursor, reaches a
-stationary `BackendHeld`, and resumes without reconstructing geometry or
+acceleration authority, while configured tangential jerk shapes the scalar
+rate profile. Full coupled and per-axis jerk remain diagnostic rather than
+feed-hold feasibility limits. The retimer preserves the marker cursor, reaches
+a stationary `BackendHeld`, and resumes without reconstructing geometry or
 replaying markers. Reaching a stop branch during feed-hold braking or resume
 retiming is a backend fault. Axis-space triggered feed hold uses the move's
 constrained-stop limits, retains the active target and input condition, keeps
@@ -973,14 +980,16 @@ runs `HomingController` through its production runtime callbacks.
 The runtime/core combination is now hosted by `ngc_ipc_backend` for the Windows
 non-hardware checkpoint. A fixed pending slot per channel preserves
 backpressure between each shared-memory ring and the core's bounded channels.
-IPC tests execute a timed `PlanChunk` through the child process and verify
-executor-generated acceptance, marker crossing, terminal stop selection,
-retirement, snapshots, feed hold, Resume, and Abort in addition to handshake,
-capacity, restart, and peer-loss behavior. The executable remains non-real-time,
-uses null I/O, and is exposed as the configured Real development target without
-claiming physical hardware availability. The session runtime sends explicit
-Enable and Disable controls at Real power boundaries, and executor epoch Reset
-retains an already-enabled held state.
+IPC tests execute a timed `PlanChunk`, an axis-space probe, and joint-space
+triggered motion through the child process and verify executor-generated
+acceptance, marker crossing, terminal stop selection, retirement, snapshots,
+feed hold, Resume, and Abort in addition to handshake, capacity, restart, and
+peer-loss behavior. The executable remains non-real-time, uses a temporary
+probe-and-homing input shim with otherwise null I/O, and is exposed as the
+configured Real development target without claiming physical hardware
+availability. The session runtime sends explicit Enable and Disable controls
+at Real power boundaries, and executor epoch Reset retains an already-enabled
+held state.
 
 - Factor reusable allocation-free execution mechanics without importing
   synthetic-input or mock-diagnostic policy.

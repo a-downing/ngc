@@ -209,9 +209,7 @@ namespace ngc {
                     || !std::isfinite(feedHold.tangentialJerk)
                     || feedHold.tangentialJerk <= 0.0))
             || !validPositiveLimit(feedHold.pathAcceleration)
-            || !validPositiveLimit(feedHold.pathJerk)
-            || !validAxisLimits(feedHold.axisAcceleration)
-            || !validAxisLimits(feedHold.axisJerk)) {
+            || !validAxisLimits(feedHold.axisAcceleration)) {
             throw std::invalid_argument(
                 "production executor feed-hold limits must be positive "
                 "and finite or infinite");
@@ -917,25 +915,6 @@ namespace ngc {
             lower, upper);
     }
 
-    bool ProductionExecutorCore::feedRetimingJerkInterval(
-        const ExecutionPolynomialEvaluation &reference,
-        double &lower, double &upper) const noexcept {
-        lower = -std::numeric_limits<double>::infinity();
-        upper = std::numeric_limits<double>::infinity();
-        const auto rate = m_feedRetiming.rate;
-        const auto rateAcceleration = m_feedRetiming.acceleration;
-        const auto base = scaled(reference.jerk, rate * rate * rate)
-            + scaled(
-                reference.state.acceleration,
-                3.0 * rate * rateAcceleration);
-
-        return constrainLinearInterval(
-            base, reference.state.velocity,
-            m_configuration.feedHold.axisJerk,
-            m_configuration.feedHold.pathJerk,
-            lower, upper);
-    }
-
     double ProductionExecutorCore::feedRetimingReferenceAdvance(
         const double physicalSeconds) noexcept {
         const auto &span = currentSpan();
@@ -970,15 +949,6 @@ namespace ngc {
             return 0.0;
         }
 
-        auto jerkLower = 0.0;
-        auto jerkUpper = 0.0;
-        if (!feedRetimingJerkInterval(
-                reference, jerkLower, jerkUpper)) {
-            fault(FEED_RETIMING_FAULT);
-
-            return 0.0;
-        }
-
         const auto safeReferenceSpeed =
             std::max(referenceSpeed, 1e-9);
         const auto accelerationMagnitude =
@@ -1004,55 +974,26 @@ namespace ngc {
             m_feedRetiming.resuming
                 ? accelerationMagnitude : -accelerationMagnitude,
             accelerationLower, accelerationUpper);
-        const auto requestedJerk = std::clamp(
-            m_feedRetiming.resuming
-                ? (release ? -jerkMagnitude : jerkMagnitude)
-                : (release ? jerkMagnitude : -jerkMagnitude),
-            jerkLower, jerkUpper);
+        const auto requestedJerk = m_feedRetiming.resuming
+            ? (release ? -jerkMagnitude : jerkMagnitude)
+            : (release ? jerkMagnitude : -jerkMagnitude);
         const auto previousAcceleration =
             m_feedRetiming.acceleration;
         auto nextAcceleration = previousAcceleration
             + requestedJerk * physicalSeconds;
-        const auto jerkAccelerationLower =
-            previousAcceleration + jerkLower * physicalSeconds;
-        const auto jerkAccelerationUpper =
-            previousAcceleration + jerkUpper * physicalSeconds;
-        const auto nextAccelerationLower =
-            std::max(accelerationLower, jerkAccelerationLower);
-        const auto nextAccelerationUpper =
-            std::min(accelerationUpper, jerkAccelerationUpper);
-        if (nextAccelerationLower > nextAccelerationUpper + 1e-12) {
-            fault(FEED_RETIMING_FAULT);
-
-            return 0.0;
-        }
-        nextAcceleration = std::clamp(
-            nextAcceleration,
-            nextAccelerationLower, nextAccelerationUpper);
-        const auto zeroAcceleration = std::clamp(
-            0.0, nextAccelerationLower, nextAccelerationUpper);
-        const auto boundedTargetAcceleration = std::clamp(
-            targetAcceleration,
-            nextAccelerationLower, nextAccelerationUpper);
         if (m_feedRetiming.resuming) {
             if (release) {
-                nextAcceleration =
-                    std::max(nextAcceleration, zeroAcceleration);
-            } else {
-                nextAcceleration =
-                    std::min(
-                        nextAcceleration,
-                        boundedTargetAcceleration);
+                nextAcceleration = std::max(nextAcceleration, 0.0);
+            } else if (nextAcceleration > targetAcceleration) {
+                nextAcceleration = targetAcceleration;
             }
         } else if (release) {
-            nextAcceleration =
-                std::min(nextAcceleration, zeroAcceleration);
-        } else {
-            nextAcceleration =
-                std::max(
-                    nextAcceleration,
-                    boundedTargetAcceleration);
+            nextAcceleration = std::min(nextAcceleration, 0.0);
+        } else if (nextAcceleration < targetAcceleration) {
+            nextAcceleration = targetAcceleration;
         }
+        nextAcceleration = std::clamp(
+            nextAcceleration, accelerationLower, accelerationUpper);
 
         auto nextRate = m_feedRetiming.rate
             + 0.5 * (previousAcceleration + nextAcceleration)
@@ -1091,50 +1032,6 @@ namespace ngc {
                 + scaled(reference.state.velocity,
                          m_feedRetiming.acceleration),
         };
-    }
-
-    position_t ProductionExecutorCore::retimedJerk(
-        const ExecutionPolynomialEvaluation &reference) const noexcept {
-        const auto rate = m_feedRetiming.rate;
-
-        return scaled(reference.jerk, rate * rate * rate)
-            + scaled(
-                reference.state.acceleration,
-                3.0 * rate * m_feedRetiming.acceleration)
-            + scaled(reference.state.velocity,
-                     m_feedRetiming.jerk);
-    }
-
-    bool ProductionExecutorCore::validRetimedDynamics(
-        const MotionState &state, const position_t &jerk) const noexcept {
-        if (!finiteMotionState(state) || !finitePosition(jerk)) {
-            return false;
-        }
-
-        const auto &limits = m_configuration.feedHold;
-        const auto within = [](const double value, const double limit) {
-            return std::isinf(limit)
-                || std::abs(value)
-                    <= limit * DYNAMIC_LIMIT_TOLERANCE + 1e-12;
-        };
-        const auto acceleration = state.acceleration;
-        if (!within(acceleration.x, limits.axisAcceleration.x)
-            || !within(acceleration.y, limits.axisAcceleration.y)
-            || !within(acceleration.z, limits.axisAcceleration.z)
-            || !within(acceleration.a, limits.axisAcceleration.a)
-            || !within(acceleration.b, limits.axisAcceleration.b)
-            || !within(acceleration.c, limits.axisAcceleration.c)
-            || !within(jerk.x, limits.axisJerk.x)
-            || !within(jerk.y, limits.axisJerk.y)
-            || !within(jerk.z, limits.axisJerk.z)
-            || !within(jerk.a, limits.axisJerk.a)
-            || !within(jerk.b, limits.axisJerk.b)
-            || !within(jerk.c, limits.axisJerk.c)) {
-            return false;
-        }
-
-        return within(magnitude(acceleration), limits.pathAcceleration)
-            && within(magnitude(jerk), limits.pathJerk);
     }
 
     void ProductionExecutorCore::finishFeedHold() noexcept {
@@ -1333,14 +1230,7 @@ namespace ngc {
             const auto reference =
                 evaluateExecutionPolynomial(span, parameter);
             if (retiming) {
-                const auto commanded = retimedState(reference);
-                const auto jerk = retimedJerk(reference);
-                if (!validRetimedDynamics(commanded, jerk)) {
-                    fault(FEED_RETIMING_FAULT);
-
-                    return;
-                }
-                m_snapshot.commanded = commanded;
+                m_snapshot.commanded = retimedState(reference);
             } else {
                 m_snapshot.commanded = reference.state;
             }

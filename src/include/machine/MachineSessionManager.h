@@ -11,6 +11,7 @@
 #include <limits>
 #include <memory>
 #include <mutex>
+#include <print>
 #include <ranges>
 #include <stdexcept>
 #include <thread>
@@ -1313,6 +1314,7 @@ private:
         m_snapshot.activity = ngc::SimulationActivity::Idle;
         m_snapshot.hasActiveMotion = false;
         if (!result) {
+            std::println(stderr, "MOTION ERROR: {}", result.error());
             m_snapshot.status = ngc::SimulationStatus::Error;
             m_snapshot.error = result.error();
             return;

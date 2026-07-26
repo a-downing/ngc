@@ -61,8 +61,6 @@ namespace ngc {
             configuration.feedHold.tangentialJerk;
         result.executor.feedHold.pathAcceleration =
             configuration.trajectory.pathAcceleration;
-        result.executor.feedHold.pathJerk =
-            configuration.trajectory.pathJerk;
 
         for (const auto &axis : configuration.axes) {
             auto &mapping = result.executor.axes[axisIndex(axis.axis)];
@@ -74,14 +72,11 @@ namespace ngc {
                 component(result.executor.controlledStopLimits.jerk, axis.axis);
             auto &holdAcceleration =
                 component(result.executor.feedHold.axisAcceleration, axis.axis);
-            auto &holdJerk =
-                component(result.executor.feedHold.axisJerk, axis.axis);
 
             stopVelocity = axis.maxVelocity;
             stopAcceleration = axis.maxAcceleration;
             stopJerk = axis.maxJerk;
             holdAcceleration = axis.maxAcceleration;
-            holdJerk = axis.maxJerk;
             for (const auto id : axis.joints) {
                 if (id >= MAX_JOINTS) {
                     throw std::invalid_argument(

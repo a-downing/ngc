@@ -1,4 +1,5 @@
 #include <atomic>
+#include <array>
 #include <chrono>
 #include <cstdint>
 #include <filesystem>
@@ -17,6 +18,8 @@
 #include "machine/ProductionExecutorRuntime.h"
 
 namespace {
+    constexpr double TEMPORARY_TRIGGER_DISTANCE = 0.5;
+
     struct Options {
         std::string mapping;
         ngc::IpcIdentity expected{};
@@ -92,11 +95,126 @@ namespace {
         }, item);
     }
 
+    class TemporaryTriggeredInputs final : public ngc::ProductionExecutorIo {
+    public:
+        void sampleDigitalInputs(ngc::ProductionExecutorDigitalInputs &inputs) noexcept override {
+            inputs.reset();
+            for (auto &input : m_inputs) {
+                if (input.enabled.load(std::memory_order_acquire)) {
+                    inputs.set(input.input.load(std::memory_order_relaxed),
+                               input.level.load(std::memory_order_relaxed));
+                }
+            }
+        }
+
+        void applyOutputs(const ngc::ProductionExecutorOutputState &) noexcept override { }
+
+        void arm(const ngc::TriggeredMove &move) noexcept {
+            clear();
+            m_epoch = move.epoch;
+            m_chunk = move.id;
+            m_axisTarget = move.target;
+            m_kind = Kind::Axis;
+            armInput(m_inputs[0], move.input, move.condition);
+            m_inputCount = 1;
+        }
+
+        void arm(ngc::TriggeredJointMove &move,
+                 const ngc::JointMotionState &starting) noexcept {
+            clear();
+            m_epoch = move.epoch;
+            m_chunk = move.id;
+            m_kind = Kind::Joint;
+            for (const auto &trigger : move.triggers) {
+                const auto start = starting.position[trigger.joint];
+                const auto delta = move.targetMode == ngc::JointTargetMode::Absolute
+                    ? move.target[trigger.joint] - start
+                    : move.target[trigger.joint];
+                if (std::abs(delta) <= TEMPORARY_TRIGGER_DISTANCE) {
+                    const auto extended =
+                        std::copysign(2.0 * TEMPORARY_TRIGGER_DISTANCE, delta);
+                    move.target[trigger.joint] =
+                        move.targetMode == ngc::JointTargetMode::Absolute
+                        ? start + extended : extended;
+                }
+                auto &input = m_inputs[m_inputCount];
+                input.joint = trigger.joint;
+                input.jointStart = start;
+                armInput(input, trigger.input, trigger.condition);
+                ++m_inputCount;
+            }
+        }
+
+        void observe(const ngc::ExecutionSnapshot &snapshot) noexcept {
+            if (m_kind == Kind::None || snapshot.epoch != m_epoch
+                || snapshot.activeChunk != m_chunk) {
+                return;
+            }
+
+            if (m_kind == Kind::Axis) {
+                if ((m_axisTarget - snapshot.commanded.position).length()
+                    <= TEMPORARY_TRIGGER_DISTANCE) {
+                    trigger(m_inputs[0]);
+                }
+                return;
+            }
+
+            for (std::size_t index = 0; index < m_inputCount; ++index) {
+                auto &input = m_inputs[index];
+                if (std::abs(snapshot.commandedJoints.position[input.joint]
+                             - input.jointStart)
+                    >= TEMPORARY_TRIGGER_DISTANCE) {
+                    trigger(input);
+                }
+            }
+        }
+
+        void clear() noexcept {
+            for (auto &input : m_inputs) {
+                input.enabled.store(false, std::memory_order_release);
+            }
+            m_kind = Kind::None;
+            m_inputCount = 0;
+        }
+
+    private:
+        enum class Kind { None, Axis, Joint };
+
+        struct Input {
+            std::atomic<bool> enabled = false;
+            std::atomic<ngc::DigitalInputId> input = 0;
+            std::atomic<bool> level = false;
+            bool triggerLevel = false;
+            ngc::JointId joint = 0;
+            double jointStart = 0.0;
+        };
+
+        static void armInput(Input &input, const ngc::DigitalInputId id,
+                             const ngc::InputCondition condition) noexcept {
+            input.input.store(id, std::memory_order_relaxed);
+            input.triggerLevel = condition == ngc::InputCondition::Active
+                || condition == ngc::InputCondition::RisingEdge;
+            input.level.store(!input.triggerLevel, std::memory_order_relaxed);
+            input.enabled.store(true, std::memory_order_release);
+        }
+
+        static void trigger(Input &input) noexcept {
+            input.level.store(input.triggerLevel, std::memory_order_release);
+        }
+
+        std::array<Input, ngc::MAX_JOINTS> m_inputs;
+        Kind m_kind = Kind::None;
+        std::size_t m_inputCount = 0;
+        ngc::EpochId m_epoch = 0;
+        ngc::ChunkId m_chunk = 0;
+        ngc::position_t m_axisTarget{};
+    };
+
     std::unique_ptr<ngc::ProductionExecutorRuntime> makeRuntime(
-        const Options &options) {
+        const Options &options, std::unique_ptr<ngc::ProductionExecutorIo> io) {
         if (!options.machineConfiguration.has_value()) {
             return std::make_unique<ngc::ProductionExecutorRuntime>(
-                ngc::ProductionExecutorRuntimeConfiguration{});
+                ngc::ProductionExecutorRuntimeConfiguration{}, std::move(io));
         }
 
         const auto configuration =
@@ -108,14 +226,16 @@ namespace {
         }
 
         return std::make_unique<ngc::ProductionExecutorRuntime>(
-            *configuration);
+            *configuration, std::move(io));
     }
 
     class IpcExecutorBridge {
     public:
         IpcExecutorBridge(ngc::IpcSharedRegion &region,
-                          ngc::MotionBackend &backend)
-            : m_region(region), m_backend(backend) { }
+                          ngc::MotionBackend &backend,
+                          TemporaryTriggeredInputs &triggeredInputs)
+            : m_region(region), m_backend(backend),
+              m_triggeredInputs(triggeredInputs) { }
 
         bool service(const bool consume) noexcept {
             auto progressed = publishOutputs();
@@ -136,6 +256,10 @@ namespace {
             if (!m_pendingEvent.has_value()) {
                 ngc::ExecutionEvent event;
                 if (m_backend.tryTakeEvent(event)) {
+                    if (std::holds_alternative<ngc::TriggeredMoveCompleted>(event)
+                        || std::holds_alternative<ngc::TriggeredJointMoveCompleted>(event)) {
+                        m_triggeredInputs.clear();
+                    }
                     m_pendingEvent = event;
                     progressed = true;
                 }
@@ -153,6 +277,8 @@ namespace {
             if (!m_pendingSnapshot.has_value()) {
                 ngc::ExecutionSnapshot snapshot;
                 if (m_backend.tryTakeSnapshot(snapshot)) {
+                    m_triggeredInputs.observe(snapshot);
+                    m_latestSnapshot = snapshot;
                     m_pendingSnapshot = snapshot;
                     progressed = true;
                 }
@@ -177,17 +303,35 @@ namespace {
                 }
             }
             if (m_pendingItem.has_value()) {
+                const auto *axisMove =
+                    std::get_if<ngc::TriggeredMove>(&*m_pendingItem);
+                auto *jointMove =
+                    std::get_if<ngc::TriggeredJointMove>(&*m_pendingItem);
+                if (!m_pendingInputsArmed && axisMove != nullptr) {
+                    m_triggeredInputs.arm(*axisMove);
+                    m_pendingInputsArmed = true;
+                } else if (!m_pendingInputsArmed && jointMove != nullptr
+                           && jointMove->triggers.size != 0) {
+                    m_triggeredInputs.arm(
+                        *jointMove, m_latestSnapshot.commandedJoints);
+                    m_pendingInputsArmed = true;
+                }
                 const auto result = m_backend.tryPublish(*m_pendingItem);
                 if (result == ngc::PublishResult::Published) {
                     m_pendingItem.reset();
+                    m_pendingInputsArmed = false;
                     progressed = true;
                 } else if (result == ngc::PublishResult::Invalid
                            && !m_pendingEvent.has_value()) {
+                    if (m_pendingInputsArmed) {
+                        m_triggeredInputs.clear();
+                    }
                     m_pendingEvent = ngc::ChunkRejected{
                         itemEpoch(*m_pendingItem),
                         itemId(*m_pendingItem),
                     };
                     m_pendingItem.reset();
+                    m_pendingInputsArmed = false;
                     progressed = true;
                 }
             }
@@ -211,11 +355,14 @@ namespace {
 
         ngc::IpcSharedRegion &m_region;
         ngc::MotionBackend &m_backend;
+        TemporaryTriggeredInputs &m_triggeredInputs;
+        ngc::ExecutionSnapshot m_latestSnapshot;
         std::optional<ngc::ExecutionItem> m_pendingItem;
         std::optional<ngc::ControlRequest> m_pendingControl;
         std::optional<ngc::ExecutionEvent> m_pendingEvent;
         std::optional<ngc::ExecutionSnapshot> m_pendingSnapshot;
         std::uint64_t m_completedControls = 0;
+        bool m_pendingInputsArmed = false;
     };
 
     int run(const Options &options) {
@@ -232,7 +379,9 @@ namespace {
             return 2;
         }
 
-        auto runtime = makeRuntime(options);
+        auto triggeredInputs = std::make_unique<TemporaryTriggeredInputs>();
+        auto *triggeredInputsPointer = triggeredInputs.get();
+        auto runtime = makeRuntime(options, std::move(triggeredInputs));
         runtime->start();
         region.peerProcessId = ngc::ipc_detail::currentProcessId();
         ngc::setIpcConnectionState(region, ngc::IpcConnectionState::PeerReady);
@@ -248,7 +397,8 @@ namespace {
             return 0;
         }
 
-        IpcExecutorBridge bridge(region, runtime->endpoint());
+        IpcExecutorBridge bridge(
+            region, runtime->endpoint(), *triggeredInputsPointer);
         const auto started = std::chrono::steady_clock::now();
 
         for (;;) {
