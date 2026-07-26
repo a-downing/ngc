@@ -13,6 +13,9 @@ namespace ngc {
         constexpr std::uint32_t EVENT_OVERFLOW_FAULT = 1;
         constexpr std::uint32_t INVALID_EXECUTION_STATE_FAULT = 2;
         constexpr std::uint32_t JOG_GENERATION_FAULT = 3;
+        constexpr std::uint32_t FEED_RETIMING_FAULT = 4;
+        constexpr std::uint32_t FEED_RETIMING_STOP_BRANCH_FAULT = 5;
+        constexpr double DYNAMIC_LIMIT_TOLERANCE = 1.01;
 
         bool zeroHighCubicControls(const AxisPolynomialSpan &span) noexcept {
             return span.coefficients[3].length() == 0.0
@@ -104,6 +107,82 @@ namespace ngc {
             };
         }
 
+        bool validPositiveLimit(const double value) noexcept {
+            return !std::isnan(value) && value > 0.0;
+        }
+
+        bool validAxisLimits(const position_t &limits) noexcept {
+            return validPositiveLimit(limits.x)
+                && validPositiveLimit(limits.y)
+                && validPositiveLimit(limits.z)
+                && validPositiveLimit(limits.a)
+                && validPositiveLimit(limits.b)
+                && validPositiveLimit(limits.c);
+        }
+
+        bool constrainLinearInterval(
+            const position_t &base, const position_t &direction,
+            const position_t &axisLimits, const double aggregateLimit,
+            double &lower, double &upper) noexcept {
+            const auto constrainAxis = [&](const double offset,
+                                           const double slope,
+                                           const double limit) {
+                if (std::isinf(limit)) {
+                    return true;
+                }
+                const auto tolerated = limit * DYNAMIC_LIMIT_TOLERANCE;
+                if (std::abs(slope) <= 1e-12) {
+                    return std::abs(offset) <= tolerated + 1e-12;
+                }
+
+                auto first = (-tolerated - offset) / slope;
+                auto second = (tolerated - offset) / slope;
+                if (first > second) {
+                    std::swap(first, second);
+                }
+                lower = std::max(lower, first);
+                upper = std::min(upper, second);
+
+                return lower <= upper + 1e-12;
+            };
+
+            if (!constrainAxis(base.x, direction.x, axisLimits.x)
+                || !constrainAxis(base.y, direction.y, axisLimits.y)
+                || !constrainAxis(base.z, direction.z, axisLimits.z)
+                || !constrainAxis(base.a, direction.a, axisLimits.a)
+                || !constrainAxis(base.b, direction.b, axisLimits.b)
+                || !constrainAxis(base.c, direction.c, axisLimits.c)) {
+                return false;
+            }
+            if (std::isinf(aggregateLimit)) {
+                return true;
+            }
+
+            const auto tolerated =
+                aggregateLimit * DYNAMIC_LIMIT_TOLERANCE;
+            const auto quadratic = dot(direction, direction);
+            const auto linear = 2.0 * dot(base, direction);
+            const auto constant =
+                dot(base, base) - tolerated * tolerated;
+            if (quadratic <= 1e-24) {
+                return constant <= 1e-12;
+            }
+
+            const auto discriminant =
+                linear * linear - 4.0 * quadratic * constant;
+            if (discriminant < -1e-12) {
+                return false;
+            }
+
+            const auto root = std::sqrt(std::max(discriminant, 0.0));
+            lower = std::max(
+                lower, (-linear - root) / (2.0 * quadratic));
+            upper = std::min(
+                upper, (-linear + root) / (2.0 * quadratic));
+
+            return lower <= upper + 1e-12;
+        }
+
     }
 
     ProductionExecutorCore::ProductionExecutorCore(
@@ -118,6 +197,24 @@ namespace ngc {
         if (m_configuration.maximumJogLeaseTicks == 0) {
             throw std::invalid_argument(
                 "production executor maximum jog lease must be positive");
+        }
+        const auto &feedHold = m_configuration.feedHold;
+        const auto hasFeedHoldAcceleration =
+            feedHold.tangentialAcceleration != 0.0;
+        const auto hasFeedHoldJerk = feedHold.tangentialJerk != 0.0;
+        if (hasFeedHoldAcceleration != hasFeedHoldJerk
+            || (hasFeedHoldAcceleration
+                && (!std::isfinite(feedHold.tangentialAcceleration)
+                    || feedHold.tangentialAcceleration <= 0.0
+                    || !std::isfinite(feedHold.tangentialJerk)
+                    || feedHold.tangentialJerk <= 0.0))
+            || !validPositiveLimit(feedHold.pathAcceleration)
+            || !validPositiveLimit(feedHold.pathJerk)
+            || !validAxisLimits(feedHold.axisAcceleration)
+            || !validAxisLimits(feedHold.axisJerk)) {
+            throw std::invalid_argument(
+                "production executor feed-hold limits must be positive "
+                "and finite or infinite");
         }
 
         constexpr auto validJointMask =
@@ -471,21 +568,52 @@ namespace ngc {
                 } else if constexpr (std::same_as<T, StartRequest>) {
                     success = !m_jog.has_value()
                         && m_snapshot.state == BackendState::Held
+                        && !m_feedRetiming.held
                         && value.epoch != 0 && value.epoch == m_snapshot.epoch
                         && value.epoch != m_controlledStoppedEpoch;
                     if (success) {
+                        resetFeedRetiming();
                         m_snapshot.state = BackendState::Running;
                     }
                 } else if constexpr (std::same_as<T, ResumeRequest>) {
+                    const auto feedHeld = m_feedRetiming.held;
                     success = !m_jog.has_value()
                         && m_snapshot.state == BackendState::Held
-                        && !m_active.has_value() && value.epoch != 0
+                        && value.epoch != 0
                         && value.epoch == m_snapshot.epoch
-                        && value.epoch != m_controlledStoppedEpoch
-                        && m_queuedExecutionItems.load(
-                            std::memory_order_acquire) != 0;
-                    if (success) {
+                        && value.epoch != m_controlledStoppedEpoch;
+                    if (success && feedHeld) {
+                        success = m_active.has_value() && !m_stopping
+                            && std::holds_alternative<PlanChunk>(
+                                m_planSlots[*m_active].item);
+                        if (success) {
+                            m_feedRetiming.held = false;
+                            m_feedRetiming.resuming = true;
+                            m_feedRetiming.acceleration = 0.0;
+                            m_feedRetiming.jerk = 0.0;
+                            m_snapshot.state = BackendState::Running;
+                        }
+                    } else if (success) {
+                        success = !m_active.has_value()
+                            && m_queuedExecutionItems.load(
+                                std::memory_order_acquire) != 0;
+                    }
+                    if (success && !feedHeld) {
+                        resetFeedRetiming();
                         m_snapshot.state = BackendState::Running;
+                    }
+                } else if constexpr (std::same_as<T, FeedHoldRequest>) {
+                    success = feedHoldAvailable()
+                        && !m_jog.has_value()
+                        && m_snapshot.state == BackendState::Running
+                        && !m_feedRetiming.resuming
+                        && m_active.has_value() && !m_stopping
+                        && std::holds_alternative<PlanChunk>(
+                            m_planSlots[*m_active].item);
+                    if (success) {
+                        m_feedRetiming.holding = true;
+                        m_feedRetiming.held = false;
+                        m_snapshot.state = BackendState::Holding;
                     }
                 } else if constexpr (std::same_as<T, ControlledStopRequest>) {
                     const auto stoppingJog = m_jog.has_value();
@@ -493,13 +621,19 @@ namespace ngc {
                         success =
                             beginJogStop(JogStopReason::RequestedStop);
                     } else {
-                        success = m_snapshot.state == BackendState::Running
+                        success = (m_snapshot.state == BackendState::Running
+                                || m_snapshot.state == BackendState::Holding
+                                || (m_snapshot.state == BackendState::Held
+                                    && m_feedRetiming.held))
                             && m_active.has_value();
                     }
                     if (success && !stoppingJog
                         && std::holds_alternative<PlanChunk>(
                             m_planSlots[*m_active].item)) {
                         success = !m_stopping && beginPlanStop();
+                        if (success) {
+                            resetFeedRetiming();
+                        }
                     } else if (success && !stoppingJog
                         && std::holds_alternative<TriggeredMove>(
                             m_planSlots[*m_active].item)) {
@@ -685,6 +819,277 @@ namespace ngc {
         }
     }
 
+    bool ProductionExecutorCore::feedHoldAvailable() const noexcept {
+        return m_configuration.feedHold.tangentialAcceleration > 0.0
+            && m_configuration.feedHold.tangentialJerk > 0.0;
+    }
+
+    bool ProductionExecutorCore::feedRetimingAccelerationInterval(
+        const position_t &referenceVelocity,
+        const position_t &referenceAcceleration,
+        double &lower, double &upper) const noexcept {
+        lower = -std::numeric_limits<double>::infinity();
+        upper = std::numeric_limits<double>::infinity();
+        const auto base = scaled(
+            referenceAcceleration,
+            m_feedRetiming.rate * m_feedRetiming.rate);
+
+        return constrainLinearInterval(
+            base, referenceVelocity,
+            m_configuration.feedHold.axisAcceleration,
+            m_configuration.feedHold.pathAcceleration,
+            lower, upper);
+    }
+
+    bool ProductionExecutorCore::feedRetimingJerkInterval(
+        const ExecutionPolynomialEvaluation &reference,
+        double &lower, double &upper) const noexcept {
+        lower = -std::numeric_limits<double>::infinity();
+        upper = std::numeric_limits<double>::infinity();
+        const auto rate = m_feedRetiming.rate;
+        const auto rateAcceleration = m_feedRetiming.acceleration;
+        const auto base = scaled(reference.jerk, rate * rate * rate)
+            + scaled(
+                reference.state.acceleration,
+                3.0 * rate * rateAcceleration);
+
+        return constrainLinearInterval(
+            base, reference.state.velocity,
+            m_configuration.feedHold.axisJerk,
+            m_configuration.feedHold.pathJerk,
+            lower, upper);
+    }
+
+    double ProductionExecutorCore::feedRetimingReferenceAdvance(
+        const double physicalSeconds) noexcept {
+        const auto &span = currentSpan();
+        const auto parameter = std::clamp(
+            m_spanElapsed * span.inverseDuration, 0.0, 1.0);
+        const auto reference =
+            evaluateExecutionPolynomial(span, parameter);
+        const auto referenceSpeed =
+            magnitude(reference.state.velocity);
+        const auto physicalReferenceAcceleration = scaled(
+            reference.state.acceleration,
+            m_feedRetiming.rate * m_feedRetiming.rate);
+        if (referenceSpeed <= 1e-10
+            && magnitude(physicalReferenceAcceleration) <= 1e-9) {
+            m_feedRetiming.rate =
+                m_feedRetiming.resuming ? 1.0 : 0.0;
+            m_feedRetiming.acceleration = 0.0;
+            m_feedRetiming.jerk = 0.0;
+            m_feedRetiming.resuming = false;
+
+            return m_feedRetiming.rate * physicalSeconds;
+        }
+
+        auto accelerationLower = 0.0;
+        auto accelerationUpper = 0.0;
+        if (!feedRetimingAccelerationInterval(
+                reference.state.velocity,
+                reference.state.acceleration,
+                accelerationLower, accelerationUpper)) {
+            fault(FEED_RETIMING_FAULT);
+
+            return 0.0;
+        }
+
+        auto jerkLower = 0.0;
+        auto jerkUpper = 0.0;
+        if (!feedRetimingJerkInterval(
+                reference, jerkLower, jerkUpper)) {
+            fault(FEED_RETIMING_FAULT);
+
+            return 0.0;
+        }
+
+        const auto safeReferenceSpeed =
+            std::max(referenceSpeed, 1e-9);
+        const auto accelerationMagnitude =
+            m_configuration.feedHold.tangentialAcceleration
+            / safeReferenceSpeed;
+        const auto jerkMagnitude =
+            m_configuration.feedHold.tangentialJerk
+            / safeReferenceSpeed;
+        const auto release = m_feedRetiming.resuming
+            ? m_feedRetiming.acceleration > 0.0
+                && 1.0 - m_feedRetiming.rate
+                    <= m_feedRetiming.acceleration
+                        * m_feedRetiming.acceleration
+                        / (2.0 * std::max(jerkMagnitude, 1e-12))
+                        + 1e-12
+            : m_feedRetiming.acceleration < 0.0
+                && m_feedRetiming.rate
+                    <= m_feedRetiming.acceleration
+                        * m_feedRetiming.acceleration
+                        / (2.0 * std::max(jerkMagnitude, 1e-12))
+                        + 1e-12;
+        const auto targetAcceleration = std::clamp(
+            m_feedRetiming.resuming
+                ? accelerationMagnitude : -accelerationMagnitude,
+            accelerationLower, accelerationUpper);
+        const auto requestedJerk = std::clamp(
+            m_feedRetiming.resuming
+                ? (release ? -jerkMagnitude : jerkMagnitude)
+                : (release ? jerkMagnitude : -jerkMagnitude),
+            jerkLower, jerkUpper);
+        const auto previousAcceleration =
+            m_feedRetiming.acceleration;
+        auto nextAcceleration = previousAcceleration
+            + requestedJerk * physicalSeconds;
+        const auto jerkAccelerationLower =
+            previousAcceleration + jerkLower * physicalSeconds;
+        const auto jerkAccelerationUpper =
+            previousAcceleration + jerkUpper * physicalSeconds;
+        const auto nextAccelerationLower =
+            std::max(accelerationLower, jerkAccelerationLower);
+        const auto nextAccelerationUpper =
+            std::min(accelerationUpper, jerkAccelerationUpper);
+        if (nextAccelerationLower > nextAccelerationUpper + 1e-12) {
+            fault(FEED_RETIMING_FAULT);
+
+            return 0.0;
+        }
+        nextAcceleration = std::clamp(
+            nextAcceleration,
+            nextAccelerationLower, nextAccelerationUpper);
+        const auto zeroAcceleration = std::clamp(
+            0.0, nextAccelerationLower, nextAccelerationUpper);
+        const auto boundedTargetAcceleration = std::clamp(
+            targetAcceleration,
+            nextAccelerationLower, nextAccelerationUpper);
+        if (m_feedRetiming.resuming) {
+            if (release) {
+                nextAcceleration =
+                    std::max(nextAcceleration, zeroAcceleration);
+            } else {
+                nextAcceleration =
+                    std::min(
+                        nextAcceleration,
+                        boundedTargetAcceleration);
+            }
+        } else if (release) {
+            nextAcceleration =
+                std::min(nextAcceleration, zeroAcceleration);
+        } else {
+            nextAcceleration =
+                std::max(
+                    nextAcceleration,
+                    boundedTargetAcceleration);
+        }
+
+        auto nextRate = m_feedRetiming.rate
+            + 0.5 * (previousAcceleration + nextAcceleration)
+                * physicalSeconds;
+        if (!m_feedRetiming.resuming && nextRate <= 1e-10) {
+            nextRate = 0.0;
+            nextAcceleration = 0.0;
+        } else if (m_feedRetiming.resuming
+                   && nextRate >= 1.0 - 1e-10) {
+            nextRate = 1.0;
+            nextAcceleration = 0.0;
+            m_feedRetiming.resuming = false;
+        }
+        nextRate = std::clamp(nextRate, 0.0, 1.0);
+
+        m_feedRetiming.jerk =
+            (nextAcceleration - previousAcceleration)
+            / physicalSeconds;
+        const auto referenceAdvance =
+            0.5 * (m_feedRetiming.rate + nextRate)
+            * physicalSeconds;
+        m_feedRetiming.rate = nextRate;
+        m_feedRetiming.acceleration = nextAcceleration;
+
+        return referenceAdvance;
+    }
+
+    MotionState ProductionExecutorCore::retimedState(
+        const ExecutionPolynomialEvaluation &reference) const noexcept {
+        const auto rate = m_feedRetiming.rate;
+
+        return {
+            reference.state.position,
+            scaled(reference.state.velocity, rate),
+            scaled(reference.state.acceleration, rate * rate)
+                + scaled(reference.state.velocity,
+                         m_feedRetiming.acceleration),
+        };
+    }
+
+    position_t ProductionExecutorCore::retimedJerk(
+        const ExecutionPolynomialEvaluation &reference) const noexcept {
+        const auto rate = m_feedRetiming.rate;
+
+        return scaled(reference.jerk, rate * rate * rate)
+            + scaled(
+                reference.state.acceleration,
+                3.0 * rate * m_feedRetiming.acceleration)
+            + scaled(reference.state.velocity,
+                     m_feedRetiming.jerk);
+    }
+
+    bool ProductionExecutorCore::validRetimedDynamics(
+        const MotionState &state, const position_t &jerk) const noexcept {
+        if (!finiteMotionState(state) || !finitePosition(jerk)) {
+            return false;
+        }
+
+        const auto &limits = m_configuration.feedHold;
+        const auto within = [](const double value, const double limit) {
+            return std::isinf(limit)
+                || std::abs(value)
+                    <= limit * DYNAMIC_LIMIT_TOLERANCE + 1e-12;
+        };
+        const auto acceleration = state.acceleration;
+        if (!within(acceleration.x, limits.axisAcceleration.x)
+            || !within(acceleration.y, limits.axisAcceleration.y)
+            || !within(acceleration.z, limits.axisAcceleration.z)
+            || !within(acceleration.a, limits.axisAcceleration.a)
+            || !within(acceleration.b, limits.axisAcceleration.b)
+            || !within(acceleration.c, limits.axisAcceleration.c)
+            || !within(jerk.x, limits.axisJerk.x)
+            || !within(jerk.y, limits.axisJerk.y)
+            || !within(jerk.z, limits.axisJerk.z)
+            || !within(jerk.a, limits.axisJerk.a)
+            || !within(jerk.b, limits.axisJerk.b)
+            || !within(jerk.c, limits.axisJerk.c)) {
+            return false;
+        }
+
+        return within(magnitude(acceleration), limits.pathAcceleration)
+            && within(magnitude(jerk), limits.pathJerk);
+    }
+
+    void ProductionExecutorCore::finishFeedHold() noexcept {
+        m_feedRetiming.holding = false;
+        m_feedRetiming.held = true;
+        m_feedRetiming.rate = 0.0;
+        m_feedRetiming.acceleration = 0.0;
+        m_feedRetiming.jerk = 0.0;
+        m_snapshot.state = BackendState::Held;
+        m_snapshot.commanded.velocity = {};
+        m_snapshot.commanded.acceleration = {};
+        m_snapshot.feedback = m_snapshot.commanded;
+        m_snapshot.executionRate = 0.0;
+        m_snapshot.executionRateAcceleration = 0.0;
+        emit(BackendHeld{
+            m_snapshot.epoch, m_snapshot.commanded,
+            BackendHoldReason::FeedHold,
+        });
+    }
+
+    void ProductionExecutorCore::resetFeedRetiming() noexcept {
+        m_feedRetiming = {};
+        m_snapshot.executionRate = 1.0;
+        m_snapshot.executionRateAcceleration = 0.0;
+    }
+
+    void ProductionExecutorCore::faultFeedRetimingAtStopBranch() noexcept {
+        discardExecution();
+        fault(FEED_RETIMING_STOP_BRANCH_FAULT);
+    }
+
     bool ProductionExecutorCore::beginPlanStop() noexcept {
         const auto &limits = m_configuration.controlledStopLimits;
         PlanStopRuntime runtime;
@@ -816,23 +1221,52 @@ namespace ngc {
     }
 
     void ProductionExecutorCore::advancePlan(double &seconds) noexcept {
-        while (m_active.has_value() && seconds > 0.0
-               && m_snapshot.state == BackendState::Running
+        const auto retiming =
+            m_feedRetiming.holding || m_feedRetiming.resuming;
+        auto referenceSeconds = seconds;
+        if (retiming) {
+            referenceSeconds =
+                feedRetimingReferenceAdvance(seconds);
+            seconds = 0.0;
+            if (m_snapshot.state == BackendState::Faulted) {
+                return;
+            }
+        }
+
+        while (m_active.has_value() && referenceSeconds > 0.0
+               && (m_snapshot.state == BackendState::Running
+                   || m_snapshot.state == BackendState::Holding)
                && std::holds_alternative<PlanChunk>(
                    m_planSlots[*m_active].item)) {
             const auto &span = currentSpan();
             const auto remaining =
                 std::max(span.duration - m_spanElapsed, 0.0);
-            const auto consumed = std::min(seconds, remaining);
-            seconds -= consumed;
+            const auto consumed =
+                std::min(referenceSeconds, remaining);
+            referenceSeconds -= consumed;
+            if (!retiming) {
+                seconds -= consumed;
+            }
             m_spanElapsed += consumed;
 
             const auto parameter = std::clamp(
                 m_spanElapsed * span.inverseDuration, 0.0, 1.0);
             m_snapshot.activeSpan = span.id;
             m_snapshot.spanProgress = parameter;
-            m_snapshot.commanded =
-                evaluateExecutionPolynomial(span, parameter).state;
+            const auto reference =
+                evaluateExecutionPolynomial(span, parameter);
+            if (retiming) {
+                const auto commanded = retimedState(reference);
+                const auto jerk = retimedJerk(reference);
+                if (!validRetimedDynamics(commanded, jerk)) {
+                    fault(FEED_RETIMING_FAULT);
+
+                    return;
+                }
+                m_snapshot.commanded = commanded;
+            } else {
+                m_snapshot.commanded = reference.state;
+            }
             m_snapshot.feedback = m_snapshot.commanded;
             emitExecutionMarkersThrough(parameter);
             if (m_snapshot.state == BackendState::Faulted) {
@@ -840,9 +1274,18 @@ namespace ngc {
             }
 
             if (m_spanElapsed + 1e-12 < span.duration) {
-                return;
+                break;
             }
             completeSpan();
+        }
+
+        m_snapshot.executionRate = m_feedRetiming.rate;
+        m_snapshot.executionRateAcceleration =
+            m_feedRetiming.acceleration;
+        if (m_feedRetiming.holding
+            && m_feedRetiming.rate == 0.0
+            && m_snapshot.state != BackendState::Faulted) {
+            finishFeedHold();
         }
     }
 
@@ -1834,6 +2277,12 @@ namespace ngc {
             release(continuationIndex);
         }
 
+        if (m_feedRetiming.holding || m_feedRetiming.resuming) {
+            faultFeedRetimingAtStopBranch();
+
+            return;
+        }
+
         emit(BranchSelected{
             current.epoch, current.branch, BranchChoice::Stop, 0,
         });
@@ -1905,6 +2354,7 @@ namespace ngc {
         }
         m_stopping = false;
         m_planStop.reset();
+        resetFeedRetiming();
         m_span = 0;
         m_nextMarker = 0;
         m_spanElapsed = 0.0;

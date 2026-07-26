@@ -21,10 +21,37 @@ namespace ngc {
         JointVector coordinateScale{};
     };
 
+    struct ProductionExecutorFeedHoldConfiguration {
+        // Both zero leave ordinary-plan feed hold unavailable. Positive values
+        // bound the requested on-path braking and resume profile.
+        double tangentialAcceleration = 0.0;
+        double tangentialJerk = 0.0;
+        // Aggregate and per-axis physical limits remain the final authority.
+        double pathAcceleration = std::numeric_limits<double>::infinity();
+        double pathJerk = std::numeric_limits<double>::infinity();
+        position_t axisAcceleration = {
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(),
+        };
+        position_t axisJerk = {
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(),
+        };
+    };
+
     struct ProductionExecutorConfiguration {
         std::array<
             ProductionExecutorAxisMapping,
             static_cast<std::size_t>(AxisId::C) + 1> axes{};
+        ProductionExecutorFeedHoldConfiguration feedHold{};
         // Physical axis-space authority reserved for cancelling ordinary
         // PlanChunk motion. Zero limits leave that operation unavailable.
         AxisMotionLimits controlledStopLimits{};
@@ -128,6 +155,15 @@ namespace ngc {
             ruckig::Trajectory<6> trajectory;
         };
 
+        struct FeedRetimingRuntime {
+            double rate = 1.0;
+            double acceleration = 0.0;
+            double jerk = 0.0;
+            bool holding = false;
+            bool held = false;
+            bool resuming = false;
+        };
+
         static bool validExecutionItem(const ExecutionItem &item) noexcept;
         static bool validPlanChunk(const PlanChunk &chunk) noexcept;
         static bool validTriggeredMove(const TriggeredMove &move) noexcept;
@@ -142,6 +178,24 @@ namespace ngc {
         void activateNext() noexcept;
         void advanceActive(double seconds) noexcept;
         void advancePlan(double &seconds) noexcept;
+        [[nodiscard]] bool feedHoldAvailable() const noexcept;
+        bool feedRetimingAccelerationInterval(
+            const position_t &referenceVelocity,
+            const position_t &referenceAcceleration,
+            double &lower, double &upper) const noexcept;
+        bool feedRetimingJerkInterval(
+            const ExecutionPolynomialEvaluation &reference,
+            double &lower, double &upper) const noexcept;
+        double feedRetimingReferenceAdvance(double physicalSeconds) noexcept;
+        [[nodiscard]] MotionState retimedState(
+            const ExecutionPolynomialEvaluation &reference) const noexcept;
+        [[nodiscard]] position_t retimedJerk(
+            const ExecutionPolynomialEvaluation &reference) const noexcept;
+        [[nodiscard]] bool validRetimedDynamics(
+            const MotionState &state, const position_t &jerk) const noexcept;
+        void finishFeedHold() noexcept;
+        void resetFeedRetiming() noexcept;
+        void faultFeedRetimingAtStopBranch() noexcept;
         bool beginPlanStop() noexcept;
         void advancePlanStop(double &seconds) noexcept;
         void completePlanStop() noexcept;
@@ -227,6 +281,7 @@ namespace ngc {
         std::optional<std::uint8_t> m_active;
         std::optional<JogRuntime> m_jog;
         std::optional<PlanStopRuntime> m_planStop;
+        FeedRetimingRuntime m_feedRetiming;
         ProductionExecutorConfiguration m_configuration;
         JointMask m_configuredJoints = 0;
         double m_servoPeriod;

@@ -915,7 +915,13 @@ bounded dead-man leases, travel limits, and separate physical stop limits. The
 ordinary-plan stop uses a fixed-size axis-space velocity trajectory generated
 from the current commanded PVA under configuration-carried physical limits. It
 retires the abandoned horizon in publication order, suppresses its future
-markers, and permanently rejects resume for that epoch. The
+markers, and permanently rejects resume for that epoch. Ordinary-plan feed
+hold uses bounded on-path rate retiming of the existing polynomial cursor.
+Every servo tick intersects configured tangential, aggregate, and per-axis
+acceleration and jerk authority, preserves the marker cursor, reaches a
+stationary `BackendHeld`, and resumes without reconstructing geometry or
+replaying markers. Reaching a stop branch during feed-hold braking or resume
+retiming is a backend fault. The
 hosting servo thread supplies digital-input samples before each tick; hardware
 acquisition and synthetic-input policy remain outside the core. Focused tests
 cover fixed-period advancement and duration accounting, continuation and stop
@@ -928,18 +934,23 @@ token-matched stopping, logical-axis mapping and offset preservation,
 travel-limit completion, bounded channels, and explicit rejection of
 unsupported inputs. They also cover mid-span ordinary-plan controlled stop,
 per-tick acceleration and jerk bounds, ordered horizon retirement, marker
-suppression, and same-epoch resume rejection.
+suppression, and same-epoch resume rejection. Ordinary-plan feed-hold tests
+cover bounded braking and resume, stationary cursor retention, ordered marker
+retention, continued braking across a dependent chunk boundary, and the fatal
+stop-branch transition.
 
 The core is not yet connected to `ngc_ipc_backend` or registered as the second
 backend-conformance target. It is not yet paired with `HomingController`
-through a production `BackendRuntime` host. Feed hold/resume and scheduled
-hardware events remain outside the current slice; they must be implemented and
-proved before the core can claim the complete production executor contract.
+through a production `BackendRuntime` host. Feed hold/resume for axis-space
+triggered moves and scheduled hardware events remain outside the current
+slice; they must be implemented and proved before the core can claim the
+complete production executor contract.
 
 - Factor reusable allocation-free execution mechanics without importing
   synthetic-input or mock-diagnostic policy.
 - Add fixed-period and bounded-resource tests.
-- Complete a production-grade feed-hold/resume design.
+- Complete a production-grade feed-hold/resume design. Complete for ordinary
+  `PlanChunk` motion; axis-space triggered moves remain.
 - Verify stop branches, triggered stops, jogging, homing, markers, and fault
   transitions under the production executor.
 

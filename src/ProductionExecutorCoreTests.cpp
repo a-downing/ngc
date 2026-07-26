@@ -202,6 +202,20 @@ namespace {
         return configuration;
     }
 
+    ngc::ProductionExecutorConfiguration feedHoldConfiguration(
+        const double acceleration = 1.0,
+        const double jerk = 4.0) {
+        ngc::ProductionExecutorConfiguration configuration;
+        configuration.feedHold.tangentialAcceleration = acceleration;
+        configuration.feedHold.tangentialJerk = jerk;
+        configuration.feedHold.pathAcceleration = acceleration;
+        configuration.feedHold.pathJerk = jerk;
+        configuration.feedHold.axisAcceleration.x = acceleration;
+        configuration.feedHold.axisJerk.x = jerk;
+
+        return configuration;
+    }
+
     JogRun runJogUntilHeld(ngc::ProductionExecutorCore &core,
                            const std::size_t maximumTicks = 4'000) {
         JogRun result;
@@ -1111,6 +1125,288 @@ namespace {
                 "ordinary controlled stop allowed its abandoned epoch to resume");
     }
 
+    void testFeedHoldPreservesAndResumesOrdinaryPlan() {
+        constexpr auto servoPeriod = 0.01;
+        constexpr auto accelerationLimit = 1.0;
+        constexpr auto jerkLimit = 4.0;
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(
+            servoPeriod,
+            feedHoldConfiguration(accelerationLimit, jerkLimit));
+        initialize(*core, 93);
+
+        auto chunk =
+            linearChunk(93, 930, 0, 931, 932, 0.0, 10.0, 10.0);
+        require(chunk.markers.push({933, 0, 0.05})
+                    && chunk.markers.push({934, 0, 0.2}),
+                "feed-hold marker fixtures did not fit");
+        require(core->tryPublish(chunk)
+                    == ngc::PublishResult::Published,
+                "feed-hold plan was not published");
+        require(core->trySubmit(ngc::StartRequest{3, 93})
+                    == ngc::SubmitResult::Submitted,
+                "feed-hold plan start did not fit");
+
+        auto previous = ngc::ExecutionSnapshot{};
+        for (auto tick = 0; tick < 20; ++tick) {
+            core->servoTick();
+            takeEvents(*core);
+            previous = latestSnapshot(*core);
+        }
+        require(core->trySubmit(ngc::FeedHoldRequest{4})
+                    == ngc::SubmitResult::Submitted,
+                "feed hold did not fit");
+
+        std::vector<ngc::ExecutionEvent> events;
+        auto sawHolding = false;
+        auto held = ngc::ExecutionSnapshot{};
+        for (auto tick = 0; tick < 500; ++tick) {
+            core->servoTick();
+            auto currentEvents = takeEvents(*core);
+            events.insert(
+                events.end(), currentEvents.begin(), currentEvents.end());
+            const auto current = latestSnapshot(*core);
+            sawHolding = sawHolding
+                || current.state == ngc::BackendState::Holding;
+            require(current.commanded.position.x
+                        + 1e-12 >= previous.commanded.position.x,
+                    "feed hold moved backward on the retained path");
+            require(current.commanded.velocity.x >= -1e-12
+                        && current.commanded.velocity.x <= 1.0 + 1e-9,
+                    "feed hold produced an invalid path velocity");
+            require(std::abs(current.commanded.acceleration.x)
+                        <= accelerationLimit * 1.01 + 1e-9,
+                    "feed hold exceeded its acceleration limit");
+            require(std::abs(
+                        current.commanded.acceleration.x
+                        - previous.commanded.acceleration.x)
+                        <= jerkLimit * 1.01 * servoPeriod + 1e-9,
+                    "feed hold exceeded its per-tick jerk limit");
+            previous = current;
+            if (current.state == ngc::BackendState::Held) {
+                held = current;
+                break;
+            }
+        }
+
+        require(sawHolding,
+                "feed hold did not expose its braking state");
+        require(held.state == ngc::BackendState::Held,
+                "feed hold did not reach a stationary held state");
+        requireNear(held.executionRate, 0.0,
+                    "feed hold retained a nonzero execution rate");
+        requireNear(held.commanded.velocity.x, 0.0,
+                    "feed hold retained commanded velocity");
+        requireNear(held.commanded.acceleration.x, 0.0,
+                    "feed hold retained commanded acceleration");
+        require(held.spanProgress > 0.02 && held.spanProgress < 0.2,
+                "feed hold did not preserve an interior plan cursor");
+
+        const auto holdRequests =
+            selectEvents<ngc::RequestCompleted>(events);
+        require(std::ranges::any_of(
+                    holdRequests, [](const auto &completed) {
+                        return completed.request == 4
+                            && completed.succeeded;
+                    }),
+                "feed hold was not acknowledged");
+        const auto heldEvents =
+            selectEvents<ngc::BackendHeld>(events);
+        require(std::ranges::any_of(
+                    heldEvents, [](const auto &event) {
+                        return event.reason
+                            == ngc::BackendHoldReason::FeedHold;
+                    }),
+                "feed hold did not report its hold reason");
+        const auto markersBeforeResume =
+            selectEvents<ngc::ExecutionMarkerReached>(events);
+        require(std::ranges::none_of(
+                    markersBeforeResume, [](const auto &marker) {
+                        return marker.marker == 934;
+                    }),
+                "feed hold emitted a marker beyond its held cursor");
+
+        for (auto tick = 0; tick < 5; ++tick) {
+            core->servoTick();
+            takeEvents(*core);
+            const auto stationary = latestSnapshot(*core);
+            requireNear(
+                stationary.commanded.position.x,
+                held.commanded.position.x,
+                "held plan cursor advanced without Resume");
+            requireNear(
+                stationary.spanProgress, held.spanProgress,
+                "held span progress advanced without Resume");
+        }
+
+        require(core->trySubmit(ngc::ResumeRequest{5, 93})
+                    == ngc::SubmitResult::Submitted,
+                "feed resume did not fit");
+        auto resumedRate = false;
+        auto sawFutureMarker = false;
+        auto markerCounts = std::array<int, 2>{};
+        for (const auto &marker : markersBeforeResume) {
+            if (marker.marker == 933) {
+                ++markerCounts[0];
+            }
+        }
+        previous = held;
+        for (auto tick = 0; tick < 500; ++tick) {
+            core->servoTick();
+            auto currentEvents = takeEvents(*core);
+            const auto currentMarkers =
+                selectEvents<ngc::ExecutionMarkerReached>(
+                    currentEvents);
+            for (const auto &marker : currentMarkers) {
+                if (marker.marker == 933) {
+                    ++markerCounts[0];
+                } else if (marker.marker == 934) {
+                    ++markerCounts[1];
+                    sawFutureMarker = true;
+                }
+            }
+            events.insert(
+                events.end(), currentEvents.begin(), currentEvents.end());
+            const auto current = latestSnapshot(*core);
+            require(current.commanded.position.x
+                        + 1e-12 >= previous.commanded.position.x,
+                    "feed resume moved backward on the retained path");
+            require(std::abs(current.commanded.acceleration.x)
+                        <= accelerationLimit * 1.01 + 1e-9,
+                    "feed resume exceeded its acceleration limit");
+            require(std::abs(
+                        current.commanded.acceleration.x
+                        - previous.commanded.acceleration.x)
+                        <= jerkLimit * 1.01 * servoPeriod + 1e-9,
+                    "feed resume exceeded its per-tick jerk limit");
+            resumedRate = resumedRate
+                || current.executionRate >= 1.0 - 1e-10;
+            previous = current;
+            if (resumedRate && sawFutureMarker) {
+                break;
+            }
+        }
+
+        require(resumedRate,
+                "feed resume did not restore the full execution rate");
+        require(sawFutureMarker,
+                "feed resume did not continue through a future marker");
+        require(markerCounts[0] == 1 && markerCounts[1] == 1,
+                "feed hold/resume repeated or lost an execution marker");
+        const auto resumeRequests =
+            selectEvents<ngc::RequestCompleted>(events);
+        require(std::ranges::any_of(
+                    resumeRequests, [](const auto &completed) {
+                        return completed.request == 5
+                            && completed.succeeded;
+                    }),
+                "feed resume was not acknowledged");
+    }
+
+    void testFeedRetimingFaultsAtStopBranch() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(
+            0.01, feedHoldConfiguration(0.2, 0.4));
+        initialize(*core, 94);
+
+        const auto chunk =
+            linearChunk(94, 940, 0, 941, 942, 0.0, 0.2, 0.2);
+        require(core->tryPublish(chunk)
+                    == ngc::PublishResult::Published,
+                "short feed-hold plan was not published");
+        require(core->trySubmit(ngc::StartRequest{3, 94})
+                    == ngc::SubmitResult::Submitted,
+                "short feed-hold plan start did not fit");
+        core->servoTick();
+        takeEvents(*core);
+        latestSnapshot(*core);
+        require(core->trySubmit(ngc::FeedHoldRequest{4})
+                    == ngc::SubmitResult::Submitted,
+                "short-plan feed hold did not fit");
+
+        std::vector<ngc::ExecutionEvent> events;
+        auto snapshot = ngc::ExecutionSnapshot{};
+        for (auto tick = 0; tick < 100; ++tick) {
+            core->servoTick();
+            auto current = takeEvents(*core);
+            events.insert(events.end(), current.begin(), current.end());
+            snapshot = latestSnapshot(*core);
+            if (snapshot.state == ngc::BackendState::Faulted) {
+                break;
+            }
+        }
+
+        require(snapshot.state == ngc::BackendState::Faulted,
+                "feed retiming entered a stop branch");
+        const auto faults = selectEvents<ngc::BackendFault>(events);
+        require(faults.size() == 1 && faults[0].code == 5,
+                "stop-branch feed-retiming fault was not reported");
+        require(std::ranges::none_of(
+                    selectEvents<ngc::BranchSelected>(events),
+                    [](const auto &branch) {
+                        return branch.choice == ngc::BranchChoice::Stop;
+                    }),
+                "feed retiming selected a stop branch before faulting");
+    }
+
+    void testFeedHoldContinuesAcrossDependentChunks() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(
+            0.01, feedHoldConfiguration());
+        initialize(*core, 95);
+
+        const auto first =
+            linearChunk(95, 950, 0, 951, 952, 0.0, 0.2, 0.2);
+        const auto second =
+            linearChunk(95, 953, 951, 954, 955, 0.2, 2.2, 2.0);
+        require(core->tryPublish(first)
+                    == ngc::PublishResult::Published
+                    && core->tryPublish(second)
+                        == ngc::PublishResult::Published,
+                "dependent feed-hold chunks were not published");
+        require(core->trySubmit(ngc::StartRequest{3, 95})
+                    == ngc::SubmitResult::Submitted,
+                "dependent feed-hold plan start did not fit");
+        for (auto tick = 0; tick < 5; ++tick) {
+            core->servoTick();
+            takeEvents(*core);
+            latestSnapshot(*core);
+        }
+        require(core->trySubmit(ngc::FeedHoldRequest{4})
+                    == ngc::SubmitResult::Submitted,
+                "dependent-plan feed hold did not fit");
+
+        std::vector<ngc::ExecutionEvent> events;
+        auto snapshot = ngc::ExecutionSnapshot{};
+        for (auto tick = 0; tick < 500; ++tick) {
+            core->servoTick();
+            auto current = takeEvents(*core);
+            events.insert(events.end(), current.begin(), current.end());
+            snapshot = latestSnapshot(*core);
+            if (snapshot.state == ngc::BackendState::Held
+                || snapshot.state == ngc::BackendState::Faulted) {
+                break;
+            }
+        }
+
+        require(snapshot.state == ngc::BackendState::Held,
+                "feed hold failed while crossing a dependent chunk");
+        require(snapshot.activeChunk == second.id,
+                "feed hold did not retain the continuation chunk");
+        require(snapshot.commanded.position.x > first.branchState.position.x,
+                "feed hold did not advance across the chunk boundary");
+        const auto firstBranch = first.branch;
+        const auto secondId = second.id;
+        require(std::ranges::any_of(
+                    selectEvents<ngc::BranchSelected>(events),
+                    [firstBranch, secondId](const auto &branch) {
+                        return branch.branch == firstBranch
+                            && branch.choice
+                                == ngc::BranchChoice::Continue
+                            && branch.continuation == secondId;
+                    }),
+                "feed hold did not select the dependent continuation");
+        require(selectEvents<ngc::BackendFault>(events).empty(),
+                "feed hold faulted at a valid continuation boundary");
+    }
+
     void testIncrementalJointGroupJogReachesTarget() {
         auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
         initialize(*core, 50);
@@ -1453,6 +1749,20 @@ namespace {
         require(rejectedMapping,
                 "executor accepted an axis mapping with a zero joint scale");
 
+        auto rejectedFeedHold = false;
+        try {
+            ngc::ProductionExecutorConfiguration configuration;
+            configuration.feedHold.tangentialAcceleration = 1.0;
+            const auto invalid =
+                std::make_unique<ngc::ProductionExecutorCore>(
+                    0.001, configuration);
+            static_cast<void>(invalid);
+        } catch (const std::invalid_argument &) {
+            rejectedFeedHold = true;
+        }
+        require(rejectedFeedHold,
+                "executor accepted an incomplete feed-hold configuration");
+
         auto core = std::make_unique<ngc::ProductionExecutorCore>(0.001);
 
         ngc::TriggeredMove triggered;
@@ -1578,6 +1888,9 @@ int main() {
         testControlledStopAbortsTriggeredJointMove();
         testControlledStopAbortsAxisTriggeredMove();
         testControlledStopCancelsOrdinaryPlan();
+        testFeedHoldPreservesAndResumesOrdinaryPlan();
+        testFeedRetimingFaultsAtStopBranch();
+        testFeedHoldContinuesAcrossDependentChunks();
         testIncrementalJointGroupJogReachesTarget();
         testContinuousJogLeaseRenewalAndExpiry();
         testContinuousJogVelocityUpdateAndTokenMatchedStop();

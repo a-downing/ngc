@@ -74,8 +74,14 @@ jerk-limited independent triggered stops without importing hardware
 acquisition or synthetic input policy. The core also provides the executor
 mechanics needed by homing: same-epoch resume between triggered joint moves,
 stationary masked joint-coordinate assignment, and constrained controlled-stop
-cancellation of axis- and joint-space triggered moves. It does not yet execute
-feed hold or scheduled hardware events; it is not yet paired with
+cancellation of axis- and joint-space triggered moves. For ordinary
+`PlanChunk` motion, it executes bounded on-path feed hold and resume by
+retiming the existing polynomial cursor, intersecting configured tangential,
+aggregate, and per-axis acceleration and jerk authority on every servo tick,
+and preserving ordered marker progress. It faults rather than entering a stop
+branch while feed-hold braking or resume retiming is active. It does not yet
+execute feed hold for axis-space triggered moves or scheduled hardware events;
+it is not yet paired with
 `HomingController` through a production `BackendRuntime` host or hosted by the
 external process.
 There is no complete real-time executor,
@@ -273,7 +279,7 @@ Mock probing and homing policy stay outside `MotionBackend`. Synthetic mock inpu
 
 Jogging uses the bounded backend control/event channel, never generated G-code or `ExecutionItem`. Continuous jogs require renewal of a stable token before a fixed-tick dead-man lease expires; expiry and UI release request a constrained stop. Axis, coupled-joint-group, and individual-joint targets are mutually exclusive with other motion ownership. `MachineSessionManager` is the sole NRT producer of mock jog controls; the GUI must not write directly to the backend. The backend lease remains authoritative if UI renewal stops.
 
-Program feed hold is backend-owned motion, not a frozen NRT scheduler or servo clock. A hold request begins on-path braking on the next servo tick by retiming the precomputed trajectory, reports `Holding` while moving, and reports `Paused` only after `BackendHeld` establishes zero velocity and acceleration. Resume from a feed hold retains the normal-branch execution cursor and ramps the reference execution rate back to one; it must not reconstruct geometry, reset span progress, or replay events. During an axis-space triggered probe approach, feed hold uses the executor's constrained-stop machinery while retaining the active `TriggeredMove`, target, and input transition; it must not report probe completion or select the probe branch. Continue sampling the probe input while feed-hold braking: a detected transition latches the servo-sampled trigger state, supersedes the feed hold, and completes the probe through its ordinary constrained-stop result. If no transition occurs, Resume regenerates the remaining approach from the held zero-PVA state. Reaching a stop branch while normal-path feed-hold braking or resume retiming remains active is a fatal backend condition, not permission to enter the stop tail or resume from it. The initial mock-only retimer constrains acceleration and its requested tangential braking/acceleration profile while retaining executed per-axis and aggregate jerk as diagnostics; it does not establish a production jerk guarantee.
+Program feed hold is backend-owned motion, not a frozen NRT scheduler or servo clock. A hold request begins on-path braking on the next servo tick by retiming the precomputed trajectory, reports `Holding` while moving, and reports `Paused` only after `BackendHeld` establishes zero velocity and acceleration. Resume from a feed hold retains the normal-branch execution cursor and ramps the reference execution rate back to one; it must not reconstruct geometry, reset span progress, or replay events. During an axis-space triggered probe approach, feed hold uses the executor's constrained-stop machinery while retaining the active `TriggeredMove`, target, and input transition; it must not report probe completion or select the probe branch. Continue sampling the probe input while feed-hold braking: a detected transition latches the servo-sampled trigger state, supersedes the feed hold, and completes the probe through its ordinary constrained-stop result. If no transition occurs, Resume regenerates the remaining approach from the held zero-PVA state. Reaching a stop branch while normal-path feed-hold braking or resume retiming remains active is a fatal backend condition, not permission to enter the stop tail or resume from it. The initial mock-only retimer constrains acceleration and its requested tangential braking/acceleration profile while retaining executed per-axis and aggregate jerk as diagnostics; it does not establish a production jerk guarantee. The production executor's ordinary-plan retimer additionally intersects per-axis and aggregate jerk intervals and rejects any retimed servo state that exceeds the configured tolerated dynamic limits.
 
 Session Stop is a controlled, non-resumable operation stop, not an immediate
 Simulation reset. Moving program and triggered motion must brake through the
