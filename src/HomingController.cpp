@@ -315,6 +315,12 @@ namespace ngc {
                 if (const auto *completed =
                         std::get_if<TriggeredJointMoveCompleted>(&event);
                     completed && completed->move == move.moveId) {
+                    ExecutionSnapshot stopped;
+                    stopped.state = BackendState::Held;
+                    stopped.commandedJoints = completed->stoppedState;
+                    stopped.spanProgress = 1.0;
+                    observeSnapshot(stopped, callbacks);
+
                     return *completed;
                 }
                 if (const auto *completed = std::get_if<RequestCompleted>(&event);

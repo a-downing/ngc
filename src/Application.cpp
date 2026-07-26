@@ -158,6 +158,19 @@ class ApplicationImpl final {
             ngc::gui::sessionCommandRejectionReason(result.rejection));
     }
 
+    void publishOperatorError() {
+        if (m_errorMessage.empty()) {
+            m_printedErrorMessage.clear();
+            return;
+        }
+        if (m_errorMessage == m_printedErrorMessage) {
+            return;
+        }
+
+        std::println(stderr, "ERROR: {}", m_errorMessage);
+        m_printedErrorMessage = m_errorMessage;
+    }
+
     bool requestContinuousJogStop(const std::string_view action,
                                   const ngc::SimulationSnapshot &simulation) {
         if (!m_uiContinuousJog) {
@@ -209,6 +222,7 @@ class ApplicationImpl final {
     bool m_showExecutedJerkComb = true;
 
     std::string m_errorMessage;
+    std::string m_printedErrorMessage;
 
     ngc::SimulationTiming m_simulationTiming;
     ngc::JoggingConfiguration m_joggingConfiguration;
@@ -2064,6 +2078,30 @@ public:
             }
             ImGui::EndCombo();
         }
+        ImGui::SameLine();
+        ngc::JointMask configuredJoints = 0;
+        for (const auto &joint : m_joints) {
+            configuredJoints |= ngc::JointMask { 1 } << joint.id;
+        }
+        const auto simulateFromReal = ngc::gui::simulateFromRealControl(
+            managerState, sessions.simulation, sessions.real, configuredJoints);
+        ImGui::BeginDisabled(!simulateFromReal.available);
+        if (ImGui::Button("Simulate from Real")) {
+            const auto result =
+                m_simulation.simulateFromReal(m_controlAuthority);
+            if (!result) {
+                m_errorMessage = std::format(
+                    "Simulate from Real was rejected because {}.",
+                    result.error());
+            } else {
+                m_controlAuthority = *result;
+                m_errorMessage.clear();
+            }
+        }
+        ImGui::EndDisabled();
+        unavailableTooltip(
+            !simulateFromReal.available,
+            simulateFromReal.unavailableReason);
 
         const auto simulationControlled =
             managerState.authority.target == ngc::MachineControlTarget::Simulation;
@@ -3113,6 +3151,7 @@ public:
         if (m_enableSimulationDiagnostics) {
             renderSimulationDiagnostics(simulation);
         }
+        publishOperatorError();
     }
 
     void processPendant(const ngc::SimulationSnapshot &simulation) {

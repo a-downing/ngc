@@ -1487,6 +1487,52 @@ final_move_together = true
                         managerState, ngc::MachineControlTarget::Real).empty(),
                 "the session view should permit a configured Real control target");
 
+        ngc::MachineSessionManagerSnapshots sessions;
+        auto simulateFromReal = ngc::gui::simulateFromRealControl(
+            managerState, sessions.simulation, sessions.real,
+            ngc::JointMask { 1 });
+        require(!simulateFromReal.available
+                    && simulateFromReal.unavailableReason
+                        == "The Real machine session is not configured.",
+                "the session view should require a Real snapshot for checkpoint control");
+
+        sessions.simulation.emplace();
+        sessions.real.emplace();
+        simulateFromReal = ngc::gui::simulateFromRealControl(
+            managerState, sessions.simulation, sessions.real,
+            ngc::JointMask { 1 });
+        require(!simulateFromReal.available
+                    && simulateFromReal.unavailableReason
+                        == "Select the Real control target before creating a Simulation checkpoint.",
+                "the session view should require Real control before checkpointing");
+
+        managerState.authority.target = ngc::MachineControlTarget::Real;
+        sessions.real->powerState = ngc::MachinePowerState::On;
+        simulateFromReal = ngc::gui::simulateFromRealControl(
+            managerState, sessions.simulation, sessions.real,
+            ngc::JointMask { 1 });
+        require(!simulateFromReal.available
+                    && simulateFromReal.unavailableReason
+                        == "Every configured Real joint must be homed.",
+                "the session view should explain the Real homing requirement");
+
+        sessions.real->homedJoints = ngc::JointMask { 1 };
+        simulateFromReal = ngc::gui::simulateFromRealControl(
+            managerState, sessions.simulation, sessions.real,
+            ngc::JointMask { 1 });
+        require(simulateFromReal.available
+                    && simulateFromReal.unavailableReason.empty(),
+                "stationary homed Real state and powered-off Simulation should enable checkpointing");
+
+        sessions.simulation->powerState = ngc::MachinePowerState::On;
+        simulateFromReal = ngc::gui::simulateFromRealControl(
+            managerState, sessions.simulation, sessions.real,
+            ngc::JointMask { 1 });
+        require(!simulateFromReal.available
+                    && simulateFromReal.unavailableReason
+                        == "Simulation must be powered off and idle.",
+                "the session view should require Simulation to be powered off");
+
         ngc::SimulationSnapshot snapshot;
         auto controls = ngc::gui::machineSessionControls(snapshot, true);
         require(!controls.powered && !controls.canStart && !controls.canHome
@@ -1811,6 +1857,11 @@ final_move_together = true
                 homing->observation.joints.position[joint.id],
                 joint.homing.homePosition * joint.coordinateScale,
                 "production executor runtime should finish a homed joint at home");
+            require(std::abs(
+                        homing->observation.joints.velocity[joint.id]) <= 1e-10
+                    && std::abs(
+                        homing->observation.joints.acceleration[joint.id]) <= 1e-10,
+                    "production executor runtime should finish a homed joint at rest");
         }
         require(homing->homedJoints == configuredJoints,
                 "production executor runtime should report every configured joint homed");

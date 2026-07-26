@@ -1180,6 +1180,12 @@ private:
                 m_snapshot.status = ngc::SimulationStatus::Paused;
             } else if (held->reason == ngc::BackendHoldReason::ControlledStop) {
                 m_snapshot.machinePosition = held->state.position;
+                m_snapshot.trajectoryBackendState = ngc::BackendState::Held;
+                m_snapshot.trajectoryBackendActiveNormalRemainingSeconds = 0.0;
+                m_snapshot.trajectoryBackendQueuedNormalSeconds = 0.0;
+                m_snapshot.trajectoryBackendCommittedNormalSeconds = 0.0;
+                m_snapshot.trajectoryBackendStopBranchSeconds = 0.0;
+                m_snapshot.trajectoryBackendQueuedExecutionItems = 0;
                 m_snapshot.trajectoryBackendVelocity = 0.0;
                 m_snapshot.trajectoryBackendAcceleration = 0.0;
                 m_snapshot.hasActiveMotion = false;
@@ -1640,6 +1646,17 @@ private:
                     {
                         std::scoped_lock statusLock(m_mutex);
                         m_snapshot.statusMessages = m_machineSession.interpreter().statusMessages();
+                        m_snapshot.trajectoryBackendState =
+                            ngc::BackendState::Held;
+                        m_snapshot.trajectoryBackendActiveNormalRemainingSeconds =
+                            0.0;
+                        m_snapshot.trajectoryBackendQueuedNormalSeconds = 0.0;
+                        m_snapshot.trajectoryBackendCommittedNormalSeconds = 0.0;
+                        m_snapshot.trajectoryBackendStopBranchSeconds = 0.0;
+                        m_snapshot.trajectoryBackendQueuedExecutionItems = 0;
+                        m_snapshot.trajectoryBackendVelocity = 0.0;
+                        m_snapshot.trajectoryBackendAcceleration = 0.0;
+                        m_snapshot.hasActiveMotion = false;
                         if (persistenceError) {
                             m_snapshot.status = ngc::SimulationStatus::Error;
                             m_snapshot.programOperation =

@@ -34,6 +34,11 @@ namespace ngc::gui {
         bool canStop = false;
     };
 
+    struct SimulateFromRealControl {
+        bool available = false;
+        std::string_view unavailableReason;
+    };
+
     constexpr std::string_view controlTargetName(const MachineControlTarget target) noexcept {
         switch (target) {
             case MachineControlTarget::Simulation: return "Simulation";
@@ -67,6 +72,81 @@ namespace ngc::gui {
         }
 
         return "The machine session is not available.";
+    }
+
+    inline SimulateFromRealControl simulateFromRealControl(
+            const MachineSessionManagerState &state,
+            const std::optional<SimulationSnapshot> &simulationSession,
+            const std::optional<MachineSessionSnapshot> &realSession,
+            const JointMask configuredJoints) noexcept {
+        if (!state.realAvailable || !realSession) {
+            return {
+                false,
+                "The Real machine session is not configured.",
+            };
+        }
+        if (!state.simulationAvailable || !simulationSession) {
+            return {
+                false,
+                "The Simulation machine session is not configured.",
+            };
+        }
+        if (state.authority.target != MachineControlTarget::Real) {
+            return {
+                false,
+                "Select the Real control target before creating a Simulation checkpoint.",
+            };
+        }
+
+        const auto &simulation = *simulationSession;
+        if (simulation.powerState != MachinePowerState::Off
+            || simulation.machineActivity != MachineActivity::Idle) {
+            return {
+                false,
+                "Simulation must be powered off and idle.",
+            };
+        }
+
+        const auto &real = *realSession;
+        if (real.powerState != MachinePowerState::On) {
+            return {
+                false,
+                "Real must be powered on.",
+            };
+        }
+        if (real.machineActivity != MachineActivity::Idle) {
+            return {
+                false,
+                "Real must be idle.",
+            };
+        }
+        if (real.trajectoryBackendState == BackendState::Faulted
+            || real.trajectoryBackendFaultCode != 0) {
+            return {
+                false,
+                "Real must be fault-free.",
+            };
+        }
+        if (real.hasActiveMotion
+            || real.trajectoryBackendQueuedExecutionItems != 0
+            || real.trajectoryBackendVelocity > 1e-9
+            || real.trajectoryBackendAcceleration > 1e-9) {
+            return {
+                false,
+                "Real must be stationary with no queued execution items.",
+            };
+        }
+        if ((real.homedJoints & configuredJoints) != configuredJoints) {
+            return {
+                false,
+                "Every configured Real joint must be homed.",
+            };
+        }
+
+        return {
+            true,
+            {},
+        };
     }
 
     inline OperatorDro operatorDro(const MachineSessionSnapshot &snapshot) noexcept {

@@ -14,9 +14,10 @@ exists. Completed claims must be verified against the current code and tests.
 The application owns Simulation and the configured non-hardware Real session
 through `MachineSessionManager`, presents their backend-neutral power and
 activity state, and exposes the powered-session lifecycle explicitly. Phases 1
-through 6 are complete. The remaining mismatch is physical status and
-checkpoint presentation: the Windows Real target has null I/O, and there is no
-Real-to-Simulation checkpoint operation in the GUI.
+through 6 are complete. The remaining mismatch is physical status: the Windows
+Real target has null I/O. The GUI exposes the manager's Real-to-Simulation
+checkpoint operation with state-derived availability and precise rejection
+feedback.
 
 ## Target operator model
 
@@ -307,8 +308,10 @@ the target, and rejects stale generations or wrong targets before admission.
 Mock scheduler diagnostics and accelerated playback remain Simulation-only.
 The manager's target router and checkpoint boundary remain covered by the
 explicit in-process test host, while IPC tests cover a complete configured Real
-program epoch. Physical safety/I/O state and the Real-to-Simulation checkpoint
-UI remain unfinished.
+program epoch. The GUI exposes **Simulate from Real** only while Real control,
+power, stationary idle state, fault-free state, and homing plus powered-off
+idle Simulation state satisfy the visible checkpoint prerequisites. Physical
+safety/I/O state remains unfinished.
 
 Implement this phase with the corresponding Real-session manager work.
 
@@ -320,8 +323,9 @@ Implement this phase with the corresponding Real-session manager work.
   commands cannot reach a newly selected target. Complete for the standalone
   Simulation manager boundary and dual-session manager tests.
 - Keep inactive Real safety, communication, E-stop, and fault state visible.
-- Add the explicit **Simulate from Real** checkpoint operation. Its quiescence
-  and validation contract already exists at the manager boundary.
+- Add the explicit **Simulate from Real** checkpoint operation. Complete; its
+  quiescence and validation contract remains authoritative at the manager
+  boundary.
 
 Acceptance criteria:
 

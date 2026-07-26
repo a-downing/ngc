@@ -471,7 +471,7 @@ namespace {
         const auto initial = manager.state();
         require(initial.simulationAvailable && initial.realAvailable,
                 "configured IPC backend should expose Simulation and Real");
-        const auto realAuthority =
+        auto realAuthority =
             manager.selectControlTarget(ngc::MachineControlTarget::Real);
         require(realAuthority.has_value(),
                 realAuthority ? "" : realAuthority.error());
@@ -515,6 +515,32 @@ namespace {
                     == configuration->joints.size(),
                 "configured IPC Real homing should mark every joint homed");
 
+        auto simulationAuthority =
+            manager.simulateFromReal(*realAuthority);
+        require(simulationAuthority.has_value(),
+                simulationAuthority
+                    ? ""
+                    : std::format(
+                        "configured IPC Real homing checkpoint failed: {}",
+                        simulationAuthority.error()));
+        require(manager.powerOff(*simulationAuthority),
+                "homing-derived Simulation should power off");
+        auto simulationOff = manager.snapshot();
+        for (auto attempt = 0; attempt < 10'000
+             && simulationOff.powerState != ngc::MachinePowerState::Off
+             && simulationOff.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(1ms);
+            simulationOff = manager.snapshot();
+        }
+        require(simulationOff.powerState == ngc::MachinePowerState::Off,
+                simulationOff.error.empty()
+                    ? "homing-derived Simulation should finish powering off"
+                    : simulationOff.error);
+        realAuthority =
+            manager.selectControlTarget(ngc::MachineControlTarget::Real);
+        require(realAuthority.has_value(),
+                realAuthority ? "" : realAuthority.error());
+
         require(manager.start(
                     *realAuthority,
                     {{"G1 F120 X10\n", "ipc-real-feed-hold.ngc"}},
@@ -545,19 +571,43 @@ namespace {
                 feedHeld.error.empty()
                     ? "configured IPC Real Feed Hold should reach Paused"
                     : feedHeld.error);
-        require(manager.resume(*realAuthority),
-                "configured IPC Real Feed Hold should accept Resume");
-        auto resumed = manager.snapshot();
+        require(manager.stop(*realAuthority),
+                "configured IPC Real Feed Hold should accept Stop");
+        auto stopped = manager.snapshot();
         for (auto attempt = 0; attempt < 10'000
-             && resumed.status != ngc::SimulationStatus::Completed
-             && resumed.status != ngc::SimulationStatus::Error; ++attempt) {
+             && stopped.status != ngc::SimulationStatus::Stopped
+             && stopped.status != ngc::SimulationStatus::Error; ++attempt) {
             std::this_thread::sleep_for(1ms);
-            resumed = manager.snapshot();
+            stopped = manager.snapshot();
         }
-        require(resumed.status == ngc::SimulationStatus::Completed,
-                resumed.error.empty()
-                    ? "configured IPC Real resumed motion should complete"
-                    : resumed.error);
+        require(stopped.status == ngc::SimulationStatus::Stopped,
+                stopped.error.empty()
+                    ? "configured IPC Real controlled Stop should complete"
+                    : stopped.error);
+        simulationAuthority = manager.simulateFromReal(*realAuthority);
+        require(simulationAuthority.has_value(),
+                simulationAuthority
+                    ? ""
+                    : std::format(
+                        "configured IPC Real stopped checkpoint failed: {}",
+                        simulationAuthority.error()));
+        require(manager.powerOff(*simulationAuthority),
+                "stopped checkpoint Simulation should power off");
+        simulationOff = manager.snapshot();
+        for (auto attempt = 0; attempt < 10'000
+             && simulationOff.powerState != ngc::MachinePowerState::Off
+             && simulationOff.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(1ms);
+            simulationOff = manager.snapshot();
+        }
+        require(simulationOff.powerState == ngc::MachinePowerState::Off,
+                simulationOff.error.empty()
+                    ? "stopped checkpoint Simulation should finish powering off"
+                    : simulationOff.error);
+        realAuthority =
+            manager.selectControlTarget(ngc::MachineControlTarget::Real);
+        require(realAuthority.has_value(),
+                realAuthority ? "" : realAuthority.error());
 
         require(manager.start(
                     *realAuthority,
