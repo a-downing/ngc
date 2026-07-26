@@ -944,20 +944,24 @@ retention, continued braking across a dependent chunk boundary, and the fatal
 stop-branch transition. Axis-space triggered feed-hold tests cover constrained
 braking, stationary target-preserving Resume, duplicate and stale request
 rejection, trigger supersession during braking, and controlled Stop from the
-held state.
+held state. Scheduled spindle-output events activate exactly once before their
+indexed normal execution span through a fixed-size host-facing output state.
+Feed hold retains the event cursor, Resume does not replay applied events, and
+controlled stop suppresses events on the abandoned horizon. Disable, Reset,
+Abort, and faults establish the safe spindle output. Focused tests cover
+activation across spans and dependent chunks, hold/Resume, controlled Stop,
+Abort, Disable, and feed-retiming faults.
 
 The core is not yet connected to `ngc_ipc_backend` or registered as the second
 backend-conformance target. It is not yet paired with `HomingController`
-through a production `BackendRuntime` host. Feed hold/resume for scheduled
-hardware events remains outside the current slice; it must be implemented and
-proved before the core can claim the complete production executor contract.
+through a production `BackendRuntime` host.
 
 - Factor reusable allocation-free execution mechanics without importing
   synthetic-input or mock-diagnostic policy.
 - Add fixed-period and bounded-resource tests.
 - Complete a production-grade feed-hold/resume design. Complete for ordinary
-  `PlanChunk` motion and axis-space triggered moves; scheduled hardware events
-  remain.
+  `PlanChunk` motion, axis-space triggered moves, and scheduled spindle-output
+  events.
 - Verify stop branches, triggered stops, jogging, homing, markers, and fault
   transitions under the production executor.
 

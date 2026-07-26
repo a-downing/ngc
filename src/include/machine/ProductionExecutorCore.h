@@ -61,6 +61,11 @@ namespace ngc {
     static_assert(
         std::is_trivially_copyable_v<ProductionExecutorConfiguration>);
 
+    struct ProductionExecutorOutputState {
+        SpindleEvent spindle{};
+    };
+    static_assert(std::is_trivially_copyable_v<ProductionExecutorOutputState>);
+
     class ProductionExecutorCore final : public MotionBackend {
     public:
         static constexpr std::size_t PLAN_CAPACITY = 8;
@@ -92,6 +97,9 @@ namespace ngc {
         void setDigitalInputSample(DigitalInputId input, bool active) noexcept;
         void servoTick(bool publishSnapshot = true) noexcept;
         [[nodiscard]] double servoPeriod() const noexcept;
+        // The hosting servo thread reads this after servoTick() and maps it to
+        // physical outputs. It is not an NRT communication endpoint.
+        [[nodiscard]] ProductionExecutorOutputState outputState() const noexcept;
 
     private:
         struct PlanSlot {
@@ -240,6 +248,7 @@ namespace ngc {
         void faultJog() noexcept;
         void completeSpan() noexcept;
         void selectContinuationOrStop() noexcept;
+        void applyScheduledEventsForCurrentSpan() noexcept;
         void emitExecutionMarkersThrough(double parameter) noexcept;
         void emit(const ExecutionEvent &event) noexcept;
         void fault(std::uint32_t code) noexcept;
@@ -290,7 +299,9 @@ namespace ngc {
         double m_servoPeriod;
         double m_spanElapsed = 0.0;
         std::uint32_t m_span = 0;
+        std::uint32_t m_nextScheduledEvent = 0;
         std::uint32_t m_nextMarker = 0;
+        ProductionExecutorOutputState m_outputState;
         TriggeredRuntime m_triggered;
         std::array<TriggeredJointRuntime, MAX_JOINTS> m_triggeredJoints;
         JointMask m_triggeredJointMask = 0;

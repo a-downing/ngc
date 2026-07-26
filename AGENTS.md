@@ -59,8 +59,14 @@ implementation of the production-shaped backend contract.
 `ProductionExecutorCore` is the initial platform-independent, fixed-period,
 allocation-free execution core for normal `PlanChunk` motion, axis-space
 triggered moves, joint-space triggered moves, stop branches, markers,
-retirement, snapshots, faults, ordinary-plan controlled stop, and
-executor-owned jogging. Ordinary-plan controlled stop generates a fixed-size
+retirement, snapshots, faults, scheduled spindle-output events,
+ordinary-plan controlled stop, and executor-owned jogging. Scheduled output
+events activate exactly once before their indexed normal execution span. Feed
+hold retains the event cursor, Resume does not replay applied events, and
+controlled stop suppresses events on the abandoned horizon. Disable, Reset,
+Abort, and faults establish the safe spindle output. The hosting servo thread
+reads the latest fixed-size output state directly after each tick; it is not an
+NRT communication endpoint. Ordinary-plan controlled stop generates a fixed-size
 axis-space velocity-stop trajectory from the current commanded PVA under
 configuration-carried physical velocity, acceleration, and jerk limits,
 retires the abandoned horizon, suppresses its future markers, and permanently
@@ -84,8 +90,7 @@ triggered moves, feed hold generates a constrained stop while retaining the
 target and input condition, continues sampling during braking, and regenerates
 the remaining approach on Resume. A sampled trigger during braking supersedes
 the feed hold and completes through the ordinary triggered-stop result. The
-core does not yet execute feed hold for scheduled hardware events; it is not
-yet paired with
+core is not yet paired with
 `HomingController` through a production `BackendRuntime` host or hosted by the
 external process.
 There is no complete real-time executor,

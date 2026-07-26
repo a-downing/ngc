@@ -68,6 +68,20 @@ namespace {
         return chunk;
     }
 
+    void appendLinearSpan(ngc::PlanChunk &chunk, const ngc::SpanId span,
+                          const double from, const double to,
+                          const double duration) {
+        require(chunk.normalMotion.push(
+                    linearSpan(span, from, to, duration)),
+                "additional normal span did not fit");
+        chunk.stopTail[0] =
+            linearSpan(span + 1, to, to, 0.25);
+        chunk.branchState =
+            ngc::executionSpanEnd(chunk.normalMotion[
+                chunk.normalMotion.size - 1]);
+        chunk.stopState = chunk.branchState;
+    }
+
     ngc::TriggeredMove triggeredMove(
         const ngc::EpochId epoch, const ngc::ChunkId id,
         const ngc::BranchSequence predecessor,
@@ -374,6 +388,126 @@ namespace {
                 "terminal stop did not leave the executor held");
         requireNear(completed.commanded.position.x, 2.0,
                     "terminal stop did not reach its declared state");
+    }
+
+    void testScheduledSpindleEventsFollowExecutionCursor() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.25);
+        initialize(*core, 21);
+
+        auto first =
+            linearChunk(21, 211, 0, 311, 411, 0.0, 1.0, 0.5);
+        appendLinearSpan(first, 412, 1.0, 2.0, 0.5);
+        auto second =
+            linearChunk(21, 212, first.branch, 312, 414, 2.0, 3.0, 0.5);
+        require(first.events.push({
+                    0, ngc::SpindleEvent{
+                        true, ngc::Direction::CW, 1'200.0,
+                    },
+                })
+                    && first.events.push({
+                        1, ngc::SpindleEvent{
+                            true, ngc::Direction::CCW, 800.0,
+                        },
+                    })
+                    && second.events.push({
+                        0, ngc::SpindleEvent{},
+                    }),
+                "scheduled spindle fixtures did not fit");
+        require(core->tryPublish(first)
+                    == ngc::PublishResult::Published
+                    && core->tryPublish(second)
+                        == ngc::PublishResult::Published,
+                "scheduled spindle chunks were not published");
+        require(core->trySubmit(ngc::StartRequest{3, first.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "scheduled spindle start did not fit");
+
+        core->servoTick();
+        takeEvents(*core);
+        latestSnapshot(*core);
+        auto output = core->outputState().spindle;
+        require(output.enabled && output.direction == ngc::Direction::CW
+                    && output.speed == 1'200.0,
+                "span-zero spindle event was not applied before motion");
+
+        core->servoTick();
+        takeEvents(*core);
+        latestSnapshot(*core);
+        output = core->outputState().spindle;
+        require(output.enabled && output.direction == ngc::Direction::CCW
+                    && output.speed == 800.0,
+                "next-span spindle event was not applied at its boundary");
+
+        core->servoTick();
+        takeEvents(*core);
+        latestSnapshot(*core);
+        require(core->outputState().spindle.enabled,
+                "future continuation event ran before its chunk");
+
+        core->servoTick();
+        takeEvents(*core);
+        latestSnapshot(*core);
+        require(!core->outputState().spindle.enabled,
+                "continuation spindle event was not applied at activation");
+    }
+
+    void testAbortSuppressesFutureScheduledEvents() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.25);
+        initialize(*core, 22);
+
+        auto chunk =
+            linearChunk(22, 221, 0, 321, 421, 0.0, 1.0, 0.5);
+        appendLinearSpan(chunk, 422, 1.0, 2.0, 0.5);
+        require(chunk.events.push({
+                    0, ngc::SpindleEvent{
+                        true, ngc::Direction::CW, 1'000.0,
+                    },
+                })
+                    && chunk.events.push({
+                        1, ngc::SpindleEvent{
+                            true, ngc::Direction::CCW, 500.0,
+                        },
+                    }),
+                "abort spindle fixtures did not fit");
+        require(core->tryPublish(chunk)
+                    == ngc::PublishResult::Published,
+                "abort spindle chunk was not published");
+        require(core->trySubmit(ngc::StartRequest{3, chunk.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "abort spindle start did not fit");
+
+        core->servoTick();
+        takeEvents(*core);
+        latestSnapshot(*core);
+        require(core->outputState().spindle.enabled,
+                "abort fixture did not apply its initial spindle event");
+        require(core->trySubmit(ngc::AbortRequest{4})
+                    == ngc::SubmitResult::Submitted,
+                "scheduled-event abort did not fit");
+
+        core->servoTick();
+        const auto events = takeEvents(*core);
+        const auto snapshot = latestSnapshot(*core);
+        require(snapshot.state == ngc::BackendState::Held,
+                "scheduled-event abort did not hold the executor");
+        require(!core->outputState().spindle.enabled,
+                "abort did not establish a safe spindle output");
+        require(std::ranges::any_of(
+                    selectEvents<ngc::RequestCompleted>(events),
+                    [](const auto &completed) {
+                        return completed.request == 4
+                            && completed.succeeded;
+                    }),
+                "scheduled-event abort was not acknowledged");
+
+        require(core->trySubmit(ngc::DisableRequest{5})
+                    == ngc::SubmitResult::Submitted,
+                "scheduled-event disable did not fit");
+        core->servoTick();
+        takeEvents(*core);
+        latestSnapshot(*core);
+        require(!core->outputState().spindle.enabled,
+                "disable did not establish a safe spindle output");
     }
 
     void testMismatchedContinuationStopsSafely() {
@@ -1019,7 +1153,15 @@ namespace {
             linearChunk(92, 922, active.branch, 1'022, 1'122, 1.0, 2.0, 1.0);
         require(active.markers.push({1'201, 0, 0.1})
                     && active.markers.push({1'202, 0, 0.9})
-                    && queued.markers.push({1'203, 0, 0.0}),
+                    && queued.markers.push({1'203, 0, 0.0})
+                    && active.events.push({
+                        0, ngc::SpindleEvent{
+                            true, ngc::Direction::CW, 1'000.0,
+                        },
+                    })
+                    && queued.events.push({
+                        0, ngc::SpindleEvent{},
+                    }),
                 "controlled-stop markers did not fit");
         require(core->tryPublish(active)
                     == ngc::PublishResult::Published
@@ -1042,6 +1184,8 @@ namespace {
                     && moving.commanded.position.x > 0.2
                     && moving.commanded.velocity.x > 0.0,
                 "ordinary controlled-stop fixture did not establish motion");
+        require(core->outputState().spindle.enabled,
+                "active controlled-stop spindle event was not applied");
         require(core->trySubmit(ngc::ControlledStopRequest{11})
                     == ngc::SubmitResult::Submitted,
                 "ordinary controlled stop did not fit");
@@ -1105,6 +1249,8 @@ namespace {
             selectEvents<ngc::ExecutionMarkerReached>(events);
         require(markers.size() == 1 && markers[0].marker == 1'201,
                 "ordinary controlled stop emitted a marker beyond its cursor");
+        require(core->outputState().spindle.enabled,
+                "ordinary controlled stop applied an abandoned spindle event");
 
         require(core->tryPublish(
                     linearChunk(92, 923, 0, 1'023, 1'123, 0.0, 1.0, 1.0))
@@ -1446,8 +1592,17 @@ namespace {
 
         auto chunk =
             linearChunk(93, 930, 0, 931, 932, 0.0, 10.0, 10.0);
+        appendLinearSpan(chunk, 933, 10.0, 11.0, 1.0);
         require(chunk.markers.push({933, 0, 0.05})
-                    && chunk.markers.push({934, 0, 0.2}),
+                    && chunk.markers.push({934, 0, 0.2})
+                    && chunk.events.push({
+                        0, ngc::SpindleEvent{
+                            true, ngc::Direction::CW, 1'500.0,
+                        },
+                    })
+                    && chunk.events.push({
+                        1, ngc::SpindleEvent{},
+                    }),
                 "feed-hold marker fixtures did not fit");
         require(core->tryPublish(chunk)
                     == ngc::PublishResult::Published,
@@ -1465,6 +1620,8 @@ namespace {
         require(core->trySubmit(ngc::FeedHoldRequest{4})
                     == ngc::SubmitResult::Submitted,
                 "feed hold did not fit");
+        require(core->outputState().spindle.enabled,
+                "feed-hold fixture did not apply its initial spindle event");
 
         std::vector<ngc::ExecutionEvent> events;
         auto sawHolding = false;
@@ -1510,6 +1667,8 @@ namespace {
                     "feed hold retained commanded acceleration");
         require(held.spanProgress > 0.02 && held.spanProgress < 0.2,
                 "feed hold did not preserve an interior plan cursor");
+        require(core->outputState().spindle.enabled,
+                "feed hold applied a future spindle event");
 
         const auto holdRequests =
             selectEvents<ngc::RequestCompleted>(events);
@@ -1546,6 +1705,8 @@ namespace {
             requireNear(
                 stationary.spanProgress, held.spanProgress,
                 "held span progress advanced without Resume");
+            require(core->outputState().spindle.enabled,
+                    "held plan advanced its scheduled-event cursor");
         }
 
         require(core->trySubmit(ngc::ResumeRequest{5, 93})
@@ -1560,7 +1721,7 @@ namespace {
             }
         }
         previous = held;
-        for (auto tick = 0; tick < 500; ++tick) {
+        for (auto tick = 0; tick < 1'500; ++tick) {
             core->servoTick();
             auto currentEvents = takeEvents(*core);
             const auto currentMarkers =
@@ -1591,7 +1752,8 @@ namespace {
             resumedRate = resumedRate
                 || current.executionRate >= 1.0 - 1e-10;
             previous = current;
-            if (resumedRate && sawFutureMarker) {
+            if (resumedRate && sawFutureMarker
+                && !core->outputState().spindle.enabled) {
                 break;
             }
         }
@@ -1600,6 +1762,8 @@ namespace {
                 "feed resume did not restore the full execution rate");
         require(sawFutureMarker,
                 "feed resume did not continue through a future marker");
+        require(!core->outputState().spindle.enabled,
+                "feed resume did not apply the future spindle event");
         require(markerCounts[0] == 1 && markerCounts[1] == 1,
                 "feed hold/resume repeated or lost an execution marker");
         const auto resumeRequests =
@@ -1617,8 +1781,14 @@ namespace {
             0.01, feedHoldConfiguration(0.2, 0.4));
         initialize(*core, 94);
 
-        const auto chunk =
+        auto chunk =
             linearChunk(94, 940, 0, 941, 942, 0.0, 0.2, 0.2);
+        require(chunk.events.push({
+                    0, ngc::SpindleEvent{
+                        true, ngc::Direction::CW, 900.0,
+                    },
+                }),
+                "feed-retiming fault spindle fixture did not fit");
         require(core->tryPublish(chunk)
                     == ngc::PublishResult::Published,
                 "short feed-hold plan was not published");
@@ -1655,6 +1825,8 @@ namespace {
                         return branch.choice == ngc::BranchChoice::Stop;
                     }),
                 "feed retiming selected a stop branch before faulting");
+        require(!core->outputState().spindle.enabled,
+                "feed-retiming fault did not establish a safe spindle output");
     }
 
     void testFeedHoldContinuesAcrossDependentChunks() {
@@ -2105,10 +2277,49 @@ namespace {
 
         auto scheduled =
             linearChunk(1, 1, 0, 1, 1, 0.0, 1.0, 1.0);
-        require(scheduled.events.push({0, ngc::SpindleEvent{}}),
+        require(scheduled.events.push({1, ngc::SpindleEvent{}}),
                 "scheduled event fixture did not fit");
         require(core->tryPublish(scheduled) == ngc::PublishResult::Invalid,
-                "initial production core silently accepted a hardware event");
+                "executor accepted a scheduled event outside normal motion");
+
+        auto invalidSpindle =
+            linearChunk(1, 1, 0, 1, 1, 0.0, 1.0, 1.0);
+        require(invalidSpindle.events.push({
+                    0, ngc::SpindleEvent{
+                        true, ngc::Direction::CW,
+                        std::numeric_limits<double>::quiet_NaN(),
+                    },
+                }),
+                "invalid spindle event fixture did not fit");
+        require(core->tryPublish(invalidSpindle)
+                    == ngc::PublishResult::Invalid,
+                "executor accepted a non-finite spindle command");
+
+        auto unorderedEvents =
+            linearChunk(1, 1, 0, 1, 1, 0.0, 1.0, 1.0);
+        appendLinearSpan(unorderedEvents, 3, 1.0, 2.0, 1.0);
+        require(unorderedEvents.events.push({
+                    1, ngc::SpindleEvent{},
+                })
+                    && unorderedEvents.events.push({
+                        0, ngc::SpindleEvent{},
+                    }),
+                "unordered scheduled-event fixture did not fit");
+        require(core->tryPublish(unorderedEvents)
+                    == ngc::PublishResult::Invalid,
+                "executor accepted out-of-order scheduled events");
+
+        auto invalidDirection =
+            linearChunk(1, 1, 0, 1, 1, 0.0, 1.0, 1.0);
+        require(invalidDirection.events.push({
+                    0, ngc::SpindleEvent{
+                        true, static_cast<ngc::Direction>(2), 1'000.0,
+                    },
+                }),
+                "invalid spindle direction fixture did not fit");
+        require(core->tryPublish(invalidDirection)
+                    == ngc::PublishResult::Invalid,
+                "executor accepted an invalid spindle direction");
 
         initialize(*core, 1);
         const ngc::StartIncrementalJogRequest unsupportedAxis{
@@ -2189,6 +2400,8 @@ int main() {
     try {
         testFixedTickExecutionAndAccounting();
         testContinuationMarkersAndTerminalStop();
+        testScheduledSpindleEventsFollowExecutionCursor();
+        testAbortSuppressesFutureScheduledEvents();
         testMismatchedContinuationStopsSafely();
         testTriggeredMoveReachesTargetAtRest();
         testSampledTriggerGeneratesConstrainedStop();

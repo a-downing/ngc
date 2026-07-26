@@ -310,6 +310,7 @@ namespace ngc {
         m_snapshot.feedback = feedback;
         m_planStop.reset();
         m_controlledStoppedEpoch = 0;
+        m_outputState = {};
         m_faultEventEmitted = false;
     }
 
@@ -348,6 +349,10 @@ namespace ngc {
         return m_servoPeriod;
     }
 
+    ProductionExecutorOutputState ProductionExecutorCore::outputState() const noexcept {
+        return m_outputState;
+    }
+
     bool ProductionExecutorCore::validExecutionItem(
         const ExecutionItem &item) noexcept {
         if (const auto *chunk = std::get_if<PlanChunk>(&item)) {
@@ -367,7 +372,6 @@ namespace ngc {
         const PlanChunk &chunk) noexcept {
         if (chunk.epoch == 0 || chunk.id == 0 || chunk.branch == 0
             || chunk.normalMotion.size == 0 || chunk.stopTail.size == 0
-            || chunk.events.size != 0
             || !finiteMotionState(chunk.branchState)
             || !finiteMotionState(chunk.stopState)) {
             return false;
@@ -405,6 +409,29 @@ namespace ngc {
         if (!std::ranges::all_of(chunk.normalMotion, validSpan)
             || !std::ranges::all_of(chunk.stopTail, validSpan)) {
             return false;
+        }
+
+        std::optional<std::uint32_t> previousEventSpan;
+        for (const auto &event : chunk.events) {
+            const auto valid = std::visit([](const auto &value) {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (std::same_as<T, SpindleEvent>) {
+                    const auto validDirection =
+                        value.direction == Direction::CW
+                        || value.direction == Direction::CCW;
+
+                    return validDirection && std::isfinite(value.speed)
+                        && value.speed >= 0.0;
+                } else {
+                    return false;
+                }
+            }, event.value);
+            if (!valid || event.span >= chunk.normalMotion.size
+                || (previousEventSpan.has_value()
+                    && event.span < *previousEventSpan)) {
+                return false;
+            }
+            previousEventSpan = event.span;
         }
 
         std::optional<std::pair<std::uint32_t, double>> previous;
@@ -564,6 +591,7 @@ namespace ngc {
                     m_snapshot.commandedJoints.acceleration = {};
                     m_snapshot.feedbackJoints =
                         m_snapshot.commandedJoints;
+                    m_outputState = {};
                     success = true;
                 } else if constexpr (std::same_as<T, StartRequest>) {
                     success = !m_jog.has_value()
@@ -703,6 +731,9 @@ namespace ngc {
                         m_snapshot.feedback = m_snapshot.commanded;
                         success = true;
                     }
+                    if (success) {
+                        m_outputState = {};
+                    }
                 } else if constexpr (std::same_as<T, ResetRequest>) {
                     if (m_jog.has_value()) {
                         abandonJog(JogStopReason::Aborted);
@@ -720,6 +751,7 @@ namespace ngc {
                     m_snapshot.feedbackJoints = feedbackJoints;
                     m_planStop.reset();
                     m_controlledStoppedEpoch = 0;
+                    m_outputState = {};
                     m_faultEventEmitted = false;
                     success = value.nextEpoch != 0;
                 } else if constexpr (std::same_as<T, SetJointPositionRequest>) {
@@ -800,6 +832,7 @@ namespace ngc {
         m_active = index;
         m_stopping = false;
         m_span = 0;
+        m_nextScheduledEvent = 0;
         m_nextMarker = 0;
         m_spanElapsed = 0.0;
         m_triggered = {};
@@ -811,6 +844,10 @@ namespace ngc {
         m_snapshot.activeSpan = 0;
         emit(ChunkAccepted{itemEpoch(item), itemId(item)});
         if (std::holds_alternative<PlanChunk>(item)) {
+            applyScheduledEventsForCurrentSpan();
+            if (m_snapshot.state == BackendState::Faulted) {
+                return;
+            }
             emitExecutionMarkersThrough(0.0);
         } else if (std::holds_alternative<TriggeredMove>(item)
                    && !initializeTriggered()) {
@@ -1232,6 +1269,7 @@ namespace ngc {
         m_controlledStoppedEpoch = epoch;
         m_stopping = false;
         m_span = 0;
+        m_nextScheduledEvent = 0;
         m_nextMarker = 0;
         m_spanElapsed = 0.0;
         m_snapshot.state = BackendState::Held;
@@ -2260,6 +2298,10 @@ namespace ngc {
         const auto count = m_stopping
             ? activeChunk().stopTail.size : activeChunk().normalMotion.size;
         if (m_span < count) {
+            applyScheduledEventsForCurrentSpan();
+            if (m_snapshot.state == BackendState::Faulted) {
+                return;
+            }
             emitExecutionMarkersThrough(0.0);
 
             return;
@@ -2306,6 +2348,7 @@ namespace ngc {
                 release(currentIndex);
                 m_stopping = false;
                 m_span = 0;
+                m_nextScheduledEvent = 0;
                 m_nextMarker = 0;
                 m_spanElapsed = 0.0;
                 m_snapshot.activeChunk = itemId(continuation);
@@ -2314,6 +2357,10 @@ namespace ngc {
                     itemEpoch(continuation), itemId(continuation),
                 });
                 if (std::holds_alternative<PlanChunk>(continuation)) {
+                    applyScheduledEventsForCurrentSpan();
+                    if (m_snapshot.state == BackendState::Faulted) {
+                        return;
+                    }
                     emitExecutionMarkersThrough(0.0);
                 } else if (std::holds_alternative<TriggeredMove>(continuation)
                            && !initializeTriggered()) {
@@ -2345,6 +2392,34 @@ namespace ngc {
         m_stopping = true;
         m_span = 0;
         m_spanElapsed = 0.0;
+    }
+
+    void ProductionExecutorCore::applyScheduledEventsForCurrentSpan() noexcept {
+        if (m_stopping || !m_active.has_value()) {
+            return;
+        }
+
+        const auto &chunk = activeChunk();
+        while (m_nextScheduledEvent < chunk.events.size) {
+            const auto &event = chunk.events[m_nextScheduledEvent];
+            if (event.span > m_span) {
+                return;
+            }
+            if (event.span < m_span
+                || event.span >= chunk.normalMotion.size) {
+                fault(INVALID_EXECUTION_STATE_FAULT);
+
+                return;
+            }
+
+            std::visit([&](const auto &value) {
+                using T = std::decay_t<decltype(value)>;
+                if constexpr (std::same_as<T, SpindleEvent>) {
+                    m_outputState.spindle = value;
+                }
+            }, event.value);
+            ++m_nextScheduledEvent;
+        }
     }
 
     void ProductionExecutorCore::emitExecutionMarkersThrough(
@@ -2392,6 +2467,7 @@ namespace ngc {
     void ProductionExecutorCore::fault(const std::uint32_t code) noexcept {
         m_snapshot.state = BackendState::Faulted;
         m_snapshot.faultCode = code;
+        m_outputState = {};
         if (!m_faultEventEmitted) {
             m_faultEventEmitted = m_events.tryPush(BackendFault{code});
         }
@@ -2412,6 +2488,7 @@ namespace ngc {
         m_planStop.reset();
         resetFeedRetiming();
         m_span = 0;
+        m_nextScheduledEvent = 0;
         m_nextMarker = 0;
         m_spanElapsed = 0.0;
         m_triggered = {};
