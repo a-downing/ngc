@@ -36,6 +36,8 @@ namespace ngc {
         std::optional<ProgramPauseId> m_programPause;
         std::optional<SynchronizationFenceId> m_synchronizationFence;
         bool m_waitingForHeld = false;
+        bool m_exactStopHeld = false;
+        std::optional<RequestId> m_exactStopResumeRequest;
         GeometryEpoch m_epoch = 0;
         GeometrySequence m_nextSequence = 1;
         RequestId m_nextRequest = 1;
@@ -238,6 +240,8 @@ namespace ngc {
             m_programPause.reset();
             m_synchronizationFence.reset();
             m_waitingForHeld = false;
+            m_exactStopHeld = false;
+            m_exactStopResumeRequest.reset();
             m_backendReady = false;
             m_epoch = epoch;
             m_nextSequence = 1;
@@ -313,6 +317,16 @@ namespace ngc {
                         m_probePending = true;
                 ++m_outstandingChunks;
                 ++m_pendingItem;
+                if (m_exactStopHeld) {
+                    const auto request = m_nextRequest++;
+                    if (m_backend.trySubmit(ResumeRequest{request, m_epoch})
+                            != SubmitResult::Submitted) {
+                        fail("motion backend control channel is full while resuming after an exact stop");
+                        return false;
+                    }
+                    m_exactStopHeld = false;
+                    m_exactStopResumeRequest = request;
+                }
                 if(m_pendingItem == m_pending->items.size()) {
                     m_pending.reset();
                     m_pendingItem = 0;
@@ -392,16 +406,19 @@ namespace ngc {
                         if(m_planner.hasRollingContinuation()) {
                             fail("motion stopped on a rolling-horizon packet branch with retained prepared geometry");
                         } else {
-                            const auto request = m_nextRequest++;
-                            if(m_backend.trySubmit(ResumeRequest{request, m_epoch})
-                                    != SubmitResult::Submitted)
-                                fail("motion backend control channel is full while resuming after an exact stop");
+                            m_exactStopHeld = true;
                         }
                     }
                 } else if(const auto *completed = std::get_if<RequestCompleted>(&event)) {
                     if(completed->request == m_startRequest) {
                         m_backendReady = completed->succeeded;
                         if(!completed->succeeded) fail("motion backend rejected start request");
+                    } else if (m_exactStopResumeRequest
+                               && completed->request == *m_exactStopResumeRequest) {
+                        m_exactStopResumeRequest.reset();
+                        if (!completed->succeeded) {
+                            fail("motion backend rejected resume after an exact stop");
+                        }
                     }
                 }
             }

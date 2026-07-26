@@ -444,6 +444,72 @@ namespace {
                 std::format(
                     "configured IPC Real program should report its executed "
                     "position, got {}", completed.machinePosition.x));
+
+        constexpr std::string_view toolChange = R"NGC(
+sub _tool_change[#tool_number] {
+    print["tool change: probing tool ", #tool_number]
+    G90
+    G49
+    G20
+    G53 G0 Z#5163
+    alert["Install tool ", #tool_number, ", then press Resume"]
+    M0
+    return 1
+}
+)NGC";
+        ngc::ToolTable tools;
+        tools.set(2, {
+            .number = 2,
+            .x = 0.0,
+            .y = 0.0,
+            .z = 2.0,
+            .a = 0.0,
+            .b = 0.0,
+            .c = 0.0,
+            .diameter = 0.25,
+            .comment = "IPC tool-change fixture",
+        });
+        require(manager.setToolTable(*realAuthority, tools),
+                "configured IPC Real session should accept its tool table");
+        require(manager.start(
+                    *realAuthority,
+                    {
+                        {std::string(toolChange), "autoload/tool_change.ngc"},
+                        {"T2 M6\n", "ipc-real-tool-change.ngc"},
+                    },
+                    tools, true),
+                "configured IPC Real session should accept a tool change");
+        auto paused = manager.snapshot();
+        for (auto attempt = 0; attempt < 10'000
+             && paused.status != ngc::SimulationStatus::Paused
+             && paused.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(1ms);
+            paused = manager.snapshot();
+        }
+        require(paused.status == ngc::SimulationStatus::Paused,
+                paused.error.empty()
+                    ? std::format(
+                        "configured IPC Real tool change should reach M0; "
+                        "operation {} driver '{}'",
+                        static_cast<int>(paused.programOperation),
+                        paused.trajectoryDriverActivity)
+                    : paused.error);
+        require(paused.operatorAlert
+                    == "Install tool 2, then press Resume",
+                "configured IPC Real tool change should publish its operator alert");
+        require(manager.resume(*realAuthority),
+                "configured IPC Real tool change should accept Resume");
+        completed = manager.snapshot();
+        for (auto attempt = 0; attempt < 10'000
+             && completed.status != ngc::SimulationStatus::Completed
+             && completed.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(1ms);
+            completed = manager.snapshot();
+        }
+        require(completed.status == ngc::SimulationStatus::Completed,
+                completed.error.empty()
+                    ? "resumed IPC Real tool change should complete"
+                    : completed.error);
         require(manager.powerOff(*realAuthority),
                 "configured IPC Real session should power off");
         manager.join();
