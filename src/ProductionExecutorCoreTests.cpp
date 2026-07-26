@@ -1125,6 +1125,316 @@ namespace {
                 "ordinary controlled stop allowed its abandoned epoch to resume");
     }
 
+    void testFeedHoldPreservesAndResumesAxisTriggeredMove() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        initialize(*core, 93);
+
+        const auto move =
+            triggeredMove(93, 930, 0, 931, 932, 1.0);
+        require(core->tryPublish(move)
+                    == ngc::PublishResult::Published,
+                "triggered feed-hold move was not published");
+        require(core->trySubmit(ngc::StartRequest{3, move.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "triggered feed-hold move start did not fit");
+
+        auto moving = ngc::ExecutionSnapshot{};
+        for (auto tick = 0; tick < 1'000; ++tick) {
+            core->servoTick();
+            takeEvents(*core);
+            moving = latestSnapshot(*core);
+            if (moving.commanded.position.x >= 0.1) {
+                break;
+            }
+        }
+        require(moving.state == ngc::BackendState::Running
+                    && moving.commanded.velocity.x > 0.0,
+                "triggered feed-hold fixture did not establish motion");
+        require(core->trySubmit(ngc::FeedHoldRequest{4})
+                    == ngc::SubmitResult::Submitted,
+                "triggered feed hold did not fit");
+
+        core->servoTick();
+        auto events = takeEvents(*core);
+        auto previous = latestSnapshot(*core);
+        require(previous.state == ngc::BackendState::Holding,
+                "triggered feed hold did not expose its braking state");
+        require(core->trySubmit(ngc::FeedHoldRequest{5})
+                    == ngc::SubmitResult::Submitted,
+                "duplicate triggered feed hold did not fit");
+
+        auto held = ngc::ExecutionSnapshot{};
+        for (auto tick = 0; tick < 1'000; ++tick) {
+            core->servoTick();
+            auto currentEvents = takeEvents(*core);
+            events.insert(
+                events.end(), currentEvents.begin(), currentEvents.end());
+            const auto current = latestSnapshot(*core);
+            require(current.commanded.position.x
+                        + 1e-12 >= previous.commanded.position.x,
+                    "triggered feed hold moved backward");
+            require(std::abs(current.commanded.velocity.x)
+                        <= move.limits.velocity.x + 1e-9,
+                    "triggered feed hold exceeded its velocity limit");
+            require(std::abs(current.commanded.acceleration.x)
+                        <= move.limits.acceleration.x + 1e-9,
+                    "triggered feed hold exceeded its acceleration limit");
+            require(std::abs(
+                        current.commanded.acceleration.x
+                        - previous.commanded.acceleration.x)
+                        <= move.limits.jerk.x * core->servoPeriod() + 1e-9,
+                    "triggered feed hold exceeded its per-tick jerk limit");
+            previous = current;
+            if (current.state == ngc::BackendState::Held) {
+                held = current;
+                break;
+            }
+        }
+
+        require(held.state == ngc::BackendState::Held
+                    && held.commanded.position.x > moving.commanded.position.x
+                    && held.commanded.position.x < move.target.x,
+                "triggered feed hold did not retain an interior approach");
+        requireNear(held.commanded.velocity.x, 0.0,
+                    "triggered feed hold retained velocity");
+        requireNear(held.commanded.acceleration.x, 0.0,
+                    "triggered feed hold retained acceleration");
+        require(selectEvents<ngc::TriggeredMoveCompleted>(events).empty()
+                    && selectEvents<ngc::BranchSelected>(events).empty()
+                    && selectEvents<ngc::ChunkRetired>(events).empty(),
+                "triggered feed hold completed or retired the active move");
+        require(std::ranges::any_of(
+                    selectEvents<ngc::BackendHeld>(events),
+                    [](const auto &event) {
+                        return event.reason
+                            == ngc::BackendHoldReason::FeedHold;
+                    }),
+                "triggered feed hold did not report its hold reason");
+        const auto holdRequests =
+            selectEvents<ngc::RequestCompleted>(events);
+        require(std::ranges::any_of(
+                    holdRequests, [](const auto &completed) {
+                        return completed.request == 4
+                            && completed.succeeded;
+                    })
+                    && std::ranges::any_of(
+                        holdRequests, [](const auto &completed) {
+                            return completed.request == 5
+                                && !completed.succeeded;
+                        }),
+                "triggered feed hold request results were incorrect");
+
+        for (auto tick = 0; tick < 5; ++tick) {
+            core->servoTick();
+            takeEvents(*core);
+            const auto stationary = latestSnapshot(*core);
+            requireNear(
+                stationary.commanded.position.x,
+                held.commanded.position.x,
+                "held triggered move advanced without Resume");
+        }
+
+        require(core->trySubmit(ngc::ResumeRequest{6, move.epoch + 1})
+                    == ngc::SubmitResult::Submitted,
+                "stale triggered Resume did not fit");
+        core->servoTick();
+        const auto staleEvents = takeEvents(*core);
+        latestSnapshot(*core);
+        require(std::ranges::any_of(
+                    selectEvents<ngc::RequestCompleted>(staleEvents),
+                    [](const auto &completed) {
+                        return completed.request == 6
+                            && !completed.succeeded;
+                    }),
+                "triggered feed hold accepted a stale Resume");
+
+        require(core->trySubmit(ngc::ResumeRequest{7, move.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "triggered feed-hold Resume did not fit");
+        events.clear();
+        auto completed = ngc::ExecutionSnapshot{};
+        for (auto tick = 0; tick < 1'000; ++tick) {
+            core->servoTick();
+            auto currentEvents = takeEvents(*core);
+            events.insert(
+                events.end(), currentEvents.begin(), currentEvents.end());
+            completed = latestSnapshot(*core);
+            if (completed.state == ngc::BackendState::Held) {
+                break;
+            }
+        }
+
+        const auto completions =
+            selectEvents<ngc::TriggeredMoveCompleted>(events);
+        require(completions.size() == 1
+                    && completions[0].status
+                        == ngc::TriggeredMoveStatus::ReachedTarget,
+                "resumed triggered move did not reach its target");
+        requireNear(completed.commanded.position.x, move.target.x,
+                    "resumed triggered move lost its original target");
+        require(std::ranges::any_of(
+                    selectEvents<ngc::RequestCompleted>(events),
+                    [](const auto &request) {
+                        return request.request == 7
+                            && request.succeeded;
+                    }),
+                "triggered feed-hold Resume was not acknowledged");
+    }
+
+    void testAxisTriggerDuringFeedHoldBrakingCompletesNormally() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        initialize(*core, 94);
+
+        constexpr ngc::DigitalInputId input = 8;
+        const auto move = triggeredMove(
+            94, 940, 0, 941, 942, 1.0, input,
+            ngc::InputCondition::RisingEdge);
+        core->setDigitalInputSample(input, false);
+        require(core->tryPublish(move)
+                    == ngc::PublishResult::Published,
+                "feed-hold trigger fixture was not published");
+        require(core->trySubmit(ngc::StartRequest{3, move.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "feed-hold trigger fixture start did not fit");
+
+        auto moving = ngc::ExecutionSnapshot{};
+        for (auto tick = 0; tick < 1'000; ++tick) {
+            core->servoTick();
+            takeEvents(*core);
+            moving = latestSnapshot(*core);
+            if (moving.commanded.position.x >= 0.1) {
+                break;
+            }
+        }
+        require(moving.commanded.velocity.x > 0.0,
+                "feed-hold trigger fixture did not establish motion");
+        require(core->trySubmit(ngc::FeedHoldRequest{4})
+                    == ngc::SubmitResult::Submitted,
+                "feed-hold trigger request did not fit");
+        core->servoTick();
+        auto events = takeEvents(*core);
+        const auto braking = latestSnapshot(*core);
+        require(braking.state == ngc::BackendState::Holding
+                    && braking.commanded.velocity.x > 0.0,
+                "feed-hold trigger fixture did not begin braking");
+
+        core->setDigitalInputSample(input, true);
+        const auto triggerPosition = braking.commanded.position.x;
+        auto completed = ngc::ExecutionSnapshot{};
+        for (auto tick = 0; tick < 1'000; ++tick) {
+            core->servoTick();
+            auto currentEvents = takeEvents(*core);
+            events.insert(
+                events.end(), currentEvents.begin(), currentEvents.end());
+            completed = latestSnapshot(*core);
+            if (completed.state == ngc::BackendState::Held) {
+                break;
+            }
+        }
+
+        const auto completions =
+            selectEvents<ngc::TriggeredMoveCompleted>(events);
+        require(completions.size() == 1
+                    && completions[0].status
+                        == ngc::TriggeredMoveStatus::Triggered,
+                "input sampled during feed-hold braking did not trigger");
+        requireNear(completions[0].triggerState.position.x,
+                    triggerPosition,
+                    "feed-hold braking did not latch the sampled trigger state");
+        require(completions[0].stoppedState.position.x
+                    > completions[0].triggerState.position.x
+                    && completions[0].stoppedState.position.x
+                        < move.target.x,
+                "trigger during feed-hold braking lost its constrained stop");
+        require(std::ranges::none_of(
+                    selectEvents<ngc::BackendHeld>(events),
+                    [](const auto &event) {
+                        return event.reason
+                            == ngc::BackendHoldReason::FeedHold;
+                    }),
+                "trigger during braking entered a transient feed-held state");
+        require(std::ranges::any_of(
+                    selectEvents<ngc::BackendHeld>(events),
+                    [](const auto &event) {
+                        return event.reason
+                            == ngc::BackendHoldReason::StopBranch;
+                    }),
+                "trigger during braking did not complete at the stop branch");
+    }
+
+    void testControlledStopAbortsFeedHeldAxisTriggeredMove() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        initialize(*core, 95);
+
+        const auto move =
+            triggeredMove(95, 950, 0, 951, 952, 1.0);
+        require(core->tryPublish(move)
+                    == ngc::PublishResult::Published,
+                "feed-held controlled-stop fixture was not published");
+        require(core->trySubmit(ngc::StartRequest{3, move.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "feed-held controlled-stop fixture start did not fit");
+
+        auto moving = ngc::ExecutionSnapshot{};
+        for (auto tick = 0; tick < 1'000; ++tick) {
+            core->servoTick();
+            takeEvents(*core);
+            moving = latestSnapshot(*core);
+            if (moving.commanded.position.x >= 0.1) {
+                break;
+            }
+        }
+        require(moving.commanded.velocity.x > 0.0,
+                "feed-held controlled-stop fixture did not establish motion");
+        require(core->trySubmit(ngc::FeedHoldRequest{4})
+                    == ngc::SubmitResult::Submitted,
+                "feed-held controlled-stop hold did not fit");
+
+        auto held = ngc::ExecutionSnapshot{};
+        for (auto tick = 0; tick < 1'000; ++tick) {
+            core->servoTick();
+            takeEvents(*core);
+            held = latestSnapshot(*core);
+            if (held.state == ngc::BackendState::Held) {
+                break;
+            }
+        }
+        require(held.state == ngc::BackendState::Held
+                    && held.commanded.position.x < move.target.x,
+                "controlled-stop fixture did not reach a feed-held state");
+
+        require(core->trySubmit(ngc::ControlledStopRequest{5})
+                    == ngc::SubmitResult::Submitted,
+                "feed-held controlled stop did not fit");
+        core->servoTick();
+        const auto events = takeEvents(*core);
+        const auto stopped = latestSnapshot(*core);
+
+        const auto completions =
+            selectEvents<ngc::TriggeredMoveCompleted>(events);
+        require(completions.size() == 1
+                    && completions[0].status
+                        == ngc::TriggeredMoveStatus::Aborted,
+                "controlled stop did not abort the feed-held move");
+        requireNear(stopped.commanded.position.x,
+                    held.commanded.position.x,
+                    "controlled stop moved the feed-held position");
+        require(std::ranges::any_of(
+                    selectEvents<ngc::BackendHeld>(events),
+                    [](const auto &event) {
+                        return event.reason
+                            == ngc::BackendHoldReason::ControlledStop;
+                    }),
+                "feed-held controlled stop did not report its hold reason");
+        require(std::ranges::any_of(
+                    selectEvents<ngc::RequestCompleted>(events),
+                    [](const auto &completed) {
+                        return completed.request == 5
+                            && completed.succeeded;
+                    }),
+                "feed-held controlled stop was not acknowledged");
+    }
+
     void testFeedHoldPreservesAndResumesOrdinaryPlan() {
         constexpr auto servoPeriod = 0.01;
         constexpr auto accelerationLimit = 1.0;
@@ -1888,6 +2198,9 @@ int main() {
         testControlledStopAbortsTriggeredJointMove();
         testControlledStopAbortsAxisTriggeredMove();
         testControlledStopCancelsOrdinaryPlan();
+        testFeedHoldPreservesAndResumesAxisTriggeredMove();
+        testAxisTriggerDuringFeedHoldBrakingCompletesNormally();
+        testControlledStopAbortsFeedHeldAxisTriggeredMove();
         testFeedHoldPreservesAndResumesOrdinaryPlan();
         testFeedRetimingFaultsAtStopBranch();
         testFeedHoldContinuesAcrossDependentChunks();

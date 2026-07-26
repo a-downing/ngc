@@ -106,6 +106,7 @@ namespace ngc {
             double length = 0.0;
             double elapsed = 0.0;
             bool stopping = false;
+            bool feedHoldStopping = false;
             TriggeredMoveStatus completionStatus =
                 TriggeredMoveStatus::ReachedTarget;
             MotionState stopOrigin{};
@@ -200,8 +201,10 @@ namespace ngc {
         void advancePlanStop(double &seconds) noexcept;
         void completePlanStop() noexcept;
         bool initializeTriggered() noexcept;
-        bool beginTriggeredStop(TriggeredMoveStatus status) noexcept;
+        bool beginTriggeredStop(TriggeredMoveStatus status,
+                                bool feedHold = false) noexcept;
         void advanceTriggered(double &seconds) noexcept;
+        void finishTriggeredFeedHold() noexcept;
         void completeTriggered(TriggeredMoveStatus status) noexcept;
         void faultTriggered() noexcept;
         [[nodiscard]] MotionState triggeredStateAt(

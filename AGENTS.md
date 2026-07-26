@@ -79,9 +79,13 @@ cancellation of axis- and joint-space triggered moves. For ordinary
 retiming the existing polynomial cursor, intersecting configured tangential,
 aggregate, and per-axis acceleration and jerk authority on every servo tick,
 and preserving ordered marker progress. It faults rather than entering a stop
-branch while feed-hold braking or resume retiming is active. It does not yet
-execute feed hold for axis-space triggered moves or scheduled hardware events;
-it is not yet paired with
+branch while feed-hold braking or resume retiming is active. For axis-space
+triggered moves, feed hold generates a constrained stop while retaining the
+target and input condition, continues sampling during braking, and regenerates
+the remaining approach on Resume. A sampled trigger during braking supersedes
+the feed hold and completes through the ordinary triggered-stop result. The
+core does not yet execute feed hold for scheduled hardware events; it is not
+yet paired with
 `HomingController` through a production `BackendRuntime` host or hosted by the
 external process.
 There is no complete real-time executor,

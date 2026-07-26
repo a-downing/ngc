@@ -583,15 +583,25 @@ namespace ngc {
                         && value.epoch == m_snapshot.epoch
                         && value.epoch != m_controlledStoppedEpoch;
                     if (success && feedHeld) {
-                        success = m_active.has_value() && !m_stopping
-                            && std::holds_alternative<PlanChunk>(
-                                m_planSlots[*m_active].item);
-                        if (success) {
+                        success = m_active.has_value() && !m_stopping;
+                        if (success && std::holds_alternative<PlanChunk>(
+                                m_planSlots[*m_active].item)) {
                             m_feedRetiming.held = false;
                             m_feedRetiming.resuming = true;
                             m_feedRetiming.acceleration = 0.0;
                             m_feedRetiming.jerk = 0.0;
                             m_snapshot.state = BackendState::Running;
+                        } else if (success
+                                   && std::holds_alternative<TriggeredMove>(
+                                       m_planSlots[*m_active].item)) {
+                            success = !m_triggered.stopping
+                                && initializeTriggered();
+                            if (success) {
+                                resetFeedRetiming();
+                                m_snapshot.state = BackendState::Running;
+                            }
+                        } else {
+                            success = false;
                         }
                     } else if (success) {
                         success = !m_active.has_value()
@@ -603,13 +613,22 @@ namespace ngc {
                         m_snapshot.state = BackendState::Running;
                     }
                 } else if constexpr (std::same_as<T, FeedHoldRequest>) {
-                    success = feedHoldAvailable()
-                        && !m_jog.has_value()
+                    success = !m_jog.has_value()
                         && m_snapshot.state == BackendState::Running
                         && !m_feedRetiming.resuming
-                        && m_active.has_value() && !m_stopping
-                        && std::holds_alternative<PlanChunk>(
-                            m_planSlots[*m_active].item);
+                        && m_active.has_value() && !m_stopping;
+                    if (success && std::holds_alternative<PlanChunk>(
+                            m_planSlots[*m_active].item)) {
+                        success = feedHoldAvailable();
+                    } else if (success
+                               && std::holds_alternative<TriggeredMove>(
+                                   m_planSlots[*m_active].item)) {
+                        success = !m_triggered.stopping
+                            && beginTriggeredStop(
+                                TriggeredMoveStatus::ReachedTarget, true);
+                    } else {
+                        success = false;
+                    }
                     if (success) {
                         m_feedRetiming.holding = true;
                         m_feedRetiming.held = false;
@@ -643,6 +662,8 @@ namespace ngc {
                                        TriggeredMoveStatus::Aborted)) {
                             success = false;
                             faultTriggered();
+                        } else {
+                            resetFeedRetiming();
                         }
                     } else if (success && !stoppingJog
                                && std::holds_alternative<TriggeredJointMove>(
@@ -1321,12 +1342,15 @@ namespace ngc {
     }
 
     bool ProductionExecutorCore::beginTriggeredStop(
-        const TriggeredMoveStatus status) noexcept {
+        const TriggeredMoveStatus status, const bool feedHold) noexcept {
         const auto &move = activeTriggeredMove();
         m_triggered.stopOrigin = m_snapshot.commanded;
-        m_triggered.triggerState = m_snapshot.commanded;
+        if (!feedHold) {
+            m_triggered.triggerState = m_snapshot.commanded;
+        }
         m_triggered.completionStatus = status;
         m_triggered.stopping = true;
+        m_triggered.feedHoldStopping = feedHold;
         m_triggered.elapsed = 0.0;
         const auto scalarVelocity =
             dot(m_snapshot.commanded.velocity, m_triggered.direction);
@@ -1334,6 +1358,8 @@ namespace ngc {
             dot(m_snapshot.commanded.acceleration, m_triggered.direction);
         if (std::abs(scalarVelocity) <= 1e-12
             && std::abs(scalarAcceleration) <= 1e-12) {
+            m_triggered.trajectory = {};
+
             return true;
         }
 
@@ -1388,16 +1414,23 @@ namespace ngc {
 
     void ProductionExecutorCore::advanceTriggered(double &seconds) noexcept {
         const auto move = activeTriggeredMove();
-        if (!m_triggered.stopping && triggeredInputConditionMet(move)) {
-            if (!beginTriggeredStop(TriggeredMoveStatus::Triggered)) {
-                faultTriggered();
+        if (triggeredInputConditionMet(move)) {
+            if (!m_triggered.stopping) {
+                if (!beginTriggeredStop(TriggeredMoveStatus::Triggered)) {
+                    faultTriggered();
 
-                return;
-            }
-            if (m_triggered.trajectory.get_duration() <= 1e-12) {
-                completeTriggered(TriggeredMoveStatus::Triggered);
+                    return;
+                }
+                if (m_triggered.trajectory.get_duration() <= 1e-12) {
+                    completeTriggered(TriggeredMoveStatus::Triggered);
 
-                return;
+                    return;
+                }
+            } else if (m_triggered.feedHoldStopping) {
+                m_triggered.triggerState = m_snapshot.commanded;
+                m_triggered.completionStatus =
+                    TriggeredMoveStatus::Triggered;
+                m_triggered.feedHoldStopping = false;
             }
         }
 
@@ -1412,6 +1445,18 @@ namespace ngc {
         }
 
         const auto duration = m_triggered.trajectory.get_duration();
+        if (m_triggered.stopping && duration <= 1e-12) {
+            m_snapshot.commanded.velocity = {};
+            m_snapshot.commanded.acceleration = {};
+            m_snapshot.feedback = m_snapshot.commanded;
+            if (m_triggered.feedHoldStopping) {
+                finishTriggeredFeedHold();
+            } else {
+                completeTriggered(m_triggered.completionStatus);
+            }
+
+            return;
+        }
         const auto consumed =
             std::min(seconds, std::max(duration - m_triggered.elapsed, 0.0));
         m_triggered.elapsed += consumed;
@@ -1430,7 +1475,11 @@ namespace ngc {
             m_snapshot.commanded.velocity = {};
             m_snapshot.commanded.acceleration = {};
             m_snapshot.feedback = m_snapshot.commanded;
-            completeTriggered(m_triggered.completionStatus);
+            if (m_triggered.feedHoldStopping) {
+                finishTriggeredFeedHold();
+            } else {
+                completeTriggered(m_triggered.completionStatus);
+            }
 
             return;
         }
@@ -1440,6 +1489,12 @@ namespace ngc {
         m_snapshot.commanded.acceleration = {};
         m_snapshot.feedback = m_snapshot.commanded;
         completeTriggered(TriggeredMoveStatus::ReachedTarget);
+    }
+
+    void ProductionExecutorCore::finishTriggeredFeedHold() noexcept {
+        m_triggered.stopping = false;
+        m_triggered.feedHoldStopping = false;
+        finishFeedHold();
     }
 
     void ProductionExecutorCore::completeTriggered(
@@ -1463,6 +1518,7 @@ namespace ngc {
                 ? BackendHoldReason::ControlledStop
                 : BackendHoldReason::StopBranch,
         });
+        resetFeedRetiming();
         release(*m_active);
         m_active.reset();
     }
