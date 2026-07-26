@@ -2596,8 +2596,12 @@ public:
             ngc::gui::machineSessionControls(simulation, m_simulation.homingAvailable());
         const auto otherMotion = !controls.canJog && !simulation.jogging;
         bool heldThisFrame = false;
+        const auto continuousJogLeaseSeconds =
+            m_pendantConfiguration.velocity.leaseDuration > 0.0
+                ? m_pendantConfiguration.velocity.leaseDuration : 0.020;
         const auto leaseTicks = static_cast<std::uint32_t>(std::max(
-            1.0, std::ceil(0.020 / m_simulationTiming.servoPeriod)
+            1.0, std::ceil(continuousJogLeaseSeconds
+                           / m_simulationTiming.servoPeriod)
                 * static_cast<double>(m_simulationTickMultiplier)));
         const auto submitDirection = [&](const std::string &label, const ngc::JogTarget target,
                                          const ngc::JogMotionLimits limits,

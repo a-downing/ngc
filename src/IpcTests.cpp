@@ -515,6 +515,83 @@ namespace {
                     == configuration->joints.size(),
                 "configured IPC Real homing should mark every joint homed");
 
+        const auto xAxis = std::ranges::find(
+            configuration->axes, ngc::Machine::Axis::X,
+            &ngc::AxisConfiguration::axis);
+        require(xAxis != configuration->axes.end(),
+                "configured IPC Real jog should find X");
+        const auto xJoint = std::ranges::find(
+            configuration->joints, xAxis->joints.front(),
+            &ngc::JointConfiguration::id);
+        require(xJoint != configuration->joints.end(),
+                "configured IPC Real jog should find the X joint");
+        const auto jogLeaseTicks = static_cast<std::uint32_t>(std::ceil(
+            configuration->pendant.velocity.leaseDuration
+            / configuration->simulation.servoPeriod));
+        constexpr ngc::JogId jog = 700;
+        const ngc::StartContinuousJogRequest jogRequest {
+            .id = 701,
+            .jog = jog,
+            .target = {
+                ngc::JogTargetType::JointGroup,
+                ngc::AxisId::X,
+                static_cast<ngc::JointMask>(
+                    ngc::JointMask {1} << xJoint->id),
+            },
+            .signedVelocity = -0.5,
+            .limits = {
+                xAxis->maxVelocity,
+                std::min(xAxis->maxAcceleration,
+                         configuration->jogging.acceleration),
+                std::min(xJoint->maxJerk, configuration->jogging.jerk),
+            },
+            .stopLimits = {
+                xAxis->maxVelocity,
+                xAxis->maxAcceleration,
+                xJoint->maxJerk,
+            },
+            .travel = {
+                xAxis->minimum,
+                xAxis->maximum,
+                true,
+            },
+            .leaseTicks = jogLeaseTicks,
+        };
+        require(manager.startJog(
+                    *realAuthority, ngc::ControlRequest {jogRequest}),
+                "configured IPC Real session should accept a post-home jog");
+        for (ngc::RequestId request = 702; request < 722; ++request) {
+            std::this_thread::sleep_for(5ms);
+            if (!manager.renewJog(*realAuthority, request, jog)) {
+                const auto failed = manager.snapshot();
+                require(false, std::format(
+                    "configured IPC Real session should queue post-home jog "
+                    "renewal {}, status={}, jogging={}, reason={}, error={}",
+                    request, static_cast<int>(failed.status), failed.jogging,
+                    failed.lastJogStopReason.has_value()
+                        ? static_cast<int>(*failed.lastJogStopReason) : -1,
+                    failed.error));
+            }
+        }
+        require(manager.stopJog(*realAuthority, 722, jog),
+                "configured IPC Real session should accept the post-home jog stop");
+        auto jogged = manager.snapshot();
+        for (auto attempt = 0; attempt < 10'000
+             && jogged.jogging
+             && jogged.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(1ms);
+            jogged = manager.snapshot();
+        }
+        require(jogged.status != ngc::SimulationStatus::Error,
+                jogged.error.empty()
+                    ? "configured IPC Real post-home jog should not fail"
+                    : jogged.error);
+        require(jogged.lastJogStopReason
+                    == ngc::JogStopReason::RequestedStop,
+                "configured IPC Real post-home jog should remain leased until stopped");
+        require(jogged.machinePosition.x < homed.machinePosition.x,
+                "configured IPC Real post-home jog should move X");
+
         auto simulationAuthority =
             manager.simulateFromReal(*realAuthority);
         require(simulationAuthority.has_value(),
