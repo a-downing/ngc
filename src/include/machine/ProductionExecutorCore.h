@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <limits>
 #include <optional>
+#include <type_traits>
 
 #include <ruckig/ruckig.hpp>
 
@@ -15,6 +16,21 @@
 #include "machine/SpscChannel.h"
 
 namespace ngc {
+    struct ProductionExecutorAxisMapping {
+        JointMask joints = 0;
+        JointVector coordinateScale{};
+    };
+
+    struct ProductionExecutorConfiguration {
+        std::array<
+            ProductionExecutorAxisMapping,
+            static_cast<std::size_t>(AxisId::C) + 1> axes{};
+        std::uint32_t maximumJogLeaseTicks =
+            std::numeric_limits<std::uint32_t>::max();
+    };
+    static_assert(
+        std::is_trivially_copyable_v<ProductionExecutorConfiguration>);
+
     class ProductionExecutorCore final : public MotionBackend {
     public:
         static constexpr std::size_t PLAN_CAPACITY = 8;
@@ -26,7 +42,9 @@ namespace ngc {
         static constexpr std::size_t DIGITAL_INPUT_CAPACITY =
             std::numeric_limits<DigitalInputId>::max() + std::size_t{1};
 
-        explicit ProductionExecutorCore(double servoPeriod);
+        explicit ProductionExecutorCore(
+            double servoPeriod,
+            ProductionExecutorConfiguration configuration = {});
 
         ProductionExecutorCore(const ProductionExecutorCore &) = delete;
         ProductionExecutorCore &operator=(const ProductionExecutorCore &) = delete;
@@ -78,6 +96,28 @@ namespace ngc {
             ruckig::Trajectory<1> trajectory;
         };
 
+        struct JogRuntime {
+            JogId id = 0;
+            JogTarget target{};
+            JogMotionLimits limits{};
+            JogMotionLimits stopLimits{};
+            JogTravelRange travel{};
+            JointVector jointOrigin{};
+            double axisOrigin = 0.0;
+            double position = 0.0;
+            double velocity = 0.0;
+            double acceleration = 0.0;
+            double elapsed = 0.0;
+            double cruiseVelocity = 0.0;
+            std::uint32_t leaseTicks = 0;
+            std::uint32_t leasePeriod = 0;
+            bool continuous = false;
+            bool cruising = false;
+            bool stopping = false;
+            JogStopReason stopReason = JogStopReason::RequestedStop;
+            ruckig::Trajectory<1> trajectory;
+        };
+
         static bool validExecutionItem(const ExecutionItem &item) noexcept;
         static bool validPlanChunk(const PlanChunk &chunk) noexcept;
         static bool validTriggeredMove(const TriggeredMove &move) noexcept;
@@ -110,6 +150,24 @@ namespace ngc {
                                           TriggeredJointRuntime &runtime) noexcept;
         void advanceTriggeredJoints(double &seconds) noexcept;
         void completeTriggeredJoints() noexcept;
+        [[nodiscard]] bool validJogTarget(const JogTarget &target) const noexcept;
+        static bool validJogLimits(const JogMotionLimits &limits) noexcept;
+        static bool validJogTravel(const JogTravelRange &travel) noexcept;
+        [[nodiscard]] JointMask axisJoints(AxisId axis) const noexcept;
+        [[nodiscard]] double jogCoordinate(const JogTarget &target) const noexcept;
+        [[nodiscard]] double jogVelocity(const JogTarget &target) const noexcept;
+        [[nodiscard]] double jogAcceleration(const JogTarget &target) const noexcept;
+        void applyJogState() noexcept;
+        bool calculateJogPosition(double distance, double velocity) noexcept;
+        bool calculateJogVelocity(double targetVelocity) noexcept;
+        bool initializeJog(const StartContinuousJogRequest &request) noexcept;
+        bool initializeJog(const StartIncrementalJogRequest &request) noexcept;
+        bool setContinuousJogVelocity(double signedVelocity) noexcept;
+        bool beginJogStop(JogStopReason reason) noexcept;
+        void advanceJog(double seconds) noexcept;
+        void completeJog() noexcept;
+        void abandonJog(JogStopReason reason) noexcept;
+        void faultJog() noexcept;
         void completeSpan() noexcept;
         void selectContinuationOrStop() noexcept;
         void emitExecutionMarkersThrough(double parameter) noexcept;
@@ -154,6 +212,9 @@ namespace ngc {
         std::atomic<std::uint32_t> m_queuedExecutionItems{0};
         ExecutionSnapshot m_snapshot;
         std::optional<std::uint8_t> m_active;
+        std::optional<JogRuntime> m_jog;
+        ProductionExecutorConfiguration m_configuration;
+        JointMask m_configuredJoints = 0;
         double m_servoPeriod;
         double m_spanElapsed = 0.0;
         std::uint32_t m_span = 0;

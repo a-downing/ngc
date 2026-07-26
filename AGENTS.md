@@ -59,15 +59,19 @@ implementation of the production-shaped backend contract.
 `ProductionExecutorCore` is the initial platform-independent, fixed-period,
 allocation-free execution core for normal `PlanChunk` motion, axis-space
 triggered moves, joint-space triggered moves, stop branches, markers,
-retirement, snapshots, and faults. Its hosting servo thread supplies sampled
-digital-input levels before each tick; the core detects configured levels or
-edges, debounces joint inputs, and generates jerk-limited independent triggered
-stops without importing hardware acquisition or synthetic input policy. The
-core also provides the executor mechanics needed by homing: same-epoch resume
-between triggered joint moves, stationary masked joint-coordinate assignment,
-and constrained controlled-stop cancellation of axis- and joint-space
-triggered moves. It does not yet execute jogging, ordinary-plan controlled
-stop, feed hold, or scheduled hardware events; it is not yet paired with
+retirement, snapshots, faults, and executor-owned jogging. Continuous and
+incremental jogs use a fixed-capacity logical-axis-to-joint mapping,
+jerk-limited scalar trajectories, token-matched velocity updates and stops,
+bounded dead-man leases, travel limits, and physical stop limits. Its hosting
+servo thread supplies sampled digital-input levels before each tick; the core
+detects configured levels or edges, debounces joint inputs, and generates
+jerk-limited independent triggered stops without importing hardware
+acquisition or synthetic input policy. The core also provides the executor
+mechanics needed by homing: same-epoch resume between triggered joint moves,
+stationary masked joint-coordinate assignment, and constrained controlled-stop
+cancellation of axis- and joint-space triggered moves. It does not yet execute
+ordinary-plan controlled stop, feed hold, or scheduled hardware events; it is
+not yet paired with
 `HomingController` through a production `BackendRuntime` host or hosted by the
 external process.
 There is no complete real-time executor,

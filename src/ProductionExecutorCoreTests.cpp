@@ -179,6 +179,38 @@ namespace {
         ngc::ExecutionSnapshot snapshot;
     };
 
+    struct JogRun {
+        std::vector<ngc::ExecutionEvent> events;
+        std::vector<ngc::ExecutionSnapshot> samples;
+        ngc::ExecutionSnapshot snapshot;
+    };
+
+    ngc::JogMotionLimits jogLimits() {
+        return {
+            .velocity = 0.5,
+            .acceleration = 1.0,
+            .jerk = 4.0,
+        };
+    }
+
+    JogRun runJogUntilHeld(ngc::ProductionExecutorCore &core,
+                           const std::size_t maximumTicks = 4'000) {
+        JogRun result;
+        for (std::size_t tick = 0; tick < maximumTicks; ++tick) {
+            core.servoTick();
+            auto current = takeEvents(core);
+            result.events.insert(
+                result.events.end(), current.begin(), current.end());
+            result.snapshot = latestSnapshot(core);
+            result.samples.push_back(result.snapshot);
+            if (result.snapshot.state == ngc::BackendState::Held) {
+                return result;
+            }
+        }
+
+        throw std::runtime_error("jog did not return to held");
+    }
+
     JointMoveRun runResumedJointMove(
         ngc::ProductionExecutorCore &core,
         const ngc::TriggeredJointMove &move,
@@ -953,6 +985,322 @@ namespace {
                     "axis controlled stop retained acceleration");
     }
 
+    void testIncrementalJointGroupJogReachesTarget() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        initialize(*core, 50);
+
+        const ngc::StartIncrementalJogRequest request{
+            .id = 10,
+            .jog = 101,
+            .target = {
+                .type = ngc::JogTargetType::JointGroup,
+                .joints = ngc::JointMask{1}
+                    | ngc::JointMask{1} << 1,
+            },
+            .distance = 0.25,
+            .velocity = 0.5,
+            .limits = jogLimits(),
+            .stopLimits = jogLimits(),
+        };
+        require(core->trySubmit(request) == ngc::SubmitResult::Submitted,
+                "incremental joint-group jog did not fit");
+
+        const auto run = runJogUntilHeld(*core);
+        const auto requests =
+            selectEvents<ngc::RequestCompleted>(run.events);
+        require(std::ranges::any_of(
+                    requests, [&](const auto &completed) {
+                        return completed.request == request.id
+                            && completed.succeeded;
+                    }),
+                "incremental joint-group jog was not acknowledged");
+        const auto stopped = selectEvents<ngc::JogStopped>(run.events);
+        require(stopped.size() == 1
+                    && stopped[0].jog == request.jog
+                    && stopped[0].reason
+                        == ngc::JogStopReason::TargetReached,
+                "incremental joint-group jog did not report target completion");
+        requireNear(run.snapshot.commandedJoints.position[0], 0.25,
+                    "incremental jog missed the first joint target");
+        requireNear(run.snapshot.commandedJoints.position[1], 0.25,
+                    "incremental jog missed the coupled joint target");
+        requireNear(run.snapshot.commandedJoints.velocity[0], 0.0,
+                    "incremental jog retained joint velocity");
+        requireNear(run.snapshot.commandedJoints.acceleration[1], 0.0,
+                    "incremental jog retained joint acceleration");
+        require(run.snapshot.activeJoints == 0,
+                "completed incremental jog retained active joints");
+
+        auto previousAcceleration = 0.0;
+        for (const auto &sample : run.samples) {
+            const auto velocity =
+                sample.commandedJoints.velocity[0];
+            const auto acceleration =
+                sample.commandedJoints.acceleration[0];
+            const auto jerk =
+                (acceleration - previousAcceleration) / 0.01;
+            require(std::abs(velocity) <= 0.5 + 1e-9,
+                    "incremental jog exceeded its velocity limit");
+            require(std::abs(acceleration) <= 1.0 + 1e-9,
+                    "incremental jog exceeded its acceleration limit");
+            require(std::abs(jerk) <= 4.0 + 1e-7,
+                    "incremental jog exceeded its jerk limit");
+            previousAcceleration = acceleration;
+        }
+    }
+
+    void testContinuousJogLeaseRenewalAndExpiry() {
+        ngc::ProductionExecutorConfiguration configuration;
+        configuration.maximumJogLeaseTicks = 8;
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(
+            0.01, configuration);
+        initialize(*core, 51);
+
+        const ngc::StartContinuousJogRequest request{
+            .id = 20,
+            .jog = 102,
+            .target = {
+                .type = ngc::JogTargetType::Joint,
+                .joints = ngc::JointMask{1},
+            },
+            .signedVelocity = 0.5,
+            .limits = jogLimits(),
+            .stopLimits = jogLimits(),
+            .leaseTicks = 100,
+        };
+        require(core->trySubmit(request) == ngc::SubmitResult::Submitted,
+                "continuous jog did not fit");
+
+        std::vector<ngc::ExecutionEvent> events;
+        for (auto tick = 0; tick < 5; ++tick) {
+            core->servoTick();
+            auto current = takeEvents(*core);
+            events.insert(events.end(), current.begin(), current.end());
+            latestSnapshot(*core);
+        }
+        require(core->trySubmit(
+                    ngc::RenewJogLeaseRequest{21, request.jog})
+                    == ngc::SubmitResult::Submitted,
+                "jog lease renewal did not fit");
+        for (auto tick = 0; tick < 5; ++tick) {
+            core->servoTick();
+            auto current = takeEvents(*core);
+            events.insert(events.end(), current.begin(), current.end());
+            const auto snapshot = latestSnapshot(*core);
+            require(snapshot.state == ngc::BackendState::Running,
+                    "renewed jog lease expired at its original deadline");
+        }
+
+        auto run = runJogUntilHeld(*core);
+        events.insert(
+            events.end(), run.events.begin(), run.events.end());
+        const auto requests =
+            selectEvents<ngc::RequestCompleted>(events);
+        require(std::ranges::any_of(
+                    requests, [](const auto &completed) {
+                        return completed.request == 21
+                            && completed.succeeded;
+                    }),
+                "matching jog lease renewal was not acknowledged");
+        const auto stopped = selectEvents<ngc::JogStopped>(events);
+        require(stopped.size() == 1
+                    && stopped[0].reason
+                        == ngc::JogStopReason::LeaseExpired,
+                "unrenewed continuous jog did not stop on lease expiry");
+        require(run.snapshot.commandedJoints.position[0] > 0.0,
+                "lease-expired jog did not advance the selected joint");
+        requireNear(run.snapshot.commandedJoints.velocity[0], 0.0,
+                    "lease-expired jog retained velocity");
+        requireNear(run.snapshot.commandedJoints.acceleration[0], 0.0,
+                    "lease-expired jog retained acceleration");
+    }
+
+    void testContinuousJogVelocityUpdateAndTokenMatchedStop() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        initialize(*core, 52);
+
+        const ngc::StartContinuousJogRequest request{
+            .id = 30,
+            .jog = 103,
+            .target = {
+                .type = ngc::JogTargetType::Joint,
+                .joints = ngc::JointMask{1},
+            },
+            .signedVelocity = 0.5,
+            .limits = jogLimits(),
+            .stopLimits = jogLimits(),
+            .leaseTicks = 2'000,
+        };
+        require(core->trySubmit(request) == ngc::SubmitResult::Submitted,
+                "velocity jog did not fit");
+
+        std::vector<ngc::ExecutionEvent> events;
+        auto snapshot = ngc::ExecutionSnapshot{};
+        for (auto tick = 0; tick < 100; ++tick) {
+            core->servoTick();
+            auto current = takeEvents(*core);
+            events.insert(events.end(), current.begin(), current.end());
+            snapshot = latestSnapshot(*core);
+        }
+        require(snapshot.commandedJoints.velocity[0] > 0.0,
+                "continuous jog did not establish positive motion");
+        require(core->trySubmit(
+                    ngc::SetContinuousJogVelocityRequest{
+                        31, request.jog, -0.25})
+                    == ngc::SubmitResult::Submitted,
+                "continuous jog velocity update did not fit");
+
+        auto reversed = false;
+        for (auto tick = 0; tick < 300; ++tick) {
+            core->servoTick();
+            auto current = takeEvents(*core);
+            events.insert(events.end(), current.begin(), current.end());
+            snapshot = latestSnapshot(*core);
+            if (snapshot.commandedJoints.velocity[0] < -0.1) {
+                reversed = true;
+                break;
+            }
+        }
+        require(reversed,
+                "continuous jog did not recompute through a reversal");
+        require(core->trySubmit(
+                    ngc::StopJogRequest{32, request.jog + 1})
+                    == ngc::SubmitResult::Submitted,
+                "stale jog stop did not fit");
+        require(core->trySubmit(
+                    ngc::StopJogRequest{33, request.jog})
+                    == ngc::SubmitResult::Submitted,
+                "matching jog stop did not fit");
+
+        auto run = runJogUntilHeld(*core);
+        events.insert(
+            events.end(), run.events.begin(), run.events.end());
+        const auto requests =
+            selectEvents<ngc::RequestCompleted>(events);
+        require(std::ranges::any_of(
+                    requests, [](const auto &completed) {
+                        return completed.request == 31
+                            && completed.succeeded;
+                    }),
+                "velocity update was not acknowledged");
+        require(std::ranges::any_of(
+                    requests, [](const auto &completed) {
+                        return completed.request == 32
+                            && !completed.succeeded;
+                    }),
+                "stale jog token stopped the active jog");
+        require(std::ranges::any_of(
+                    requests, [](const auto &completed) {
+                        return completed.request == 33
+                            && completed.succeeded;
+                    }),
+                "matching jog stop was not acknowledged");
+        const auto stopped = selectEvents<ngc::JogStopped>(events);
+        require(stopped.size() == 1
+                    && stopped[0].jog == request.jog
+                    && stopped[0].reason
+                        == ngc::JogStopReason::RequestedStop,
+                "token-matched stop did not complete exactly one jog");
+        requireNear(run.snapshot.commandedJoints.velocity[0], 0.0,
+                    "requested jog stop retained velocity");
+        requireNear(run.snapshot.commandedJoints.acceleration[0], 0.0,
+                    "requested jog stop retained acceleration");
+    }
+
+    void testLogicalAxisJogUpdatesMappedJoints() {
+        ngc::ProductionExecutorConfiguration configuration;
+        auto &x = configuration.axes[
+            static_cast<std::size_t>(ngc::AxisId::X)];
+        x.joints = ngc::JointMask{1} | ngc::JointMask{1} << 1;
+        x.coordinateScale[0] = 1.0;
+        x.coordinateScale[1] = -1.0;
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(
+            0.01, configuration);
+        initialize(*core, 53);
+        ngc::JointVector jointPosition;
+        jointPosition[0] = 1.0;
+        jointPosition[1] = -1.0;
+        require(core->trySubmit(ngc::SetJointPositionRequest{
+                    39, x.joints, jointPosition})
+                    == ngc::SubmitResult::Submitted,
+                "logical-axis joint origin assignment did not fit");
+        core->servoTick();
+        takeEvents(*core);
+        latestSnapshot(*core);
+
+        const ngc::StartIncrementalJogRequest request{
+            .id = 40,
+            .jog = 104,
+            .target = {
+                .type = ngc::JogTargetType::Axis,
+                .axis = ngc::AxisId::X,
+            },
+            .distance = 0.2,
+            .velocity = 0.5,
+            .limits = jogLimits(),
+            .stopLimits = jogLimits(),
+        };
+        require(core->trySubmit(request) == ngc::SubmitResult::Submitted,
+                "logical-axis jog did not fit");
+
+        const auto run = runJogUntilHeld(*core);
+        const auto stopped =
+            selectEvents<ngc::JogStopped>(run.events);
+        require(stopped.size() == 1
+                    && stopped[0].reason
+                        == ngc::JogStopReason::TargetReached,
+                "logical-axis jog did not complete");
+        requireNear(run.snapshot.commanded.position.x, 0.2,
+                    "logical-axis jog missed its coordinate target");
+        requireNear(run.snapshot.commandedJoints.position[0], 1.2,
+                    "logical-axis jog did not preserve the first joint offset");
+        requireNear(run.snapshot.commandedJoints.position[1], -1.2,
+                    "logical-axis jog did not preserve the second joint offset");
+        requireNear(run.snapshot.commandedJoints.velocity[0], 0.0,
+                    "logical-axis jog retained mapped joint velocity");
+        requireNear(run.snapshot.commandedJoints.acceleration[1], 0.0,
+                    "logical-axis jog retained mapped joint acceleration");
+    }
+
+    void testContinuousJogStopsAtTravelLimit() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        initialize(*core, 54);
+
+        const ngc::StartContinuousJogRequest request{
+            .id = 50,
+            .jog = 105,
+            .target = {
+                .type = ngc::JogTargetType::Joint,
+                .joints = ngc::JointMask{1},
+            },
+            .signedVelocity = 0.5,
+            .limits = jogLimits(),
+            .stopLimits = jogLimits(),
+            .travel = {
+                .minimum = -0.1,
+                .maximum = 0.1,
+                .enabled = true,
+            },
+            .leaseTicks = 1'000,
+        };
+        require(core->trySubmit(request) == ngc::SubmitResult::Submitted,
+                "travel-limited jog did not fit");
+
+        const auto run = runJogUntilHeld(*core);
+        const auto stopped =
+            selectEvents<ngc::JogStopped>(run.events);
+        require(stopped.size() == 1
+                    && stopped[0].reason
+                        == ngc::JogStopReason::LimitReached,
+                "continuous jog did not report its travel limit");
+        requireNear(run.snapshot.commandedJoints.position[0], 0.1,
+                    "continuous jog crossed or missed its travel limit");
+        requireNear(run.snapshot.commandedJoints.velocity[0], 0.0,
+                    "travel-limited jog retained velocity");
+        requireNear(run.snapshot.commandedJoints.acceleration[0], 0.0,
+                    "travel-limited jog retained acceleration");
+    }
+
     void testBoundedAndExplicitlyUnsupportedInputs() {
         auto rejectedPeriod = false;
         try {
@@ -964,6 +1312,20 @@ namespace {
         }
         require(rejectedPeriod,
                 "executor accepted a non-positive fixed servo period");
+
+        auto rejectedMapping = false;
+        try {
+            ngc::ProductionExecutorConfiguration configuration;
+            configuration.axes[0].joints = ngc::JointMask{1};
+            const auto invalid =
+                std::make_unique<ngc::ProductionExecutorCore>(
+                    0.001, configuration);
+            static_cast<void>(invalid);
+        } catch (const std::invalid_argument &) {
+            rejectedMapping = true;
+        }
+        require(rejectedMapping,
+                "executor accepted an axis mapping with a zero joint scale");
 
         auto core = std::make_unique<ngc::ProductionExecutorCore>(0.001);
 
@@ -1001,6 +1363,33 @@ namespace {
                 "scheduled event fixture did not fit");
         require(core->tryPublish(scheduled) == ngc::PublishResult::Invalid,
                 "initial production core silently accepted a hardware event");
+
+        initialize(*core, 1);
+        const ngc::StartIncrementalJogRequest unsupportedAxis{
+            .id = 100,
+            .jog = 1,
+            .target = {
+                .type = ngc::JogTargetType::Axis,
+                .axis = ngc::AxisId::X,
+            },
+            .distance = 0.1,
+            .velocity = 0.1,
+            .limits = jogLimits(),
+            .stopLimits = jogLimits(),
+        };
+        require(core->trySubmit(unsupportedAxis)
+                    == ngc::SubmitResult::Submitted,
+                "unconfigured axis jog did not fit for rejection");
+        core->servoTick();
+        const auto unsupportedEvents = takeEvents(*core);
+        latestSnapshot(*core);
+        const auto unsupportedRequests =
+            selectEvents<ngc::RequestCompleted>(unsupportedEvents);
+        require(unsupportedRequests.size() == 1
+                    && unsupportedRequests[0].request
+                        == unsupportedAxis.id
+                    && !unsupportedRequests[0].succeeded,
+                "executor accepted an unconfigured logical-axis jog");
 
         auto invalidCoefficient =
             linearChunk(1, 2, 0, 2, 3, 0.0, 1.0, 1.0);
@@ -1062,6 +1451,11 @@ int main() {
         testHomingControlSequence();
         testControlledStopAbortsTriggeredJointMove();
         testControlledStopAbortsAxisTriggeredMove();
+        testIncrementalJointGroupJogReachesTarget();
+        testContinuousJogLeaseRenewalAndExpiry();
+        testContinuousJogVelocityUpdateAndTokenMatchedStop();
+        testLogicalAxisJogUpdatesMappedJoints();
+        testContinuousJogStopsAtTravelLimit();
         testBoundedAndExplicitlyUnsupportedInputs();
     } catch (const std::exception &error) {
         std::cerr << "Production executor core test failure: "

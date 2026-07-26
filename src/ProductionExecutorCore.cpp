@@ -12,6 +12,7 @@ namespace ngc {
     namespace {
         constexpr std::uint32_t EVENT_OVERFLOW_FAULT = 1;
         constexpr std::uint32_t INVALID_EXECUTION_STATE_FAULT = 2;
+        constexpr std::uint32_t JOG_GENERATION_FAULT = 3;
 
         bool zeroHighCubicControls(const AxisPolynomialSpan &span) noexcept {
             return span.coefficients[3].length() == 0.0
@@ -65,13 +66,64 @@ namespace ngc {
 
             return false;
         }
+
+        double &axisComponent(position_t &position,
+                              const AxisId axis) noexcept {
+            switch (axis) {
+                case AxisId::X: return position.x;
+                case AxisId::Y: return position.y;
+                case AxisId::Z: return position.z;
+                case AxisId::A: return position.a;
+                case AxisId::B: return position.b;
+                case AxisId::C: return position.c;
+            }
+
+            return position.x;
+        }
+
+        double axisComponent(const position_t &position,
+                             const AxisId axis) noexcept {
+            auto copy = position;
+
+            return axisComponent(copy, axis);
+        }
     }
 
-    ProductionExecutorCore::ProductionExecutorCore(const double servoPeriod)
-        : m_servoPeriod(servoPeriod) {
+    ProductionExecutorCore::ProductionExecutorCore(
+        const double servoPeriod,
+        ProductionExecutorConfiguration configuration)
+        : m_configuration(std::move(configuration)),
+          m_servoPeriod(servoPeriod) {
         if (!std::isfinite(servoPeriod) || servoPeriod <= 0.0) {
             throw std::invalid_argument(
                 "production executor servo period must be finite and positive");
+        }
+        if (m_configuration.maximumJogLeaseTicks == 0) {
+            throw std::invalid_argument(
+                "production executor maximum jog lease must be positive");
+        }
+
+        constexpr auto validJointMask =
+            static_cast<JointMask>((JointMask{1} << MAX_JOINTS) - 1);
+        for (const auto &axis : m_configuration.axes) {
+            if ((axis.joints & ~validJointMask) != 0
+                || (axis.joints & m_configuredJoints) != 0) {
+                throw std::invalid_argument(
+                    "production executor axis mappings must contain "
+                    "distinct valid joints");
+            }
+            for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+                const auto mask =
+                    static_cast<JointMask>(JointMask{1} << joint);
+                if ((axis.joints & mask) != 0
+                    && (!std::isfinite(axis.coordinateScale[joint])
+                        || std::abs(axis.coordinateScale[joint]) <= 1e-12)) {
+                    throw std::invalid_argument(
+                        "production executor axis mapping scales must be "
+                        "finite and nonzero");
+                }
+            }
+            m_configuredJoints |= axis.joints;
         }
     }
 
@@ -127,6 +179,9 @@ namespace ngc {
     void ProductionExecutorCore::restoreStationaryState(
         const MotionState &commanded, const MotionState &feedback) noexcept {
         discardExecution();
+        if (m_jog.has_value()) {
+            m_jog.reset();
+        }
 
         ControlRequest control;
         while (m_controls.tryPop(control)) { }
@@ -152,10 +207,12 @@ namespace ngc {
 
         if (m_snapshot.state == BackendState::Running
             || m_snapshot.state == BackendState::Holding) {
-            if (!m_active.has_value()) {
+            if (m_jog.has_value()) {
+                advanceJog(m_servoPeriod);
+            } else if (!m_active.has_value()) {
                 activateNext();
             }
-            if (m_active.has_value()
+            if (!m_jog.has_value() && m_active.has_value()
                 && (m_snapshot.state == BackendState::Running
                     || m_snapshot.state == BackendState::Holding)) {
                 advanceActive(m_servoPeriod);
@@ -370,28 +427,38 @@ namespace ngc {
                 using T = std::decay_t<decltype(value)>;
                 auto success = false;
                 if constexpr (std::same_as<T, EnableRequest>) {
-                    success = m_snapshot.state == BackendState::Disabled
-                        || m_snapshot.state == BackendState::Held;
+                    success = !m_jog.has_value()
+                        && (m_snapshot.state == BackendState::Disabled
+                            || m_snapshot.state == BackendState::Held);
                     if (success) {
                         m_snapshot.state = BackendState::Held;
                         m_snapshot.faultCode = 0;
                         m_faultEventEmitted = false;
                     }
                 } else if constexpr (std::same_as<T, DisableRequest>) {
+                    if (m_jog.has_value()) {
+                        abandonJog(JogStopReason::Disabled);
+                    }
                     discardExecution();
                     m_snapshot.state = BackendState::Disabled;
                     m_snapshot.commanded.velocity = {};
                     m_snapshot.commanded.acceleration = {};
                     m_snapshot.feedback = m_snapshot.commanded;
+                    m_snapshot.commandedJoints.velocity = {};
+                    m_snapshot.commandedJoints.acceleration = {};
+                    m_snapshot.feedbackJoints =
+                        m_snapshot.commandedJoints;
                     success = true;
                 } else if constexpr (std::same_as<T, StartRequest>) {
-                    success = m_snapshot.state == BackendState::Held
+                    success = !m_jog.has_value()
+                        && m_snapshot.state == BackendState::Held
                         && value.epoch != 0 && value.epoch == m_snapshot.epoch;
                     if (success) {
                         m_snapshot.state = BackendState::Running;
                     }
                 } else if constexpr (std::same_as<T, ResumeRequest>) {
-                    success = m_snapshot.state == BackendState::Held
+                    success = !m_jog.has_value()
+                        && m_snapshot.state == BackendState::Held
                         && !m_active.has_value() && value.epoch != 0
                         && value.epoch == m_snapshot.epoch
                         && m_queuedExecutionItems.load(
@@ -400,9 +467,15 @@ namespace ngc {
                         m_snapshot.state = BackendState::Running;
                     }
                 } else if constexpr (std::same_as<T, ControlledStopRequest>) {
-                    success = m_snapshot.state == BackendState::Running
-                        && m_active.has_value();
-                    if (success
+                    const auto stoppingJog = m_jog.has_value();
+                    if (stoppingJog) {
+                        success =
+                            beginJogStop(JogStopReason::RequestedStop);
+                    } else {
+                        success = m_snapshot.state == BackendState::Running
+                            && m_active.has_value();
+                    }
+                    if (success && !stoppingJog
                         && std::holds_alternative<TriggeredMove>(
                             m_planSlots[*m_active].item)) {
                         if (m_triggered.stopping) {
@@ -412,7 +485,7 @@ namespace ngc {
                             success = false;
                             faultTriggered();
                         }
-                    } else if (success
+                    } else if (success && !stoppingJog
                                && std::holds_alternative<TriggeredJointMove>(
                                    m_planSlots[*m_active].item)) {
                         const auto &move = activeTriggeredJointMove();
@@ -433,20 +506,27 @@ namespace ngc {
                                 break;
                             }
                         }
-                    } else {
+                    } else if (!stoppingJog) {
                         success = false;
                     }
-                    if (success) {
+                    if (success && !stoppingJog) {
                         m_snapshot.state = BackendState::Holding;
                     }
                 } else if constexpr (std::same_as<T, AbortRequest>) {
-                    discardExecution();
-                    m_snapshot.state = BackendState::Held;
-                    m_snapshot.commanded.velocity = {};
-                    m_snapshot.commanded.acceleration = {};
-                    m_snapshot.feedback = m_snapshot.commanded;
-                    success = true;
+                    if (m_jog.has_value()) {
+                        success = beginJogStop(JogStopReason::Aborted);
+                    } else {
+                        discardExecution();
+                        m_snapshot.state = BackendState::Held;
+                        m_snapshot.commanded.velocity = {};
+                        m_snapshot.commanded.acceleration = {};
+                        m_snapshot.feedback = m_snapshot.commanded;
+                        success = true;
+                    }
                 } else if constexpr (std::same_as<T, ResetRequest>) {
+                    if (m_jog.has_value()) {
+                        abandonJog(JogStopReason::Aborted);
+                    }
                     discardExecution();
                     const auto commanded = m_snapshot.commanded;
                     const auto feedback = m_snapshot.feedback;
@@ -464,7 +544,8 @@ namespace ngc {
                     constexpr auto validJointMask =
                         static_cast<JointMask>(
                             (JointMask{1} << MAX_JOINTS) - 1);
-                    success = m_snapshot.state == BackendState::Held
+                    success = !m_jog.has_value()
+                        && m_snapshot.state == BackendState::Held
                         && !m_active.has_value() && value.joints != 0
                         && (value.joints & ~validJointMask) == 0;
                     for (JointId joint = 0;
@@ -494,6 +575,24 @@ namespace ngc {
                         m_snapshot.feedbackJoints =
                             m_snapshot.commandedJoints;
                     }
+                } else if constexpr (
+                    std::same_as<T, StartContinuousJogRequest>
+                    || std::same_as<T, StartIncrementalJogRequest>) {
+                    success = initializeJog(value);
+                } else if constexpr (
+                    std::same_as<T, RenewJogLeaseRequest>) {
+                    success = m_jog.has_value() && m_jog->continuous
+                        && !m_jog->stopping && m_jog->id == value.jog;
+                    if (success) {
+                        m_jog->leaseTicks = m_jog->leasePeriod;
+                    }
+                } else if constexpr (
+                    std::same_as<T, SetContinuousJogVelocityRequest>) {
+                    success = m_jog.has_value() && m_jog->id == value.jog
+                        && setContinuousJogVelocity(value.signedVelocity);
+                } else if constexpr (std::same_as<T, StopJogRequest>) {
+                    success = m_jog.has_value() && m_jog->id == value.jog
+                        && beginJogStop(JogStopReason::RequestedStop);
                 }
 
                 emit(RequestCompleted{value.id, success});
@@ -1017,6 +1116,484 @@ namespace ngc {
         });
         release(*m_active);
         m_active.reset();
+    }
+
+    bool ProductionExecutorCore::validJogTarget(
+        const JogTarget &target) const noexcept {
+        constexpr auto validJointMask =
+            static_cast<JointMask>((JointMask{1} << MAX_JOINTS) - 1);
+        if ((target.joints & ~validJointMask) != 0) {
+            return false;
+        }
+        if (target.type == JogTargetType::Axis) {
+            return target.joints == 0 && axisJoints(target.axis) != 0;
+        }
+        if (target.joints == 0
+            || (m_configuredJoints != 0
+                && (target.joints & ~m_configuredJoints) != 0)) {
+            return false;
+        }
+        if (target.type == JogTargetType::Joint) {
+            return (target.joints & (target.joints - 1)) == 0;
+        }
+
+        return target.type == JogTargetType::JointGroup;
+    }
+
+    bool ProductionExecutorCore::validJogLimits(
+        const JogMotionLimits &limits) noexcept {
+        return std::isfinite(limits.velocity) && limits.velocity > 0.0
+            && std::isfinite(limits.acceleration)
+            && limits.acceleration > 0.0
+            && std::isfinite(limits.jerk) && limits.jerk > 0.0;
+    }
+
+    bool ProductionExecutorCore::validJogTravel(
+        const JogTravelRange &travel) noexcept {
+        return !travel.enabled
+            || (std::isfinite(travel.minimum)
+                && std::isfinite(travel.maximum)
+                && travel.minimum <= travel.maximum);
+    }
+
+    JointMask ProductionExecutorCore::axisJoints(
+        const AxisId axis) const noexcept {
+        const auto index = static_cast<std::size_t>(axis);
+        if (index >= m_configuration.axes.size()) {
+            return 0;
+        }
+
+        return m_configuration.axes[index].joints;
+    }
+
+    double ProductionExecutorCore::jogCoordinate(
+        const JogTarget &target) const noexcept {
+        if (target.type == JogTargetType::Axis) {
+            return axisComponent(m_snapshot.commanded.position, target.axis);
+        }
+        for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+            if ((target.joints & (JointMask{1} << joint)) != 0) {
+                return m_snapshot.commandedJoints.position[joint];
+            }
+        }
+
+        return 0.0;
+    }
+
+    double ProductionExecutorCore::jogVelocity(
+        const JogTarget &target) const noexcept {
+        if (target.type == JogTargetType::Axis) {
+            return axisComponent(m_snapshot.commanded.velocity, target.axis);
+        }
+        for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+            if ((target.joints & (JointMask{1} << joint)) != 0) {
+                return m_snapshot.commandedJoints.velocity[joint];
+            }
+        }
+
+        return 0.0;
+    }
+
+    double ProductionExecutorCore::jogAcceleration(
+        const JogTarget &target) const noexcept {
+        if (target.type == JogTargetType::Axis) {
+            return axisComponent(
+                m_snapshot.commanded.acceleration, target.axis);
+        }
+        for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+            if ((target.joints & (JointMask{1} << joint)) != 0) {
+                return m_snapshot.commandedJoints.acceleration[joint];
+            }
+        }
+
+        return 0.0;
+    }
+
+    void ProductionExecutorCore::applyJogState() noexcept {
+        const auto &jog = *m_jog;
+        if (jog.target.type == JogTargetType::Axis) {
+            axisComponent(m_snapshot.commanded.position, jog.target.axis) =
+                jog.axisOrigin + jog.position;
+            axisComponent(m_snapshot.commanded.velocity, jog.target.axis) =
+                jog.velocity;
+            axisComponent(
+                m_snapshot.commanded.acceleration, jog.target.axis) =
+                jog.acceleration;
+            m_snapshot.feedback = m_snapshot.commanded;
+
+            const auto &mapping = m_configuration.axes[
+                static_cast<std::size_t>(jog.target.axis)];
+            for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+                const auto mask =
+                    static_cast<JointMask>(JointMask{1} << joint);
+                if ((mapping.joints & mask) == 0) {
+                    continue;
+                }
+                m_snapshot.commandedJoints.position[joint] =
+                    jog.jointOrigin[joint]
+                    + jog.position * mapping.coordinateScale[joint];
+                m_snapshot.commandedJoints.velocity[joint] =
+                    jog.velocity * mapping.coordinateScale[joint];
+                m_snapshot.commandedJoints.acceleration[joint] =
+                    jog.acceleration * mapping.coordinateScale[joint];
+            }
+            m_snapshot.feedbackJoints = m_snapshot.commandedJoints;
+
+            return;
+        }
+
+        for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+            const auto mask =
+                static_cast<JointMask>(JointMask{1} << joint);
+            if ((jog.target.joints & mask) == 0) {
+                continue;
+            }
+            m_snapshot.commandedJoints.position[joint] =
+                jog.jointOrigin[joint] + jog.position;
+            m_snapshot.commandedJoints.velocity[joint] = jog.velocity;
+            m_snapshot.commandedJoints.acceleration[joint] =
+                jog.acceleration;
+        }
+        m_snapshot.feedbackJoints = m_snapshot.commandedJoints;
+    }
+
+    bool ProductionExecutorCore::calculateJogPosition(
+        const double distance, const double velocity) noexcept {
+        auto &jog = *m_jog;
+        ruckig::InputParameter<1> input;
+        input.current_position = {jog.position};
+        input.current_velocity = {jog.velocity};
+        input.current_acceleration = {jog.acceleration};
+        input.target_position = {distance};
+        input.target_velocity = {0.0};
+        input.target_acceleration = {0.0};
+        input.max_velocity = {
+            std::max(
+                std::min(velocity, jog.limits.velocity),
+                std::abs(jog.velocity)),
+        };
+        input.max_acceleration = {jog.limits.acceleration};
+        input.max_jerk = {jog.limits.jerk};
+        ruckig::Ruckig<1> generator;
+
+        return generator.calculate(input, jog.trajectory)
+            == ruckig::Result::Working;
+    }
+
+    bool ProductionExecutorCore::calculateJogVelocity(
+        const double targetVelocity) noexcept {
+        auto &jog = *m_jog;
+        const auto &limits = jog.stopping
+            ? jog.stopLimits : jog.limits;
+        ruckig::InputParameter<1> input;
+        input.control_interface = ruckig::ControlInterface::Velocity;
+        input.current_position = {jog.position};
+        input.current_velocity = {jog.velocity};
+        input.current_acceleration = {jog.acceleration};
+        input.target_position = {jog.position};
+        input.target_velocity = {targetVelocity};
+        input.target_acceleration = {0.0};
+        input.max_velocity = {
+            std::max(limits.velocity, std::abs(jog.velocity)),
+        };
+        input.max_acceleration = {limits.acceleration};
+        input.max_jerk = {limits.jerk};
+        ruckig::Ruckig<1> generator;
+
+        return generator.calculate(input, jog.trajectory)
+            == ruckig::Result::Working;
+    }
+
+    bool ProductionExecutorCore::initializeJog(
+        const StartContinuousJogRequest &request) noexcept {
+        if (m_snapshot.state != BackendState::Held
+            || m_active.has_value() || m_jog.has_value()
+            || request.jog == 0 || !validJogTarget(request.target)
+            || !validJogLimits(request.limits)
+            || !validJogLimits(request.stopLimits)
+            || !validJogTravel(request.travel)
+            || !std::isfinite(request.signedVelocity)
+            || std::abs(request.signedVelocity) <= 1e-12
+            || request.leaseTicks == 0) {
+            return false;
+        }
+
+        const auto coordinate = jogCoordinate(request.target);
+        if (request.travel.enabled
+            && (coordinate < request.travel.minimum - 1e-12
+                || coordinate > request.travel.maximum + 1e-12)) {
+            return false;
+        }
+
+        m_jog.emplace();
+        auto &jog = *m_jog;
+        jog.id = request.jog;
+        jog.target = request.target;
+        jog.limits = request.limits;
+        jog.stopLimits = request.stopLimits;
+        jog.travel = request.travel;
+        jog.axisOrigin = coordinate;
+        jog.jointOrigin = m_snapshot.commandedJoints.position;
+        jog.velocity = jogVelocity(request.target);
+        jog.acceleration = jogAcceleration(request.target);
+        jog.continuous = true;
+        jog.leasePeriod = std::min(
+            request.leaseTicks,
+            m_configuration.maximumJogLeaseTicks);
+        jog.leaseTicks = jog.leasePeriod;
+        jog.cruiseVelocity = std::clamp(
+            request.signedVelocity, -jog.limits.velocity,
+            jog.limits.velocity);
+
+        auto calculated = false;
+        if (jog.travel.enabled) {
+            const auto target = jog.cruiseVelocity < 0.0
+                ? jog.travel.minimum : jog.travel.maximum;
+            const auto distance = target - coordinate;
+            calculated = std::abs(distance) > 1e-12
+                && ((jog.cruiseVelocity < 0.0 && distance < 0.0)
+                    || (jog.cruiseVelocity > 0.0 && distance > 0.0))
+                && calculateJogPosition(
+                    distance, std::abs(jog.cruiseVelocity));
+        } else {
+            calculated = calculateJogVelocity(jog.cruiseVelocity);
+        }
+        if (!calculated) {
+            m_jog.reset();
+
+            return false;
+        }
+
+        m_snapshot.state = BackendState::Running;
+        m_snapshot.activeJoints = request.target.type == JogTargetType::Axis
+            ? axisJoints(request.target.axis) : request.target.joints;
+
+        return true;
+    }
+
+    bool ProductionExecutorCore::initializeJog(
+        const StartIncrementalJogRequest &request) noexcept {
+        if (m_snapshot.state != BackendState::Held
+            || m_active.has_value() || m_jog.has_value()
+            || request.jog == 0 || !validJogTarget(request.target)
+            || !validJogLimits(request.limits)
+            || !validJogLimits(request.stopLimits)
+            || !validJogTravel(request.travel)
+            || !std::isfinite(request.distance)
+            || std::abs(request.distance) <= 1e-12
+            || !std::isfinite(request.velocity)
+            || request.velocity <= 0.0) {
+            return false;
+        }
+
+        const auto coordinate = jogCoordinate(request.target);
+        if (request.travel.enabled
+            && (coordinate < request.travel.minimum - 1e-12
+                || coordinate > request.travel.maximum + 1e-12)) {
+            return false;
+        }
+        auto distance = request.distance;
+        if (request.travel.enabled) {
+            distance = std::clamp(
+                coordinate + distance, request.travel.minimum,
+                request.travel.maximum) - coordinate;
+        }
+        if (std::abs(distance) <= 1e-12) {
+            return false;
+        }
+
+        m_jog.emplace();
+        auto &jog = *m_jog;
+        jog.id = request.jog;
+        jog.target = request.target;
+        jog.limits = request.limits;
+        jog.stopLimits = request.stopLimits;
+        jog.travel = request.travel;
+        jog.axisOrigin = coordinate;
+        jog.jointOrigin = m_snapshot.commandedJoints.position;
+        jog.velocity = jogVelocity(request.target);
+        jog.acceleration = jogAcceleration(request.target);
+        if (!calculateJogPosition(distance, request.velocity)) {
+            m_jog.reset();
+
+            return false;
+        }
+
+        m_snapshot.state = BackendState::Running;
+        m_snapshot.activeJoints = request.target.type == JogTargetType::Axis
+            ? axisJoints(request.target.axis) : request.target.joints;
+
+        return true;
+    }
+
+    bool ProductionExecutorCore::setContinuousJogVelocity(
+        const double signedVelocity) noexcept {
+        if (!m_jog.has_value() || !m_jog->continuous
+            || m_jog->stopping || !std::isfinite(signedVelocity)
+            || std::abs(signedVelocity) <= 1e-12) {
+            return false;
+        }
+
+        auto &jog = *m_jog;
+        jog.cruiseVelocity = std::clamp(
+            signedVelocity, -jog.limits.velocity, jog.limits.velocity);
+        auto calculated = false;
+        if (jog.travel.enabled) {
+            const auto coordinate = jog.axisOrigin + jog.position;
+            const auto target = jog.cruiseVelocity < 0.0
+                ? jog.travel.minimum : jog.travel.maximum;
+            const auto distance = target - jog.axisOrigin;
+            calculated =
+                ((jog.cruiseVelocity < 0.0 && target < coordinate - 1e-12)
+                    || (jog.cruiseVelocity > 0.0
+                        && target > coordinate + 1e-12))
+                && calculateJogPosition(
+                    distance, std::abs(jog.cruiseVelocity));
+        } else {
+            calculated = calculateJogVelocity(jog.cruiseVelocity);
+        }
+        if (!calculated) {
+            return false;
+        }
+
+        jog.elapsed = 0.0;
+        jog.cruising = false;
+        jog.leaseTicks = jog.leasePeriod;
+
+        return true;
+    }
+
+    bool ProductionExecutorCore::beginJogStop(
+        const JogStopReason reason) noexcept {
+        if (!m_jog.has_value() || m_jog->stopping) {
+            return false;
+        }
+
+        auto &jog = *m_jog;
+        jog.stopping = true;
+        jog.cruising = false;
+        jog.stopReason = reason;
+        jog.elapsed = 0.0;
+        if (std::abs(jog.velocity) <= 1e-12
+            && std::abs(jog.acceleration) <= 1e-12) {
+            jog.velocity = 0.0;
+            jog.acceleration = 0.0;
+            applyJogState();
+            completeJog();
+
+            return true;
+        }
+        if (!calculateJogVelocity(0.0)) {
+            faultJog();
+
+            return false;
+        }
+
+        return true;
+    }
+
+    void ProductionExecutorCore::advanceJog(const double seconds) noexcept {
+        if (!m_jog.has_value() || seconds <= 0.0) {
+            return;
+        }
+        if (m_jog->continuous && !m_jog->stopping
+            && m_jog->leaseTicks != 0) {
+            --m_jog->leaseTicks;
+            if (m_jog->leaseTicks == 0
+                && !beginJogStop(JogStopReason::LeaseExpired)) {
+                return;
+            }
+            if (!m_jog.has_value()) {
+                return;
+            }
+        }
+
+        auto &jog = *m_jog;
+        if (jog.cruising) {
+            jog.position += jog.cruiseVelocity * seconds;
+            jog.velocity = jog.cruiseVelocity;
+            jog.acceleration = 0.0;
+            applyJogState();
+
+            return;
+        }
+
+        const auto duration = jog.trajectory.get_duration();
+        const auto consumed =
+            std::min(seconds, std::max(duration - jog.elapsed, 0.0));
+        jog.elapsed += consumed;
+        jog.trajectory.at_time(
+            jog.elapsed, jog.position, jog.velocity, jog.acceleration);
+        applyJogState();
+        if (jog.elapsed + 1e-12 < duration) {
+            return;
+        }
+
+        const auto remaining = seconds - consumed;
+        if (jog.stopping) {
+            jog.velocity = 0.0;
+            jog.acceleration = 0.0;
+            applyJogState();
+            completeJog();
+
+            return;
+        }
+        if (jog.continuous && !jog.travel.enabled) {
+            jog.cruising = true;
+            if (remaining > 0.0) {
+                jog.position += jog.cruiseVelocity * remaining;
+                jog.velocity = jog.cruiseVelocity;
+                jog.acceleration = 0.0;
+                applyJogState();
+            }
+
+            return;
+        }
+
+        jog.velocity = 0.0;
+        jog.acceleration = 0.0;
+        jog.stopReason = jog.continuous
+            ? JogStopReason::LimitReached : JogStopReason::TargetReached;
+        applyJogState();
+        completeJog();
+    }
+
+    void ProductionExecutorCore::completeJog() noexcept {
+        const auto jog = *m_jog;
+        m_snapshot.activeJoints = 0;
+        m_snapshot.state = BackendState::Held;
+        emit(JogStopped{
+            jog.id, jog.target, jog.stopReason,
+            m_snapshot.commanded, m_snapshot.commandedJoints,
+        });
+        m_jog.reset();
+    }
+
+    void ProductionExecutorCore::abandonJog(
+        const JogStopReason reason) noexcept {
+        if (!m_jog.has_value()) {
+            return;
+        }
+
+        m_jog->velocity = 0.0;
+        m_jog->acceleration = 0.0;
+        m_jog->stopReason = reason;
+        applyJogState();
+        completeJog();
+    }
+
+    void ProductionExecutorCore::faultJog() noexcept {
+        if (m_jog.has_value()) {
+            m_jog->stopReason = JogStopReason::Fault;
+            const auto jog = *m_jog;
+            m_snapshot.activeJoints = 0;
+            emit(JogStopped{
+                jog.id, jog.target, jog.stopReason,
+                m_snapshot.commanded, m_snapshot.commandedJoints,
+            });
+            m_jog.reset();
+        }
+        fault(JOG_GENERATION_FAULT);
     }
 
     void ProductionExecutorCore::completeSpan() noexcept {
