@@ -1,4 +1,5 @@
 #include <chrono>
+#include <cmath>
 #include <filesystem>
 #include <iostream>
 #include <memory>
@@ -37,7 +38,10 @@ namespace {
             .peerExpectedIdentity = identity(),
             .handshakeTimeout = 2s,
             .shutdownTimeout = 2s,
-            .peerArguments = {},
+            .peerArguments = {
+                "--machine-configuration",
+                std::filesystem::absolute("machine.toml").string(),
+            },
         };
     }
 
@@ -56,14 +60,35 @@ namespace {
         throw std::runtime_error("timed out waiting for IPC event");
     }
 
+    ngc::RequestCompleted waitForRequest(
+        ngc::ExternalRealtimeRuntime &runtime,
+        const ngc::RequestId request) {
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto event = waitForEvent(runtime);
+            if (const auto *completed =
+                    std::get_if<ngc::RequestCompleted>(&event);
+                completed != nullptr && completed->request == request) {
+                return *completed;
+            }
+        }
+
+        throw std::runtime_error("timed out waiting for IPC control completion");
+    }
+
     ngc::ExecutionSnapshot waitForSnapshot(
         ngc::ExternalRealtimeRuntime &runtime,
-        const ngc::BackendState expected) {
+        const ngc::BackendState expected,
+        const std::optional<double> expectedX = std::nullopt) {
         const auto deadline = std::chrono::steady_clock::now() + 2s;
         ngc::ExecutionSnapshot snapshot;
         while (std::chrono::steady_clock::now() < deadline) {
             while (runtime.endpoint().tryTakeSnapshot(snapshot)) {
-                if (snapshot.state == expected) {
+                if (snapshot.state == expected
+                    && (!expectedX.has_value()
+                        || std::abs(
+                            snapshot.commanded.position.x - *expectedX)
+                            < 1e-9)) {
                     return snapshot;
                 }
             }
@@ -71,6 +96,81 @@ namespace {
         }
 
         throw std::runtime_error("timed out waiting for IPC snapshot");
+    }
+
+    ngc::ExecutionSnapshot waitForMotionProgress(
+        ngc::ExternalRealtimeRuntime &runtime, const double minimumX) {
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        ngc::ExecutionSnapshot snapshot;
+        while (std::chrono::steady_clock::now() < deadline) {
+            while (runtime.endpoint().tryTakeSnapshot(snapshot)) {
+                if (snapshot.state == ngc::BackendState::Running
+                    && snapshot.commanded.position.x >= minimumX) {
+                    return snapshot;
+                }
+            }
+            std::this_thread::sleep_for(1ms);
+        }
+
+        throw std::runtime_error("timed out waiting for IPC motion progress");
+    }
+
+    ngc::BackendHeld waitForHeld(
+        ngc::ExternalRealtimeRuntime &runtime,
+        const ngc::BackendHoldReason reason) {
+        const auto deadline = std::chrono::steady_clock::now() + 2s;
+        while (std::chrono::steady_clock::now() < deadline) {
+            const auto event = waitForEvent(runtime);
+            if (const auto *fault = std::get_if<ngc::BackendFault>(&event)) {
+                throw std::runtime_error(
+                    "IPC executor faulted while waiting for held state: "
+                    + std::to_string(fault->code));
+            }
+            if (const auto *held = std::get_if<ngc::BackendHeld>(&event);
+                held != nullptr && held->reason == reason) {
+                return *held;
+            }
+        }
+
+        throw std::runtime_error("timed out waiting for IPC held event");
+    }
+
+    ngc::AxisPolynomialSpan linearSpan(
+        const ngc::SpanId id, const double from, const double to,
+        const double duration) {
+        ngc::AxisPolynomialSpan span;
+        span.id = id;
+        span.duration = duration;
+        span.inverseDuration = 1.0 / duration;
+        span.inverseDurationSquared =
+            span.inverseDuration * span.inverseDuration;
+        span.inverseDurationCubed =
+            span.inverseDurationSquared * span.inverseDuration;
+        span.origin.x = from;
+        span.coefficients[0].x = to - from;
+
+        return span;
+    }
+
+    ngc::PlanChunk linearChunk(
+        const ngc::EpochId epoch, const ngc::ChunkId id,
+        const double from, const double to, const double duration) {
+        ngc::PlanChunk chunk;
+        chunk.epoch = epoch;
+        chunk.id = id;
+        chunk.branch = id + 100;
+        require(chunk.normalMotion.push(
+                    linearSpan(id + 200, from, to, duration)),
+                "IPC normal span fixture did not fit");
+        require(chunk.stopTail.push(
+                    linearSpan(id + 201, to, to, 0.01)),
+                "IPC stop span fixture did not fit");
+        require(chunk.markers.push({id + 300, 0, 0.5}),
+                "IPC marker fixture did not fit");
+        chunk.branchState = ngc::executionSpanEnd(chunk.normalMotion[0]);
+        chunk.stopState.position.x = to;
+
+        return chunk;
     }
 
     void testProtocolLayoutAndBoundedRings() {
@@ -159,38 +259,124 @@ namespace {
                 "IPC snapshot ring should report backpressure when full");
     }
 
-    void testExternalRuntimeHandshakeAndTransport(
+    void testExternalRuntimeExecutesThroughProductionCore(
         const std::filesystem::path &peer) {
         ngc::ExternalRealtimeRuntime runtime(configuration(peer));
         runtime.start();
         runtime.start();
         require(runtime.connected(), "external runtime should complete its handshake");
 
-        ngc::PlanChunk chunk;
-        chunk.epoch = 17;
-        chunk.id = 23;
+        constexpr ngc::EpochId epoch = 17;
+        require(runtime.endpoint().trySubmit(ngc::ResetRequest{21, epoch})
+                    == ngc::SubmitResult::Submitted,
+                "external runtime should submit an executor reset");
+        require(waitForRequest(runtime, 21).succeeded,
+                "IPC executor should accept its epoch reset");
+        require(runtime.endpoint().trySubmit(ngc::EnableRequest{22})
+                    == ngc::SubmitResult::Submitted,
+                "external runtime should submit an enable request");
+        require(waitForRequest(runtime, 22).succeeded,
+                "IPC executor should enable through the production core");
+        static_cast<void>(waitForSnapshot(runtime, ngc::BackendState::Held));
+
+        const auto chunk = linearChunk(epoch, 23, 0.0, 0.125, 0.03);
         require(runtime.endpoint().tryPublish(chunk)
                     == ngc::PublishResult::Published,
                 "external runtime should publish an execution item");
-        const auto accepted = waitForEvent(runtime);
-        require(std::get<ngc::ChunkAccepted>(accepted).epoch == 17
-                    && std::get<ngc::ChunkAccepted>(accepted).chunk == 23,
-                "IPC peer should acknowledge the exact execution identity");
-
-        require(runtime.endpoint().trySubmit(ngc::EnableRequest{31})
+        require(runtime.endpoint().trySubmit(ngc::StartRequest{24, epoch})
                     == ngc::SubmitResult::Submitted,
-                "external runtime should submit a control request");
-        const auto completed = waitForEvent(runtime);
-        require(std::get<ngc::RequestCompleted>(completed).request == 31
-                    && std::get<ngc::RequestCompleted>(completed).succeeded,
-                "IPC peer should acknowledge the exact control identity");
-        static_cast<void>(waitForSnapshot(runtime, ngc::BackendState::Held));
+                "external runtime should start the published epoch");
+        require(waitForRequest(runtime, 24).succeeded,
+                "IPC executor should start the published epoch");
+
+        const auto accepted = waitForEvent(runtime);
+        require(std::get<ngc::ChunkAccepted>(accepted).epoch == epoch
+                    && std::get<ngc::ChunkAccepted>(accepted).chunk == chunk.id,
+                "IPC executor should accept the exact execution identity");
+        const auto marker = waitForEvent(runtime);
+        require(std::get<ngc::ExecutionMarkerReached>(marker).marker
+                    == chunk.markers[0].id,
+                "IPC executor should report a marker from its timed cursor");
+        const auto branch = waitForEvent(runtime);
+        require(std::get<ngc::BranchSelected>(branch).choice
+                    == ngc::BranchChoice::Stop,
+                "IPC executor should select the terminal stop branch");
+        const auto retired = waitForEvent(runtime);
+        require(std::get<ngc::ChunkRetired>(retired).chunk == chunk.id,
+                "IPC executor should retire the executed chunk");
+        const auto held = waitForEvent(runtime);
+        require(std::get<ngc::BackendHeld>(held).reason
+                    == ngc::BackendHoldReason::StopBranch,
+                "IPC executor should report its terminal held state");
+        static_cast<void>(waitForSnapshot(
+            runtime, ngc::BackendState::Held, 0.125));
 
         runtime.stop();
         runtime.stop();
         require(!runtime.connected(), "stopped external runtime should disconnect");
         runtime.start();
         require(runtime.connected(), "external runtime should support a fresh restart");
+        runtime.stop();
+    }
+
+    void testExternalRuntimeFeedHoldAndResume(
+        const std::filesystem::path &peer) {
+        ngc::ExternalRealtimeRuntime runtime(configuration(peer));
+        runtime.start();
+
+        constexpr ngc::EpochId epoch = 18;
+        require(runtime.endpoint().trySubmit(ngc::ResetRequest{41, epoch})
+                    == ngc::SubmitResult::Submitted,
+                "feed-hold IPC reset should fit");
+        require(waitForRequest(runtime, 41).succeeded,
+                "feed-hold IPC reset should succeed");
+        require(runtime.endpoint().trySubmit(ngc::EnableRequest{42})
+                    == ngc::SubmitResult::Submitted,
+                "feed-hold IPC enable should fit");
+        require(waitForRequest(runtime, 42).succeeded,
+                "feed-hold IPC enable should succeed");
+
+        const auto chunk = linearChunk(epoch, 43, 0.0, 10.0, 10.0);
+        require(runtime.endpoint().tryPublish(chunk)
+                    == ngc::PublishResult::Published,
+                "feed-hold IPC chunk should fit");
+        require(runtime.endpoint().trySubmit(ngc::StartRequest{44, epoch})
+                    == ngc::SubmitResult::Submitted,
+                "feed-hold IPC start should fit");
+        require(waitForRequest(runtime, 44).succeeded,
+                "feed-hold IPC start should succeed");
+        const auto accepted = waitForEvent(runtime);
+        require(std::get<ngc::ChunkAccepted>(accepted).chunk == chunk.id,
+                "feed-hold IPC chunk should activate");
+        static_cast<void>(waitForMotionProgress(runtime, 0.1));
+
+        require(runtime.endpoint().trySubmit(ngc::FeedHoldRequest{45})
+                    == ngc::SubmitResult::Submitted,
+                "IPC feed hold should fit");
+        require(waitForRequest(runtime, 45).succeeded,
+                "production executor should accept IPC feed hold");
+        const auto feedHeld = waitForHeld(
+            runtime, ngc::BackendHoldReason::FeedHold);
+        require(feedHeld.state.position.x > 0.0
+                    && feedHeld.state.position.x < 10.0,
+                "IPC feed hold should stop on the active path");
+
+        require(runtime.endpoint().trySubmit(
+                    ngc::ResumeRequest{46, epoch})
+                    == ngc::SubmitResult::Submitted,
+                "IPC resume should fit");
+        require(waitForRequest(runtime, 46).succeeded,
+                "production executor should resume the held IPC cursor");
+        static_cast<void>(waitForMotionProgress(
+            runtime, feedHeld.state.position.x + 0.01));
+        require(runtime.endpoint().trySubmit(ngc::AbortRequest{47})
+                    == ngc::SubmitResult::Submitted,
+                "resumed IPC abort should fit");
+        require(waitForRequest(runtime, 47).succeeded,
+                "resumed IPC motion should accept Abort");
+        static_cast<void>(waitForSnapshot(
+            runtime, ngc::BackendState::Held));
+
         runtime.stop();
     }
 
@@ -210,6 +396,28 @@ namespace {
         require(runtime.lastRejection()
                     == ngc::IpcRejection::AuthorityGeneration,
                 "stale authority handshake should retain its rejection reason");
+    }
+
+    void testExternalRuntimeRejectsInvalidExecutorConfiguration(
+        const std::filesystem::path &peer) {
+        auto options = configuration(peer);
+        options.peerArguments = {
+            "--machine-configuration",
+            std::filesystem::absolute(
+                "missing_ipc_machine_configuration.toml").string(),
+        };
+        ngc::ExternalRealtimeRuntime runtime(std::move(options));
+
+        auto rejected = false;
+        try {
+            runtime.start();
+        } catch (const std::runtime_error &) {
+            rejected = true;
+        }
+        require(rejected,
+                "invalid executor configuration should fail IPC startup");
+        require(!runtime.connected(),
+                "invalid executor configuration should not advertise readiness");
     }
 
     void testExternalRuntimeReportsBackpressure(
@@ -285,8 +493,10 @@ int main(const int argc, char **argv) {
         require(argc == 2, "ngc_ipc_tests requires the peer executable path");
         const std::filesystem::path peer = argv[1];
         testProtocolLayoutAndBoundedRings();
-        testExternalRuntimeHandshakeAndTransport(peer);
+        testExternalRuntimeExecutesThroughProductionCore(peer);
+        testExternalRuntimeFeedHoldAndResume(peer);
         testExternalRuntimeRejectsStaleHandshake(peer);
+        testExternalRuntimeRejectsInvalidExecutorConfiguration(peer);
         testExternalRuntimeReportsBackpressure(peer);
         testPeerLossAndInterruptedEpochRefusal(peer);
         std::cout << "ngc_ipc_tests passed\n";

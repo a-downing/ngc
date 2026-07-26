@@ -103,9 +103,12 @@ There is no complete real-time executor,
 HAL component, or physical backend yet. `ExternalRealtimeRuntime`
 implements the NRT side of the versioned shared-memory IPC boundary and owns a
 bounded `MotionBackend` proxy. The `ngc_ipc_backend` executable is a
-transport-only non-hardware peer used to prove handshakes, channel behavior,
-process lifecycle, and peer-loss handling; it is not a production executor and
-must not be exposed as Real. Preserve the separation
+non-hardware executor-in-the-loop peer: it validates typed machine
+configuration during startup, hosts `ProductionExecutorRuntime`, and bridges
+bounded execution items, controls, events, and snapshots across the production
+IPC path. On Windows its ordinary scheduler thread and null I/O boundary prove
+functional executor and process behavior, not real-time latency or hardware
+safety. It must not be exposed as Real. Preserve the separation
 between interpretation, geometry preparation, trajectory planning, execution,
 and hardware access. Never make geometry construction depend on whether the
 consumer is Preview or Simulation.

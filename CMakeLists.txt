@@ -136,6 +136,7 @@ target_include_directories(ngc_ipc_tests PRIVATE src)
 target_link_libraries(ngc_ipc_tests PRIVATE ngc_core)
 ngc_target_defaults(ngc_ipc_tests)
 add_test(NAME ngc_ipc_tests COMMAND ngc_ipc_tests $<TARGET_FILE:ngc_ipc_backend>)
+set_tests_properties(ngc_ipc_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_executable(ngc_simulation_diagnostic tools/ngc_simulation_diagnostic.cpp)
 target_include_directories(ngc_simulation_diagnostic PRIVATE src)

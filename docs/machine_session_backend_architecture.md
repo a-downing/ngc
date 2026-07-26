@@ -805,8 +805,9 @@ stale-command rejection across actual transfers, independent power and tool
 tables, and one-way motion isolation. Production still exposes Real as
 unavailable: Real configuration and `ExternalRealtimeRuntime` construction,
 inactive physical event draining, and live physical snapshots remain future
-work and must never fall back to the in-process test host. The transport-only
-`ExternalRealtimeRuntime` IPC skeleton is not a Real session or an executor.
+work and must never fall back to the in-process test host. The
+`ExternalRealtimeRuntime` path and its Windows non-hardware executor peer are
+not a Real session or a physical backend.
 
 - Support standalone Simulation with no `[real_run]` configuration.
 - Support optional Real and Simulation sessions concurrently. Complete at the
@@ -869,12 +870,14 @@ expectations.
 
 ### Phase 9: Add the IPC skeleton
 
-Status: implemented as a transport-only, non-hardware skeleton.
+Status: implemented through a non-hardware executor-in-the-loop checkpoint.
 `ExternalRealtimeRuntime` owns a platform shared-memory mapping, child-process
 lifecycle, and a bounded `MotionBackend` proxy. `ngc_ipc_backend` opens the same
-fixed layout as a separate process and acknowledges opaque execution and
-control records without importing `MockMotionBackend` or claiming production
-execution semantics. The connection validates ABI and payload layout,
+fixed layout as a separate process, validates optional typed machine
+configuration before advertising readiness, hosts `ProductionExecutorRuntime`,
+and bridges bounded execution items, controls, events, and snapshots to the
+real production executor core without importing `MockMotionBackend`. The
+connection validates ABI and payload layout,
 configuration and topology fingerprints, and session, epoch, and control
 authority generations before entering Running. Peer loss becomes a bounded
 backend fault after already-published peer events are drained, and an epoch
@@ -882,15 +885,17 @@ interrupted by peer loss cannot be resumed after a fresh connection.
 
 The shared-memory storage and process layer has Windows and POSIX
 implementations, but this phase has only been built and exercised on the
-supported Windows development environment. Linux validation remains required
-before the IPC layer can support the production executor.
+supported Windows development environment. The Windows peer uses an ordinary
+scheduler thread and a null I/O boundary, so its results prove functional
+executor and process behavior rather than real-time latency or hardware
+safety. Linux validation remains required before physical transport work.
 
 - Implement fixed shared-memory rings and the physical `MotionBackend` proxy.
   Complete for the transport skeleton.
 - Add ABI, topology, configuration, session, epoch, and authority handshakes.
   Complete.
 - Run a non-hardware backend process using the production IPC path. Complete
-  with the transport-only peer.
+  with the Windows executor-in-the-loop peer.
 - Test peer death, stale generations, full channels, restart, and refusal to
   resume interrupted epochs. Complete on Windows.
 
@@ -961,8 +966,14 @@ tests cover fixed-period progress, clean stop, and restore gating. The runtime
 is registered as the second backend-conformance target, and an end-to-end test
 runs `HomingController` through its production runtime callbacks.
 
-The runtime/core combination is not yet connected to `ngc_ipc_backend`; that
-executable remains the transport-only peer.
+The runtime/core combination is now hosted by `ngc_ipc_backend` for the Windows
+non-hardware checkpoint. A fixed pending slot per channel preserves
+backpressure between each shared-memory ring and the core's bounded channels.
+IPC tests execute a timed `PlanChunk` through the child process and verify
+executor-generated acceptance, marker crossing, terminal stop selection,
+retirement, snapshots, feed hold, Resume, and Abort in addition to handshake,
+capacity, restart, and peer-loss behavior. The executable remains non-real-time,
+uses null I/O, and must not be exposed as Real.
 
 - Factor reusable allocation-free execution mechanics without importing
   synthetic-input or mock-diagnostic policy.
