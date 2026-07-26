@@ -131,19 +131,6 @@ namespace ngc::gui {
         return "Unknown";
     }
 
-    constexpr std::string_view simulationStatusName(const SimulationStatus status) noexcept {
-        switch (status) {
-            case SimulationStatus::Stopped: return "Stopped";
-            case SimulationStatus::Running: return "Running";
-            case SimulationStatus::Holding: return "Holding";
-            case SimulationStatus::Paused: return "Paused";
-            case SimulationStatus::Completed: return "Completed";
-            case SimulationStatus::Error: return "Error";
-        }
-
-        return "Unknown";
-    }
-
     constexpr std::string_view sessionCommandRejectionReason(
             const SessionCommandRejection rejection) noexcept {
         switch (rejection) {

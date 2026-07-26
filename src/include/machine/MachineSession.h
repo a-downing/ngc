@@ -182,7 +182,6 @@ namespace ngc {
         [[nodiscard]] bool powerOn() noexcept;
         [[nodiscard]] bool powerOff() noexcept;
         [[nodiscard]] bool beginActivity(MachineActivity activity) noexcept;
-        void setActivity(MachineActivity activity) noexcept;
         void finishActivity() noexcept;
         void fault() noexcept;
 
@@ -374,7 +373,6 @@ namespace ngc {
         template<typename Self> auto &geometryPolicy(this Self &&self) {
             return std::forward<Self>(self).m_geometryPolicy;
         }
-        [[nodiscard]] const GeometryStreamProducer *geometryProducer() const noexcept;
 
     private:
         [[nodiscard]] ProgramOperationUpdate programOperationUpdate() const;

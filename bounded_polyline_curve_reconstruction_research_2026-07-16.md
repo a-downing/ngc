@@ -60,9 +60,9 @@ The best next prototype is a hybrid with a fast common path and a proof-preservi
 
 This structure puts the expensive work where it belongs: a narrow banded solve and local proof subdivisions around active constraints. Arc recognition reduces system size but is not required for correctness.
 
-### Experiment with the existing tool
+### Experiment with the retired prototype
 
-`tools/ngc_quintic_spline_analyzer.cpp` was updated so the programmed `P` and allowed fraction of `P` are explicit, and so it reports fitting time. The experiment used the captured `adaptive.ngc` spline ID 1 from `build/adaptive_spline_geometry.txt`:
+The former standalone quintic spline analyzer made the programmed `P` and allowed fraction of `P` explicit and reported fitting time. The experiment used the captured `adaptive.ngc` spline ID 1 from `build/adaptive_spline_geometry.txt`:
 
 - sources 1 through 48: 42 tiny lines followed by six arcs;
 - production representation: 32 cubic controls and 29 spans;

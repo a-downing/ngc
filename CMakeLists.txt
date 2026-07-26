@@ -171,6 +171,3 @@ add_test(NAME ngc_spline_half_entity_controls_test
 set_tests_properties(ngc_spline_half_entity_controls_test PROPERTIES
     PASS_REGULAR_EXPRESSION
         "reconstructed 1 variable-control short-entity splines with one interior control per two entities")
-
-add_executable(ngc_quintic_spline_analyzer tools/ngc_quintic_spline_analyzer.cpp)
-ngc_target_defaults(ngc_quintic_spline_analyzer)

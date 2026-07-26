@@ -132,10 +132,6 @@ namespace ngc {
         return true;
     }
 
-    void ExecutionCoordinator::setActivity(const MachineActivity activity) noexcept {
-        m_activity.store(activity);
-    }
-
     void ExecutionCoordinator::finishActivity() noexcept {
         if (m_powerState.load() == MachinePowerState::On) {
             m_activity.store(MachineActivity::Idle);
@@ -851,9 +847,5 @@ namespace ngc {
 
     void MachineSession::completeProgramPresentation() {
         m_presentationTracker.completeDeferredBlocks();
-    }
-
-    const GeometryStreamProducer *MachineSession::geometryProducer() const noexcept {
-        return m_geometryProducer.get();
     }
 }

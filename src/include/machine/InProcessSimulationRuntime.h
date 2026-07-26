@@ -50,7 +50,6 @@ namespace ngc {
         void waitForServiceMotion() override;
         bool beginTimedExecution();
         void endTimedExecution();
-        [[nodiscard]] bool timedExecutionActive() const noexcept;
 
         void setTickMultiplier(int multiplier) noexcept;
         [[nodiscard]] std::uint32_t tickMultiplier() const noexcept;

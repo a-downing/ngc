@@ -136,10 +136,6 @@ namespace ngc {
         }
     }
 
-    bool InProcessSimulationRuntime::timedExecutionActive() const noexcept {
-        return m_timedExecutionActive.load(std::memory_order_acquire);
-    }
-
     void InProcessSimulationRuntime::setTickMultiplier(const int multiplier) noexcept {
         m_tickMultiplier.store(
             static_cast<std::uint32_t>(std::clamp(multiplier, 1, 1000)),
