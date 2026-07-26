@@ -142,6 +142,9 @@ namespace ngc::pendant {
                     if (m_cancelled.load(std::memory_order_acquire)) {
                         return std::unexpected(cancelledError());
                     }
+                    while (m_outputPending.load(std::memory_order_acquire)) {
+                        m_outputPending.wait(true, std::memory_order_acquire);
+                    }
 
                     auto wait = CANCELLATION_POLL_PERIOD;
                     if (finite) {
@@ -203,25 +206,50 @@ namespace ngc::pendant {
                     return std::unexpected(cancelledError());
                 }
 
-                std::scoped_lock lock(m_ioMutex);
-                if (m_cancelled.load(std::memory_order_acquire)) {
-                    return std::unexpected(cancelledError());
-                }
-                errno = 0;
-                const auto streamCount = hid_write(m_device.get(), report.data(), report.size());
-                const auto streamCode = errno;
-                if (streamCount < 0) {
-                    return std::unexpected(linuxError(
-                        "HID output stream write failed", streamCode, hid_error(m_device.get())));
-                }
-                if (static_cast<std::size_t>(streamCount) != report.size()) {
-                    return std::unexpected(HidError {
-                        HidErrorCode::IoFailure, 0,
-                        "HID output report was only partially written",
-                    });
-                }
+                m_outputPending.store(true, std::memory_order_release);
+                auto result = [&]() -> std::expected<void, HidError> {
+                    std::scoped_lock lock(m_ioMutex);
+                    if (m_cancelled.load(std::memory_order_acquire)) {
+                        return std::unexpected(cancelledError());
+                    }
+                    errno = 0;
+                    const auto streamCount =
+                        hid_write(m_device.get(), report.data(), report.size());
+                    const auto streamCode = errno;
+                    if (streamCount < 0) {
+                        return std::unexpected(linuxError(
+                            "HID output stream write failed", streamCode,
+                            hid_error(m_device.get())));
+                    }
+                    if (static_cast<std::size_t>(streamCount) != report.size()) {
+                        return std::unexpected(HidError {
+                            HidErrorCode::IoFailure, 0,
+                            "HID output report was only partially written",
+                        });
+                    }
 
-                return {};
+                    // Match the device's working Windows sequence: its LCD applies
+                    // the control output report, while the stream write alone is ignored.
+                    errno = 0;
+                    const auto outputCount =
+                        hid_send_output_report(m_device.get(), report.data(), report.size());
+                    const auto outputCode = errno;
+                    if (outputCount < 0) {
+                        return std::unexpected(linuxError(
+                            "HID output report failed", outputCode, hid_error(m_device.get())));
+                    }
+                    if (static_cast<std::size_t>(outputCount) != report.size()) {
+                        return std::unexpected(HidError {
+                            HidErrorCode::IoFailure, 0,
+                            "HID output report was only partially sent",
+                        });
+                    }
+
+                    return {};
+                }();
+                m_outputPending.store(false, std::memory_order_release);
+                m_outputPending.notify_all();
+                return result;
             }
 
             void cancel() noexcept override {
@@ -233,6 +261,7 @@ namespace ngc::pendant {
             std::size_t m_inputLength = 0;
             std::size_t m_outputLength = 0;
             std::atomic<bool> m_cancelled { false };
+            std::atomic<bool> m_outputPending { false };
             std::mutex m_ioMutex;
         };
 
