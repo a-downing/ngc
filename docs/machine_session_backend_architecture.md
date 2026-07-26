@@ -904,21 +904,25 @@ execution-item, control, event, input-sample, and snapshot storage and executes
 validated normal `PlanChunk` polynomials, dependent continuations, axis-space
 `TriggeredMove` approaches and constrained stops, joint-space
 `TriggeredJointMove` approaches with independently debounced triggers and
-constrained stops, terminal stop branches, ordered markers, retirement,
+constrained stops, same-epoch resume between service moves, stationary masked
+joint-coordinate assignment, constrained controlled-stop cancellation of
+triggered moves, terminal stop branches, ordered markers, retirement,
 snapshots, and bounded fault transitions. The hosting servo thread supplies
-digital-input samples before each tick; hardware acquisition and
-synthetic-input policy remain outside the core. Focused tests cover fixed-period
-advancement and duration accounting, continuation and stop selection, marker
-order, stale-continuation rejection, sampled trigger state, jerk-limited
-trigger stopping, independent joint triggers, absolute and relative joint
-targets, plan-to-triggered continuation, bounded channels, and explicit
-rejection of unsupported inputs.
+digital-input samples before each tick; hardware acquisition and synthetic-input
+policy remain outside the core. Focused tests cover fixed-period advancement
+and duration accounting, continuation and stop selection, marker order,
+stale-continuation rejection, sampled trigger state, jerk-limited trigger
+stopping, independent joint triggers, absolute and relative joint targets,
+plan-to-triggered continuation, a four-phase homing-style control sequence,
+controlled homing cancellation, bounded channels, and explicit rejection of
+unsupported inputs.
 
 The core is not yet connected to `ngc_ipc_backend` or registered as the second
-backend-conformance target. Jogging, complete homing, feed hold/resume,
-controlled stop, and scheduled hardware events remain outside the current
-slice; they must be implemented and proved before the core can claim the
-complete production executor contract.
+backend-conformance target. It is not yet paired with `HomingController`
+through a production `BackendRuntime` host. Jogging, ordinary-plan controlled
+stop, feed hold/resume, and scheduled hardware events remain outside the
+current slice; they must be implemented and proved before the core can claim
+the complete production executor contract.
 
 - Factor reusable allocation-free execution mechanics without importing
   synthetic-input or mock-diagnostic policy.

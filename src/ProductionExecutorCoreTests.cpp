@@ -4,6 +4,7 @@
 #include <iostream>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string_view>
 #include <type_traits>
@@ -171,6 +172,60 @@ namespace {
         }
 
         return selected;
+    }
+
+    struct JointMoveRun {
+        std::vector<ngc::ExecutionEvent> events;
+        ngc::ExecutionSnapshot snapshot;
+    };
+
+    JointMoveRun runResumedJointMove(
+        ngc::ProductionExecutorCore &core,
+        const ngc::TriggeredJointMove &move,
+        const ngc::RequestId request,
+        const std::optional<std::pair<ngc::DigitalInputId, double>>
+            trigger = std::nullopt) {
+        if (trigger) {
+            core.setDigitalInputSample(trigger->first, false);
+        }
+        require(core.tryPublish(ngc::ExecutionItem{move})
+                    == ngc::PublishResult::Published,
+                "homing phase was not published");
+        require(core.trySubmit(ngc::ResumeRequest{request, move.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "homing phase resume did not fit");
+
+        JointMoveRun result;
+        auto triggerApplied = false;
+        for (auto tick = 0; tick < 2'000; ++tick) {
+            if (trigger && !triggerApplied
+                && result.snapshot.commandedJoints.position[0]
+                    >= trigger->second) {
+                core.setDigitalInputSample(trigger->first, true);
+                triggerApplied = true;
+            }
+            core.servoTick();
+            auto current = takeEvents(core);
+            result.events.insert(
+                result.events.end(), current.begin(), current.end());
+            result.snapshot = latestSnapshot(core);
+            if (result.snapshot.state == ngc::BackendState::Held) {
+                break;
+            }
+        }
+
+        require(result.snapshot.state == ngc::BackendState::Held,
+                "homing phase did not return to held");
+        const auto requests =
+            selectEvents<ngc::RequestCompleted>(result.events);
+        require(std::ranges::any_of(
+                    requests, [request](const auto &completed) {
+                        return completed.request == request
+                            && completed.succeeded;
+                    }),
+                "homing phase resume was not acknowledged");
+
+        return result;
     }
 
     void testFixedTickExecutionAndAccounting() {
@@ -596,6 +651,308 @@ namespace {
                     "relative joint target did not use retained joint state");
     }
 
+    void testHomingControlSequence() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        initialize(*core, 80);
+
+        ngc::JointVector initial;
+        initial[0] = -0.1;
+        initial[1] = 0.25;
+        constexpr auto homingJoint = ngc::JointMask{1};
+        require(core->trySubmit(
+                    ngc::SetJointPositionRequest{
+                        10, homingJoint | ngc::JointMask{1} << 1, initial,
+                    }) == ngc::SubmitResult::Submitted,
+                "initial homing coordinates did not fit");
+        core->servoTick();
+        auto events = takeEvents(*core);
+        auto snapshot = latestSnapshot(*core);
+        const auto coordinateRequests =
+            selectEvents<ngc::RequestCompleted>(events);
+        require(coordinateRequests.size() == 1
+                    && coordinateRequests[0].request == 10
+                    && coordinateRequests[0].succeeded,
+                "stationary joint coordinate assignment was rejected");
+        requireNear(snapshot.commandedJoints.position[0], initial[0],
+                    "first joint coordinate was not assigned");
+        requireNear(snapshot.commandedJoints.position[1], initial[1],
+                    "second joint coordinate was not assigned");
+
+        constexpr ngc::DigitalInputId input = 20;
+        auto fast = triggeredJointMove(80, 801, 0, 901, 1'001);
+        fast.joints = homingJoint;
+        fast.targetMode = ngc::JointTargetMode::Relative;
+        fast.target[0] = 0.5;
+        fast.triggerRequired = true;
+        require(fast.triggers.push({
+                    0, input, ngc::InputCondition::Active, 0.0,
+                }),
+                "fast-search trigger did not fit");
+        const auto fastRun =
+            runResumedJointMove(*core, fast, 11, {{input, 0.05}});
+        const auto fastCompleted =
+            selectEvents<ngc::TriggeredJointMoveCompleted>(
+                fastRun.events);
+        require(fastCompleted.size() == 1
+                    && fastCompleted[0].status
+                        == ngc::TriggeredMoveStatus::Triggered,
+                "fast homing search did not stop on its input");
+
+        auto backoff = triggeredJointMove(
+            80, 802, fast.branch, 902, 1'002);
+        backoff.joints = homingJoint;
+        backoff.targetMode = ngc::JointTargetMode::Absolute;
+        backoff.target[0] =
+            fastCompleted[0].triggerState.position[0] - 0.05;
+        const auto backoffRun =
+            runResumedJointMove(*core, backoff, 12);
+        const auto backoffCompleted =
+            selectEvents<ngc::TriggeredJointMoveCompleted>(
+                backoffRun.events);
+        require(backoffCompleted.size() == 1
+                    && backoffCompleted[0].status
+                        == ngc::TriggeredMoveStatus::ReachedTarget,
+                "fixed homing backoff did not reach its target");
+
+        auto slow = triggeredJointMove(
+            80, 803, backoff.branch, 903, 1'003);
+        slow.joints = homingJoint;
+        slow.targetMode = ngc::JointTargetMode::Relative;
+        slow.target[0] = 0.15;
+        slow.limits.velocity[0] = 0.1;
+        slow.triggerRequired = true;
+        require(slow.triggers.push({
+                    0, input, ngc::InputCondition::Active, 0.0,
+                }),
+                "slow-latch trigger did not fit");
+        const auto slowTrigger =
+            backoffCompleted[0].stoppedState.position[0] + 0.04;
+        const auto slowRun =
+            runResumedJointMove(*core, slow, 13, {{input, slowTrigger}});
+        const auto slowCompleted =
+            selectEvents<ngc::TriggeredJointMoveCompleted>(
+                slowRun.events);
+        require(slowCompleted.size() == 1
+                    && slowCompleted[0].status
+                        == ngc::TriggeredMoveStatus::Triggered,
+                "slow homing latch did not stop on its input");
+
+        auto calibrated = slowCompleted[0].stoppedState.position;
+        calibrated[0] +=
+            -0.25 - slowCompleted[0].triggerState.position[0];
+        require(core->trySubmit(
+                    ngc::SetJointPositionRequest{
+                        14, homingJoint, calibrated,
+                    }) == ngc::SubmitResult::Submitted,
+                "latched coordinate assignment did not fit");
+        core->servoTick();
+        events = takeEvents(*core);
+        snapshot = latestSnapshot(*core);
+        const auto calibratedRequests =
+            selectEvents<ngc::RequestCompleted>(events);
+        require(calibratedRequests.size() == 1
+                    && calibratedRequests[0].request == 14
+                    && calibratedRequests[0].succeeded,
+                "latched coordinate assignment was rejected");
+        requireNear(snapshot.commandedJoints.position[0],
+                    calibrated[0],
+                    "latched coordinate assignment used the wrong position");
+        requireNear(snapshot.commandedJoints.position[1], initial[1],
+                    "masked coordinate assignment changed another joint");
+
+        auto finalMove = triggeredJointMove(
+            80, 804, slow.branch, 904, 1'004);
+        finalMove.joints = homingJoint;
+        finalMove.targetMode = ngc::JointTargetMode::Absolute;
+        finalMove.target[0] = 0.1;
+        const auto finalRun =
+            runResumedJointMove(*core, finalMove, 15);
+        const auto finalCompleted =
+            selectEvents<ngc::TriggeredJointMoveCompleted>(
+                finalRun.events);
+        require(finalCompleted.size() == 1
+                    && finalCompleted[0].status
+                        == ngc::TriggeredMoveStatus::ReachedTarget,
+                "final homing move did not reach its target");
+        requireNear(finalRun.snapshot.commandedJoints.position[0],
+                    finalMove.target[0],
+                    "final homing move stopped at the wrong coordinate");
+        requireNear(finalRun.snapshot.commandedJoints.position[1],
+                    initial[1],
+                    "homing sequence changed an unselected joint");
+    }
+
+    void testControlledStopAbortsTriggeredJointMove() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        initialize(*core, 90);
+
+        auto move = triggeredJointMove(90, 901, 0, 1'001, 1'101);
+        require(core->tryPublish(ngc::ExecutionItem{move})
+                    == ngc::PublishResult::Published,
+                "controlled-stop fixture was not published");
+        require(core->trySubmit(ngc::ResumeRequest{10, move.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "controlled-stop fixture resume did not fit");
+
+        ngc::ExecutionSnapshot moving;
+        for (auto tick = 0; tick < 1'000; ++tick) {
+            core->servoTick();
+            takeEvents(*core);
+            moving = latestSnapshot(*core);
+            if (moving.commandedJoints.position[0] >= 0.05) {
+                break;
+            }
+        }
+        require(moving.state == ngc::BackendState::Running
+                    && moving.commandedJoints.velocity[0] > 0.0,
+                "controlled-stop fixture did not establish motion");
+
+        require(core->trySubmit(
+                    ngc::SetJointPositionRequest{
+                        11, ngc::JointMask{1}, {},
+                    }) == ngc::SubmitResult::Submitted,
+                "moving coordinate-assignment rejection did not fit");
+        core->servoTick();
+        auto events = takeEvents(*core);
+        auto snapshot = latestSnapshot(*core);
+        const auto rejectedAssignments =
+            selectEvents<ngc::RequestCompleted>(events);
+        require(std::ranges::any_of(
+                    rejectedAssignments, [](const auto &completed) {
+                        return completed.request == 11
+                            && !completed.succeeded;
+                    }),
+                "moving joint coordinate assignment was not rejected");
+
+        require(core->trySubmit(ngc::ControlledStopRequest{12})
+                    == ngc::SubmitResult::Submitted,
+                "controlled stop did not fit");
+        auto sawHolding = false;
+        auto previousAcceleration =
+            snapshot.commandedJoints.acceleration[0];
+        for (auto tick = 0; tick < 1'000; ++tick) {
+            core->servoTick();
+            auto current = takeEvents(*core);
+            events.insert(events.end(), current.begin(), current.end());
+            snapshot = latestSnapshot(*core);
+            sawHolding = sawHolding
+                || snapshot.state == ngc::BackendState::Holding;
+            require(std::abs(
+                        snapshot.commandedJoints.acceleration[0]
+                        - previousAcceleration)
+                        <= move.limits.jerk[0]
+                            * core->servoPeriod() + 1e-9,
+                    "controlled joint stop exceeded its per-tick jerk limit");
+            previousAcceleration =
+                snapshot.commandedJoints.acceleration[0];
+            if (snapshot.state == ngc::BackendState::Held) {
+                break;
+            }
+        }
+
+        const auto requests =
+            selectEvents<ngc::RequestCompleted>(events);
+        require(std::ranges::any_of(
+                    requests, [](const auto &completed) {
+                        return completed.request == 12
+                            && completed.succeeded;
+                    }),
+                "controlled joint stop was not acknowledged");
+        const auto completions =
+            selectEvents<ngc::TriggeredJointMoveCompleted>(events);
+        require(completions.size() == 1
+                    && completions[0].status
+                        == ngc::TriggeredMoveStatus::Aborted
+                    && completions[0].triggeredJoints == 0,
+                "controlled joint stop did not abort without fabricating triggers");
+        const auto held = selectEvents<ngc::BackendHeld>(events);
+        require(sawHolding
+                    && std::ranges::any_of(
+                        held, [](const auto &event) {
+                            return event.reason
+                                == ngc::BackendHoldReason::ControlledStop;
+                        }),
+                "controlled joint stop did not report its holding lifecycle");
+        require(snapshot.state == ngc::BackendState::Held
+                    && snapshot.commandedJoints.position[0]
+                        > moving.commandedJoints.position[0]
+                    && snapshot.commandedJoints.position[0]
+                        < move.target[0],
+                "controlled joint stop did not brake before the target");
+        requireNear(snapshot.commandedJoints.velocity[0], 0.0,
+                    "controlled joint stop retained velocity");
+        requireNear(snapshot.commandedJoints.acceleration[0], 0.0,
+                    "controlled joint stop retained acceleration");
+    }
+
+    void testControlledStopAbortsAxisTriggeredMove() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        initialize(*core, 91);
+
+        const auto move =
+            triggeredMove(91, 911, 0, 1'011, 1'111, 1.0);
+        require(core->tryPublish(ngc::ExecutionItem{move})
+                    == ngc::PublishResult::Published,
+                "axis controlled-stop fixture was not published");
+        require(core->trySubmit(ngc::ResumeRequest{10, move.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "axis controlled-stop fixture resume did not fit");
+
+        ngc::ExecutionSnapshot moving;
+        for (auto tick = 0; tick < 1'000; ++tick) {
+            core->servoTick();
+            takeEvents(*core);
+            moving = latestSnapshot(*core);
+            if (moving.commanded.position.x >= 0.05) {
+                break;
+            }
+        }
+        require(moving.state == ngc::BackendState::Running
+                    && moving.commanded.velocity.x > 0.0,
+                "axis controlled-stop fixture did not establish motion");
+        require(core->trySubmit(ngc::ControlledStopRequest{11})
+                    == ngc::SubmitResult::Submitted,
+                "axis controlled stop did not fit");
+
+        std::vector<ngc::ExecutionEvent> events;
+        ngc::ExecutionSnapshot snapshot;
+        auto sawHolding = false;
+        for (auto tick = 0; tick < 1'000; ++tick) {
+            core->servoTick();
+            auto current = takeEvents(*core);
+            events.insert(events.end(), current.begin(), current.end());
+            snapshot = latestSnapshot(*core);
+            sawHolding = sawHolding
+                || snapshot.state == ngc::BackendState::Holding;
+            if (snapshot.state == ngc::BackendState::Held) {
+                break;
+            }
+        }
+
+        const auto completions =
+            selectEvents<ngc::TriggeredMoveCompleted>(events);
+        require(completions.size() == 1
+                    && completions[0].status
+                        == ngc::TriggeredMoveStatus::Aborted,
+                "axis controlled stop did not abort the triggered move");
+        const auto held = selectEvents<ngc::BackendHeld>(events);
+        require(sawHolding
+                    && std::ranges::any_of(
+                        held, [](const auto &event) {
+                            return event.reason
+                                == ngc::BackendHoldReason::ControlledStop;
+                        }),
+                "axis controlled stop did not report its holding lifecycle");
+        require(snapshot.commanded.position.x
+                    > moving.commanded.position.x
+                    && snapshot.commanded.position.x < move.target.x,
+                "axis controlled stop did not brake before the target");
+        requireNear(snapshot.commanded.velocity.x, 0.0,
+                    "axis controlled stop retained velocity");
+        requireNear(snapshot.commanded.acceleration.x, 0.0,
+                    "axis controlled stop retained acceleration");
+    }
+
     void testBoundedAndExplicitlyUnsupportedInputs() {
         auto rejectedPeriod = false;
         try {
@@ -702,6 +1059,9 @@ int main() {
         testSampledTriggerGeneratesConstrainedStop();
         testPlanContinuesIntoTriggeredMove();
         testTriggeredJointsStopIndependentlyAndRetainState();
+        testHomingControlSequence();
+        testControlledStopAbortsTriggeredJointMove();
+        testControlledStopAbortsAxisTriggeredMove();
         testBoundedAndExplicitlyUnsupportedInputs();
     } catch (const std::exception &error) {
         std::cerr << "Production executor core test failure: "

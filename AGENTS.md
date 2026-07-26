@@ -62,9 +62,14 @@ triggered moves, joint-space triggered moves, stop branches, markers,
 retirement, snapshots, and faults. Its hosting servo thread supplies sampled
 digital-input levels before each tick; the core detects configured levels or
 edges, debounces joint inputs, and generates jerk-limited independent triggered
-stops without importing hardware acquisition or synthetic input policy. It does
-not yet execute jogging, complete homing, feed hold, controlled stop, or
-scheduled hardware events, and it is not yet hosted by the external process.
+stops without importing hardware acquisition or synthetic input policy. The
+core also provides the executor mechanics needed by homing: same-epoch resume
+between triggered joint moves, stationary masked joint-coordinate assignment,
+and constrained controlled-stop cancellation of axis- and joint-space
+triggered moves. It does not yet execute jogging, ordinary-plan controlled
+stop, feed hold, or scheduled hardware events; it is not yet paired with
+`HomingController` through a production `BackendRuntime` host or hosted by the
+external process.
 There is no complete real-time executor,
 HAL component, or physical backend yet. `ExternalRealtimeRuntime`
 implements the NRT side of the versioned shared-memory IPC boundary and owns a

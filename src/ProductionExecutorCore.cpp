@@ -150,11 +150,14 @@ namespace ngc {
     void ProductionExecutorCore::servoTick(const bool shouldPublishSnapshot) noexcept {
         serviceControls();
 
-        if (m_snapshot.state == BackendState::Running) {
+        if (m_snapshot.state == BackendState::Running
+            || m_snapshot.state == BackendState::Holding) {
             if (!m_active.has_value()) {
                 activateNext();
             }
-            if (m_active.has_value() && m_snapshot.state == BackendState::Running) {
+            if (m_active.has_value()
+                && (m_snapshot.state == BackendState::Running
+                    || m_snapshot.state == BackendState::Holding)) {
                 advanceActive(m_servoPeriod);
             }
         }
@@ -387,6 +390,55 @@ namespace ngc {
                     if (success) {
                         m_snapshot.state = BackendState::Running;
                     }
+                } else if constexpr (std::same_as<T, ResumeRequest>) {
+                    success = m_snapshot.state == BackendState::Held
+                        && !m_active.has_value() && value.epoch != 0
+                        && value.epoch == m_snapshot.epoch
+                        && m_queuedExecutionItems.load(
+                            std::memory_order_acquire) != 0;
+                    if (success) {
+                        m_snapshot.state = BackendState::Running;
+                    }
+                } else if constexpr (std::same_as<T, ControlledStopRequest>) {
+                    success = m_snapshot.state == BackendState::Running
+                        && m_active.has_value();
+                    if (success
+                        && std::holds_alternative<TriggeredMove>(
+                            m_planSlots[*m_active].item)) {
+                        if (m_triggered.stopping) {
+                            success = false;
+                        } else if (!beginTriggeredStop(
+                                       TriggeredMoveStatus::Aborted)) {
+                            success = false;
+                            faultTriggered();
+                        }
+                    } else if (success
+                               && std::holds_alternative<TriggeredJointMove>(
+                                   m_planSlots[*m_active].item)) {
+                        const auto &move = activeTriggeredJointMove();
+                        m_triggeredJointCompletionStatus =
+                            TriggeredMoveStatus::Aborted;
+                        for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+                            const auto mask =
+                                static_cast<JointMask>(JointMask{1} << joint);
+                            auto &runtime = m_triggeredJoints[joint];
+                            if ((move.joints & mask) == 0 || runtime.finished
+                                || runtime.stopping) {
+                                continue;
+                            }
+                            if (!beginTriggeredJointStop(
+                                    move, joint, false)) {
+                                success = false;
+                                faultTriggered();
+                                break;
+                            }
+                        }
+                    } else {
+                        success = false;
+                    }
+                    if (success) {
+                        m_snapshot.state = BackendState::Holding;
+                    }
                 } else if constexpr (std::same_as<T, AbortRequest>) {
                     discardExecution();
                     m_snapshot.state = BackendState::Held;
@@ -408,6 +460,40 @@ namespace ngc {
                     m_snapshot.feedbackJoints = feedbackJoints;
                     m_faultEventEmitted = false;
                     success = value.nextEpoch != 0;
+                } else if constexpr (std::same_as<T, SetJointPositionRequest>) {
+                    constexpr auto validJointMask =
+                        static_cast<JointMask>(
+                            (JointMask{1} << MAX_JOINTS) - 1);
+                    success = m_snapshot.state == BackendState::Held
+                        && !m_active.has_value() && value.joints != 0
+                        && (value.joints & ~validJointMask) == 0;
+                    for (JointId joint = 0;
+                         success && joint < MAX_JOINTS; ++joint) {
+                        const auto mask =
+                            static_cast<JointMask>(JointMask{1} << joint);
+                        if ((value.joints & mask) != 0
+                            && !std::isfinite(value.position[joint])) {
+                            success = false;
+                        }
+                    }
+                    if (success) {
+                        for (JointId joint = 0;
+                             joint < MAX_JOINTS; ++joint) {
+                            const auto mask =
+                                static_cast<JointMask>(
+                                    JointMask{1} << joint);
+                            if ((value.joints & mask) == 0) {
+                                continue;
+                            }
+                            m_snapshot.commandedJoints.position[joint] =
+                                value.position[joint];
+                            m_snapshot.commandedJoints.velocity[joint] = 0.0;
+                            m_snapshot.commandedJoints.acceleration[joint] =
+                                0.0;
+                        }
+                        m_snapshot.feedbackJoints =
+                            m_snapshot.commandedJoints;
+                    }
                 }
 
                 emit(RequestCompleted{value.id, success});
@@ -438,6 +524,8 @@ namespace ngc {
         m_triggered = {};
         m_triggeredJoints = {};
         m_triggeredJointMask = 0;
+        m_triggeredJointCompletionStatus =
+            TriggeredMoveStatus::ReachedTarget;
         m_snapshot.activeChunk = itemId(item);
         m_snapshot.activeSpan = 0;
         emit(ChunkAccepted{itemEpoch(item), itemId(item)});
@@ -454,7 +542,8 @@ namespace ngc {
 
     void ProductionExecutorCore::advanceActive(double seconds) noexcept {
         while (m_active.has_value() && seconds > 0.0
-               && m_snapshot.state == BackendState::Running) {
+               && (m_snapshot.state == BackendState::Running
+                   || m_snapshot.state == BackendState::Holding)) {
             const auto &item = m_planSlots[*m_active].item;
             if (std::holds_alternative<PlanChunk>(item)) {
                 advancePlan(seconds);
@@ -668,7 +757,10 @@ namespace ngc {
         m_snapshot.state = BackendState::Held;
         m_snapshot.lastBranch = move.branch;
         emit(BackendHeld{
-            move.epoch, stopped, BackendHoldReason::StopBranch,
+            move.epoch, stopped,
+            status == TriggeredMoveStatus::Aborted
+                ? BackendHoldReason::ControlledStop
+                : BackendHoldReason::StopBranch,
         });
         release(*m_active);
         m_active.reset();
@@ -682,6 +774,8 @@ namespace ngc {
         const auto &move = activeTriggeredJointMove();
         m_triggeredJoints = {};
         m_triggeredJointMask = 0;
+        m_triggeredJointCompletionStatus =
+            TriggeredMoveStatus::ReachedTarget;
         m_snapshot.activeJoints = move.joints;
         for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
             const auto mask = static_cast<JointMask>(JointMask{1} << joint);
@@ -726,7 +820,8 @@ namespace ngc {
     }
 
     bool ProductionExecutorCore::beginTriggeredJointStop(
-        const TriggeredJointMove &move, const JointId joint) noexcept {
+        const TriggeredJointMove &move, const JointId joint,
+        const bool triggered) noexcept {
         auto &runtime = m_triggeredJoints[joint];
         const auto &state = m_snapshot.commandedJoints;
         runtime.stopping = true;
@@ -734,8 +829,10 @@ namespace ngc {
         runtime.triggerVelocity = state.velocity[joint];
         runtime.triggerAcceleration = state.acceleration[joint];
         runtime.elapsed = 0.0;
-        m_triggeredJointMask |=
-            static_cast<JointMask>(JointMask{1} << joint);
+        if (triggered) {
+            m_triggeredJointMask |=
+                static_cast<JointMask>(JointMask{1} << joint);
+        }
         if (std::abs(runtime.triggerVelocity) <= 1e-12
             && std::abs(runtime.triggerAcceleration) <= 1e-12) {
             runtime.finished = true;
@@ -819,7 +916,8 @@ namespace ngc {
             auto &runtime = m_triggeredJoints[trigger.joint];
             if (!runtime.finished && !runtime.stopping
                 && triggeredJointInputQualified(trigger, runtime)
-                && !beginTriggeredJointStop(move, trigger.joint)) {
+                && !beginTriggeredJointStop(
+                    move, trigger.joint, true)) {
                 faultTriggered();
 
                 return;
@@ -892,10 +990,14 @@ namespace ngc {
                 runtime.triggerAcceleration;
         }
         const auto status =
-            expectedTriggers != 0
-            && (m_triggeredJointMask & expectedTriggers) == expectedTriggers
-            ? TriggeredMoveStatus::Triggered
-            : TriggeredMoveStatus::ReachedTarget;
+            m_triggeredJointCompletionStatus
+                == TriggeredMoveStatus::Aborted
+            ? TriggeredMoveStatus::Aborted
+            : expectedTriggers != 0
+                && (m_triggeredJointMask & expectedTriggers)
+                    == expectedTriggers
+                ? TriggeredMoveStatus::Triggered
+                : TriggeredMoveStatus::ReachedTarget;
         emit(TriggeredJointMoveCompleted{
             move.epoch, move.moveId, status, m_triggeredJointMask,
             triggerState, m_snapshot.commandedJoints,
@@ -909,7 +1011,9 @@ namespace ngc {
         m_snapshot.activeJoints = 0;
         emit(BackendHeld{
             move.epoch, m_snapshot.commanded,
-            BackendHoldReason::StopBranch,
+            status == TriggeredMoveStatus::Aborted
+                ? BackendHoldReason::ControlledStop
+                : BackendHoldReason::StopBranch,
         });
         release(*m_active);
         m_active.reset();
@@ -1070,6 +1174,8 @@ namespace ngc {
         m_triggered = {};
         m_triggeredJoints = {};
         m_triggeredJointMask = 0;
+        m_triggeredJointCompletionStatus =
+            TriggeredMoveStatus::ReachedTarget;
         m_snapshot.activeJoints = 0;
     }
 

@@ -105,7 +105,7 @@ namespace ngc {
         bool initializeTriggeredJoint(const TriggeredJointMove &move,
                                       JointId joint) noexcept;
         bool beginTriggeredJointStop(const TriggeredJointMove &move,
-                                     JointId joint) noexcept;
+                                     JointId joint, bool triggered) noexcept;
         bool triggeredJointInputQualified(const JointTrigger &trigger,
                                           TriggeredJointRuntime &runtime) noexcept;
         void advanceTriggeredJoints(double &seconds) noexcept;
@@ -161,6 +161,8 @@ namespace ngc {
         TriggeredRuntime m_triggered;
         std::array<TriggeredJointRuntime, MAX_JOINTS> m_triggeredJoints;
         JointMask m_triggeredJointMask = 0;
+        TriggeredMoveStatus m_triggeredJointCompletionStatus =
+            TriggeredMoveStatus::ReachedTarget;
         std::bitset<DIGITAL_INPUT_CAPACITY> m_digitalInputs;
         std::bitset<DIGITAL_INPUT_CAPACITY> m_previousDigitalInputs;
         bool m_stopping = false;
