@@ -856,8 +856,9 @@ restore gating, enable/disable, repeated epochs, dependent publication and
 retirement, marker ordering, triggered joint motion, jogging lease expiry,
 controlled Stop, abort, bounded publication and control channels, and a fatal
 hold transition. Direct mock-only diagnostic tests remain alongside this suite.
-The second target remains blocked on the reusable production executor core;
-future executor and IPC runtimes must register with the same suite rather than
+The second target remains pending while the initial production executor core
+gains the complete backend-neutral primitive coverage required by the suite.
+Future executor and IPC runtimes must register with the same suite rather than
 forking its behavioral expectations.
 
 - Build a reusable behavioral suite for enable/disable, repeated epochs,
@@ -896,6 +897,21 @@ before the IPC layer can support the production executor.
   resume interrupted epochs. Complete on Windows.
 
 ### Phase 10: Extract and prove the production executor core
+
+Status: in progress. `ProductionExecutorCore` now provides the first
+platform-independent, fixed-period execution slice. It owns only fixed-capacity
+plan, control, event, and snapshot storage and executes validated normal
+`PlanChunk` polynomials, dependent continuations, terminal stop branches,
+ordered markers, retirement, snapshots, and bounded fault transitions. Focused
+tests cover fixed-period advancement and duration accounting, continuation and
+stop selection, marker order, stale-continuation rejection, bounded channels,
+and explicit rejection of unsupported inputs.
+
+The core is not yet connected to `ngc_ipc_backend` or registered as the second
+backend-conformance target. Triggered moves, jogging, homing, feed hold/resume,
+controlled stop, and scheduled hardware events remain outside this initial
+slice; they must be implemented and proved before the core can claim the
+complete production executor contract.
 
 - Factor reusable allocation-free execution mechanics without importing
   synthetic-input or mock-diagnostic policy.

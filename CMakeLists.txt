@@ -44,6 +44,7 @@ add_library(ngc_core STATIC
         src/MachineSession.cpp
         src/MachineConfiguration.cpp
         src/ProgramExecutionController.cpp
+        src/ProductionExecutorCore.cpp
         src/PreparedGeometry.cpp
         src/SplineReconstruction.cpp
         src/TrajectoryCompiler.cpp
@@ -114,6 +115,13 @@ target_include_directories(ngc_tests PRIVATE src)
 target_link_libraries(ngc_tests PRIVATE ngc_core glm::glm-header-only PathTempo::PathTempo)
 ngc_target_defaults(ngc_tests)
 add_test(NAME ngc_tests COMMAND ngc_tests)
+
+add_executable(ngc_production_executor_tests
+    src/ProductionExecutorCoreTests.cpp
+)
+target_link_libraries(ngc_production_executor_tests PRIVATE ngc_core)
+ngc_target_defaults(ngc_production_executor_tests)
+add_test(NAME ngc_production_executor_tests COMMAND ngc_production_executor_tests)
 
 add_executable(ngc_ipc_backend tools/ngc_ipc_backend.cpp)
 target_include_directories(ngc_ipc_backend PRIVATE src)

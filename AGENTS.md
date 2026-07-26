@@ -55,8 +55,13 @@ delegates Simulation runtime responsibilities to that runtime. The
 runtime and backend survive individual program epochs; timed scheduling is
 activated only for an active program epoch, while homing and jogging currently
 use runtime-owned synchronous service stepping. `MockMotionBackend` is a non-RT
-implementation of the production-shaped backend contract. There is no real-time
-executor, HAL component, or physical backend yet. `ExternalRealtimeRuntime`
+implementation of the production-shaped backend contract.
+`ProductionExecutorCore` is the initial platform-independent, fixed-period,
+allocation-free execution core for normal `PlanChunk` motion, stop branches,
+markers, retirement, snapshots, and faults. It does not yet execute triggered
+moves, jogging, homing, feed hold, or scheduled hardware events, and it is not
+yet hosted by the external process. There is no complete real-time executor,
+HAL component, or physical backend yet. `ExternalRealtimeRuntime`
 implements the NRT side of the versioned shared-memory IPC boundary and owns a
 bounded `MotionBackend` proxy. The `ngc_ipc_backend` executable is a
 transport-only non-hardware peer used to prove handshakes, channel behavior,
