@@ -12,6 +12,7 @@
 #include <thread>
 #include <variant>
 
+#include "ExecutionItemOperations.h"
 #include "IpcPlatform.h"
 #include "machine/IpcProtocol.h"
 #include "machine/MachineConfiguration.h"
@@ -81,18 +82,6 @@ namespace {
         }
 
         return options;
-    }
-
-    ngc::EpochId itemEpoch(const ngc::ExecutionItem &item) noexcept {
-        return std::visit([](const auto &value) {
-            return value.epoch;
-        }, item);
-    }
-
-    ngc::ChunkId itemId(const ngc::ExecutionItem &item) noexcept {
-        return std::visit([](const auto &value) {
-            return value.id;
-        }, item);
     }
 
     class TemporaryTriggeredInputs final : public ngc::ProductionExecutorIo {
@@ -327,8 +316,8 @@ namespace {
                         m_triggeredInputs.clear();
                     }
                     m_pendingEvent = ngc::ChunkRejected{
-                        itemEpoch(*m_pendingItem),
-                        itemId(*m_pendingItem),
+                        ngc::execution_item::epoch(*m_pendingItem),
+                        ngc::execution_item::id(*m_pendingItem),
                     };
                     m_pendingItem.reset();
                     m_pendingInputsArmed = false;

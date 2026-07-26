@@ -1,5 +1,6 @@
 #include "machine/MockMotionBackend.h"
 
+#include "ExecutionItemOperations.h"
 #include "machine/MachineConfiguration.h"
 
 #include <algorithm>
@@ -7,6 +8,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <ranges>
 #include <type_traits>
 
 #include <ruckig/ruckig.hpp>
@@ -256,23 +258,6 @@ namespace ngc {
             m_snapshot.feedbackJoints = m_snapshot.commandedJoints;
         }
 
-        static std::uint64_t secondsToNanoseconds(const double seconds) {
-            constexpr auto scale=1.0e9;
-            if(!std::isfinite(seconds)||seconds<=0.0) return 0;
-            const auto maximum=static_cast<double>(std::numeric_limits<std::uint64_t>::max());
-            if(seconds>=maximum/scale) return std::numeric_limits<std::uint64_t>::max();
-            return static_cast<std::uint64_t>(std::llround(seconds*scale));
-        }
-
-        static std::uint64_t normalMotionNanoseconds(const ExecutionItem &item) {
-            const auto *chunk=std::get_if<PlanChunk>(&item);
-            if(!chunk) return 0;
-            auto seconds=0.0;
-            for(const auto &span:chunk->normalMotion)
-                seconds+=std::max(span.duration,0.0);
-            return secondsToNanoseconds(seconds);
-        }
-
     public:
         Impl(const FeedHoldConfiguration &feedHold, const TrajectoryLimits &trajectory)
             : m_feedHoldLimits(feedHold), m_trajectoryLimits(trajectory) { }
@@ -283,84 +268,17 @@ namespace ngc {
               m_axes(axes), m_joints(joints) { }
 
         PublishResult publish(const ExecutionItem &item) noexcept {
-            const auto valid = std::visit([](const auto &value) {
-                using T = std::decay_t<decltype(value)>;
-                if constexpr(std::same_as<T, PlanChunk>) {
-                    if (value.normalMotion.size == 0 || value.stopTail.size == 0
-                       || value.epoch == 0 || value.id == 0) {
-                        return false;
-                    }
-                    const auto validSpan = [](const AxisPolynomialSpan &span) {
-                        if (span.id == 0
-                           || (span.degree
-                                    != ExecutionPolynomialDegree::Cubic
-                               && span.degree
-                                    != ExecutionPolynomialDegree::Quintic)
-                           || !std::isfinite(span.duration)
-                           || span.duration <= 0.0
-                           || !std::isfinite(span.inverseDuration)
-                           || span.inverseDuration <= 0.0) {
-                            return false;
-                        }
-                        return span.degree
-                                != ExecutionPolynomialDegree::Cubic
-                            || (span.coefficients[3].length() == 0.0
-                                && span.coefficients[4].length() == 0.0);
-                    };
-                    if (!std::ranges::all_of(
-                            value.normalMotion, validSpan)
-                       || !std::ranges::all_of(
-                            value.stopTail, validSpan)) {
-                        return false;
-                    }
-                    std::optional<std::pair<std::uint32_t, double>> previous;
-                    for (const auto &marker : value.markers) {
-                        const auto location =
-                            std::pair{marker.span, marker.parameter};
-                        if (marker.id == 0
-                           || marker.span >= value.normalMotion.size
-                           || !std::isfinite(marker.parameter)
-                           || marker.parameter < 0.0
-                           || marker.parameter > 1.0
-                           || (previous && location < *previous)) {
-                            return false;
-                        }
-                        previous = location;
-                    }
-                    return true;
-                }
-                else if constexpr(std::same_as<T, TriggeredMove>)
-                    return value.epoch != 0 && value.id != 0 && value.moveId != 0
-                        && magnitude(value.target) < std::numeric_limits<double>::infinity()
-                        && magnitude(value.limits.velocity) > 0.0
-                        && magnitude(value.limits.acceleration) > 0.0
-                        && magnitude(value.limits.jerk) > 0.0;
-                else {
-                    if(value.epoch == 0 || value.id == 0 || value.moveId == 0 || value.joints == 0) return false;
-                    for(JointId joint = 0; joint < MAX_JOINTS; ++joint) {
-                        if((value.joints & (JointMask{1} << joint)) == 0) continue;
-                        if(!std::isfinite(value.target[joint]) || value.limits.velocity[joint] <= 0.0
-                           || value.limits.acceleration[joint] <= 0.0 || value.limits.jerk[joint] <= 0.0)
-                            return false;
-                    }
-                    JointMask boundJoints = 0;
-                    for(const auto &trigger : value.triggers) {
-                        if(trigger.joint >= MAX_JOINTS
-                           || (value.joints & (JointMask{1} << trigger.joint)) == 0
-                           || (boundJoints & (JointMask{1} << trigger.joint)) != 0
-                           || !std::isfinite(trigger.debounce) || trigger.debounce < 0.0) return false;
-                        boundJoints |= JointMask{1} << trigger.joint;
-                    }
-                    return !value.triggerRequired || boundJoints == value.joints;
-                }
-            }, item);
-            if(!valid) return PublishResult::Invalid;
+            if (!execution_item::valid(item)) {
+                return PublishResult::Invalid;
+            }
+
             for(std::uint8_t index = 0; index < m_planSlots.size(); ++index) {
                 bool expected = false;
                 if(!m_planSlots[index].occupied.compare_exchange_strong(expected, true, std::memory_order_acquire)) continue;
                 auto &slot=m_planSlots[index];
                 slot.item = item;
-                slot.normalMotionNanoseconds=normalMotionNanoseconds(item);
+                slot.normalMotionNanoseconds=
+                    execution_item::normalMotionNanoseconds(item);
                 m_queuedNormalMotionNanoseconds.fetch_add(
                     slot.normalMotionNanoseconds,std::memory_order_release);
                 m_queuedExecutionItems.fetch_add(1,std::memory_order_release);
@@ -521,15 +439,6 @@ namespace ngc {
         const ExecutionItem &activeItem() const { return m_planSlots[*m_active].item; }
         PlanChunk &activeChunk() { return std::get<PlanChunk>(activeItem()); }
         const PlanChunk &activeChunk() const { return std::get<PlanChunk>(activeItem()); }
-        static EpochId itemEpoch(const ExecutionItem &item) {
-            return std::visit([](const auto &value) { return value.epoch; }, item);
-        }
-        static ChunkId itemId(const ExecutionItem &item) {
-            return std::visit([](const auto &value) { return value.id; }, item);
-        }
-        static BranchSequence itemPredecessor(const ExecutionItem &item) {
-            return std::visit([](const auto &value) { return value.predecessorBranch; }, item);
-        }
         const AxisPolynomialSpan &currentSpan() const {
             const auto &chunk = activeChunk();
             return m_stopping ? chunk.stopTail[m_span] : chunk.normalMotion[m_span];
@@ -1673,8 +1582,10 @@ namespace ngc {
             if(!m_plans.tryPop(index)) return;
             accountForDequeued(index);
             const auto &item = m_planSlots[index].item;
-            if(itemEpoch(item) != m_snapshot.epoch) {
-                emit(ChunkRejected { itemEpoch(item), itemId(item) });
+            if (execution_item::epoch(item) != m_snapshot.epoch) {
+                emit(ChunkRejected {
+                    execution_item::epoch(item),
+                    execution_item::id(item) });
                 release(index);
                 return;
             }
@@ -1683,9 +1594,11 @@ namespace ngc {
             m_span = 0;
             m_nextMarker = 0;
             m_spanElapsed = 0.0;
-            m_snapshot.activeChunk = itemId(item);
+            m_snapshot.activeChunk = execution_item::id(item);
             m_snapshot.activeSpan = 0;
-            emit(ChunkAccepted { itemEpoch(item), itemId(item) });
+            emit(ChunkAccepted {
+                execution_item::epoch(item),
+                execution_item::id(item) });
             if (std::holds_alternative<PlanChunk>(item)) {
                 emitExecutionMarkersThrough(0.0);
             }
@@ -1729,11 +1642,15 @@ namespace ngc {
             if(hasContinuation) accountForDequeued(continuationIndex);
             const auto &current = activeChunk();
             if(hasContinuation
-               && itemEpoch(m_planSlots[continuationIndex].item) == current.epoch
-               && itemPredecessor(m_planSlots[continuationIndex].item) == current.branch) {
+               && execution_item::epoch(
+                      m_planSlots[continuationIndex].item) == current.epoch
+               && execution_item::predecessor(
+                      m_planSlots[continuationIndex].item) == current.branch) {
                 const auto oldIndex = *m_active;
                 const auto &continuation = m_planSlots[continuationIndex].item;
-                emit(BranchSelected { current.epoch, current.branch, BranchChoice::Continue, itemId(continuation) });
+                emit(BranchSelected {
+                    current.epoch, current.branch, BranchChoice::Continue,
+                    execution_item::id(continuation) });
                 ++m_continuationSequence;
                 emit(ChunkRetired { current.epoch, current.id });
                 m_active = continuationIndex;
@@ -1741,9 +1658,11 @@ namespace ngc {
                 m_span = 0;
                 m_nextMarker = 0;
                 m_spanElapsed = 0.0;
-                m_snapshot.activeChunk = itemId(continuation);
+                m_snapshot.activeChunk = execution_item::id(continuation);
                 m_snapshot.activeSpan = 0;
-                emit(ChunkAccepted { itemEpoch(continuation), itemId(continuation) });
+                emit(ChunkAccepted {
+                    execution_item::epoch(continuation),
+                    execution_item::id(continuation) });
                 if (std::holds_alternative<PlanChunk>(continuation)) {
                     emitExecutionMarkersThrough(0.0);
                 }
@@ -1753,7 +1672,9 @@ namespace ngc {
             } else {
                 if(hasContinuation) {
                     const auto &continuation = m_planSlots[continuationIndex].item;
-                    emit(ChunkRejected { itemEpoch(continuation), itemId(continuation) });
+                    emit(ChunkRejected {
+                        execution_item::epoch(continuation),
+                        execution_item::id(continuation) });
                     release(continuationIndex);
                 }
                 emit(BranchSelected { current.epoch, current.branch, BranchChoice::Stop, 0 });

@@ -208,6 +208,40 @@ namespace ngc::test {
                     "disable did not establish the disabled state");
         }
 
+        void verifyExecutionItemValidation(const BackendConformanceTarget &target) {
+            RuntimeFixture fixture(target, target.createRuntime());
+
+            auto missingBranch =
+                linearChunk(1, 1, 0, 1, 1, 0.0, 0.1, 0.1);
+            missingBranch.branch = 0;
+            require(target,
+                    fixture.backend().tryPublish(missingBranch)
+                        == PublishResult::Invalid,
+                    "an execution item without a branch was accepted");
+
+            auto invalidEvent =
+                linearChunk(1, 2, 0, 2, 3, 0.0, 0.1, 0.1);
+            require(target,
+                    invalidEvent.events.push({
+                        1, SpindleEvent{},
+                    }),
+                    "the invalid scheduled-event fixture did not fit");
+            require(target,
+                    fixture.backend().tryPublish(invalidEvent)
+                        == PublishResult::Invalid,
+                    "a scheduled event outside normal motion was accepted");
+
+            auto invalidTrigger = target.makeTriggeredJointMove();
+            invalidTrigger.epoch = 1;
+            invalidTrigger.branch = 1;
+            invalidTrigger.triggerRequired = true;
+            invalidTrigger.triggers.size = 0;
+            require(target,
+                    fixture.backend().tryPublish(invalidTrigger)
+                        == PublishResult::Invalid,
+                    "a required triggered-joint move without triggers was accepted");
+        }
+
         void verifyPublicationMarkersAndRepeatedEpochs(
             const BackendConformanceTarget &target) {
             RuntimeFixture fixture(target, target.createRuntime());
@@ -507,6 +541,7 @@ namespace ngc::test {
         }
 
         verifyRuntimeLifecycle(target);
+        verifyExecutionItemValidation(target);
         verifyPublicationMarkersAndRepeatedEpochs(target);
         verifyTriggeredJointMotion(target);
         verifyJogLease(target);

@@ -724,18 +724,20 @@ sub _tool_change[#tool_number] {
         ngc::ExternalRealtimeRuntime runtime(std::move(options));
         runtime.start();
 
+        require(runtime.endpoint().tryPublish(ngc::PlanChunk{})
+                    == ngc::PublishResult::Invalid,
+                "external runtime accepted an invalid execution item");
+
         for (std::uint64_t index = 0;
              index < ngc::IPC_EXECUTION_CAPACITY; ++index) {
-            ngc::PlanChunk chunk;
-            chunk.epoch = 1;
-            chunk.id = index + 1;
+            const auto chunk = linearChunk(
+                1, index + 1, 0.0, 0.01, 0.01);
             require(runtime.endpoint().tryPublish(chunk)
                         == ngc::PublishResult::Published,
                     "non-consuming IPC peer should expose every bounded slot");
         }
-        ngc::PlanChunk overflow;
-        overflow.epoch = 1;
-        overflow.id = 100;
+        const auto overflow =
+            linearChunk(1, 100, 0.0, 0.01, 0.01);
         require(runtime.endpoint().tryPublish(overflow)
                     == ngc::PublishResult::Full,
                 "full IPC execution ring should report backpressure");

@@ -11,6 +11,7 @@
 #include <utility>
 #include <variant>
 
+#include "ExecutionItemOperations.h"
 #include "IpcPlatform.h"
 
 namespace ngc {
@@ -23,12 +24,6 @@ namespace ngc {
                 && identity.sessionGeneration == 0
                 && identity.epochGeneration == 0
                 && identity.authorityGeneration == 0;
-        }
-
-        EpochId executionItemEpoch(const ExecutionItem &item) noexcept {
-            return std::visit([](const auto &value) {
-                return value.epoch;
-            }, item);
         }
 
         std::string rejectionMessage(const IpcRejection rejection) {
@@ -59,6 +54,10 @@ namespace ngc {
             explicit Endpoint(Impl &owner) : m_owner(owner) { }
 
             PublishResult tryPublish(const ExecutionItem &item) noexcept override {
+                if (!execution_item::valid(item)) {
+                    return PublishResult::Invalid;
+                }
+
                 m_owner.refreshPeerState();
                 if (!m_owner.running()) {
                     return PublishResult::Invalid;
@@ -67,7 +66,7 @@ namespace ngc {
                     return PublishResult::Full;
                 }
 
-                const auto epoch = executionItemEpoch(item);
+                const auto epoch = execution_item::epoch(item);
                 if (epoch != 0) {
                     m_owner.m_lastPublishedEpoch = epoch;
                 }

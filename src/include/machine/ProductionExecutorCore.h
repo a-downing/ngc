@@ -171,16 +171,6 @@ namespace ngc {
             bool resuming = false;
         };
 
-        static bool validExecutionItem(const ExecutionItem &item) noexcept;
-        static bool validPlanChunk(const PlanChunk &chunk) noexcept;
-        static bool validTriggeredMove(const TriggeredMove &move) noexcept;
-        static bool validTriggeredJointMove(const TriggeredJointMove &move) noexcept;
-        static std::uint64_t normalMotionNanoseconds(const ExecutionItem &item) noexcept;
-        static std::uint64_t secondsToNanoseconds(double seconds) noexcept;
-        static EpochId itemEpoch(const ExecutionItem &item) noexcept;
-        static ChunkId itemId(const ExecutionItem &item) noexcept;
-        static BranchSequence itemPredecessor(const ExecutionItem &item) noexcept;
-
         void serviceControls() noexcept;
         void activateNext() noexcept;
         void advanceActive(double seconds) noexcept;
