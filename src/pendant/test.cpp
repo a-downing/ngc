@@ -17,6 +17,7 @@
 #include "pendant/VistaCncP2sManager.h"
 #include "pendant/VistaCncP2sProfile.h"
 #include "pendant/VistaCncP2sProtocol.h"
+#include "platform/HidReportDescriptor.h"
 
 namespace {
     void require(const bool condition, const std::string_view message) {
@@ -137,6 +138,51 @@ namespace {
         bool m_cancelRequested = false;
         std::vector<std::vector<std::uint8_t>> m_outputs;
     };
+
+    void testHidReportDescriptorLengths() {
+        namespace hid_detail = ngc::pendant::hid_detail;
+
+        const std::array<std::uint8_t, 34> unnumbered {
+            0x06, 0xa0, 0xff, 0x09, 0x01, 0xa1, 0x01, 0x09,
+            0x03, 0x15, 0x00, 0x26, 0xff, 0x00, 0x75, 0x08,
+            0x95, 0x08, 0x81, 0x02, 0x09, 0x04, 0x15, 0x00,
+            0x26, 0xff, 0x00, 0x75, 0x08, 0x95, 0x14, 0x91,
+            0x02, 0xc0,
+        };
+        const auto unnumberedLengths = hid_detail::hidApiReportLengths(unnumbered);
+        require(unnumberedLengths && unnumberedLengths->input == 8
+                && unnumberedLengths->output == 21,
+                "unnumbered HID reports should omit the input ID and reserve output ID zero");
+
+        const std::array<std::uint8_t, 14> numbered {
+            0x85, 0x05, 0x75, 0x01, 0x95, 0x09, 0x81, 0x02,
+            0x75, 0x08, 0x95, 0x14, 0x91, 0x02,
+        };
+        const auto numberedLengths = hid_detail::hidApiReportLengths(numbered);
+        require(numberedLengths && numberedLengths->input == 3
+                && numberedLengths->output == 21,
+                "numbered HID reports should include their nonzero report ID");
+
+        const std::array<std::uint8_t, 14> pushed {
+            0x75, 0x08, 0x95, 0x08, 0xa4,
+            0x85, 0x02, 0x95, 0x04, 0x81, 0x02,
+            0xb4, 0x91, 0x02,
+        };
+        const auto pushedLengths = hid_detail::hidApiReportLengths(pushed);
+        require(pushedLengths && pushedLengths->input == 5
+                && pushedLengths->output == 9,
+                "HID global push and pop should restore report size, count, and ID");
+
+        const std::array<std::uint8_t, 1> truncated { 0x75 };
+        require(!hid_detail::hidApiReportLengths(truncated),
+                "a truncated HID descriptor item should be rejected");
+
+        const std::array<std::uint8_t, 6> inputOnly {
+            0x75, 0x08, 0x95, 0x08, 0x81, 0x02,
+        };
+        require(!hid_detail::hidApiReportLengths(inputOnly),
+                "a HID interface without both input and output reports should be rejected");
+    }
 
     void testInputDecoder() {
         namespace protocol = ngc::pendant::vista_cnc_p2s;
@@ -640,6 +686,7 @@ namespace {
 
 int main() {
     try {
+        testHidReportDescriptorLengths();
         testInputDecoder();
         testDriverFramesWindowsReportsAndDisplay();
         testPositionDisplayUsesBothEightCharacterRows();

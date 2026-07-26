@@ -1339,7 +1339,6 @@ private:
                     m_programRunning = false;
                     m_snapshot.activity = ngc::SimulationActivity::Idle;
                 } else if(state == ngc::PreparedDriverState::Error) {
-                    m_snapshot.status = ngc::SimulationStatus::Error;
                     m_snapshot.activity = ngc::SimulationActivity::Idle;
                     m_snapshot.error = *m_driver.error(); m_running = false; m_programRunning = false;
                 } else if(state == ngc::PreparedDriverState::Completed) {
@@ -1368,6 +1367,8 @@ private:
                             m_programRunning = false;
                             m_snapshot.status = ngc::SimulationStatus::Completed;
                             m_snapshot.activity = ngc::SimulationActivity::Idle;
+                        } else {
+                            m_snapshot.status = ngc::SimulationStatus::Error;
                         }
                     }
                     break;
@@ -1406,7 +1407,6 @@ private:
                     &&!m_driver.hasPendingPublication(),std::memory_order_release);
                 state = m_driver.state();
                 if(state == ngc::PreparedDriverState::Error) {
-                    m_snapshot.status = ngc::SimulationStatus::Error;
                     m_snapshot.activity = ngc::SimulationActivity::Idle;
                     m_snapshot.error = *m_driver.error();
                     m_running = false;
@@ -1424,6 +1424,7 @@ private:
                     {
                         std::scoped_lock statusLock(m_mutex);
                         m_snapshot.statusMessages = m_session.statusMessages();
+                        m_snapshot.status = ngc::SimulationStatus::Error;
                     }
                     break;
                 }

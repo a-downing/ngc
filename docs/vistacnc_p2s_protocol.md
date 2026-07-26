@@ -9,7 +9,7 @@ This document records the observed USB HID protocol for the VistaCNC P2-S pendan
 - Output interrupt endpoint: `0x01`.
 - Input payload: 8 bytes (a platform HID API may expose a leading report-ID byte).
 - Display output payload: 20 bytes. Bytes 0-15 are the visible space-padded display text, byte 16 is non-visible/unknown, byte 17 is an incrementing sequence number, and bytes 18-19 are zero in the old driver.
-- The HID descriptor declares 9-byte input and 21-byte output reports at the Windows API boundary; each includes a leading report ID of zero before the USB payload.
+- The HID descriptor declares 8-byte input and 20-byte output payloads without numbered reports. The Windows API includes a leading report-ID byte of zero in both capability lengths. Linux HIDAPI omits that byte when reading an unnumbered input report and requires it when writing an output report.
 
 ## Input report
 
