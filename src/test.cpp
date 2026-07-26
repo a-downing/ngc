@@ -1200,6 +1200,7 @@ final_move_together = true
                 realAuthority ? "" : realAuthority.error());
         require(manager.powerOn(*realAuthority),
                 "checkpoint source Real session should power on");
+        manager.setTickMultiplier(1000);
 
         ngc::ToolTable realTools;
         realTools.set(1, {1, 0, 0, 2, 0, 0, 0, 0.5, "Real checkpoint tool"});
@@ -1418,6 +1419,7 @@ final_move_together = true
         requireNear(preview.read(ngc::Var::G54_X), 7.0,
                     "Preview should retain its independent parameter mutation");
         require(manager.powerOn(authority), "parameter Simulation should power on explicitly");
+        manager.setTickMultiplier(1000);
         requireNear(manager.parameterSnapshot().at(ngc::Var::G54_X), 0.0,
                     "Preview evaluation must not alter the Simulation parameter snapshot");
         preview.join();

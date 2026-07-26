@@ -1,0 +1,2 @@
+# VistaCNC P2-S (04d8:fce2): permit the active desktop user and plugdev members.
+SUBSYSTEM=="hidraw", ATTRS{idVendor}=="04d8", ATTRS{idProduct}=="fce2", MODE="0660", GROUP="plugdev", TAG+="uaccess"

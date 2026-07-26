@@ -1616,7 +1616,6 @@ private:
                 m_snapshot.programOperation =
                     m_machineSession.programExecution().presentation();
                 if (operation.state == ngc::ProgramOperationState::Error) {
-                    m_snapshot.status = ngc::SimulationStatus::Error;
                     m_snapshot.activity = ngc::SimulationActivity::Idle;
                     m_snapshot.programOperation =
                         ngc::ProgramOperationPresentation::Failed;
@@ -1749,8 +1748,11 @@ private:
                                 m_snapshot.programOperation =
                                     ngc::ProgramOperationPresentation::Completed;
                             }
-                        } else if (persistenceError && m_snapshot.error.empty()) {
-                            m_snapshot.error = *persistenceError;
+                        } else {
+                            if (persistenceError && m_snapshot.error.empty()) {
+                                m_snapshot.error = *persistenceError;
+                            }
+                            m_snapshot.status = ngc::SimulationStatus::Error;
                         }
                     }
                     break;
