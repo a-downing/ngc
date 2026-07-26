@@ -25,6 +25,9 @@ namespace ngc {
         std::array<
             ProductionExecutorAxisMapping,
             static_cast<std::size_t>(AxisId::C) + 1> axes{};
+        // Physical axis-space authority reserved for cancelling ordinary
+        // PlanChunk motion. Zero limits leave that operation unavailable.
+        AxisMotionLimits controlledStopLimits{};
         std::uint32_t maximumJogLeaseTicks =
             std::numeric_limits<std::uint32_t>::max();
     };
@@ -118,6 +121,13 @@ namespace ngc {
             ruckig::Trajectory<1> trajectory;
         };
 
+        struct PlanStopRuntime {
+            MotionState origin{};
+            double elapsed = 0.0;
+            bool stationary = false;
+            ruckig::Trajectory<6> trajectory;
+        };
+
         static bool validExecutionItem(const ExecutionItem &item) noexcept;
         static bool validPlanChunk(const PlanChunk &chunk) noexcept;
         static bool validTriggeredMove(const TriggeredMove &move) noexcept;
@@ -132,6 +142,9 @@ namespace ngc {
         void activateNext() noexcept;
         void advanceActive(double seconds) noexcept;
         void advancePlan(double &seconds) noexcept;
+        bool beginPlanStop() noexcept;
+        void advancePlanStop(double &seconds) noexcept;
+        void completePlanStop() noexcept;
         bool initializeTriggered() noexcept;
         bool beginTriggeredStop(TriggeredMoveStatus status) noexcept;
         void advanceTriggered(double &seconds) noexcept;
@@ -213,6 +226,7 @@ namespace ngc {
         ExecutionSnapshot m_snapshot;
         std::optional<std::uint8_t> m_active;
         std::optional<JogRuntime> m_jog;
+        std::optional<PlanStopRuntime> m_planStop;
         ProductionExecutorConfiguration m_configuration;
         JointMask m_configuredJoints = 0;
         double m_servoPeriod;
@@ -224,6 +238,7 @@ namespace ngc {
         JointMask m_triggeredJointMask = 0;
         TriggeredMoveStatus m_triggeredJointCompletionStatus =
             TriggeredMoveStatus::ReachedTarget;
+        EpochId m_controlledStoppedEpoch = 0;
         std::bitset<DIGITAL_INPUT_CAPACITY> m_digitalInputs;
         std::bitset<DIGITAL_INPUT_CAPACITY> m_previousDigitalInputs;
         bool m_stopping = false;

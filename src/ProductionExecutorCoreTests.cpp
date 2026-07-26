@@ -193,6 +193,15 @@ namespace {
         };
     }
 
+    ngc::ProductionExecutorConfiguration controlledStopConfiguration() {
+        ngc::ProductionExecutorConfiguration configuration;
+        configuration.controlledStopLimits.velocity.x = 2.0;
+        configuration.controlledStopLimits.acceleration.x = 2.0;
+        configuration.controlledStopLimits.jerk.x = 8.0;
+
+        return configuration;
+    }
+
     JogRun runJogUntilHeld(ngc::ProductionExecutorCore &core,
                            const std::size_t maximumTicks = 4'000) {
         JogRun result;
@@ -985,6 +994,123 @@ namespace {
                     "axis controlled stop retained acceleration");
     }
 
+    void testControlledStopCancelsOrdinaryPlan() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(
+            0.01, controlledStopConfiguration());
+        initialize(*core, 92);
+
+        auto active =
+            linearChunk(92, 921, 0, 1'021, 1'121, 0.0, 1.0, 1.0);
+        auto queued =
+            linearChunk(92, 922, active.branch, 1'022, 1'122, 1.0, 2.0, 1.0);
+        require(active.markers.push({1'201, 0, 0.1})
+                    && active.markers.push({1'202, 0, 0.9})
+                    && queued.markers.push({1'203, 0, 0.0}),
+                "controlled-stop markers did not fit");
+        require(core->tryPublish(active)
+                    == ngc::PublishResult::Published
+                    && core->tryPublish(queued)
+                        == ngc::PublishResult::Published,
+                "controlled-stop plan horizon was not published");
+        require(core->trySubmit(ngc::StartRequest{10, active.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "controlled-stop plan start did not fit");
+
+        std::vector<ngc::ExecutionEvent> events;
+        ngc::ExecutionSnapshot moving;
+        for (auto tick = 0; tick < 25; ++tick) {
+            core->servoTick();
+            auto current = takeEvents(*core);
+            events.insert(events.end(), current.begin(), current.end());
+            moving = latestSnapshot(*core);
+        }
+        require(moving.state == ngc::BackendState::Running
+                    && moving.commanded.position.x > 0.2
+                    && moving.commanded.velocity.x > 0.0,
+                "ordinary controlled-stop fixture did not establish motion");
+        require(core->trySubmit(ngc::ControlledStopRequest{11})
+                    == ngc::SubmitResult::Submitted,
+                "ordinary controlled stop did not fit");
+
+        auto previousAcceleration = moving.commanded.acceleration.x;
+        auto sawHolding = false;
+        ngc::ExecutionSnapshot stopped;
+        for (auto tick = 0; tick < 1'000; ++tick) {
+            core->servoTick();
+            auto current = takeEvents(*core);
+            events.insert(events.end(), current.begin(), current.end());
+            stopped = latestSnapshot(*core);
+            sawHolding = sawHolding
+                || stopped.state == ngc::BackendState::Holding;
+            require(std::abs(stopped.commanded.acceleration.x)
+                        <= 2.0 + 1e-9,
+                    "ordinary controlled stop exceeded its acceleration limit");
+            require(std::abs(
+                        stopped.commanded.acceleration.x
+                        - previousAcceleration)
+                        <= 8.0 * core->servoPeriod() + 1e-8,
+                    "ordinary controlled stop exceeded its per-tick jerk limit");
+            previousAcceleration = stopped.commanded.acceleration.x;
+            if (stopped.state == ngc::BackendState::Held) {
+                break;
+            }
+        }
+
+        require(sawHolding && stopped.state == ngc::BackendState::Held,
+                "ordinary controlled stop did not complete its holding lifecycle");
+        require(stopped.commanded.position.x
+                    > moving.commanded.position.x
+                    && stopped.commanded.position.x < 1.0,
+                "ordinary controlled stop did not brake before the plan endpoint");
+        requireNear(stopped.commanded.velocity.x, 0.0,
+                    "ordinary controlled stop retained velocity");
+        requireNear(stopped.commanded.acceleration.x, 0.0,
+                    "ordinary controlled stop retained acceleration");
+        require(stopped.queuedExecutionItems == 0,
+                "ordinary controlled stop retained its queued horizon");
+
+        const auto requests =
+            selectEvents<ngc::RequestCompleted>(events);
+        require(std::ranges::any_of(
+                    requests, [](const auto &completed) {
+                        return completed.request == 11
+                            && completed.succeeded;
+                    }),
+                "ordinary controlled stop was not acknowledged");
+        const auto retired = selectEvents<ngc::ChunkRetired>(events);
+        require(retired.size() == 2
+                    && retired[0].chunk == active.id
+                    && retired[1].chunk == queued.id,
+                "ordinary controlled stop did not retire its horizon in order");
+        const auto held = selectEvents<ngc::BackendHeld>(events);
+        require(held.size() == 1
+                    && held[0].reason
+                        == ngc::BackendHoldReason::ControlledStop,
+                "ordinary controlled stop did not report its terminal reason");
+        const auto markers =
+            selectEvents<ngc::ExecutionMarkerReached>(events);
+        require(markers.size() == 1 && markers[0].marker == 1'201,
+                "ordinary controlled stop emitted a marker beyond its cursor");
+
+        require(core->tryPublish(
+                    linearChunk(92, 923, 0, 1'023, 1'123, 0.0, 1.0, 1.0))
+                    == ngc::PublishResult::Published,
+                "same-epoch resume rejection fixture was not published");
+        require(core->trySubmit(ngc::ResumeRequest{12, 92})
+                    == ngc::SubmitResult::Submitted,
+                "same-epoch resume rejection did not fit");
+        core->servoTick();
+        const auto resumeEvents = takeEvents(*core);
+        latestSnapshot(*core);
+        require(std::ranges::any_of(
+                    selectEvents<ngc::RequestCompleted>(resumeEvents),
+                    [](const auto &completed) {
+                        return completed.request == 12
+                            && !completed.succeeded;
+                    }),
+                "ordinary controlled stop allowed its abandoned epoch to resume");
+    }
+
     void testIncrementalJointGroupJogReachesTarget() {
         auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
         initialize(*core, 50);
@@ -1451,6 +1577,7 @@ int main() {
         testHomingControlSequence();
         testControlledStopAbortsTriggeredJointMove();
         testControlledStopAbortsAxisTriggeredMove();
+        testControlledStopCancelsOrdinaryPlan();
         testIncrementalJointGroupJogReachesTarget();
         testContinuousJogLeaseRenewalAndExpiry();
         testContinuousJogVelocityUpdateAndTokenMatchedStop();

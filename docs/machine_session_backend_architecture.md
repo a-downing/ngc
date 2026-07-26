@@ -906,11 +906,16 @@ validated normal `PlanChunk` polynomials, dependent continuations, axis-space
 `TriggeredJointMove` approaches with independently debounced triggers and
 constrained stops, same-epoch resume between service moves, stationary masked
 joint-coordinate assignment, constrained controlled-stop cancellation of
-triggered moves, executor-owned continuous and incremental jogging, terminal
-stop branches, ordered markers, retirement, snapshots, and bounded fault
+triggered moves, constrained ordinary-plan controlled stop, executor-owned
+continuous and incremental jogging, terminal stop branches, ordered markers,
+retirement, snapshots, and bounded fault
 transitions. Jogging uses fixed-capacity logical-axis-to-joint mappings,
 jerk-limited scalar trajectories, token-matched velocity updates and stops,
 bounded dead-man leases, travel limits, and separate physical stop limits. The
+ordinary-plan stop uses a fixed-size axis-space velocity trajectory generated
+from the current commanded PVA under configuration-carried physical limits. It
+retires the abandoned horizon in publication order, suppresses its future
+markers, and permanently rejects resume for that epoch. The
 hosting servo thread supplies digital-input samples before each tick; hardware
 acquisition and synthetic-input policy remain outside the core. Focused tests
 cover fixed-period advancement and duration accounting, continuation and stop
@@ -921,14 +926,15 @@ homing-style control sequence, controlled homing cancellation, incremental and
 continuous jog completion, renewal and lease expiry, velocity reversal,
 token-matched stopping, logical-axis mapping and offset preservation,
 travel-limit completion, bounded channels, and explicit rejection of
-unsupported inputs.
+unsupported inputs. They also cover mid-span ordinary-plan controlled stop,
+per-tick acceleration and jerk bounds, ordered horizon retirement, marker
+suppression, and same-epoch resume rejection.
 
 The core is not yet connected to `ngc_ipc_backend` or registered as the second
 backend-conformance target. It is not yet paired with `HomingController`
-through a production `BackendRuntime` host. Ordinary-plan controlled stop, feed
-hold/resume, and scheduled hardware events remain outside the current slice;
-they must be implemented and proved before the core can claim the complete
-production executor contract.
+through a production `BackendRuntime` host. Feed hold/resume and scheduled
+hardware events remain outside the current slice; they must be implemented and
+proved before the core can claim the complete production executor contract.
 
 - Factor reusable allocation-free execution mechanics without importing
   synthetic-input or mock-diagnostic policy.

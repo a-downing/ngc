@@ -87,6 +87,23 @@ namespace ngc {
 
             return axisComponent(copy, axis);
         }
+
+        std::array<double, 6> axisValues(
+            const position_t &value) noexcept {
+            return {
+                value.x, value.y, value.z,
+                value.a, value.b, value.c,
+            };
+        }
+
+        position_t axisPosition(
+            const std::array<double, 6> &value) noexcept {
+            return {
+                value[0], value[1], value[2],
+                value[3], value[4], value[5],
+            };
+        }
+
     }
 
     ProductionExecutorCore::ProductionExecutorCore(
@@ -194,6 +211,8 @@ namespace ngc {
         m_snapshot.state = BackendState::Disabled;
         m_snapshot.commanded = commanded;
         m_snapshot.feedback = feedback;
+        m_planStop.reset();
+        m_controlledStoppedEpoch = 0;
         m_faultEventEmitted = false;
     }
 
@@ -452,7 +471,8 @@ namespace ngc {
                 } else if constexpr (std::same_as<T, StartRequest>) {
                     success = !m_jog.has_value()
                         && m_snapshot.state == BackendState::Held
-                        && value.epoch != 0 && value.epoch == m_snapshot.epoch;
+                        && value.epoch != 0 && value.epoch == m_snapshot.epoch
+                        && value.epoch != m_controlledStoppedEpoch;
                     if (success) {
                         m_snapshot.state = BackendState::Running;
                     }
@@ -461,6 +481,7 @@ namespace ngc {
                         && m_snapshot.state == BackendState::Held
                         && !m_active.has_value() && value.epoch != 0
                         && value.epoch == m_snapshot.epoch
+                        && value.epoch != m_controlledStoppedEpoch
                         && m_queuedExecutionItems.load(
                             std::memory_order_acquire) != 0;
                     if (success) {
@@ -476,6 +497,10 @@ namespace ngc {
                             && m_active.has_value();
                     }
                     if (success && !stoppingJog
+                        && std::holds_alternative<PlanChunk>(
+                            m_planSlots[*m_active].item)) {
+                        success = !m_stopping && beginPlanStop();
+                    } else if (success && !stoppingJog
                         && std::holds_alternative<TriggeredMove>(
                             m_planSlots[*m_active].item)) {
                         if (m_triggered.stopping) {
@@ -538,6 +563,8 @@ namespace ngc {
                     m_snapshot.feedback = feedback;
                     m_snapshot.commandedJoints = commandedJoints;
                     m_snapshot.feedbackJoints = feedbackJoints;
+                    m_planStop.reset();
+                    m_controlledStoppedEpoch = 0;
                     m_faultEventEmitted = false;
                     success = value.nextEpoch != 0;
                 } else if constexpr (std::same_as<T, SetJointPositionRequest>) {
@@ -644,7 +671,9 @@ namespace ngc {
                && (m_snapshot.state == BackendState::Running
                    || m_snapshot.state == BackendState::Holding)) {
             const auto &item = m_planSlots[*m_active].item;
-            if (std::holds_alternative<PlanChunk>(item)) {
+            if (m_planStop.has_value()) {
+                advancePlanStop(seconds);
+            } else if (std::holds_alternative<PlanChunk>(item)) {
                 advancePlan(seconds);
             } else if (std::holds_alternative<TriggeredMove>(item)) {
                 advanceTriggered(seconds);
@@ -654,6 +683,136 @@ namespace ngc {
                 fault(INVALID_EXECUTION_STATE_FAULT);
             }
         }
+    }
+
+    bool ProductionExecutorCore::beginPlanStop() noexcept {
+        const auto &limits = m_configuration.controlledStopLimits;
+        PlanStopRuntime runtime;
+        runtime.origin = m_snapshot.commanded;
+
+        ruckig::InputParameter<6> input;
+        input.control_interface = ruckig::ControlInterface::Velocity;
+        input.current_position = {};
+        input.current_velocity = axisValues(runtime.origin.velocity);
+        input.current_acceleration =
+            axisValues(runtime.origin.acceleration);
+        input.target_position = {};
+        input.target_velocity = {};
+        input.target_acceleration = {};
+        const auto velocityLimits = axisValues(limits.velocity);
+        const auto accelerationLimits =
+            axisValues(limits.acceleration);
+        const auto jerkLimits = axisValues(limits.jerk);
+        auto movingAxes = std::size_t{0};
+        for (auto axis = std::size_t{0}; axis < 6; ++axis) {
+            const auto moving =
+                std::abs(input.current_velocity[axis]) > 1e-12
+                || std::abs(input.current_acceleration[axis]) > 1e-12;
+            input.enabled[axis] = moving;
+            if (!moving) {
+                input.max_velocity[axis] = 1.0;
+                input.max_acceleration[axis] = 1.0;
+                input.max_jerk[axis] = 1.0;
+                continue;
+            }
+            if (!std::isfinite(velocityLimits[axis])
+                || velocityLimits[axis] <= 0.0
+                || !std::isfinite(accelerationLimits[axis])
+                || accelerationLimits[axis] <= 0.0
+                || !std::isfinite(jerkLimits[axis])
+                || jerkLimits[axis] <= 0.0) {
+                return false;
+            }
+
+            input.max_velocity[axis] = velocityLimits[axis];
+            input.max_acceleration[axis] = accelerationLimits[axis];
+            input.max_jerk[axis] = jerkLimits[axis];
+            ++movingAxes;
+        }
+        if (movingAxes == 0) {
+            runtime.stationary = true;
+            m_planStop = std::move(runtime);
+
+            return true;
+        }
+
+        ruckig::Ruckig<6> generator;
+        if (generator.calculate(input, runtime.trajectory)
+            != ruckig::Result::Working) {
+            return false;
+        }
+
+        m_planStop = std::move(runtime);
+
+        return true;
+    }
+
+    void ProductionExecutorCore::advancePlanStop(double &seconds) noexcept {
+        auto &stop = *m_planStop;
+        if (stop.stationary) {
+            completePlanStop();
+
+            return;
+        }
+
+        const auto duration = stop.trajectory.get_duration();
+        const auto consumed =
+            std::min(seconds, std::max(duration - stop.elapsed, 0.0));
+        stop.elapsed += consumed;
+
+        std::array<double, 6> position{};
+        std::array<double, 6> velocity{};
+        std::array<double, 6> acceleration{};
+        stop.trajectory.at_time(
+            stop.elapsed, position, velocity, acceleration);
+        m_snapshot.commanded = {
+            stop.origin.position + axisPosition(position),
+            axisPosition(velocity),
+            axisPosition(acceleration),
+        };
+        m_snapshot.feedback = m_snapshot.commanded;
+        m_snapshot.spanProgress = duration > 0.0
+            ? std::clamp(stop.elapsed / duration, 0.0, 1.0) : 1.0;
+        seconds -= consumed;
+
+        if (stop.elapsed + 1e-12 < duration) {
+            return;
+        }
+
+        completePlanStop();
+    }
+
+    void ProductionExecutorCore::completePlanStop() noexcept {
+        const auto epoch = activeChunk().epoch;
+        m_snapshot.commanded.velocity = {};
+        m_snapshot.commanded.acceleration = {};
+        m_snapshot.feedback = m_snapshot.commanded;
+
+        emit(ChunkRetired{epoch, activeChunk().id});
+        release(*m_active);
+        m_active.reset();
+
+        std::uint8_t index = 0;
+        while (m_plans.tryPop(index)) {
+            accountForDequeued(index);
+            emit(ChunkRetired{
+                itemEpoch(m_planSlots[index].item),
+                itemId(m_planSlots[index].item),
+            });
+            release(index);
+        }
+
+        m_planStop.reset();
+        m_controlledStoppedEpoch = epoch;
+        m_stopping = false;
+        m_span = 0;
+        m_nextMarker = 0;
+        m_spanElapsed = 0.0;
+        m_snapshot.state = BackendState::Held;
+        emit(BackendHeld{
+            epoch, m_snapshot.commanded,
+            BackendHoldReason::ControlledStop,
+        });
     }
 
     void ProductionExecutorCore::advancePlan(double &seconds) noexcept {
@@ -1745,6 +1904,7 @@ namespace ngc {
             release(index);
         }
         m_stopping = false;
+        m_planStop.reset();
         m_span = 0;
         m_nextMarker = 0;
         m_spanElapsed = 0.0;

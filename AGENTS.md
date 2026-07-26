@@ -59,7 +59,12 @@ implementation of the production-shaped backend contract.
 `ProductionExecutorCore` is the initial platform-independent, fixed-period,
 allocation-free execution core for normal `PlanChunk` motion, axis-space
 triggered moves, joint-space triggered moves, stop branches, markers,
-retirement, snapshots, faults, and executor-owned jogging. Continuous and
+retirement, snapshots, faults, ordinary-plan controlled stop, and
+executor-owned jogging. Ordinary-plan controlled stop generates a fixed-size
+axis-space velocity-stop trajectory from the current commanded PVA under
+configuration-carried physical velocity, acceleration, and jerk limits,
+retires the abandoned horizon, suppresses its future markers, and permanently
+rejects resume for that epoch. Continuous and
 incremental jogs use a fixed-capacity logical-axis-to-joint mapping,
 jerk-limited scalar trajectories, token-matched velocity updates and stops,
 bounded dead-man leases, travel limits, and physical stop limits. Its hosting
@@ -70,8 +75,7 @@ acquisition or synthetic input policy. The core also provides the executor
 mechanics needed by homing: same-epoch resume between triggered joint moves,
 stationary masked joint-coordinate assignment, and constrained controlled-stop
 cancellation of axis- and joint-space triggered moves. It does not yet execute
-ordinary-plan controlled stop, feed hold, or scheduled hardware events; it is
-not yet paired with
+feed hold or scheduled hardware events; it is not yet paired with
 `HomingController` through a production `BackendRuntime` host or hosted by the
 external process.
 There is no complete real-time executor,
