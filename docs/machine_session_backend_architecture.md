@@ -899,9 +899,10 @@ fakes axis-space probe input 0.5 machine units before its move target and each
 joint-space homing input after 0.5 machine units of travel from its move start.
 For a shorter triggered joint approach, the peer lengthens its private item
 copy so the fixed transition can be sampled and stopped. These results prove
-functional executor and process behavior rather than real-time latency or
-hardware safety. Linux validation remains required before physical transport
-work.
+functional executor and process behavior rather than hardware safety. The
+production IPC path and configured RT hosting have been validated on the Linux
+RT development host; physical transport and hardware commissioning remain
+separate later phases.
 
 - Implement fixed shared-memory rings and the physical `MotionBackend` proxy.
   Complete for the transport skeleton.
@@ -914,7 +915,8 @@ work.
 
 ### Phase 10: Extract and prove the production executor core
 
-Status: in progress. `ProductionExecutorCore` now provides the first
+Status: implemented through the non-hardware Linux RT checkpoint.
+`ProductionExecutorCore` provides the first
 platform-independent, fixed-period execution slice. It owns only fixed-capacity
 execution-item, control, event, input-sample, and snapshot storage and executes
 validated normal `PlanChunk` polynomials, dependent continuations, axis-space
@@ -1003,16 +1005,17 @@ IPC tests execute a timed `PlanChunk`, an axis-space probe, and joint-space
 triggered motion through the child process and verify executor-generated
 acceptance, marker crossing, terminal stop selection, retirement, snapshots,
 feed hold, Resume, and Abort in addition to handshake, capacity, restart, and
-peer-loss behavior. The executable remains non-real-time, uses a temporary
-probe-and-homing input shim with otherwise null I/O, and is exposed as the
-configured Real development target without claiming physical hardware
+peer-loss behavior. The executable remains non-hardware, uses a temporary
+probe-and-homing input shim with otherwise null I/O, and runs either an
+ordinary scheduler thread or the configured Linux RT host. It is exposed as
+the configured Real development target without claiming physical hardware
 availability. The session runtime sends explicit Enable and Disable controls
 at Real power boundaries, and executor epoch Reset retains an already-enabled
 held state.
 
 - Factor reusable allocation-free execution mechanics without importing
-  synthetic-input or mock-diagnostic policy.
-- Add fixed-period and bounded-resource tests.
+  synthetic-input or mock-diagnostic policy. Complete.
+- Add fixed-period and bounded-resource tests. Complete.
 - Complete a production-grade feed-hold/resume design. Complete for ordinary
   `PlanChunk` motion, axis-space triggered moves, and scheduled spindle-output
   events.
