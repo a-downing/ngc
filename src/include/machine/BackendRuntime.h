@@ -3,6 +3,7 @@
 #include <cstdint>
 
 #include "machine/MotionBackend.h"
+#include "machine/RealtimeTiming.h"
 
 namespace ngc {
     struct BackendCapabilities { };
@@ -32,5 +33,9 @@ namespace ngc {
         virtual void serviceImmediate() = 0;
         [[nodiscard]] virtual std::uint64_t advanceServiceMotionPeriod() = 0;
         virtual void waitForServiceMotion() = 0;
+        virtual bool tryTakeRealtimeTiming(
+            RealtimeTimingSummary &) noexcept {
+            return false;
+        }
     };
 }

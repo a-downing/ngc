@@ -8,14 +8,16 @@
 #include <type_traits>
 
 #include "machine/MotionBackend.h"
+#include "machine/RealtimeTiming.h"
 
 namespace ngc {
     inline constexpr std::uint64_t IPC_MAGIC = 0x4e47435f49504331ULL;
-    inline constexpr std::uint32_t IPC_ABI_VERSION = 1;
+    inline constexpr std::uint32_t IPC_ABI_VERSION = 2;
     inline constexpr std::size_t IPC_EXECUTION_CAPACITY = 8;
     inline constexpr std::size_t IPC_CONTROL_CAPACITY = 16;
     inline constexpr std::size_t IPC_EVENT_CAPACITY = 64;
     inline constexpr std::size_t IPC_SNAPSHOT_CAPACITY = 8;
+    inline constexpr std::size_t IPC_REALTIME_TIMING_CAPACITY = 64;
 
     enum class IpcConnectionState : std::uint32_t {
         Empty,
@@ -66,6 +68,7 @@ namespace ngc {
         std::uint32_t controlRequestSize = 0;
         std::uint32_t executionEventSize = 0;
         std::uint32_t executionSnapshotSize = 0;
+        std::uint32_t realtimeTimingSummarySize = 0;
         IpcIdentity identity{};
         alignas(64) std::uint32_t connectionState = 0;
         std::uint32_t rejection = 0;
@@ -77,6 +80,9 @@ namespace ngc {
         IpcRingStorage<ControlRequest, IPC_CONTROL_CAPACITY> controls;
         IpcRingStorage<ExecutionEvent, IPC_EVENT_CAPACITY> events;
         IpcRingStorage<ExecutionSnapshot, IPC_SNAPSHOT_CAPACITY> snapshots;
+        IpcRingStorage<
+            RealtimeTimingSummary,
+            IPC_REALTIME_TIMING_CAPACITY> realtimeTiming;
     };
 
     static_assert(std::is_standard_layout_v<IpcSharedRegion>);
@@ -145,6 +151,8 @@ namespace ngc {
         region.controlRequestSize = sizeof(ControlRequest);
         region.executionEventSize = sizeof(ExecutionEvent);
         region.executionSnapshotSize = sizeof(ExecutionSnapshot);
+        region.realtimeTimingSummarySize =
+            sizeof(RealtimeTimingSummary);
         region.identity = identity;
         region.frontendProcessId = frontendProcessId;
         setIpcConnectionState(region, IpcConnectionState::FrontendReady);
@@ -162,7 +170,9 @@ namespace ngc {
             || region.executionItemSize != sizeof(ExecutionItem)
             || region.controlRequestSize != sizeof(ControlRequest)
             || region.executionEventSize != sizeof(ExecutionEvent)
-            || region.executionSnapshotSize != sizeof(ExecutionSnapshot)) {
+            || region.executionSnapshotSize != sizeof(ExecutionSnapshot)
+            || region.realtimeTimingSummarySize
+                != sizeof(RealtimeTimingSummary)) {
             return IpcRejection::RegionLayout;
         }
         if (region.identity.configurationFingerprint != expected.configurationFingerprint) {

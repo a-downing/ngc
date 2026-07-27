@@ -45,6 +45,7 @@ namespace {
             .peerArguments = {
                 "--machine-configuration",
                 std::filesystem::absolute("machine.toml").string(),
+                "--non-realtime",
             },
         };
     }
@@ -100,6 +101,22 @@ namespace {
         }
 
         throw std::runtime_error("timed out waiting for IPC snapshot");
+    }
+
+    ngc::RealtimeTimingSummary waitForRealtimeTiming(
+        ngc::ExternalRealtimeRuntime &runtime,
+        const std::chrono::milliseconds timeout = 2s) {
+        const auto deadline = std::chrono::steady_clock::now() + timeout;
+        ngc::RealtimeTimingSummary timing;
+        while (std::chrono::steady_clock::now() < deadline) {
+            if (runtime.tryTakeRealtimeTiming(timing)) {
+                return timing;
+            }
+            std::this_thread::sleep_for(1ms);
+        }
+
+        throw std::runtime_error(
+            "timed out waiting for IPC real-time timing summary");
     }
 
     ngc::ExecutionSnapshot waitForMotionProgress(
@@ -261,6 +278,27 @@ namespace {
         snapshotOverflow.epoch = 1000;
         require(!ngc::ipcTryPush(region->snapshots, snapshotOverflow),
                 "IPC snapshot ring should report backpressure when full");
+
+        for (std::uint64_t index = 0;
+             index < ngc::IPC_REALTIME_TIMING_CAPACITY; ++index) {
+            ngc::RealtimeTimingSummary timing;
+            timing.firstTick = index + 1;
+            require(ngc::ipcTryPush(region->realtimeTiming, timing),
+                    "IPC timing ring should accept its advertised capacity");
+        }
+        ngc::RealtimeTimingSummary timingOverflow;
+        timingOverflow.firstTick = 1000;
+        require(!ngc::ipcTryPush(
+                    region->realtimeTiming, timingOverflow),
+                "IPC timing ring should report backpressure when full");
+        for (std::uint64_t index = 0;
+             index < ngc::IPC_REALTIME_TIMING_CAPACITY; ++index) {
+            ngc::RealtimeTimingSummary timing;
+            require(ngc::ipcTryPop(region->realtimeTiming, timing),
+                    "IPC timing ring should retain every accepted summary");
+            require(timing.firstTick == index + 1,
+                    "IPC timing ring should preserve FIFO order");
+        }
     }
 
     void testExternalRuntimeExecutesThroughProductionCore(
@@ -269,6 +307,10 @@ namespace {
         runtime.start();
         runtime.start();
         require(runtime.connected(), "external runtime should complete its handshake");
+        const auto timing = waitForRealtimeTiming(runtime);
+        require(timing.sampleCount != 0
+                    && timing.maximumExecutionNanoseconds != 0,
+                "external runtime should expose peer servo timing");
 
         constexpr ngc::EpochId epoch = 17;
         require(runtime.endpoint().trySubmit(ngc::ResetRequest{21, epoch})
@@ -458,7 +500,8 @@ namespace {
     }
 
     void testConfiguredRealSessionRunsThroughIpcExecutor(
-        const std::filesystem::path &peer) {
+        const std::filesystem::path &peer,
+        const bool realtime) {
         auto configuration = ngc::loadMachineConfiguration("machine.toml");
         require(configuration.has_value(),
                 configuration ? "" : configuration.error());
@@ -467,6 +510,9 @@ namespace {
         require(configuration->realBackend->executable
                     == std::filesystem::absolute(peer).lexically_normal(),
                 "repository Real backend path should select the built IPC executor");
+        if (!realtime) {
+            configuration->realBackend->realtimeEnabled = false;
+        }
 
         ngc::MachineSessionManager manager(*configuration);
         const auto initial = manager.state();
@@ -662,6 +708,9 @@ namespace {
                 stopped.error.empty()
                     ? "configured IPC Real controlled Stop should complete"
                     : stopped.error);
+        require(stopped.realtimeTiming.has_value()
+                    && stopped.realtimeTiming->sampleCount != 0,
+                "configured IPC Real snapshot should expose executor timing");
         simulationAuthority = manager.simulateFromReal(*realAuthority);
         require(simulationAuthority.has_value(),
                 simulationAuthority
@@ -917,13 +966,19 @@ sub _tool_change[#tool_number] {
 
 int main(const int argc, char **argv) {
     try {
-        require(argc == 2, "ngc_ipc_tests requires the peer executable path");
+        require(
+            argc == 2
+                || (argc == 3
+                    && std::string_view(argv[2]) == "--realtime"),
+            "ngc_ipc_tests requires the peer executable path and optional --realtime");
         const std::filesystem::path peer = argv[1];
+        const auto realtime = argc == 3;
         testProtocolLayoutAndBoundedRings();
         testExternalRuntimeExecutesThroughProductionCore(peer);
         testExternalRuntimeFeedHoldAndResume(peer);
         testExternalRuntimeFakesTriggeredJointInput(peer);
-        testConfiguredRealSessionRunsThroughIpcExecutor(peer);
+        testConfiguredRealSessionRunsThroughIpcExecutor(
+            peer, realtime);
         testExternalRuntimeRejectsStaleHandshake(peer);
         testExternalRuntimeRejectsInvalidExecutorConfiguration(peer);
         testExternalRuntimeReportsBackpressure(peer);

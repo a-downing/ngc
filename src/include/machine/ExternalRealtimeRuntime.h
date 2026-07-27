@@ -40,6 +40,8 @@ namespace ngc {
 
         [[nodiscard]] bool connected() const noexcept;
         [[nodiscard]] IpcRejection lastRejection() const noexcept;
+        bool tryTakeRealtimeTiming(
+            RealtimeTimingSummary &summary) noexcept override;
 
     private:
         class Impl;

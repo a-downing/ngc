@@ -2297,14 +2297,17 @@ public:
             m_enableToolWindow = true;
         }
         ImGui::SameLine();
-        ImGui::BeginDisabled(!simulation.simulationDiagnostics.has_value());
+        const auto diagnosticsAvailable =
+            simulation.simulationDiagnostics.has_value()
+            || simulation.realtimeTiming.has_value();
+        ImGui::BeginDisabled(!diagnosticsAvailable);
         if (ImGui::Button("Diagnostics")) {
             m_enableSimulationDiagnostics = true;
         }
         ImGui::EndDisabled();
         unavailableTooltip(
-            !simulation.simulationDiagnostics.has_value(),
-            "Mock scheduler diagnostics are available only for Simulation.");
+            !diagnosticsAvailable,
+            "Executor diagnostics are not available for this session.");
         ImGui::End();
     }
 
@@ -2862,7 +2865,7 @@ public:
         ImGui::SetNextWindowSize({ 760.0f, 620.0f }, ImGuiCond_FirstUseEver);
         ImGui::SetNextWindowSizeConstraints({ 480.0f, 320.0f }, { FLT_MAX, FLT_MAX });
 
-        if (ImGui::Begin("Simulation Diagnostics", &m_enableSimulationDiagnostics)) {
+        if (ImGui::Begin("Execution Diagnostics", &m_enableSimulationDiagnostics)) {
             if (ImGui::CollapsingHeader(
                     "Visualization", ImGuiTreeNodeFlags_DefaultOpen)) {
                 ImGui::Checkbox(
@@ -2883,6 +2886,36 @@ public:
 
             if (ImGui::CollapsingHeader(
                     "Scheduler and servo", ImGuiTreeNodeFlags_DefaultOpen)) {
+                if (const auto &timing = simulation.realtimeTiming) {
+                    ImGui::Text(
+                        "RT ticks: %llu-%llu | Samples: %llu",
+                        static_cast<unsigned long long>(timing->firstTick),
+                        static_cast<unsigned long long>(timing->lastTick),
+                        static_cast<unsigned long long>(timing->sampleCount));
+                    ImGui::Text(
+                        "Maximum wake: %.1f us | Maximum tick: %.1f us | "
+                        "Minimum slack: %.1f us",
+                        static_cast<double>(
+                            timing->maximumWakeLatenessNanoseconds) * 1.0e-3,
+                        static_cast<double>(
+                            timing->maximumExecutionNanoseconds) * 1.0e-3,
+                        static_cast<double>(
+                            timing->minimumDeadlineSlackNanoseconds) * 1.0e-3);
+                    ImGui::Text(
+                        "Missed deadlines: %llu | Skipped periods: %llu | "
+                        "Maximum consecutive: %llu",
+                        static_cast<unsigned long long>(
+                            timing->missedDeadlines),
+                        static_cast<unsigned long long>(
+                            timing->skippedPeriods),
+                        static_cast<unsigned long long>(
+                            timing->maximumConsecutiveMisses));
+                    ImGui::Text(
+                        "Diagnostic publication backpressure: %llu",
+                        static_cast<unsigned long long>(
+                            timing->failedPublications));
+                    ImGui::Separator();
+                }
                 if (const auto &diagnostics = simulation.simulationDiagnostics) {
                     const auto elapsed = std::max(diagnostics->programElapsedSeconds, 0.0);
                     const auto totalWholeSeconds = static_cast<std::uint64_t>(elapsed);
@@ -2912,7 +2945,7 @@ public:
                         diagnostics->maximumTickExecutionSeconds * 1.0e6);
                     ImGui::Text(
                         "Executed path jerk: %.6g", diagnostics->executedPathJerk);
-                } else {
+                } else if (!simulation.realtimeTiming) {
                     ImGui::TextDisabled(
                         "Scheduler diagnostics are unavailable for this backend.");
                 }

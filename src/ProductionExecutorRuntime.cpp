@@ -1,15 +1,31 @@
 #include "machine/ProductionExecutorRuntime.h"
 
 #include <algorithm>
+#include <array>
+#include <bit>
+#include <cerrno>
 #include <chrono>
 #include <cmath>
+#include <cstddef>
 #include <limits>
 #include <ranges>
 #include <stdexcept>
+#include <system_error>
 #include <utility>
+
+#ifdef __linux__
+#include <pthread.h>
+#include <sched.h>
+#include <sys/mman.h>
+#include <time.h>
+#endif
 
 namespace ngc {
     namespace {
+#ifdef __linux__
+        constexpr std::size_t SERVO_STACK_PREFAULT_BYTES = 128 * 1024;
+#endif
+
         class NullProductionExecutorIo final : public ProductionExecutorIo {
         public:
             void sampleDigitalInputs(
@@ -46,15 +62,110 @@ namespace ngc {
 
             return value.x;
         }
+
+        std::size_t histogramBucket(const std::uint64_t nanoseconds) noexcept {
+            if (nanoseconds == 0) {
+                return 0;
+            }
+
+            return std::min<std::size_t>(
+                std::bit_width(nanoseconds),
+                REALTIME_TIMING_HISTOGRAM_BUCKETS - 1);
+        }
+
+#ifdef __linux__
+        void excludeCpuFromCurrentThread(
+            const std::uint32_t cpu) {
+            if (cpu >= CPU_SETSIZE) {
+                throw std::runtime_error(
+                    "production executor real-time CPU exceeds CPU_SETSIZE");
+            }
+
+            cpu_set_t affinity;
+            CPU_ZERO(&affinity);
+            if (const auto error = pthread_getaffinity_np(
+                    pthread_self(), sizeof(affinity), &affinity);
+                error != 0) {
+                throw std::system_error(
+                    error, std::generic_category(),
+                    "failed to read production executor host affinity");
+            }
+
+            CPU_CLR(cpu, &affinity);
+            auto hasHousekeepingCpu = false;
+            for (auto candidate = 0;
+                 candidate < CPU_SETSIZE; ++candidate) {
+                hasHousekeepingCpu =
+                    hasHousekeepingCpu
+                    || CPU_ISSET(candidate, &affinity);
+            }
+            if (!hasHousekeepingCpu) {
+                throw std::runtime_error(
+                    "production executor host has no housekeeping CPU after isolation");
+            }
+            if (const auto error = pthread_setaffinity_np(
+                    pthread_self(), sizeof(affinity), &affinity);
+                error != 0) {
+                throw std::system_error(
+                    error, std::generic_category(),
+                    "failed to isolate the production executor host thread");
+            }
+        }
+
+        void prefaultServoStack() noexcept {
+            std::array<std::byte, SERVO_STACK_PREFAULT_BYTES> stack{};
+            volatile auto *pages = stack.data();
+            constexpr auto pageSize = std::size_t{4096};
+            for (auto offset = std::size_t{0};
+                 offset < stack.size(); offset += pageSize) {
+                pages[offset] = std::byte{0};
+            }
+        }
+
+        void sleepUntil(
+            const std::chrono::steady_clock::time_point deadline) noexcept {
+            const auto nanoseconds =
+                std::chrono::duration_cast<std::chrono::nanoseconds>(
+                    deadline.time_since_epoch()).count();
+            const timespec target{
+                .tv_sec = static_cast<time_t>(
+                    nanoseconds / 1'000'000'000),
+                .tv_nsec = static_cast<long>(
+                    nanoseconds % 1'000'000'000),
+            };
+
+            while (clock_nanosleep(
+                       CLOCK_MONOTONIC, TIMER_ABSTIME,
+                       &target, nullptr)
+                   == EINTR) { }
+        }
+#endif
     }
+
+    struct ProductionExecutorRuntime::TimingAccumulator {
+        RealtimeTimingSummary summary;
+        std::uint64_t consecutiveMisses = 0;
+        std::uint32_t ticksSincePublicationAttempt = 0;
+    };
 
     ProductionExecutorRuntimeConfiguration productionExecutorRuntimeConfiguration(
         const MachineConfiguration &configuration) {
         ProductionExecutorRuntimeConfiguration result;
-        result.servoPeriod = configuration.simulation.servoPeriod;
-        result.serviceTicksPerPeriod = static_cast<std::uint32_t>(std::max(
-            1.0, std::round(configuration.simulation.schedulerPeriod
-                            / configuration.simulation.servoPeriod)));
+        if (configuration.realBackend.has_value()) {
+            result.servoPeriod = configuration.realBackend->servoPeriod;
+            result.serviceTicksPerPeriod = 1;
+            result.realtime = {
+                .enabled = configuration.realBackend->realtimeEnabled,
+                .cpu = configuration.realBackend->realtimeCpu,
+                .priority = configuration.realBackend->realtimePriority,
+                .lockMemory = configuration.realBackend->lockMemory,
+            };
+        } else {
+            result.servoPeriod = configuration.simulation.servoPeriod;
+            result.serviceTicksPerPeriod = static_cast<std::uint32_t>(std::max(
+                1.0, std::round(configuration.simulation.schedulerPeriod
+                                / configuration.simulation.servoPeriod)));
+        }
         result.executor.feedHold.tangentialAcceleration =
             configuration.feedHold.tangentialAcceleration;
         result.executor.feedHold.tangentialJerk =
@@ -114,11 +225,23 @@ namespace ngc {
               configuration.servoPeriod, std::move(configuration.executor))),
           m_io(io ? std::move(io)
                   : std::make_unique<NullProductionExecutorIo>()),
+          m_timingAccumulator(std::make_unique<TimingAccumulator>()),
           m_servoPeriod(configuration.servoPeriod),
-          m_serviceTicksPerPeriod(configuration.serviceTicksPerPeriod) {
+          m_serviceTicksPerPeriod(configuration.serviceTicksPerPeriod),
+          m_timingPublicationTicks(configuration.timingPublicationTicks),
+          m_realtime(configuration.realtime) {
         if (m_serviceTicksPerPeriod == 0) {
             throw std::invalid_argument(
                 "production executor service period must contain at least one tick");
+        }
+        if (m_timingPublicationTicks == 0) {
+            throw std::invalid_argument(
+                "production executor timing publication period must contain at least one tick");
+        }
+        if (m_realtime.enabled
+            && (m_realtime.priority < 1 || m_realtime.priority > 99)) {
+            throw std::invalid_argument(
+                "production executor real-time priority must be between 1 and 99");
         }
     }
 
@@ -138,12 +261,34 @@ namespace ngc {
     }
 
     void ProductionExecutorRuntime::start() {
-        std::scoped_lock lock(m_lifecycleMutex);
+        std::unique_lock lock(m_lifecycleMutex);
         if (m_started) {
             return;
         }
 
-        m_stopping = false;
+        if (m_realtime.enabled) {
+#ifdef __linux__
+            excludeCpuFromCurrentThread(m_realtime.cpu);
+            if (m_realtime.lockMemory
+                && mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
+                throw std::system_error(
+                    errno, std::generic_category(),
+                    "failed to lock production executor memory");
+            }
+#else
+            if (m_realtime.lockMemory) {
+                throw std::runtime_error(
+                    "production executor memory locking is unavailable on this platform");
+            }
+#endif
+        }
+
+        m_stopping.store(false, std::memory_order_release);
+        m_startupComplete = false;
+        m_startupError.clear();
+        *m_timingAccumulator = {};
+        RealtimeTimingSummary staleTiming;
+        while (m_timing.tryPop(staleTiming)) { }
         m_started = true;
         try {
             m_servoThread = std::thread(
@@ -151,6 +296,19 @@ namespace ngc {
         } catch (...) {
             m_started = false;
             throw;
+        }
+
+        m_lifecycleCv.wait(lock, [&] {
+            return m_startupComplete;
+        });
+        if (!m_startupError.empty()) {
+            const auto error = m_startupError;
+            lock.unlock();
+            m_servoThread.join();
+            lock.lock();
+            m_started = false;
+
+            throw std::runtime_error(error);
         }
     }
 
@@ -160,14 +318,13 @@ namespace ngc {
             if (!m_started) {
                 return;
             }
-            m_stopping = true;
+            m_stopping.store(true, std::memory_order_release);
         }
-        m_lifecycleCv.notify_all();
         m_servoThread.join();
 
         std::scoped_lock lock(m_lifecycleMutex);
         m_started = false;
-        m_stopping = false;
+        m_stopping.store(false, std::memory_order_release);
     }
 
     BackendCapabilities ProductionExecutorRuntime::capabilities() const noexcept {
@@ -239,28 +396,126 @@ namespace ngc {
     }
 
     std::uint64_t ProductionExecutorRuntime::servoTicks() const noexcept {
-        std::scoped_lock lock(m_lifecycleMutex);
+        return m_servoTicks.load(std::memory_order_relaxed);
+    }
 
-        return m_servoTicks;
+    bool ProductionExecutorRuntime::tryTakeRealtimeTiming(
+        RealtimeTimingSummary &summary) noexcept {
+        return m_timing.tryPop(summary);
+    }
+
+    void ProductionExecutorRuntime::configureServoThread() {
+#ifdef __linux__
+        if (!m_realtime.enabled) {
+            return;
+        }
+
+        if (m_realtime.cpu >= CPU_SETSIZE) {
+            throw std::runtime_error(
+                "production executor real-time CPU exceeds CPU_SETSIZE");
+        }
+
+        cpu_set_t affinity;
+        CPU_ZERO(&affinity);
+        CPU_SET(m_realtime.cpu, &affinity);
+        if (const auto error = pthread_setaffinity_np(
+                pthread_self(), sizeof(affinity), &affinity);
+            error != 0) {
+            throw std::system_error(
+                error, std::generic_category(),
+                "failed to set production executor CPU affinity");
+        }
+
+        prefaultServoStack();
+
+        sched_param parameters{};
+        parameters.sched_priority = m_realtime.priority;
+        if (const auto error = pthread_setschedparam(
+                pthread_self(), SCHED_FIFO, &parameters);
+            error != 0) {
+            throw std::system_error(
+                error, std::generic_category(),
+                "failed to set production executor SCHED_FIFO policy");
+        }
+#else
+        if (m_realtime.enabled) {
+            throw std::runtime_error(
+                "production executor real-time hosting is unavailable on this platform");
+        }
+#endif
     }
 
     void ProductionExecutorRuntime::runServoLoop() {
         using clock = std::chrono::steady_clock;
 
+        try {
+            configureServoThread();
+        } catch (const std::exception &error) {
+            {
+                std::scoped_lock lock(m_lifecycleMutex);
+                m_startupError = error.what();
+                m_startupComplete = true;
+            }
+            m_lifecycleCv.notify_all();
+
+            return;
+        }
+
+        {
+            std::scoped_lock lock(m_lifecycleMutex);
+            m_startupComplete = true;
+        }
+        m_lifecycleCv.notify_all();
+
+        const auto period = std::chrono::duration_cast<clock::duration>(
+            std::chrono::duration<double>(m_servoPeriod));
         auto deadline = clock::now();
         for (;;) {
-            deadline += std::chrono::duration_cast<clock::duration>(
-                std::chrono::duration<double>(m_servoPeriod));
-            {
-                std::unique_lock lock(m_lifecycleMutex);
-                if (m_lifecycleCv.wait_until(lock, deadline, [&] {
-                        return m_stopping;
-                    })) {
-                    return;
-                }
+            deadline += period;
+#ifdef __linux__
+            if (m_realtime.enabled) {
+                sleepUntil(deadline);
+            } else {
+                std::this_thread::sleep_until(deadline);
+            }
+#else
+            std::this_thread::sleep_until(deadline);
+#endif
+            if (m_stopping.load(std::memory_order_acquire)) {
+                break;
             }
 
+            const auto wake = clock::now();
             tick(true);
+            const auto finished = clock::now();
+            const auto nextDeadline = deadline + period;
+            const auto wakeLateness = std::chrono::duration_cast<
+                std::chrono::nanoseconds>(wake - deadline).count();
+            const auto execution = std::chrono::duration_cast<
+                std::chrono::nanoseconds>(finished - wake).count();
+            const auto slack = std::chrono::duration_cast<
+                std::chrono::nanoseconds>(nextDeadline - finished).count();
+            auto skippedPeriods = std::uint64_t{0};
+            if (finished >= nextDeadline) {
+                skippedPeriods = static_cast<std::uint64_t>(
+                    (finished - deadline) / period);
+                deadline += period * skippedPeriods;
+            }
+
+            observeTiming(
+                m_servoTicks.load(std::memory_order_relaxed),
+                wakeLateness, static_cast<std::uint64_t>(execution),
+                slack, skippedPeriods);
+            if (m_realtime.enabled && slack < 0) {
+                m_core->reportHostFault(
+                    PRODUCTION_EXECUTOR_DEADLINE_MISS_FAULT);
+                m_io->applyOutputs(m_core->outputState());
+            }
+        }
+
+        if (m_timingAccumulator->summary.sampleCount != 0) {
+            static_cast<void>(m_timing.tryPush(
+                m_timingAccumulator->summary));
         }
     }
 
@@ -271,26 +526,89 @@ namespace ngc {
         m_core->servoTick(publishSnapshot);
         m_io->applyOutputs(m_core->outputState());
 
-        {
-            std::scoped_lock lock(m_lifecycleMutex);
-            ++m_servoTicks;
+        m_servoTicks.fetch_add(1, std::memory_order_relaxed);
+    }
+
+    void ProductionExecutorRuntime::observeTiming(
+        const std::uint64_t tick,
+        const std::int64_t wakeLatenessNanoseconds,
+        const std::uint64_t executionNanoseconds,
+        const std::int64_t deadlineSlackNanoseconds,
+        const std::uint64_t skippedPeriods) noexcept {
+        auto &accumulator = *m_timingAccumulator;
+        auto &summary = accumulator.summary;
+        if (summary.sampleCount == 0) {
+            summary.firstTick = tick;
+            summary.minimumDeadlineSlackNanoseconds =
+                deadlineSlackNanoseconds;
+            summary.worstTick = tick;
         }
-        m_lifecycleCv.notify_all();
+
+        summary.lastTick = tick;
+        ++summary.sampleCount;
+        summary.maximumWakeLatenessNanoseconds = std::max(
+            summary.maximumWakeLatenessNanoseconds,
+            wakeLatenessNanoseconds);
+        summary.maximumExecutionNanoseconds = std::max(
+            summary.maximumExecutionNanoseconds,
+            executionNanoseconds);
+        if (deadlineSlackNanoseconds
+            < summary.minimumDeadlineSlackNanoseconds) {
+            summary.minimumDeadlineSlackNanoseconds =
+                deadlineSlackNanoseconds;
+            summary.worstTick = tick;
+        }
+        summary.skippedPeriods += skippedPeriods;
+
+        if (deadlineSlackNanoseconds < 0) {
+            ++summary.missedDeadlines;
+            ++accumulator.consecutiveMisses;
+            summary.maximumConsecutiveMisses = std::max(
+                summary.maximumConsecutiveMisses,
+                accumulator.consecutiveMisses);
+        } else {
+            accumulator.consecutiveMisses = 0;
+        }
+
+        const auto nonnegativeWake = static_cast<std::uint64_t>(
+            std::max<std::int64_t>(0, wakeLatenessNanoseconds));
+        ++summary.wakeLatenessHistogram[
+            histogramBucket(nonnegativeWake)];
+        ++summary.executionHistogram[
+            histogramBucket(executionNanoseconds)];
+
+        ++accumulator.ticksSincePublicationAttempt;
+        if (accumulator.ticksSincePublicationAttempt
+            < m_timingPublicationTicks) {
+            return;
+        }
+
+        accumulator.ticksSincePublicationAttempt = 0;
+        if (m_timing.tryPush(summary)) {
+            const auto consecutiveMisses =
+                accumulator.consecutiveMisses;
+            accumulator = {};
+            accumulator.consecutiveMisses = consecutiveMisses;
+        } else {
+            ++summary.failedPublications;
+        }
     }
 
     bool ProductionExecutorRuntime::running() const noexcept {
         std::scoped_lock lock(m_lifecycleMutex);
 
-        return m_started && !m_stopping;
+        return m_started
+            && !m_stopping.load(std::memory_order_acquire);
     }
 
     std::uint64_t ProductionExecutorRuntime::waitForNextTick(
         const std::uint64_t previousTicks) {
-        std::unique_lock lock(m_lifecycleMutex);
-        m_lifecycleCv.wait(lock, [&] {
-            return m_servoTicks != previousTicks || !m_started || m_stopping;
-        });
+        auto current = m_servoTicks.load(std::memory_order_relaxed);
+        while (current == previousTicks && running()) {
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+            current = m_servoTicks.load(std::memory_order_relaxed);
+        }
 
-        return m_servoTicks - previousTicks;
+        return current - previousTicks;
     }
 }

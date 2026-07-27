@@ -12,6 +12,7 @@
 #include "machine/MachineCommand.h"
 #include "machine/MachineSession.h"
 #include "machine/MotionBackend.h"
+#include "machine/RealtimeTiming.h"
 
 namespace ngc {
     enum class SimulationStatus { Stopped, Running, Holding, Paused, Completed, Error };
@@ -37,6 +38,7 @@ namespace ngc {
         ProgramOperationPresentation programOperation =
             ProgramOperationPresentation::Inactive;
         std::optional<SimulationDiagnostics> simulationDiagnostics;
+        std::optional<RealtimeTimingSummary> realtimeTiming;
         position_t machinePosition{};
         TrajectoryCommandPresentation activePresentation{};
         double commandProgress = 0.0;

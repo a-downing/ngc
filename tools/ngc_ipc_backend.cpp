@@ -26,6 +26,7 @@ namespace {
         ngc::IpcIdentity expected{};
         std::optional<std::filesystem::path> machineConfiguration;
         bool consume = true;
+        bool nonRealtime = false;
         std::optional<std::uint64_t> exitAfterControls;
         std::optional<std::chrono::milliseconds> exitAfterHandshake;
     };
@@ -68,6 +69,8 @@ namespace {
                 options.machineConfiguration = value();
             } else if (option == "--no-consume") {
                 options.consume = false;
+            } else if (option == "--non-realtime") {
+                options.nonRealtime = true;
             } else if (option == "--exit-after-controls") {
                 options.exitAfterControls = parseUnsigned(value());
             } else if (option == "--exit-after-handshake-ms") {
@@ -214,16 +217,23 @@ namespace {
                 + configuration.error());
         }
 
+        auto runtimeConfiguration =
+            ngc::productionExecutorRuntimeConfiguration(*configuration);
+        if (options.nonRealtime) {
+            runtimeConfiguration.realtime = {};
+        }
+
         return std::make_unique<ngc::ProductionExecutorRuntime>(
-            *configuration, std::move(io));
+            std::move(runtimeConfiguration), std::move(io));
     }
 
     class IpcExecutorBridge {
     public:
         IpcExecutorBridge(ngc::IpcSharedRegion &region,
+                          ngc::ProductionExecutorRuntime &runtime,
                           ngc::MotionBackend &backend,
                           TemporaryTriggeredInputs &triggeredInputs)
-            : m_region(region), m_backend(backend),
+            : m_region(region), m_runtime(runtime), m_backend(backend),
               m_triggeredInputs(triggeredInputs) { }
 
         bool service(const bool consume) noexcept {
@@ -276,6 +286,20 @@ namespace {
                 && ngc::ipcTryPush(
                     m_region.snapshots, *m_pendingSnapshot)) {
                 m_pendingSnapshot.reset();
+                progressed = true;
+            }
+
+            if (!m_pendingTiming.has_value()) {
+                ngc::RealtimeTimingSummary timing;
+                if (m_runtime.tryTakeRealtimeTiming(timing)) {
+                    m_pendingTiming = timing;
+                    progressed = true;
+                }
+            }
+            if (m_pendingTiming.has_value()
+                && ngc::ipcTryPush(
+                    m_region.realtimeTiming, *m_pendingTiming)) {
+                m_pendingTiming.reset();
                 progressed = true;
             }
 
@@ -343,6 +367,7 @@ namespace {
         }
 
         ngc::IpcSharedRegion &m_region;
+        ngc::ProductionExecutorRuntime &m_runtime;
         ngc::MotionBackend &m_backend;
         TemporaryTriggeredInputs &m_triggeredInputs;
         ngc::ExecutionSnapshot m_latestSnapshot;
@@ -350,6 +375,7 @@ namespace {
         std::optional<ngc::ControlRequest> m_pendingControl;
         std::optional<ngc::ExecutionEvent> m_pendingEvent;
         std::optional<ngc::ExecutionSnapshot> m_pendingSnapshot;
+        std::optional<ngc::RealtimeTimingSummary> m_pendingTiming;
         std::uint64_t m_completedControls = 0;
         bool m_pendingInputsArmed = false;
     };
@@ -387,7 +413,8 @@ namespace {
         }
 
         IpcExecutorBridge bridge(
-            region, runtime->endpoint(), *triggeredInputsPointer);
+            region, *runtime, runtime->endpoint(),
+            *triggeredInputsPointer);
         const auto started = std::chrono::steady_clock::now();
 
         for (;;) {

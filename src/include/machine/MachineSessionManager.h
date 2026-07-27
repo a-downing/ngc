@@ -47,7 +47,7 @@ class SessionBackendRuntime final : public ngc::BackendRuntime {
             .authorityGeneration = 1,
         };
 
-        return {
+        ngc::ExternalRealtimeRuntimeConfiguration result{
             .peerExecutable = backend.executable,
             .identity = identity,
             .peerExpectedIdentity = identity,
@@ -56,6 +56,16 @@ class SessionBackendRuntime final : public ngc::BackendRuntime {
                 backend.machineConfiguration.string(),
             },
         };
+        if (!backend.realtimeEnabled) {
+            result.peerArguments.push_back("--non-realtime");
+        }
+#ifndef __linux__
+        if (backend.realtimeEnabled) {
+            result.peerArguments.push_back("--non-realtime");
+        }
+#endif
+
+        return result;
     }
 
 public:
@@ -82,7 +92,9 @@ public:
                                 : static_cast<ngc::InProcessSimulationRuntime *>(
                                       m_runtime.get())),
           m_external(external),
-          m_servoPeriod(configuration.simulation.servoPeriod) { }
+          m_servoPeriod(external
+              ? configuration.realBackend->servoPeriod
+              : configuration.simulation.servoPeriod) { }
 
     ngc::MotionBackend &endpoint() noexcept override {
         return m_runtime->endpoint();
@@ -130,6 +142,11 @@ public:
 
     void waitForServiceMotion() override {
         m_runtime->waitForServiceMotion();
+    }
+
+    bool tryTakeRealtimeTiming(
+            ngc::RealtimeTimingSummary &summary) noexcept override {
+        return m_runtime->tryTakeRealtimeTiming(summary);
     }
 
     bool beginTimedExecution() {
@@ -264,6 +281,7 @@ class MachineSessionHost {
     std::thread m_timedSnapshotThread;
     bool m_stopTimedSnapshotService = false;
     std::optional<ngc::ExecutionSnapshot> m_latestTimedBackendSnapshot;
+    std::optional<ngc::RealtimeTimingSummary> m_latestRealtimeTiming;
     SessionBackendRuntime m_runtime;
     ngc::MachineSession m_machineSession;
     ngc::TrajectoryLimits m_limits;
@@ -781,6 +799,9 @@ public:
     ngc::SimulationSnapshot snapshot() const {
         std::scoped_lock lock(m_mutex);
         auto result = m_snapshot;
+        if (const auto timing = latestRealtimeTiming()) {
+            result.realtimeTiming = *timing;
+        }
         if (m_programRunning) {
             if (const auto backend = latestTimedBackendSnapshot()) {
                 applyBackendObservation(result, *backend);
@@ -1094,6 +1115,7 @@ private:
             std::scoped_lock lock(m_timedSnapshotMutex);
             m_stopTimedSnapshotService = false;
             m_latestTimedBackendSnapshot.reset();
+            m_latestRealtimeTiming.reset();
         }
         m_timedSnapshotThread = std::thread([this] {
             const auto drainLatest = [&] {
@@ -1105,6 +1127,27 @@ private:
                 if (latest) {
                     std::scoped_lock lock(m_timedSnapshotMutex);
                     m_latestTimedBackendSnapshot = *latest;
+                }
+
+                std::optional<ngc::RealtimeTimingSummary> latestTiming;
+                ngc::RealtimeTimingSummary timing;
+                while (m_runtime.tryTakeRealtimeTiming(timing)) {
+                    if (!latestTiming) {
+                        latestTiming = timing;
+                    } else {
+                        ngc::mergeRealtimeTiming(
+                            *latestTiming, timing);
+                    }
+                }
+                if (latestTiming) {
+                    std::scoped_lock lock(m_timedSnapshotMutex);
+                    if (!m_latestRealtimeTiming) {
+                        m_latestRealtimeTiming = *latestTiming;
+                    } else {
+                        ngc::mergeRealtimeTiming(
+                            *m_latestRealtimeTiming,
+                            *latestTiming);
+                    }
                 }
             };
 
@@ -1139,6 +1182,13 @@ private:
         std::scoped_lock lock(m_timedSnapshotMutex);
 
         return m_latestTimedBackendSnapshot;
+    }
+
+    [[nodiscard]] std::optional<ngc::RealtimeTimingSummary>
+    latestRealtimeTiming() const {
+        std::scoped_lock lock(m_timedSnapshotMutex);
+
+        return m_latestRealtimeTiming;
     }
 
     void copyRuntimeTimingSnapshot() {
@@ -1251,6 +1301,13 @@ private:
     }
 
     void applyLatestTimedBackendSnapshot() {
+        {
+            std::scoped_lock lock(m_timedSnapshotMutex);
+            if (m_latestRealtimeTiming) {
+                m_snapshot.realtimeTiming =
+                    *m_latestRealtimeTiming;
+            }
+        }
         if (const auto backend = latestTimedBackendSnapshot()) {
             applyBackendSnapshot(*backend);
         }

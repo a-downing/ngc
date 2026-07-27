@@ -254,6 +254,14 @@ namespace ngc {
             return m_lastRejection;
         }
 
+        bool tryTakeRealtimeTiming(
+            RealtimeTimingSummary &summary) noexcept {
+            refreshPeerState();
+
+            return m_region != nullptr
+                && ipcTryPop(m_region->realtimeTiming, summary);
+        }
+
         MotionBackend &endpoint() noexcept {
             return m_endpoint;
         }
@@ -385,5 +393,10 @@ namespace ngc {
 
     IpcRejection ExternalRealtimeRuntime::lastRejection() const noexcept {
         return m_impl->lastRejection();
+    }
+
+    bool ExternalRealtimeRuntime::tryTakeRealtimeTiming(
+        RealtimeTimingSummary &summary) noexcept {
+        return m_impl->tryTakeRealtimeTiming(summary);
     }
 }

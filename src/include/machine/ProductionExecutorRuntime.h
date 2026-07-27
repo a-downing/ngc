@@ -1,17 +1,24 @@
 #pragma once
 
+#include <atomic>
 #include <bitset>
 #include <condition_variable>
 #include <cstdint>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <thread>
 
 #include "machine/BackendRuntime.h"
 #include "machine/MachineConfiguration.h"
 #include "machine/ProductionExecutorCore.h"
+#include "machine/RealtimeTiming.h"
+#include "machine/SpscChannel.h"
 
 namespace ngc {
+    inline constexpr std::uint32_t
+        PRODUCTION_EXECUTOR_DEADLINE_MISS_FAULT = 0x52540001;
+
     using ProductionExecutorDigitalInputs =
         std::bitset<ProductionExecutorCore::DIGITAL_INPUT_CAPACITY>;
 
@@ -32,7 +39,14 @@ namespace ngc {
     struct ProductionExecutorRuntimeConfiguration {
         double servoPeriod = 0.001;
         std::uint32_t serviceTicksPerPeriod = 1;
+        std::uint32_t timingPublicationTicks = 100;
         ProductionExecutorConfiguration executor;
+        struct RealtimeHost {
+            bool enabled = false;
+            std::uint32_t cpu = 0;
+            int priority = 0;
+            bool lockMemory = false;
+        } realtime;
     };
 
     [[nodiscard]] ProductionExecutorRuntimeConfiguration
@@ -66,24 +80,42 @@ namespace ngc {
 
         [[nodiscard]] bool started() const noexcept;
         [[nodiscard]] std::uint64_t servoTicks() const noexcept;
+        bool tryTakeRealtimeTiming(
+            RealtimeTimingSummary &summary) noexcept override;
 
     private:
+        struct TimingAccumulator;
+
+        void configureServoThread();
         void runServoLoop();
         void tick(bool publishSnapshot) noexcept;
+        void observeTiming(
+            std::uint64_t tick, std::int64_t wakeLatenessNanoseconds,
+            std::uint64_t executionNanoseconds,
+            std::int64_t deadlineSlackNanoseconds,
+            std::uint64_t skippedPeriods) noexcept;
         [[nodiscard]] bool running() const noexcept;
         [[nodiscard]] std::uint64_t waitForNextTick(
             std::uint64_t previousTicks);
 
+        static constexpr std::size_t TIMING_CAPACITY = 64;
+
         std::unique_ptr<ProductionExecutorCore> m_core;
         std::unique_ptr<ProductionExecutorIo> m_io;
+        std::unique_ptr<TimingAccumulator> m_timingAccumulator;
         ProductionExecutorDigitalInputs m_inputs;
         double m_servoPeriod;
         std::uint32_t m_serviceTicksPerPeriod;
+        std::uint32_t m_timingPublicationTicks;
+        ProductionExecutorRuntimeConfiguration::RealtimeHost m_realtime;
+        SpscChannel<RealtimeTimingSummary, TIMING_CAPACITY> m_timing;
         mutable std::mutex m_lifecycleMutex;
         std::condition_variable m_lifecycleCv;
         std::thread m_servoThread;
         bool m_started = false;
-        bool m_stopping = false;
-        std::uint64_t m_servoTicks = 0;
+        bool m_startupComplete = false;
+        std::string m_startupError;
+        std::atomic<bool> m_stopping{false};
+        std::atomic<std::uint64_t> m_servoTicks{0};
     };
 }

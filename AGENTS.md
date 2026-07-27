@@ -97,20 +97,29 @@ the core. It derives fixed-capacity executor mappings and limits from typed
 machine configuration, owns fixed-period ticking and stopped-state synchronous
 service stepping, samples a fixed-size digital-input image before each tick,
 and applies the fixed-size output state afterward through an injected I/O
-boundary. Hardware acquisition and synthetic-input policy remain outside the
-runtime. The runtime is the second backend-conformance target and is paired
+boundary. On configured Linux hosts, its existing servo thread removes the
+calling NRT host from the selected CPU, locks process memory, pins itself,
+enters `SCHED_FIFO`, prefaults its stack, and sleeps to absolute monotonic
+deadlines. Host setup failure is fatal rather than falling back to ordinary
+scheduling. A missed hosted deadline faults the executor and reapplies safe
+outputs instead of issuing catch-up ticks. The servo thread aggregates
+fixed-size timing summaries and publishes them through a bounded SPSC
+diagnostic channel; the NRT peer bridges those summaries through a separate
+versioned IPC ring into Real session snapshots. Diagnostic backpressure never
+blocks motion. Hardware acquisition and synthetic-input policy remain outside
+the runtime. The runtime is the second backend-conformance target and is paired
 end-to-end with `HomingController`. It is hosted by the external process for
-the configured Windows non-hardware Real target.
-There is no complete real-time executor,
-HAL component, or physical backend yet. `ExternalRealtimeRuntime`
+the configured non-hardware Real target. There is no HAL component or physical
+backend yet. `ExternalRealtimeRuntime`
 implements the NRT side of the versioned shared-memory IPC boundary and owns a
 bounded `MotionBackend` proxy. The `ngc_ipc_backend` executable is a
 non-hardware executor-in-the-loop peer: it validates typed machine
 configuration during startup, hosts `ProductionExecutorRuntime`, and bridges
 bounded execution items, controls, events, and snapshots across the production
-IPC path. On Windows its ordinary scheduler thread and non-hardware I/O
-boundary prove functional executor and process behavior, not real-time latency
-or hardware safety. The peer temporarily fakes axis-space probe and
+IPC path. On Windows its ordinary scheduler thread proves functional executor
+and process behavior. On configured Linux RT hosts, its RT scheduler and
+non-hardware I/O boundary prove the production execution and diagnostic path,
+not physical I/O or hardware safety. The peer temporarily fakes axis-space probe and
 joint-space homing inputs. Probe input triggers 0.5 machine units before its
 move target; each homing input triggers after its joint travels 0.5 machine
 units from the move start. The peer lengthens its private copy of a shorter
@@ -221,6 +230,9 @@ Tests are framework-free executables, with the core suite in `src/test.cpp`. The
 - Trajectory, axis, joint, jogging, probing, simulation, and homing values use the configured machine unit and seconds as documented in `machine.toml` and `MachineConfiguration`.
 - `rapid_velocity` is converted at the loader boundary to the per-minute representation expected by canonical motion.
 - `simulation.scheduler_period` must be an integer multiple of `servo_period`.
+- `[real_backend]` owns the external executor's independent `servo_period` and
+  optional Linux-only `realtime_cpu`, `realtime_priority`, and `lock_memory`
+  host policy. Configuring one of the CPU/priority pair requires both.
 - The loader owns and validates logical axes, axis-to-joint topology, digital-input IDs, probing input, per-joint motion/homing values, and ordered homing groups. Logical coordinates without configured axes, duplicate or out-of-range IDs, and incomplete joint/group mappings are startup errors.
 - A positive homing `backoff_distance` means clearance behind the fast-trigger position. `switch_position` is assigned at the slow latch and `home_position` is the final post-latch destination.
 - Jog start limits come from `[jogging]`; jog stop and lease-expiry authority comes from the physical axis/joint limits carried in `stopLimits`.

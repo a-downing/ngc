@@ -888,9 +888,13 @@ backend fault after already-published peer events are drained, and an epoch
 interrupted by peer loss cannot be resumed after a fresh connection.
 
 The shared-memory storage and process layer has Windows and POSIX
-implementations, but this phase has only been built and exercised on the
-supported Windows development environment. The Windows peer uses an ordinary
-scheduler thread and a non-hardware I/O boundary. A temporary peer-local shim
+implementations and the executor-in-the-loop path is exercised on both
+supported development platforms. The Windows peer uses an ordinary scheduler
+thread. On Linux, typed Real-backend configuration can require locked memory,
+a selected CPU, `SCHED_FIFO` priority, and absolute monotonic servo deadlines.
+The NRT peer host is excluded from the servo CPU before the RT thread starts.
+Any host setup failure rejects startup rather than falling back to ordinary
+scheduling. Both platforms still use a non-hardware I/O boundary. A temporary peer-local shim
 fakes axis-space probe input 0.5 machine units before its move target and each
 joint-space homing input after 0.5 machine units of travel from its move start.
 For a shorter triggered joint approach, the peer lengthens its private item
@@ -977,8 +981,23 @@ tests cover fixed-period progress, clean stop, and restore gating. The runtime
 is registered as the second backend-conformance target, and an end-to-end test
 runs `HomingController` through its production runtime callbacks.
 
-The runtime/core combination is now hosted by `ngc_ipc_backend` for the Windows
-non-hardware checkpoint. A fixed pending slot per channel preserves
+The configured Linux host turns that existing servo thread into the RT thread;
+it does not add a parallel execution loop. The thread is CPU-pinned,
+memory-locked, stack-prefaulted, and scheduled with `SCHED_FIFO`, then waits on
+absolute monotonic deadlines. It never takes the lifecycle mutex or notifies a
+condition variable from a servo tick. A missed deadline faults the executor,
+establishes safe outputs, and skips the abandoned period rather than running
+back-to-back catch-up ticks. Each tick measures wake lateness, executor
+duration, deadline slack, missed deadlines, and skipped periods. Fixed-size
+histogram summaries cross a bounded SPSC diagnostic channel every 100 ticks.
+The NRT bridge forwards them through a separate versioned
+shared-memory ring, and the frontend aggregates them into the Real session
+snapshot. A full diagnostic channel retains the active aggregate and records
+failed publications without delaying execution; safety faults continue to use
+the executor event path.
+
+The runtime/core combination is now hosted by `ngc_ipc_backend` for the
+non-hardware Windows and Linux checkpoints. A fixed pending slot per channel preserves
 backpressure between each shared-memory ring and the core's bounded channels.
 IPC tests execute a timed `PlanChunk`, an axis-space probe, and joint-space
 triggered motion through the child process and verify executor-generated

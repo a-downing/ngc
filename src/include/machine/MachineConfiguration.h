@@ -115,6 +115,11 @@ namespace ngc {
     struct RealBackendConfiguration {
         std::filesystem::path executable;
         std::filesystem::path machineConfiguration;
+        double servoPeriod = 0.001;
+        bool realtimeEnabled = false;
+        std::uint32_t realtimeCpu = 0;
+        int realtimePriority = 0;
+        bool lockMemory = false;
     };
 
     struct MachineConfiguration {

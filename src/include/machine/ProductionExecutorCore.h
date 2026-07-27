@@ -94,6 +94,7 @@ namespace ngc {
         void setDigitalInputSamples(
             const std::bitset<DIGITAL_INPUT_CAPACITY> &inputs) noexcept;
         void servoTick(bool publishSnapshot = true) noexcept;
+        void reportHostFault(std::uint32_t code) noexcept;
         [[nodiscard]] double servoPeriod() const noexcept;
         // The hosting servo thread reads this after servoTick() and maps it to
         // physical outputs. It is not an NRT communication endpoint.

@@ -326,6 +326,12 @@ namespace ngc {
         }
     }
 
+    void ProductionExecutorCore::reportHostFault(
+        const std::uint32_t code) noexcept {
+        fault(code);
+        publishSnapshot();
+    }
+
     double ProductionExecutorCore::servoPeriod() const noexcept {
         return m_servoPeriod;
     }

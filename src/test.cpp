@@ -13,6 +13,7 @@
 #include <limits>
 #include <mutex>
 #include <numbers>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -1735,6 +1736,76 @@ final_move_together = true
                     "production runtime should restore commanded axis position");
         requireNear(snapshot.commandedJoints.position[0], 0.5,
                     "production runtime should restore commanded joint position");
+    }
+
+    void testProductionExecutorRuntimePublishesBoundedTiming() {
+        ngc::ProductionExecutorRuntimeConfiguration configuration;
+        configuration.servoPeriod = 0.0001;
+        configuration.timingPublicationTicks = 4;
+        ngc::ProductionExecutorRuntime runtime(configuration);
+
+        runtime.start();
+        for (auto attempt = 0;
+             attempt < 1000 && runtime.servoTicks() < 8; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        ngc::RealtimeTimingSummary timing;
+        require(runtime.tryTakeRealtimeTiming(timing),
+                "production executor runtime should publish bounded timing summaries");
+        require(timing.sampleCount == 4 && timing.lastTick >= timing.firstTick,
+                "production timing summary should cover its configured publication interval");
+        require(timing.maximumExecutionNanoseconds > 0,
+                "production timing summary should measure executor work");
+        require(timing.minimumDeadlineSlackNanoseconds
+                    <= static_cast<std::int64_t>(100'000),
+                "production timing summary should measure remaining deadline slack");
+        const auto wakeSamples = std::accumulate(
+            timing.wakeLatenessHistogram.begin(),
+            timing.wakeLatenessHistogram.end(), std::uint64_t{0});
+        const auto executionSamples = std::accumulate(
+            timing.executionHistogram.begin(),
+            timing.executionHistogram.end(), std::uint64_t{0});
+        require(wakeSamples == timing.sampleCount
+                    && executionSamples == timing.sampleCount,
+                "production timing histograms should account for every measured tick");
+
+        runtime.stop();
+    }
+
+    void testProductionExecutorTimingBackpressureDoesNotBlockServo() {
+        ngc::ProductionExecutorRuntimeConfiguration configuration;
+        configuration.servoPeriod = 0.0001;
+        configuration.timingPublicationTicks = 1;
+        ngc::ProductionExecutorRuntime runtime(configuration);
+
+        runtime.start();
+        for (auto attempt = 0;
+             attempt < 1000 && runtime.servoTicks() < 80; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(runtime.servoTicks() >= 80,
+                "full production timing channel should not stop servo progress");
+
+        ngc::RealtimeTimingSummary timing;
+        require(runtime.tryTakeRealtimeTiming(timing),
+                "production timing backpressure fixture should fill its channel");
+        const auto releaseTick = runtime.servoTicks();
+        for (auto attempt = 0;
+             attempt < 1000
+                 && runtime.servoTicks() < releaseTick + 2; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+
+        auto observedBackpressure = false;
+        while (runtime.tryTakeRealtimeTiming(timing)) {
+            observedBackpressure = observedBackpressure
+                || timing.failedPublications != 0;
+        }
+        require(observedBackpressure,
+                "production timing should report failed nonblocking publications after recovery");
+
+        runtime.stop();
     }
 
     void testHomingControllerOwnsBackendNeutralSequence() {
@@ -7367,7 +7438,15 @@ G1 F60 X2
                         == "ngc_ipc_backend.exe"
                     && repositoryConfiguration->realBackend
                            ->machineConfiguration.filename()
-                        == "machine.toml",
+                        == "machine.toml"
+                    && repositoryConfiguration->realBackend->servoPeriod
+                        == 0.001
+                    && repositoryConfiguration->realBackend->realtimeEnabled
+                    && repositoryConfiguration->realBackend->realtimeCpu
+                        == 15
+                    && repositoryConfiguration->realBackend->realtimePriority
+                        == 95
+                    && repositoryConfiguration->realBackend->lockMemory,
                 "machine configuration should enable the external IPC Real backend");
 
         require(!configuration->coordinates.empty(),
@@ -7887,6 +7966,8 @@ int main() {
         testMachineSessionViewDerivesOperatorControls();
         testInProcessSimulationRuntimePersistsAcrossTimedEpochs();
         testProductionExecutorRuntimeOwnsFixedPeriodLifecycle();
+        testProductionExecutorRuntimePublishesBoundedTiming();
+        testProductionExecutorTimingBackpressureDoesNotBlockServo();
         testHomingControllerOwnsBackendNeutralSequence();
         testProductionExecutorRuntimeRunsHomingController();
         testMachineSessionOwnsBackendNeutralServiceOperations();

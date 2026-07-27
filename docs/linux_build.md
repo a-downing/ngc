@@ -24,6 +24,49 @@ through CTest:
 ctest --test-dir build -E '^ngc_tests$' --output-on-failure
 ```
 
+## Real-time executor host
+
+The configured Linux IPC executor uses the existing
+`ProductionExecutorRuntime` servo thread as its RT thread. The Real backend
+settings select its period, CPU, FIFO priority, and memory-locking policy:
+
+```toml
+[real_backend]
+type = "ipc_executor"
+executable = "build/ngc_ipc_backend.exe"
+servo_period = 0.001
+realtime_cpu = 15
+realtime_priority = 95
+lock_memory = true
+```
+
+The selected user must have sufficient `rtprio` and `memlock` limits. Verify
+the login session before starting NGC:
+
+```bash
+ulimit -r
+ulimit -l
+```
+
+The executor rejects startup if Linux cannot lock memory, remove its NRT host
+from the selected CPU, pin the servo thread, or enter the configured
+`SCHED_FIFO` priority. It does not silently use ordinary scheduling. Keep the
+selected CPU's SMT sibling free of ordinary work and route routine IRQs to
+housekeeping CPUs.
+
+Run the ordinary portable IPC suite with:
+
+```bash
+./build/ngc_ipc_tests ./build/ngc_ipc_backend.exe
+```
+
+On a configured RT development host, exercise the same Real-session path with
+RT hosting enabled:
+
+```bash
+./build/ngc_ipc_tests ./build/ngc_ipc_backend.exe --realtime
+```
+
 ## VistaCNC P2-S access
 
 The Linux transport uses HIDAPI's hidraw backend. Install the supplied udev

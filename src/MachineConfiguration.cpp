@@ -233,10 +233,78 @@ namespace ngc {
                 if (!executable) {
                     return std::unexpected(executable.error());
                 }
+                auto realServoPeriod = result.simulation.servoPeriod;
+                if (realBackend->contains("servo_period")) {
+                    const auto configured = positiveNumber(
+                        *realBackend, "servo_period", path);
+                    if (!configured) {
+                        return std::unexpected(configured.error());
+                    }
+                    realServoPeriod = *configured;
+                }
+
+                const auto *realtimeCpuNode =
+                    realBackend->get("realtime_cpu");
+                const auto *realtimePriorityNode =
+                    realBackend->get("realtime_priority");
+                if ((realtimeCpuNode == nullptr)
+                    != (realtimePriorityNode == nullptr)) {
+                    return std::unexpected(configurationError(
+                        path, "real_backend",
+                        "realtime_cpu and realtime_priority must be configured together",
+                        realBackendNode));
+                }
+
+                auto realtimeEnabled = false;
+                auto realtimeCpu = std::uint32_t{0};
+                auto realtimePriority = 0;
+                if (realtimeCpuNode != nullptr) {
+                    const auto cpu = integer(
+                        *realBackend, "realtime_cpu", path);
+                    const auto priority = integer(
+                        *realBackend, "realtime_priority", path);
+                    if (!cpu) {
+                        return std::unexpected(cpu.error());
+                    }
+                    if (!priority) {
+                        return std::unexpected(priority.error());
+                    }
+                    if (*cpu < 0
+                        || *cpu > std::numeric_limits<std::uint32_t>::max()) {
+                        return std::unexpected(configurationError(
+                            path, "real_backend.realtime_cpu",
+                            "must be a non-negative 32-bit CPU index",
+                            realtimeCpuNode));
+                    }
+                    if (*priority < 1 || *priority > 99) {
+                        return std::unexpected(configurationError(
+                            path, "real_backend.realtime_priority",
+                            "must be between 1 and 99",
+                            realtimePriorityNode));
+                    }
+                    realtimeEnabled = true;
+                    realtimeCpu = static_cast<std::uint32_t>(*cpu);
+                    realtimePriority = static_cast<int>(*priority);
+                }
+
+                auto lockMemory = false;
+                if (realBackend->contains("lock_memory")) {
+                    const auto configured = requiredBool(
+                        *realBackend, "lock_memory", path);
+                    if (!configured) {
+                        return std::unexpected(configured.error());
+                    }
+                    lockMemory = *configured;
+                }
                 result.realBackend = RealBackendConfiguration{
                     .executable = resolveConfigurationPath(*executable),
                     .machineConfiguration =
                         std::filesystem::absolute(path).lexically_normal(),
+                    .servoPeriod = realServoPeriod,
+                    .realtimeEnabled = realtimeEnabled,
+                    .realtimeCpu = realtimeCpu,
+                    .realtimePriority = realtimePriority,
+                    .lockMemory = lockMemory,
                 };
             }
             if (parameterStores) {
