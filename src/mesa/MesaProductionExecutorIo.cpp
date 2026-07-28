@@ -33,6 +33,11 @@ namespace ngc::mesa {
             return std::unexpected(
                 "input program references unavailable Mesa field inputs");
         }
+        if (ioProgram.fieldOutputCount()
+            > io->digitalOutputCount()) {
+            return std::unexpected(
+                "digital I/O program references unavailable Mesa field outputs");
+        }
         if (stepGenerators.size() > MAX_JOINTS) {
             return std::unexpected(
                 "Mesa joint-to-StepGen mapping exceeds joint capacity");
@@ -118,25 +123,27 @@ namespace ngc::mesa {
             return;
         }
 
-        auto fieldInputs = FieldDigitalInputImage{};
         const auto &mesaInputs =
             m_io->inputImage().fieldDigitalInputs;
         for (std::size_t index = 0;
              index < m_ioProgram.fieldInputCount(); ++index) {
-            fieldInputs[index] = mesaInputs[index];
+            m_fieldInputs[index] = mesaInputs[index];
         }
-        m_ioProgram.execute(fieldInputs, inputs);
+        m_ioProgram.executeInputs(
+            m_fieldInputs, m_logicalOutputs, inputs);
     }
 
     void MesaProductionExecutorIo::applyOutputs(
         const ProductionExecutorOutputState &outputs) noexcept {
         auto next = HostMot2CyclicOutputImage{};
         if (m_faultCode != 0 || !outputs.executorEnabled) {
+            m_logicalOutputs.reset();
             m_pendingOutputs = next;
 
             return;
         }
 
+        m_logicalOutputs = outputs.digitalOutputs;
         next.watchdogEnabled = true;
         next.stepGeneratorsEnabled =
             m_stepGeneratorCount != 0;
@@ -149,6 +156,15 @@ namespace ngc::mesa {
                     * mapping.stepsPerMachineUnit,
                 .enabled = true,
             };
+        }
+        auto fieldOutputs = FieldDigitalOutputImage{};
+        m_ioProgram.executeOutputs(
+            m_fieldInputs, m_logicalOutputs, fieldOutputs);
+        next.digitalOutputsEnabled =
+            m_ioProgram.fieldOutputCount() != 0;
+        for (std::size_t index = 0;
+             index < m_ioProgram.fieldOutputCount(); ++index) {
+            next.digitalOutputs[index] = fieldOutputs[index];
         }
 
         m_pendingOutputs = next;

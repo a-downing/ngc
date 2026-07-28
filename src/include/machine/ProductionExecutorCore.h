@@ -57,6 +57,7 @@ namespace ngc {
     struct ProductionExecutorOutputState {
         JointMotionState commandedJoints{};
         SpindleEvent spindle{};
+        LogicalDigitalOutputImage digitalOutputs;
         bool executorEnabled = false;
     };
     static_assert(std::is_trivially_copyable_v<ProductionExecutorOutputState>);

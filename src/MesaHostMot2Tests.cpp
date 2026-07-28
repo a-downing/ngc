@@ -1106,6 +1106,9 @@ namespace {
         constexpr std::array<ngc::DigitalInputId, 3> logicalInputs{
             0, 1, 2,
         };
+        constexpr std::array<ngc::DigitalOutputId, 2> declaredOutputs{
+            3, 4,
+        };
         auto program = ngc::DigitalIoProgram::compile(
             R"PROGRAM(
                 not r0, fieldin0
@@ -1117,60 +1120,100 @@ namespace {
                 mov in0, r5
                 mov in1, r3
                 mov in2, r4
+                not r6, out3
+                mov fieldout0, r6
+                mov fieldout1, out4
             )PROGRAM",
-            2, logicalInputs, 0.001);
+            2, logicalInputs, 2, declaredOutputs, 0.001);
         require(program.has_value()
-                && program->instructionCount() == 9
+                && program->instructionCount() == 12
                 && program->fieldInputCount() == 2
-                && program->logicalInputCount() == 3,
-                "valid digital-input program was rejected");
+                && program->logicalInputCount() == 3
+                && program->fieldOutputCount() == 2
+                && program->logicalOutputCount() == 2,
+                "valid digital I/O program was rejected");
 
         auto fieldInputs = ngc::FieldDigitalInputImage{};
         fieldInputs[1] = true;
+        auto logicalOutputs = ngc::LogicalDigitalOutputImage{};
+        logicalOutputs[4] = true;
         auto logical = ngc::LogicalDigitalInputImage{};
-        program->execute(fieldInputs, logical);
+        program->executeInputs(
+            fieldInputs, logicalOutputs, logical);
         require(logical[0] && logical[1] && logical[2],
                 "digital-input program produced incorrect Boolean outputs");
+        auto fieldOutputs = ngc::FieldDigitalOutputImage{};
+        program->executeOutputs(
+            fieldInputs, logicalOutputs, fieldOutputs);
+        require(fieldOutputs[0] && fieldOutputs[1],
+                "digital-output program produced incorrect Boolean outputs");
 
         fieldInputs[1] = false;
-        program->execute(fieldInputs, logical);
+        logicalOutputs[3] = true;
+        logicalOutputs[4] = false;
+        program->executeInputs(
+            fieldInputs, logicalOutputs, logical);
         require(logical[0] && !logical[1] && !logical[2],
                 "debounce changed before its stable-time threshold");
-        program->execute(fieldInputs, logical);
+        program->executeOutputs(
+            fieldInputs, logicalOutputs, fieldOutputs);
+        require(fieldOutputs.none(),
+                "digital-output program did not observe logical outputs");
+        program->executeInputs(
+            fieldInputs, logicalOutputs, logical);
         require(logical[0],
                 "debounce changed one tick before its threshold");
-        program->execute(fieldInputs, logical);
+        program->executeInputs(
+            fieldInputs, logicalOutputs, logical);
         require(!logical[0],
                 "debounce did not change at its stable-time threshold");
 
         program->reset();
-        program->execute(fieldInputs, logical);
+        program->executeInputs(
+            fieldInputs, logicalOutputs, logical);
         require(!logical[0],
-                "digital-input program reset retained debounce state");
+                "digital I/O program reset retained debounce state");
     }
 
     void testRejectsInvalidDigitalIoPrograms() {
         constexpr std::array<ngc::DigitalInputId, 1> logicalInput{0};
+        constexpr std::array<ngc::DigitalOutputId, 1> logicalOutput{0};
         const auto uninitialized =
             ngc::DigitalIoProgram::compile(
                 "and r0, r1, fieldin0\nmov in0, r0",
-                1, logicalInput, 0.001);
+                1, logicalInput, 0, {}, 0.001);
         const auto invalidFieldInput =
             ngc::DigitalIoProgram::compile(
                 "mov in0, fieldin1",
-                1, logicalInput, 0.001);
+                1, logicalInput, 0, {}, 0.001);
         const auto duplicateOutput =
             ngc::DigitalIoProgram::compile(
                 "mov in0, fieldin0\nmov in0, 1",
-                1, logicalInput, 0.001);
+                1, logicalInput, 0, {}, 0.001);
         const auto statefulOutput =
             ngc::DigitalIoProgram::compile(
                 "debounce in0, fieldin0, 10ms",
-                1, logicalInput, 0.001);
+                1, logicalInput, 0, {}, 0.001);
         const auto invalidDuration =
             ngc::DigitalIoProgram::compile(
                 "debounce r0, fieldin0, forever\nmov in0, r0",
-                1, logicalInput, 0.001);
+                1, logicalInput, 0, {}, 0.001);
+        const auto readFieldOutput =
+            ngc::DigitalIoProgram::compile(
+                "mov in0, fieldout0\nmov fieldout0, out0",
+                0, logicalInput, 1, logicalOutput, 0.001);
+        const auto writeLogicalOutput =
+            ngc::DigitalIoProgram::compile(
+                "mov in0, 0\nmov out0, 1\nmov fieldout0, out0",
+                0, logicalInput, 1, logicalOutput, 0.001);
+        const auto missingFieldOutput =
+            ngc::DigitalIoProgram::compile(
+                "mov in0, 0",
+                0, logicalInput, 1, logicalOutput, 0.001);
+        const auto undeclaredLogicalOutput =
+            ngc::DigitalIoProgram::compile(
+                "mov in0, 0\nmov fieldout0, out1",
+                0, logicalInput, 1, logicalOutput, 0.001);
 
         require(!uninitialized.has_value()
                 && uninitialized.error().find("uninitialized")
@@ -1192,6 +1235,24 @@ namespace {
                 && invalidDuration.error().find("invalid duration")
                     != std::string::npos,
                 "input program accepted an invalid duration");
+        require(!readFieldOutput.has_value()
+                && readFieldOutput.error().find("write-only")
+                    != std::string::npos,
+                "digital I/O program read a field output");
+        require(!writeLogicalOutput.has_value()
+                && writeLogicalOutput.error().find("invalid destination")
+                    != std::string::npos,
+                "digital I/O program wrote a logical output");
+        require(!missingFieldOutput.has_value()
+                && missingFieldOutput.error().find(
+                    "does not write field output")
+                    != std::string::npos,
+                "digital I/O program accepted an unassigned field output");
+        require(!undeclaredLogicalOutput.has_value()
+                && undeclaredLogicalOutput.error().find(
+                    "undeclared logical output")
+                    != std::string::npos,
+                "digital I/O program read an undeclared logical output");
     }
 
     void testBridgesMesaInputsAndStepGeneratorsToExecutorIo() {
@@ -1201,11 +1262,21 @@ namespace {
         putCyclicConfirmation(response, 0, 1, 1);
 
         constexpr std::array<ngc::DigitalInputId, 1> logicalInput{0};
+        constexpr std::array<ngc::DigitalOutputId, 1> logicalOutput{0};
         auto program = ngc::DigitalIoProgram::compile(
-            "not r0, fieldin0\nmov in0, r0",
-            11, logicalInput, 0.001);
+            R"PROGRAM(
+                not r0, fieldin0
+                mov in0, r0
+                mov fieldout0, out0
+                mov fieldout1, 0
+                mov fieldout2, 0
+                mov fieldout3, 0
+                mov fieldout4, 0
+                mov fieldout5, 0
+            )PROGRAM",
+            11, logicalInput, 6, logicalOutput, 0.001);
         require(program.has_value(),
-                "Mesa executor input program did not compile");
+                "Mesa executor digital I/O program did not compile");
         constexpr std::array mappings{
             ngc::mesa::MesaStepGeneratorMapping{
                 .joint = 0,
@@ -1219,9 +1290,21 @@ namespace {
                 "valid Mesa executor I/O adapter was rejected");
 
         auto outputs = ngc::ProductionExecutorOutputState{};
+        (*adapter)->applyOutputs(outputs);
+        require(
+            !(*adapter)->pendingOutputs().watchdogEnabled
+                && !(*adapter)->pendingOutputs().stepGeneratorsEnabled
+                && !(*adapter)->pendingOutputs().digitalOutputsEnabled,
+            "disabled Mesa executor I/O did not retain safe outputs");
+
         outputs.executorEnabled = true;
         outputs.commandedJoints.velocity[0] = 0.25;
+        outputs.digitalOutputs[0] = true;
         (*adapter)->applyOutputs(outputs);
+        require(
+            (*adapter)->pendingOutputs().digitalOutputsEnabled
+                && (*adapter)->pendingOutputs().digitalOutputs[0],
+            "Mesa executor I/O did not stage its field output");
         response = transport.response(46);
         putCyclicConfirmation(response, 36, 2, 2);
         auto inputs = ngc::ProductionExecutorDigitalInputs{};
@@ -1236,6 +1319,10 @@ namespace {
                     == static_cast<std::uint32_t>(
                         static_cast<std::int32_t>(42'949.67296)),
                 "Mesa executor I/O mapped the wrong joint StepGen rate");
+        require(littleEndian32(
+                    findRequestWrite(
+                        transport.request(), 0x7D00).data) == 1,
+                "Mesa executor I/O did not map the field output to SSR data");
 
         response = transport.response(46);
         putLittleEndian32(response.subspan(32), 1);
@@ -1250,7 +1337,8 @@ namespace {
                             ngc::mesa::HostMot2CyclicIoFault::WatchdogTripped))
                 && inputs.none()
                 && !(*adapter)->pendingOutputs().watchdogEnabled
-                && !(*adapter)->pendingOutputs().stepGeneratorsEnabled,
+                && !(*adapter)->pendingOutputs().stepGeneratorsEnabled
+                && !(*adapter)->pendingOutputs().digitalOutputsEnabled,
                 "Mesa executor I/O did not latch its fault and stage safe outputs");
     }
 }

@@ -23,7 +23,7 @@ namespace ngc {
             if (!text.starts_with(prefix)
                 || text.size() == prefix.size()) {
                 return std::unexpected(std::format(
-                    "input program line {} has invalid operand '{}'",
+                    "digital I/O program line {} has invalid operand '{}'",
                     line, text));
             }
 
@@ -35,7 +35,7 @@ namespace ngc {
                 || end != digits.data() + digits.size()
                 || value >= capacity) {
                 return std::unexpected(std::format(
-                    "input program line {} operand '{}' is out of range",
+                    "digital I/O program line {} operand '{}' is out of range",
                     line, text));
             }
 
@@ -72,7 +72,7 @@ namespace ngc {
             }
 
             return std::unexpected(std::format(
-                "input program line {} has invalid duration '{}'",
+                "digital I/O program line {} has invalid duration '{}'",
                 line, text));
         }
 
@@ -113,15 +113,22 @@ namespace ngc {
         const std::string_view source,
         const std::size_t fieldInputCount,
         const std::span<const DigitalInputId> logicalInputs,
+        const std::size_t fieldOutputCount,
+        const std::span<const DigitalOutputId> logicalOutputs,
         const double servoPeriod) {
         if (fieldInputCount
             > DIGITAL_IO_PROGRAM_FIELD_INPUT_CAPACITY) {
             return std::unexpected(
-                "input program field-input count exceeds capacity");
+                "digital I/O program field-input count exceeds capacity");
+        }
+        if (fieldOutputCount
+            > DIGITAL_IO_PROGRAM_FIELD_OUTPUT_CAPACITY) {
+            return std::unexpected(
+                "digital I/O program field-output count exceeds capacity");
         }
         if (!std::isfinite(servoPeriod) || servoPeriod <= 0.0) {
             return std::unexpected(
-                "input program servo period must be positive");
+                "digital I/O program servo period must be positive");
         }
 
         auto declaredInputs =
@@ -129,25 +136,39 @@ namespace ngc {
         for (const auto input : logicalInputs) {
             if (declaredInputs[input]) {
                 return std::unexpected(std::format(
-                    "input program declares logical input {} more than once",
+                    "digital I/O program declares logical input {} more than once",
                     input));
             }
             declaredInputs[input] = true;
+        }
+        auto declaredOutputs =
+            std::bitset<LOGICAL_DIGITAL_OUTPUT_CAPACITY>{};
+        for (const auto output : logicalOutputs) {
+            if (declaredOutputs[output]) {
+                return std::unexpected(std::format(
+                    "digital I/O program declares logical output {} more than once",
+                    output));
+            }
+            declaredOutputs[output] = true;
         }
 
         auto result = DigitalIoProgram{};
         result.m_fieldInputCount = fieldInputCount;
         result.m_logicalInputCount = logicalInputs.size();
+        result.m_fieldOutputCount = fieldOutputCount;
+        result.m_logicalOutputCount = logicalOutputs.size();
         auto assignedRegisters =
             std::bitset<DIGITAL_IO_PROGRAM_REGISTER_CAPACITY>{};
         auto assignedInputs =
             std::bitset<LOGICAL_DIGITAL_INPUT_CAPACITY>{};
+        auto assignedFieldOutputs =
+            std::bitset<DIGITAL_IO_PROGRAM_FIELD_OUTPUT_CAPACITY>{};
 
         const auto lines = tokenize(source);
         if (lines.size()
             > DIGITAL_IO_PROGRAM_INSTRUCTION_CAPACITY) {
             return std::unexpected(
-                "input program instruction count exceeds capacity");
+                "digital I/O program instruction count exceeds capacity");
         }
 
         const auto parseOperand = [&](const std::string_view text,
@@ -171,6 +192,18 @@ namespace ngc {
                     .index = *index,
                 };
             }
+            if (text.starts_with("fieldout")) {
+                const auto index = parseIndex(
+                    text, "fieldout", fieldOutputCount, line);
+                if (!index) {
+                    return std::unexpected(index.error());
+                }
+
+                return Operand{
+                    .kind = OperandKind::FieldOutput,
+                    .index = *index,
+                };
+            }
             if (text.starts_with("in")) {
                 const auto index = parseIndex(
                     text, "in", LOGICAL_DIGITAL_INPUT_CAPACITY,
@@ -181,6 +214,19 @@ namespace ngc {
 
                 return Operand{
                     .kind = OperandKind::LogicalInput,
+                    .index = *index,
+                };
+            }
+            if (text.starts_with("out")) {
+                const auto index = parseIndex(
+                    text, "out", LOGICAL_DIGITAL_OUTPUT_CAPACITY,
+                    line);
+                if (!index) {
+                    return std::unexpected(index.error());
+                }
+
+                return Operand{
+                    .kind = OperandKind::LogicalOutput,
                     .index = *index,
                 };
             }
@@ -202,15 +248,22 @@ namespace ngc {
             const Operand &operand,
             const std::size_t line)
             -> std::expected<void, std::string> {
-            if (operand.kind == OperandKind::LogicalInput) {
+            if (operand.kind == OperandKind::LogicalInput
+                || operand.kind == OperandKind::FieldOutput) {
                 return std::unexpected(std::format(
-                    "input program line {} reads write-only logical input {}",
+                    "digital I/O program line {} reads a write-only operand",
+                    line));
+            }
+            if (operand.kind == OperandKind::LogicalOutput
+                && !declaredOutputs[operand.index]) {
+                return std::unexpected(std::format(
+                    "digital I/O program line {} reads undeclared logical output {}",
                     line, operand.index));
             }
             if (operand.kind == OperandKind::Register
                 && !assignedRegisters[operand.index]) {
                 return std::unexpected(std::format(
-                    "input program line {} reads uninitialized register r{}",
+                    "digital I/O program line {} reads uninitialized register r{}",
                     line, operand.index));
             }
 
@@ -228,22 +281,33 @@ namespace ngc {
                 return {};
             }
             if (!logicalAllowed
-                || operand.kind != OperandKind::LogicalInput) {
+                || (operand.kind != OperandKind::LogicalInput
+                    && operand.kind != OperandKind::FieldOutput)) {
                 return std::unexpected(std::format(
-                    "input program line {} has an invalid destination",
+                    "digital I/O program line {} has an invalid destination",
                     line));
             }
-            if (!declaredInputs[operand.index]) {
+            if (operand.kind == OperandKind::LogicalInput) {
+                if (!declaredInputs[operand.index]) {
+                    return std::unexpected(std::format(
+                        "digital I/O program line {} writes undeclared logical input {}",
+                        line, operand.index));
+                }
+                if (assignedInputs[operand.index]) {
+                    return std::unexpected(std::format(
+                        "digital I/O program line {} writes logical input {} more than once",
+                        line, operand.index));
+                }
+                assignedInputs[operand.index] = true;
+
+                return {};
+            }
+            if (assignedFieldOutputs[operand.index]) {
                 return std::unexpected(std::format(
-                    "input program line {} writes undeclared logical input {}",
+                    "digital I/O program line {} writes field output {} more than once",
                     line, operand.index));
             }
-            if (assignedInputs[operand.index]) {
-                return std::unexpected(std::format(
-                    "input program line {} writes logical input {} more than once",
-                    line, operand.index));
-            }
-            assignedInputs[operand.index] = true;
+            assignedFieldOutputs[operand.index] = true;
 
             return {};
         };
@@ -272,12 +336,12 @@ namespace ngc {
                 expectedTokens = 4;
             } else {
                 return std::unexpected(std::format(
-                    "input program line {} has unknown opcode '{}'",
+                    "digital I/O program line {} has unknown opcode '{}'",
                     line.number, tokens[0]));
             }
             if (tokens.size() != expectedTokens) {
                 return std::unexpected(std::format(
-                    "input program line {} opcode '{}' expects {} operands",
+                    "digital I/O program line {} opcode '{}' expects {} operands",
                     line.number, tokens[0], expectedTokens - 1));
             }
 
@@ -330,7 +394,7 @@ namespace ngc {
                     > static_cast<double>(
                         std::numeric_limits<std::uint32_t>::max())) {
                     return std::unexpected(std::format(
-                        "input program line {} debounce duration exceeds capacity",
+                        "digital I/O program line {} debounce duration exceeds capacity",
                         line.number));
                 }
                 instruction.debounceTicks =
@@ -353,8 +417,16 @@ namespace ngc {
         for (const auto input : logicalInputs) {
             if (!assignedInputs[input]) {
                 return std::unexpected(std::format(
-                    "input program does not write logical input {}",
+                    "digital I/O program does not write logical input {}",
                     input));
+            }
+        }
+        for (std::size_t output = 0;
+             output < fieldOutputCount; ++output) {
+            if (!assignedFieldOutputs[output]) {
+                return std::unexpected(std::format(
+                    "digital I/O program does not write field output {}",
+                    output));
             }
         }
 
@@ -364,6 +436,7 @@ namespace ngc {
     bool DigitalIoProgram::value(
         const Operand &operand,
         const FieldDigitalInputImage &fieldInputs,
+        const LogicalDigitalOutputImage &logicalOutputs,
         const std::bitset<
             DIGITAL_IO_PROGRAM_REGISTER_CAPACITY> &registers) const noexcept {
         switch (operand.kind) {
@@ -371,26 +444,38 @@ namespace ngc {
                 return registers[operand.index];
             case OperandKind::FieldInput:
                 return fieldInputs[operand.index];
+            case OperandKind::LogicalOutput:
+                return logicalOutputs[operand.index];
             case OperandKind::Constant:
                 return operand.constant;
             case OperandKind::LogicalInput:
+            case OperandKind::FieldOutput:
                 return false;
         }
 
         return false;
     }
 
-    void DigitalIoProgram::execute(
+    void DigitalIoProgram::evaluate(
         const FieldDigitalInputImage &fieldInputs,
-        LogicalDigitalInputImage &logicalInputs) noexcept {
+        const LogicalDigitalOutputImage &logicalOutputs,
+        LogicalDigitalInputImage &logicalInputs,
+        FieldDigitalOutputImage &fieldOutputs,
+        std::array<
+            DebounceState,
+            DIGITAL_IO_PROGRAM_INSTRUCTION_CAPACITY> &debounce,
+        const bool advanceDebounce) const noexcept {
         auto registers =
             std::bitset<DIGITAL_IO_PROGRAM_REGISTER_CAPACITY>{};
         auto nextInputs = LogicalDigitalInputImage{};
+        auto nextFieldOutputs = FieldDigitalOutputImage{};
         for (std::size_t index = 0;
              index < m_instructionCount; ++index) {
             const auto &instruction = m_instructions[index];
             const auto first =
-                value(instruction.first, fieldInputs, registers);
+                value(
+                    instruction.first, fieldInputs,
+                    logicalOutputs, registers);
             auto result = false;
             switch (instruction.opcode) {
                 case Opcode::Move:
@@ -401,18 +486,25 @@ namespace ngc {
                     break;
                 case Opcode::And:
                     result = first && value(
-                        instruction.second, fieldInputs, registers);
+                        instruction.second, fieldInputs,
+                        logicalOutputs, registers);
                     break;
                 case Opcode::Or:
                     result = first || value(
-                        instruction.second, fieldInputs, registers);
+                        instruction.second, fieldInputs,
+                        logicalOutputs, registers);
                     break;
                 case Opcode::Xor:
                     result = first != value(
-                        instruction.second, fieldInputs, registers);
+                        instruction.second, fieldInputs,
+                        logicalOutputs, registers);
                     break;
                 case Opcode::Debounce: {
-                    auto &state = m_debounce[index];
+                    auto &state = debounce[index];
+                    if (!advanceDebounce) {
+                        result = state.output;
+                        break;
+                    }
                     if (!state.initialized) {
                         state.initialized = true;
                         state.output = first;
@@ -446,12 +538,37 @@ namespace ngc {
             if (instruction.destination.kind
                 == OperandKind::Register) {
                 registers[instruction.destination.index] = result;
-            } else {
+            } else if (instruction.destination.kind
+                       == OperandKind::LogicalInput) {
                 nextInputs[instruction.destination.index] = result;
+            } else {
+                nextFieldOutputs[instruction.destination.index] = result;
             }
         }
 
         logicalInputs = nextInputs;
+        fieldOutputs = nextFieldOutputs;
+    }
+
+    void DigitalIoProgram::executeInputs(
+        const FieldDigitalInputImage &fieldInputs,
+        const LogicalDigitalOutputImage &logicalOutputs,
+        LogicalDigitalInputImage &logicalInputs) noexcept {
+        auto unusedFieldOutputs = FieldDigitalOutputImage{};
+        evaluate(
+            fieldInputs, logicalOutputs, logicalInputs,
+            unusedFieldOutputs, m_debounce, true);
+    }
+
+    void DigitalIoProgram::executeOutputs(
+        const FieldDigitalInputImage &fieldInputs,
+        const LogicalDigitalOutputImage &logicalOutputs,
+        FieldDigitalOutputImage &fieldOutputs) const noexcept {
+        auto unusedInputs = LogicalDigitalInputImage{};
+        auto debounce = m_debounce;
+        evaluate(
+            fieldInputs, logicalOutputs, unusedInputs,
+            fieldOutputs, debounce, false);
     }
 
     void DigitalIoProgram::reset() noexcept {
@@ -468,5 +585,13 @@ namespace ngc {
 
     std::size_t DigitalIoProgram::logicalInputCount() const noexcept {
         return m_logicalInputCount;
+    }
+
+    std::size_t DigitalIoProgram::fieldOutputCount() const noexcept {
+        return m_fieldOutputCount;
+    }
+
+    std::size_t DigitalIoProgram::logicalOutputCount() const noexcept {
+        return m_logicalOutputCount;
     }
 }

@@ -161,6 +161,11 @@ namespace ngc {
         std::numeric_limits<DigitalInputId>::max() + std::size_t{1};
     using LogicalDigitalInputImage =
         std::bitset<LOGICAL_DIGITAL_INPUT_CAPACITY>;
+    using DigitalOutputId = std::uint16_t;
+    inline constexpr std::size_t LOGICAL_DIGITAL_OUTPUT_CAPACITY =
+        std::numeric_limits<DigitalOutputId>::max() + std::size_t{1};
+    using LogicalDigitalOutputImage =
+        std::bitset<LOGICAL_DIGITAL_OUTPUT_CAPACITY>;
     using TriggeredMoveId = std::uint64_t;
     using JointId = std::uint8_t;
     using JointMask = std::uint16_t;

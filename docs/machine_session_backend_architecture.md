@@ -526,7 +526,6 @@ and r2, r0, r1
 debounce r3, r2, 10ms
 mov in0, r3
 
-# Planned logical-output mapping:
 mov fieldout0, out0
 """
 
@@ -572,10 +571,12 @@ outN     -> program -> fieldoutN
 ```
 
 `fieldinN` is a read-only sampled field input and `inN` is a write-only logical
-input supplied atomically to the executor. The planned output extension makes
-`outN` a read-only logical output produced by the executor or G-code and
-`fieldoutN` a write-only field output. Registers `rN` remain read/write
-temporaries. The assembler rejects operands used against their direction.
+input supplied atomically to the executor. `outN` is a read-only logical output
+carried by the executor output state and `fieldoutN` is a write-only field
+output staged for the cyclic HostMot2 adapter. Registers `rN` remain read/write
+temporaries. The assembler rejects operands used against their direction,
+requires every configured logical input and field output to be assigned
+exactly once, and rejects reads from undeclared logical outputs.
 
 Assembly source expresses debounce in time, for example
 `debounce r0, fieldin0, 10ms`. NRT compilation rounds the duration up to an
@@ -1171,16 +1172,20 @@ held state.
   required logical input, and time durations rounded up to servo ticks. Its
   allocation-free execution supports `mov`, `not`, `and`, `or`, `xor`, and
   symmetric stateful `debounce dest, src, time`, then commits the complete
-  logical image atomically. `MesaProductionExecutorIo` safely initializes the
-  cyclic layer, runs that program on every valid field sample, stages configured
-  joint velocities as StepGen rates, requires the watchdog for enabled motion,
-  and promotes cyclic failures to executor host faults with safe pending
-  outputs. The current compiler and executor adapter implement only
-  `fieldinN -> inN`; they do not yet accept `outN` or `fieldoutN`.
-  Physical-backend configuration parsing and hosting, the planned
-  `outN -> fieldoutN` program path for executor/G-code digital outputs,
-  generated-step feedback, configured SSR output integration, and
-  physical-host validation remain.
+  logical image atomically. The compiler also accepts read-only `outN` logical
+  outputs and requires a complete, single-assignment `fieldoutN` image. Input
+  and output evaluation remain separately bounded so the executor's
+  sample-before-tick and apply-after-tick order does not advance debounce state
+  twice. `MesaProductionExecutorIo` safely initializes the cyclic layer, runs
+  the input side on every valid field sample, stages configured joint
+  velocities as StepGen rates, maps the executor-carried logical output image
+  through the output side into the configured HostMot2 SSR bindings, requires
+  the watchdog for enabled motion, and promotes cyclic failures to executor
+  host faults with safe pending outputs. Disabled and faulted states suppress
+  the watchdog, StepGen motion, and digital outputs. Physical-backend
+  configuration parsing and hosting, executor/G-code producers for logical
+  digital-output events, generated-step feedback, and physical-host validation
+  remain.
 - Validate on a dedicated Linux RT host and NIC before enabling outputs.
 
 ### Phase 12: Staged physical commissioning

@@ -101,12 +101,17 @@ boundary. The physical Mesa integration slice exposes unmodified board input
 levels as `fieldinN`, executes an NRT-compiled, fixed-capacity Boolean input
 program with `mov`, `not`, `and`, `or`, `xor`, and stateful `debounce`
 instructions, and atomically supplies its `inN` logical-input image to the
-executor. `fieldinN` operands are read-only, `inN` operands are write-only, and
-debounce durations written as time are rounded up to fixed servo ticks during
-NRT compilation. Its bounded adapter stages commanded joint velocities as
-StepGen rates, requires
+executor. The same program maps the executor-carried `outN` logical-output
+image into `fieldoutN` outputs staged for the configured HostMot2 SSR bindings.
+`fieldinN` and `outN` operands are read-only, while `inN` and `fieldoutN`
+operands are write-only. Every configured logical input and field output must
+be assigned exactly once, and debounce durations written as time are rounded
+up to fixed servo ticks during NRT compilation. Its bounded adapter stages
+commanded joint velocities as StepGen rates, requires
 the watchdog for enabled motion, and converts any invalid cyclic exchange into
-an executor host fault and safe output image. On configured Linux hosts, the
+an executor host fault and safe output image. Disabled and faulted executor
+states suppress the watchdog, StepGen motion, and digital outputs. On
+configured Linux hosts, the
 runtime's existing servo thread removes the
 calling NRT host from the selected CPU, locks process memory, pins itself,
 enters `SCHED_FIFO`, prefaults its stack, and sleeps to absolute monotonic

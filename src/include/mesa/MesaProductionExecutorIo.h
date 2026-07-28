@@ -55,6 +55,8 @@ namespace ngc::mesa {
             MAX_JOINTS> m_stepGenerators{};
         std::size_t m_stepGeneratorCount = 0;
         HostMot2CyclicOutputImage m_pendingOutputs;
+        FieldDigitalInputImage m_fieldInputs;
+        LogicalDigitalOutputImage m_logicalOutputs;
         std::uint32_t m_faultCode = 0;
     };
 }
