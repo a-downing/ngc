@@ -31,7 +31,8 @@ MDI, Simulation, and Real operation.
    - The NGC front end remains NRT.
    - A local shared-memory proxy implements the front end's `MotionBackend`
      endpoint.
-   - The physical-backend process owns the RT executor and Mesa communication.
+   - The physical-backend process owns the RT executor and composes independent
+     Mesa motion and optional spindle hardware roles.
    - The Mesa 7I96 is reached through a dedicated Ethernet interface.
 
 4. A powered, homed, stationary Real session may be used to initialize
@@ -1211,8 +1212,9 @@ held state.
   the watchdog, StepGen motion, and digital outputs. The typed Mesa
   configuration loader, DPLL-latched generated-step feedback, and active
   StepGen diagnostic are complete. The initial `ngc_mesa_backend` process
-  performs NRT-only machine/Mesa configuration loading and cross-validation,
-  constructs the physical I/O adapter, hosts `ProductionExecutorRuntime`
+  performs NRT-only machine/physical-backend configuration loading and
+  cross-validation, constructs the composed physical I/O adapter, hosts
+  `ProductionExecutorRuntime`
   behind the production IPC bridge without synthetic inputs, and faults to
   safe outputs when its configured external-enable logical input is outside
   its explicitly configured `high` or `low` active polarity.
@@ -1221,9 +1223,9 @@ held state.
   disconnected `external_enable_field` as an active-low enable. That mapping
   is explicitly non-fail-safe and must be replaced before any physical output
   is connected.
-  Executor/G-code producers for additional logical-output events, spindle
-  integration, application-default selection, and physical commissioning
-  remain.
+  Executor/G-code producers for additional logical-output events, Huanyang
+  serial/protocol integration, application-default selection, and physical
+  commissioning remain.
 - Validate on a dedicated Linux RT host and NIC before enabling outputs.
 
 ### Phase 12: Staged physical commissioning
@@ -1285,7 +1287,7 @@ physical commissioning:
 - steps per revolution, electronic gearing, screw pitch, and axis direction;
 - required step length, step space, direction setup, and direction hold;
 - E-stop, STO, drive-enable, fault, and contactor wiring;
-- spindle/VFD command interface and spindle-encoder details;
+- Huanyang serial transport, VFD status policy, and spindle-encoder details;
 - exact allocation of the 7I96 isolated inputs and outputs; and
 - whether an explicit persistent user-parameter range beyond the current
   predefined nonvolatile cells is desired.
