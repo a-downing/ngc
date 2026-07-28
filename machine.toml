@@ -27,7 +27,7 @@ executable = "build/ngc_ipc_backend.exe"
 # Linux production executor host settings.
 servo_period = 0.001
 realtime_cpu = 15
-realtime_priority = 95
+realtime_priority = 98
 lock_memory = true
 
 [feed_hold]

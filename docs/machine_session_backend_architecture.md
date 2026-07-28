@@ -485,37 +485,51 @@ table.
 - logical digital-input identities;
 - probing input identity;
 - Simulation timing and typed Simulation startup state; and
-- the optional Real backend kind and backend-configuration path.
+- the optional Real backend kind, executable, backend-configuration path, and
+  authoritative Real servo period.
 
 Illustrative selection:
 
 ```toml
-[operation]
-default_mode = "simulation"
-
-[real_run]
-backend = "mesa_7i96"
-backend_config = "mesa_7i96.toml"
+[real_backend]
+type = "mesa_hostmot2"
+executable = "build/ngc_rt_backend.exe"
+configuration = "mesa_7i96.toml"
+servo_period = 0.001
 ```
 
-The entire `[real_run]` section may be absent. Simulation remains available.
+The entire `[real_backend]` section may be absent. Simulation remains
+available. The front end passes the resolved backend-configuration path and
+the servo period as separate typed command-line arguments to the backend
+executable. The servo period is part of the shared planning and execution
+contract, so `machine.toml` is its single source of truth. The backend may
+validate hardware timing against that supplied period but must not override it
+or define a duplicate value in its own file. The effective IPC configuration
+fingerprint includes the servo period.
 
 The backend-specific file maps the logical machine to physical hardware:
 
 ```toml
-[board]
-model = "7i96"
-address = "192.168.1.121"
+[realtime]
+cpu = 15
+priority = 98
+lock_memory = true
 
-[inputs.probe]
+[motion]
+driver = "mesa_hostmot2"
+address = "10.10.10.10"
+expected_board = "7i96"
+
+[motion.inputs.tool_probe]
 pin = 0
 active_low = false
 
-[outputs.drive_enable]
+[motion.outputs.drive_enable]
 pin = 0
 active_low = false
+safe_state = false
 
-[[stepgens]]
+[[motion.stepgens]]
 joint = 0
 channel = 0
 steps_per_machine_unit = 4000.0
@@ -533,9 +547,11 @@ The physical configuration owns:
 - watchdog and communication policy; and
 - physical enable and fault wiring.
 
-Startup code loads both files, validates their composition completely, and
-passes typed configuration to the physical runtime. The backend and RT executor
-never parse TOML or access configuration files.
+The backend executable's NRT bootstrap parses the backend-specific file,
+combines it with the authoritative parameters and topology supplied by the
+front end, validates the composition completely, and passes typed
+configuration to the physical runtime. The physical runtime, device drivers,
+and RT executor never parse TOML or access configuration files.
 
 ## Physical backend process
 
@@ -549,10 +565,14 @@ NGC front end process
             v
 ngc_rt_backend process
   RT executor, execution ownership, joint mapping
-            |
-            | Mesa HostMot2 transport on dedicated NIC
-            v
-Mesa 7I96
+      |                         |
+      | RT cyclic motion I/O    | bounded desired state and status
+      v                         v
+  Mesa HostMot2             NRT spindle worker
+  dedicated NIC                 |
+      |                         | USB serial / Modbus RTU
+      v                         v
+  Mesa board                    VFD
 ```
 
 The NRT front-end proxy preserves the existing `MotionBackend` operations:
@@ -578,6 +598,53 @@ configuration, connects to and discovers the board, allocates and locks memory,
 and initializes communication. Its fixed-period RT thread owns all cyclic motion
 execution. Optional low-priority diagnostics remain outside the RT loop.
 
+The executable composes independently selected hardware roles behind one fixed
+`ProductionExecutorIo` boundary. Small role-specific abstract interfaces, such
+as `MotionHardware` and `SpindleHardware`, own virtual methods appropriate to
+their different timing models. Concrete types such as `MesaHostMot2` and
+`ModbusRtuVfd` implement those interfaces and are selected by a compile-time
+factory from validated configuration. They are constructed during NRT startup
+and remain fixed while the runtime is active. This is ordinary C++ composition,
+not a dynamically loaded plugin system or a general signal graph.
+
+The motion interface owns one bounded, allocation-free, nonblocking,
+`noexcept` hardware cycle. The initial `MesaHostMot2` implementation discovers
+HostMot2 modules and validates configured capabilities rather than creating a
+separate driver for every Mesa board model. Moving to another compatible Mesa
+board should normally require only configuration changes. A genuinely
+different motion-controller family adds one new motion-interface
+implementation while reusing IPC, execution, spindle control, and safety
+handling.
+
+`MesaHostMot2` is itself a reusable stack rather than one implementation
+written around the 7I96. Its board-independent layers own UDP transport,
+LBP16 framing, packet sequencing and timeout handling, IDROM and module
+discovery, typed register access, cyclic input/output images, watchdog service,
+and common step-generator, encoder, and digital-I/O behavior. Configuration
+binds discovered capabilities and channels to NGC joints and logical signals.
+A thin board description may add expected identity, connector or pin naming,
+and model-specific capability constraints, but it must not duplicate the
+transport, protocol, discovery, register-mapping, or cyclic-I/O implementation.
+Add board-specific code only when discovered capabilities and validated data
+cannot describe a real behavioral difference safely.
+
+The spindle interface has a different timing model. USB serial communication
+must never run in the RT servo cycle. The RT-facing output application publishes
+the latest desired spindle state through a bounded nonblocking channel to an
+NRT spindle worker, which performs serial communication and publishes bounded
+status and faults in the reverse direction. Disable, Abort, executor fault,
+frontend loss, communication timeout, and backend shutdown establish the
+defined safe spindle state.
+
+Most USB-to-RS-485 adapters are treated as operating-system serial ports rather
+than distinct backend drivers. The reusable layering is serial transport,
+Modbus RTU framing, and VFD behavior. Differences between VFD models should be
+validated register/profile data when possible and a small spindle-interface
+implementation only when their behavior cannot be described safely as data.
+Spindle configuration and implementation are deferred; the initial physical
+backend may omit the spindle role while reporting it unavailable and preserving
+safe output behavior.
+
 Frontend loss causes the executor to select a proved constrained-stop path
 rather than continue indefinitely. Backend-process or host loss is covered by
 the HostMot2 watchdog and external drive-safety design. Neither response permits
@@ -593,6 +660,12 @@ The first physical target is the Mesa 7I96:
 - six isolated outputs;
 - RS-422/RS-485 and a parallel expansion connector; and
 - HostMot2 access over UDP/LBP16.
+
+The development board is configured at `10.10.10.10` and has Ethernet MAC
+address `00:60:1b:16:01:31`. The dedicated host interface must have an address
+on `10.10.10.0/24` without installing a gateway or DNS route. The current Arch
+Linux development-host configuration is recorded in
+[Linux build and pendant setup](linux_build.md#mesa-7i96-development-network).
 
 The current four-joint X, Y1, Y2, Z topology fits four step generators and leaves
 one spare channel.

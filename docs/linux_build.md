@@ -67,6 +67,53 @@ RT hosting enabled:
 ./build/ngc_ipc_tests ./build/ngc_ipc_backend.exe --realtime
 ```
 
+## Mesa 7I96 development network
+
+The Arch Linux development host reaches the dedicated Mesa 7I96 directly over
+the onboard Ethernet controller. Its confirmed network identities are:
+
+| Role | Interface or device | Address |
+| --- | --- | --- |
+| Dedicated host NIC | `enp17s0` | `10.10.10.1/24` |
+| Mesa 7I96 | `00:60:1b:16:01:31` | `10.10.10.10` |
+| USB internet NIC | `enp24s0u2u4` | DHCP |
+
+NetworkManager owns both host interfaces. The `Mesa 7i96` connection uses
+manual IPv4, has no gateway or DNS server, sets `ipv4.never-default`, ignores
+automatic routes and DNS, and disables IPv6. The `USB Internet` connection
+uses DHCP and owns the ordinary default route and DNS. Do not run the global
+`dhcpcd` service alongside NetworkManager; competing managers can install an
+unwanted route when the dedicated interface gains carrier.
+
+The equivalent persistent Mesa profile can be established with:
+
+```bash
+sudo nmcli connection add type ethernet \
+    ifname enp17s0 \
+    con-name "Mesa 7i96" \
+    ipv4.method manual \
+    ipv4.addresses 10.10.10.1/24 \
+    ipv4.never-default yes \
+    ipv4.ignore-auto-routes yes \
+    ipv4.ignore-auto-dns yes \
+    ipv6.method disabled
+sudo systemctl disable --now dhcpcd.service
+```
+
+NetworkManager keyfiles live under
+`/etc/NetworkManager/system-connections/`. Verify that the board route remains
+local and internet remains on the USB interface with:
+
+```bash
+ip route get 10.10.10.10
+ip route get 1.1.1.1
+ping -I enp17s0 10.10.10.10
+```
+
+The first route must select `enp17s0` with source `10.10.10.1`; the second must
+select `enp24s0u2u4`. The board should answer with sub-millisecond latency on a
+direct cable.
+
 ## VistaCNC P2-S access
 
 The Linux transport uses HIDAPI's hidraw backend. Install the supplied udev
