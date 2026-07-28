@@ -552,7 +552,7 @@ namespace {
         const auto configuration =
             ngc::mesa::loadMesaBackendConfiguration(
                 std::filesystem::path(NGC_SOURCE_DIR)
-                    / "mesa_7i96.toml");
+                    / "physical_backend.toml");
 
         require(configuration.has_value()
                 && configuration->address == "10.10.10.10"

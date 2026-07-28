@@ -494,7 +494,7 @@ Illustrative selection:
 [real_backend]
 type = "mesa_hostmot2"
 executable = "build/ngc_rt_backend.exe"
-configuration = "mesa_7i96.toml"
+configuration = "physical_backend.toml"
 servo_period = 0.001
 ```
 
@@ -507,7 +507,8 @@ validate hardware timing against that supplied period but must not override it
 or define a duplicate value in its own file. The effective IPC configuration
 fingerprint includes the servo period.
 
-The backend-specific file maps the logical machine to physical hardware:
+The physical-backend file composes independently configured hardware roles
+and maps the logical machine to physical hardware:
 
 ```toml
 [realtime]
@@ -543,6 +544,18 @@ joint = 0
 channel = 0
 steps_per_machine_unit = 4000.0
 invert_direction = false
+
+[spindle]
+enabled = false
+driver = "huanyang_hycomm"
+device = "/dev/ttyUSB0"
+baud = 9600
+data_bits = 8
+parity = "none"
+stop_bits = 1
+slave_address = 1
+maximum_speed = 24000
+at_speed_tolerance = 0.02
 ```
 
 The physical configuration owns:
@@ -559,6 +572,10 @@ The physical configuration owns:
 - step length, space, direction setup, and direction hold;
 - watchdog and communication policy; and
 - physical enable and fault wiring.
+
+The spindle role is independent of Mesa motion I/O. Its configuration owns
+the serial transport, Huanyang protocol identity, speed bounds, and feedback
+policy. A disabled spindle role is validated but opens no serial device.
 
 The backend executable's NRT bootstrap parses the backend-specific file,
 combines it with the authoritative parameters and topology supplied by the
@@ -681,9 +698,10 @@ than distinct backend drivers. The reusable layering is serial transport,
 Modbus RTU framing, and VFD behavior. Differences between VFD models should be
 validated register/profile data when possible and a small spindle-interface
 implementation only when their behavior cannot be described safely as data.
-Spindle configuration and implementation are deferred; the initial physical
-backend may omit the spindle role while reporting it unavailable and preserving
-safe output behavior.
+Typed physical-backend and spindle configuration, the generic spindle-hardware
+boundary, and the bounded RT-to-NRT spindle worker are complete. The current
+configuration keeps the spindle disabled. Huanyang serial transport, protocol
+execution, status publication, and physical commissioning remain.
 
 Frontend loss causes the executor to select a proved constrained-stop path
 rather than continue indefinitely. Backend-process or host loss is covered by

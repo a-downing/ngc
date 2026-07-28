@@ -64,7 +64,9 @@ add_library(ngc_core STATIC
         src/Machine.cpp
         src/MockMotionBackend.cpp
         src/ParameterStore.cpp
+        src/PhysicalProductionExecutorIo.cpp
         src/PresentationTracker.cpp
+        src/SpindleHardware.cpp
         src/ToolTable.cpp)
 target_include_directories(ngc_core PUBLIC src/include)
 target_link_libraries(ngc_core
@@ -100,6 +102,15 @@ target_link_libraries(
         ngc_mesa_configuration
         PUBLIC ngc_mesa ngc_configuration)
 ngc_target_defaults(ngc_mesa_configuration)
+
+add_library(ngc_physical_configuration STATIC
+        src/physical/PhysicalBackendConfiguration.cpp)
+target_include_directories(
+        ngc_physical_configuration PUBLIC src/include)
+target_link_libraries(
+        ngc_physical_configuration
+        PUBLIC ngc_mesa_configuration ngc_configuration)
+ngc_target_defaults(ngc_physical_configuration)
 
 add_library(ngc_operator STATIC
         src/operator/OperatorJogController.cpp
@@ -175,6 +186,20 @@ target_link_libraries(
 ngc_target_defaults(ngc_mesa_tests)
 add_test(NAME ngc_mesa_tests COMMAND ngc_mesa_tests)
 
+add_executable(
+    ngc_physical_backend_tests
+    src/PhysicalBackendTests.cpp)
+target_compile_definitions(
+    ngc_physical_backend_tests
+    PRIVATE NGC_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(
+    ngc_physical_backend_tests
+    PRIVATE ngc_core ngc_physical_configuration)
+ngc_target_defaults(ngc_physical_backend_tests)
+add_test(
+    NAME ngc_physical_backend_tests
+    COMMAND ngc_physical_backend_tests)
+
 add_executable(ngc_ipc_backend tools/ngc_ipc_backend.cpp)
 target_include_directories(ngc_ipc_backend PRIVATE src)
 target_link_libraries(ngc_ipc_backend PRIVATE ngc_core)
@@ -215,13 +240,14 @@ add_executable(ngc_mesa_backend tools/ngc_mesa_backend.cpp)
 target_include_directories(ngc_mesa_backend PRIVATE src)
 target_link_libraries(
     ngc_mesa_backend
-    PRIVATE ngc_mesa_executor ngc_mesa_configuration)
+    PRIVATE ngc_mesa_executor ngc_physical_configuration)
 ngc_target_defaults(ngc_mesa_backend)
 add_test(
     NAME ngc_mesa_backend_configuration
     COMMAND ngc_mesa_backend
         --machine-configuration ${CMAKE_SOURCE_DIR}/machine.toml
-        --mesa-configuration ${CMAKE_SOURCE_DIR}/mesa_7i96.toml
+        --backend-configuration
+            ${CMAKE_SOURCE_DIR}/physical_backend.toml
         --validate-config-only)
 
 add_executable(

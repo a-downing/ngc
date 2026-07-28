@@ -1,6 +1,7 @@
-# Physical-backend configuration derived from my_LinuxCNC_machine. The typed
-# NRT loader, active StepGen board diagnostic, and initial physical-backend
-# process consume this schema. The physical process is not yet the
+# Physical-backend configuration derived from my_LinuxCNC_machine. It composes
+# independent Mesa motion and Huanyang spindle roles. The typed NRT loader,
+# active StepGen board diagnostic, and initial physical-backend process consume
+# this schema. The physical process is not yet the
 # application's default Real target or physically commissioned.
 #
 # Machine topology, trajectory behavior, limits, homing positions, logical
@@ -152,14 +153,16 @@ maximum_generated_step_error = 2.0
 # The existing machine drives a Huanyang VFD independently of Mesa through the
 # LinuxCNC hy_vfd protocol. The legacy configuration overrides the serial
 # device, baud rate, and parity; the remaining serial values and target retain
-# the hy_vfd defaults. NGC's bounded NRT spindle worker is not implemented yet,
-# so the current physical backend validates but does not consume this table.
+# the hy_vfd defaults. The physical backend validates this independent role,
+# but it remains disabled until its serial hardware implementation and physical
+# commissioning are complete.
 #
 # The legacy driver did not override the VFD's frequency or motor parameters.
 # Read PD004, PD005, PD011, and PD141 through PD144 from the VFD during NRT
 # startup rather than replacing its stored values from this configuration.
 [spindle]
-driver = "huanyang_modbus"
+enabled = false
+driver = "huanyang_hycomm"
 device = "/dev/ttyUSB0"
 baud = 9600
 data_bits = 8

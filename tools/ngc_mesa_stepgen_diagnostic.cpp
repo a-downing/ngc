@@ -28,7 +28,8 @@ namespace {
 
     struct Options {
         std::string machineConfiguration = "machine.toml";
-        std::string mesaConfiguration = "mesa_7i96.toml";
+        std::string mesaConfiguration =
+            "physical_backend.toml";
         std::chrono::milliseconds timeout{10};
         std::uint32_t cyclesPerDirection = 1'000;
         double rateStepsPerSecond = 800.0;

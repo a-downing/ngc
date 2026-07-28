@@ -165,13 +165,17 @@ without opening the board or starting an RT thread with:
 cmake --build build --target ngc_mesa_backend
 ./build/ngc_mesa_backend \
     --machine-configuration machine.toml \
-    --mesa-configuration mesa_7i96.toml \
+    --backend-configuration physical_backend.toml \
     --validate-config-only
 ```
 
-The executable parses both files only during NRT bootstrap. It then passes
-typed runtime configuration to `ProductionExecutorRuntime` and typed hardware
-configuration to the Mesa adapter. For bare-board commissioning only, the
+The executable parses both files only during NRT bootstrap. The physical
+backend configuration composes independent Mesa motion and optional spindle
+roles. It passes typed runtime configuration to
+`ProductionExecutorRuntime` and typed motion configuration to the Mesa
+adapter. The Huanyang spindle role remains configured but disabled until its
+serial implementation and physical commissioning are complete. For
+bare-board commissioning only, the
 current configuration treats disconnected `fieldin2` as an active-low
 `external_enable` through the named physical operand
 `external_enable_field`. This permits a normal physical-peer start but is not
@@ -180,6 +184,21 @@ connecting any drive, motor, spindle, or other output. A normal invocation is
 launched by the application's external-runtime IPC boundary; do not select it
 as the Real target beyond this isolated commissioning setup until the staged
 checks are complete.
+
+Exercise the same physical process through the production IPC boundary without
+commanding motion with:
+
+```bash
+cmake --build build --target ngc_mesa_backend ngc_mesa_backend_smoke
+./build/ngc_mesa_backend_smoke \
+    --peer build/ngc_mesa_backend \
+    --machine-config machine.toml \
+    --backend-config physical_backend.toml
+```
+
+This write-capable bare-board test configures Mesa, services the watchdog,
+enables and disables the executor, and requires zero commanded joint motion.
+Run it only with no drives, motors, spindle, or other outputs connected.
 
 ## VistaCNC P2-S access
 

@@ -22,21 +22,23 @@
 #include "machine/IpcExecutorBridge.h"
 #include "machine/IpcProtocol.h"
 #include "machine/MachineConfiguration.h"
+#include "machine/PhysicalProductionExecutorIo.h"
 #include "machine/ProductionExecutorRuntime.h"
 #include "mesa/HostMot2CyclicIo.h"
 #include "mesa/HostMot2Discovery.h"
 #include "mesa/Lbp16UdpTransport.h"
-#include "mesa/MesaBackendConfiguration.h"
 #include "mesa/MesaProductionExecutorIo.h"
 #include "mesa/SevenI96Capabilities.h"
 #include "mesa/SevenI96CyclicLayout.h"
+#include "physical/PhysicalBackendConfiguration.h"
 
 namespace {
     struct Options {
         std::string mapping;
         ngc::IpcIdentity expected{};
         std::filesystem::path machineConfiguration = "machine.toml";
-        std::filesystem::path mesaConfiguration = "mesa_7i96.toml";
+        std::filesystem::path backendConfiguration =
+            "physical_backend.toml";
         std::chrono::milliseconds timeout{10};
         bool validateConfigurationOnly = false;
     };
@@ -84,8 +86,8 @@ namespace {
                     parseUnsigned(value());
             } else if (option == "--machine-configuration") {
                 result.machineConfiguration = value();
-            } else if (option == "--mesa-configuration") {
-                result.mesaConfiguration = value();
+            } else if (option == "--backend-configuration") {
+                result.backendConfiguration = value();
             } else if (option == "--timeout-ms") {
                 result.timeout = std::chrono::milliseconds(
                     parseUnsigned(value()));
@@ -272,8 +274,10 @@ namespace {
 
     std::unique_ptr<ngc::ProductionExecutorRuntime> makeRuntime(
         const ngc::MachineConfiguration &machine,
-        const ngc::mesa::MesaBackendConfiguration &mesa,
+        const ngc::physical::PhysicalBackendConfiguration
+            &physical,
         ngc::mesa::Lbp16UdpTransport &transport) {
+        const auto &mesa = physical.motion;
         const auto inventory =
             ngc::mesa::discoverHostMot2(transport);
         if (!inventory) {
@@ -315,17 +319,27 @@ namespace {
             .requiredLevel = mesa.safety->polarity
                 == ngc::mesa::MesaSafetyPolarity::ActiveHigh,
         };
-        auto io = ngc::mesa::MesaProductionExecutorIo::create(
+        auto motion = ngc::mesa::MesaProductionExecutorIo::create(
             std::move(*cyclic),
             compileDigitalIoProgram(machine, mesa),
             mappings, safetyInput);
-        if (!io) {
-            throw std::runtime_error(io.error());
+        if (!motion) {
+            throw std::runtime_error(motion.error());
         }
+        auto spindle = std::unique_ptr<ngc::SpindleHardware>{};
+        if (physical.spindle.has_value()
+            && physical.spindle->enabled) {
+            throw std::runtime_error(
+                "enabled Huanyang spindle hardware is not "
+                "implemented");
+        }
+        auto io =
+            std::make_unique<ngc::PhysicalProductionExecutorIo>(
+                std::move(*motion), std::move(spindle));
 
         return std::make_unique<ngc::ProductionExecutorRuntime>(
             ngc::productionExecutorRuntimeConfiguration(machine),
-            std::move(*io));
+            std::move(io));
     }
 
     int run(const Options &options) {
@@ -334,23 +348,25 @@ namespace {
         if (!machine) {
             throw std::runtime_error(machine.error());
         }
-        const auto mesa = ngc::mesa::loadMesaBackendConfiguration(
-            options.mesaConfiguration);
-        if (!mesa) {
-            throw std::runtime_error(mesa.error());
+        const auto physical =
+            ngc::physical::loadPhysicalBackendConfiguration(
+                options.backendConfiguration);
+        if (!physical) {
+            throw std::runtime_error(physical.error());
         }
+        const auto &mesa = physical->motion;
         static_cast<void>(servoPeriodNanoseconds(*machine));
-        if (mesa->safety.has_value()) {
+        if (mesa.safety.has_value()) {
             static_cast<void>(resolveInput(
-                *machine, mesa->safety->enableInput));
+                *machine, mesa.safety->enableInput));
         }
-        static_cast<void>(stepGeneratorMappings(*machine, *mesa));
+        static_cast<void>(stepGeneratorMappings(*machine, mesa));
         static_cast<void>(compileDigitalIoProgram(
-            *machine, *mesa));
+            *machine, mesa));
         if (options.validateConfigurationOnly) {
             return 0;
         }
-        if (!mesa->safety.has_value()) {
+        if (!mesa.safety.has_value()) {
             throw std::runtime_error(
                 "Mesa physical backend requires a configured "
                 "motion.safety enable input");
@@ -381,14 +397,14 @@ namespace {
         }
 
         auto transport = ngc::mesa::Lbp16UdpTransport::open({
-            .address = mesa->address,
+            .address = mesa.address,
             .timeout = options.timeout,
         });
         if (!transport) {
             throw std::runtime_error(transport.error());
         }
         auto runtime = makeRuntime(
-            *machine, *mesa, **transport);
+            *machine, *physical, **transport);
         runtime->start();
         region.peerProcessId =
             ngc::ipc_detail::currentProcessId();

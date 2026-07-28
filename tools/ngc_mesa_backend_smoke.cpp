@@ -17,7 +17,8 @@ namespace {
     struct Options {
         std::filesystem::path peer = "build/ngc_mesa_backend";
         std::filesystem::path machine = "machine.toml";
-        std::filesystem::path mesa = "mesa_7i96.toml";
+        std::filesystem::path backend =
+            "physical_backend.toml";
     };
 
     Options parseOptions(const int argc, char **argv) {
@@ -38,8 +39,8 @@ namespace {
                 result.peer = value();
             } else if (option == "--machine-config") {
                 result.machine = value();
-            } else if (option == "--mesa-config") {
-                result.mesa = value();
+            } else if (option == "--backend-config") {
+                result.backend = value();
             } else {
                 throw std::runtime_error(
                     "unknown option: " + std::string(option));
@@ -154,8 +155,9 @@ namespace {
             .peerArguments = {
                 "--machine-configuration",
                 std::filesystem::absolute(options.machine).string(),
-                "--mesa-configuration",
-                std::filesystem::absolute(options.mesa).string(),
+                "--backend-configuration",
+                std::filesystem::absolute(
+                    options.backend).string(),
             },
         });
         runtime.start();

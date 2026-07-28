@@ -141,10 +141,19 @@ the runtime. The runtime is the second backend-conformance target and is paired
 end-to-end with `HomingController`. It is hosted by the external process for
 the configured non-hardware Real target. There is no HAL component.
 `ngc_mesa_backend` is the initial physical executor process: its NRT bootstrap
-loads and cross-validates the typed machine and Mesa configurations, discovers
-and validates the 7I96, compiles the bounded digital-I/O program, constructs
-`MesaProductionExecutorIo`, then starts `ProductionExecutorRuntime` and bridges
-it over the existing production IPC rings without synthetic triggered inputs.
+loads and cross-validates the typed machine and physical-backend
+configurations. The physical-backend configuration composes independent Mesa
+motion and optional spindle roles; `MesaBackendConfiguration` remains limited
+to Mesa motion hardware. The current Huanyang spindle role is typed and
+validated but disabled. `PhysicalProductionExecutorIo` composes motion I/O with
+an optional `SpindleHardware` behind a bounded RT-to-NRT `SpindleWorker`;
+serial communication never runs in the servo cycle, and worker shutdown or a
+latched spindle communication fault establishes the spindle safe stop. The
+Huanyang serial transport and protocol implementation remain future work.
+The process discovers and validates the 7I96, compiles the bounded digital-I/O
+program, constructs `MesaProductionExecutorIo`, then starts
+`ProductionExecutorRuntime` and bridges it over the existing production IPC
+rings without synthetic triggered inputs.
 When `motion.safety` identifies a verified external-enable logical input and
 its explicit `high` or `low` active polarity, loss of that level latches a
 backend fault and safe outputs. A normal physical-peer
