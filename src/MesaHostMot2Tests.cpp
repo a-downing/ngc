@@ -12,6 +12,7 @@
 
 #include "mesa/HostMot2Discovery.h"
 #include "mesa/HostMot2Latency.h"
+#include "mesa/Lbp16CyclicTransaction.h"
 #include "mesa/SevenI96Capabilities.h"
 
 namespace {
@@ -26,6 +27,34 @@ namespace {
         if (!condition) {
             throw std::runtime_error(std::string(message));
         }
+    }
+
+    void putLittleEndian16(
+        const std::span<std::byte> destination,
+        const std::uint16_t value) {
+        require(destination.size() >= 2,
+                "little-endian 16-bit destination is too small");
+        destination[0] = static_cast<std::byte>(value);
+        destination[1] = static_cast<std::byte>(value >> 8);
+    }
+
+    void putLittleEndian32(
+        const std::span<std::byte> destination,
+        const std::uint32_t value) {
+        require(destination.size() >= 4,
+                "little-endian 32-bit destination is too small");
+        destination[0] = static_cast<std::byte>(value);
+        destination[1] = static_cast<std::byte>(value >> 8);
+        destination[2] = static_cast<std::byte>(value >> 16);
+        destination[3] = static_cast<std::byte>(value >> 24);
+    }
+
+    std::uint8_t byteValue(
+        const std::span<const std::byte> bytes,
+        const std::size_t offset) {
+        require(offset < bytes.size(), "byte fixture offset is out of range");
+
+        return std::to_integer<std::uint8_t>(bytes[offset]);
     }
 
     class FixtureReader final : public ngc::mesa::HostMot2RegisterReader {
@@ -110,6 +139,78 @@ namespace {
 
     private:
         std::size_t m_reads = 0;
+    };
+
+    class DatagramFixtureTransport final
+        : public ngc::mesa::Lbp16DatagramTransport {
+    public:
+        ngc::mesa::Lbp16DatagramResult exchange(
+            const std::span<const std::byte> request,
+            const std::span<std::byte> response) noexcept override {
+            m_requestSize = request.size();
+            std::ranges::copy(request, m_request.begin());
+            if (m_status != ngc::mesa::Lbp16DatagramStatus::Complete) {
+                return {
+                    .status = m_status,
+                    .systemError = m_systemError,
+                    .sentBytes = request.size(),
+                    .receivedBytes = 0,
+                };
+            }
+            if (response.size() != m_responseSize) {
+                return {
+                    .status =
+                        ngc::mesa::Lbp16DatagramStatus::UnexpectedResponseSize,
+                    .systemError = 0,
+                    .sentBytes = request.size(),
+                    .receivedBytes = m_responseSize,
+                };
+            }
+
+            std::ranges::copy(
+                std::span(m_response).first(m_responseSize),
+                response.begin());
+
+            return {
+                .status = ngc::mesa::Lbp16DatagramStatus::Complete,
+                .systemError = 0,
+                .sentBytes = request.size(),
+                .receivedBytes = response.size(),
+            };
+        }
+
+        std::span<std::byte> response(const std::size_t size) {
+            require(size <= m_response.size(),
+                    "datagram fixture response is too large");
+            m_response.fill(std::byte{});
+            m_responseSize = size;
+
+            return std::span(m_response).first(size);
+        }
+
+        std::span<const std::byte> request() const {
+            return std::span(m_request).first(m_requestSize);
+        }
+
+        void fail(
+            const ngc::mesa::Lbp16DatagramStatus status,
+            const int systemError) {
+            m_status = status;
+            m_systemError = systemError;
+        }
+
+    private:
+        std::array<
+            std::byte,
+            ngc::mesa::LBP16_MAX_DATAGRAM_SIZE> m_request{};
+        std::array<
+            std::byte,
+            ngc::mesa::LBP16_MAX_DATAGRAM_SIZE> m_response{};
+        std::size_t m_requestSize = 0;
+        std::size_t m_responseSize = 0;
+        ngc::mesa::Lbp16DatagramStatus m_status =
+            ngc::mesa::Lbp16DatagramStatus::Complete;
+        int m_systemError = 0;
     };
 
     void putModule(
@@ -442,6 +543,156 @@ namespace {
                     != std::string::npos,
                 "zero latency period was not rejected");
     }
+
+    void testBuildsAndValidatesCyclicLbp16Transaction() {
+        DatagramFixtureTransport transport;
+        ngc::mesa::Lbp16CyclicTransaction transaction(transport);
+        const auto write =
+            transaction.addHostMot2Write(0x2000, 8);
+        const auto read =
+            transaction.addHostMot2Read(0x1000, 8);
+        require(write.has_value() && read.has_value(),
+                "valid cyclic operations were rejected");
+        const std::array<std::byte, 8> output{
+            std::byte{0x10}, std::byte{0x20},
+            std::byte{0x30}, std::byte{0x40},
+            std::byte{0x50}, std::byte{0x60},
+            std::byte{0x70}, std::byte{0x80},
+        };
+        std::ranges::copy(
+            output, transaction.writeData(*write).begin());
+        require(transaction.finalize().has_value(),
+                "valid cyclic transaction could not be finalized");
+
+        const auto readSequence = std::uint32_t{0x1122'3344};
+        const auto writeSequence = std::uint32_t{0x5566'7788};
+        auto response = transport.response(transaction.responseSize());
+        const std::array<std::byte, 8> input{
+            std::byte{0x81}, std::byte{0x72},
+            std::byte{0x63}, std::byte{0x54},
+            std::byte{0x45}, std::byte{0x36},
+            std::byte{0x27}, std::byte{0x18},
+        };
+        std::ranges::copy(input, response.begin());
+        putLittleEndian32(response.subspan(8), readSequence);
+        putLittleEndian32(response.subspan(12), writeSequence);
+        putLittleEndian16(response.subspan(16), 0);
+
+        const auto result =
+            transaction.exchange(readSequence, writeSequence);
+
+        require(result.fault == ngc::mesa::Lbp16CyclicFault::None
+                && transaction.hasValidInputs(),
+                "valid cyclic response was rejected");
+        require(std::ranges::equal(
+                    transaction.readData(*read), input),
+                "validated cyclic input image is incorrect");
+        const auto request = transport.request();
+        require(request.size() == 36,
+                "cyclic request has the wrong size");
+        require(byteValue(request, 0) == 0x82
+                && byteValue(request, 1) == 0xC2
+                && byteValue(request, 2) == 0x00
+                && byteValue(request, 3) == 0x20,
+                "cyclic HostMot2 write command is incorrect");
+        require(std::ranges::equal(
+                    request.subspan(4, output.size()), output),
+                "cyclic HostMot2 output payload is incorrect");
+        require(byteValue(request, 12) == 0x82
+                && byteValue(request, 13) == 0x42
+                && byteValue(request, 14) == 0x00
+                && byteValue(request, 15) == 0x10,
+                "cyclic HostMot2 read command is incorrect");
+        require(byteValue(request, 16) == 0x84
+                && byteValue(request, 17) == 0xD1
+                && byteValue(request, 18) == 0x10
+                && byteValue(request, 19) == 0x00,
+                "cyclic sequence write command is incorrect");
+        require(byteValue(request, 28) == 0x84
+                && byteValue(request, 29) == 0x51
+                && byteValue(request, 32) == 0x01
+                && byteValue(request, 33) == 0x59,
+                "cyclic validation read commands are incorrect");
+    }
+
+    void testCyclicFailuresInvalidateInputs() {
+        DatagramFixtureTransport transport;
+        ngc::mesa::Lbp16CyclicTransaction transaction(transport);
+        const auto read =
+            transaction.addHostMot2Read(0x1000, 4);
+        require(read.has_value() && transaction.finalize().has_value(),
+                "cyclic failure fixture could not be built");
+        auto response = transport.response(transaction.responseSize());
+        putLittleEndian32(response, 0x1234'5678);
+        putLittleEndian32(response.subspan(4), 1);
+        putLittleEndian32(response.subspan(8), 1);
+
+        require(transaction.exchange(1, 1).fault
+                    == ngc::mesa::Lbp16CyclicFault::None
+                && !transaction.readData(*read).empty(),
+                "cyclic failure fixture did not establish valid input");
+
+        putLittleEndian32(response.subspan(4), 0);
+        const auto stale = transaction.exchange(2, 2);
+        require(stale.fault
+                    == ngc::mesa::Lbp16CyclicFault::ReadSequenceMismatch
+                && stale.receivedReadSequence == 0
+                && transaction.readData(*read).empty(),
+                "stale cyclic response did not invalidate input");
+
+        putLittleEndian32(response.subspan(4), 2);
+        putLittleEndian32(response.subspan(8), 1);
+        const auto unconfirmedWrite = transaction.exchange(2, 2);
+        require(unconfirmedWrite.fault
+                    == ngc::mesa::Lbp16CyclicFault::WriteSequenceMismatch
+                && unconfirmedWrite.receivedWriteSequence == 1
+                && transaction.readData(*read).empty(),
+                "unconfirmed cyclic write did not invalidate input");
+
+        putLittleEndian32(response.subspan(4), 3);
+        putLittleEndian32(response.subspan(8), 3);
+        putLittleEndian16(response.subspan(12), 0x0020);
+        const auto boardError = transaction.exchange(3, 3);
+        require(boardError.fault
+                    == ngc::mesa::Lbp16CyclicFault::BoardProtocolError
+                && boardError.boardError == 0x0020
+                && transaction.readData(*read).empty(),
+                "board protocol error did not invalidate input");
+
+        transport.fail(
+            ngc::mesa::Lbp16DatagramStatus::ReceiveFailed, 11);
+        const auto transportError = transaction.exchange(4, 4);
+        require(transportError.fault
+                    == ngc::mesa::Lbp16CyclicFault::Transport
+                && transportError.transport.systemError == 11
+                && transaction.readData(*read).empty(),
+                "transport failure did not invalidate input");
+    }
+
+    void testRejectsInvalidCyclicTransactionConstruction() {
+        DatagramFixtureTransport transport;
+        ngc::mesa::Lbp16CyclicTransaction transaction(transport);
+
+        const auto unaligned =
+            transaction.addHostMot2Read(0x1002, 4);
+        const auto tooLarge =
+            transaction.addHostMot2Write(0x2000, 512);
+
+        require(!unaligned.has_value()
+                && unaligned.error().find("aligned")
+                    != std::string::npos,
+                "unaligned cyclic read was not rejected");
+        require(!tooLarge.has_value()
+                && tooLarge.error().find("word command limit")
+                    != std::string::npos,
+                "oversized cyclic write was not rejected");
+        require(transaction.finalize().has_value(),
+                "empty validation-only cyclic transaction was rejected");
+        require(!transaction.finalize().has_value(),
+                "cyclic transaction accepted duplicate finalization");
+        require(!transaction.addHostMot2Read(0x1000, 4).has_value(),
+                "cyclic transaction accepted an operation after finalization");
+    }
 }
 
 int main() {
@@ -456,6 +707,9 @@ int main() {
         testRejectsIncompatibleSevenI96PinsAndSelections();
         testMeasuresReadOnlyCyclicLatencyAndAnomalies();
         testRejectsInvalidLatencyConfiguration();
+        testBuildsAndValidatesCyclicLbp16Transaction();
+        testCyclicFailuresInvalidateInputs();
+        testRejectsInvalidCyclicTransactionConstruction();
     } catch (const std::exception &error) {
         std::cerr << "Mesa HostMot2 test failure: "
                   << error.what() << '\n';

@@ -65,6 +65,7 @@ ngc_target_defaults(ngc_core)
 add_library(ngc_mesa STATIC
         src/mesa/HostMot2Discovery.cpp
         src/mesa/HostMot2Latency.cpp
+        src/mesa/Lbp16CyclicTransaction.cpp
         src/mesa/Lbp16UdpTransport.cpp
         src/mesa/SevenI96Capabilities.cpp)
 target_include_directories(ngc_mesa PUBLIC src/include)

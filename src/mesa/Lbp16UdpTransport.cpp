@@ -55,11 +55,19 @@ namespace ngc::mesa {
                 "{} failed with Windows socket error {}",
                 operation, WSAGetLastError());
         }
+
+        int lastSocketError() noexcept {
+            return WSAGetLastError();
+        }
 #else
         std::string socketError(
             const std::string_view operation) {
             return std::format(
                 "{} failed: {}", operation, std::strerror(errno));
+        }
+
+        int lastSocketError() noexcept {
+            return errno;
         }
 #endif
     }
@@ -102,7 +110,7 @@ namespace ngc::mesa {
 #endif
         }
 
-        std::expected<void, std::string> exchange(
+        std::expected<void, std::string> readExchange(
             const std::uint16_t addressValue,
             const std::span<std::byte> destination) {
             const auto words = static_cast<std::uint8_t>(
@@ -143,6 +151,70 @@ namespace ngc::mesa {
             }
 
             return {};
+        }
+
+        Lbp16DatagramResult exchangeDatagram(
+            const std::span<const std::byte> request,
+            const std::span<std::byte> response) noexcept {
+            auto result = Lbp16DatagramResult{};
+            if (request.empty() || response.empty()
+                || request.size() > LBP16_MAX_DATAGRAM_SIZE
+                || response.size() > LBP16_MAX_DATAGRAM_SIZE) {
+                return result;
+            }
+
+#ifdef _WIN32
+            const auto sent = ::send(
+                socket, reinterpret_cast<const char *>(request.data()),
+                static_cast<int>(request.size()), 0);
+#else
+            const auto sent = ::send(
+                socket, request.data(), request.size(), 0);
+#endif
+            if (sent < 0) {
+                result.status = Lbp16DatagramStatus::SendFailed;
+                result.systemError = lastSocketError();
+
+                return result;
+            }
+            result.sentBytes = static_cast<std::size_t>(sent);
+            if (result.sentBytes != request.size()) {
+                result.status = Lbp16DatagramStatus::PartialSend;
+
+                return result;
+            }
+
+            std::array<
+                std::byte,
+                LBP16_MAX_DATAGRAM_SIZE + 1> datagram{};
+#ifdef _WIN32
+            const auto received = ::recv(
+                socket, reinterpret_cast<char *>(datagram.data()),
+                static_cast<int>(response.size() + 1), 0);
+#else
+            const auto received = ::recv(
+                socket, datagram.data(), response.size() + 1, 0);
+#endif
+            if (received < 0) {
+                result.status = Lbp16DatagramStatus::ReceiveFailed;
+                result.systemError = lastSocketError();
+
+                return result;
+            }
+            result.receivedBytes = static_cast<std::size_t>(received);
+            if (result.receivedBytes != response.size()) {
+                result.status =
+                    Lbp16DatagramStatus::UnexpectedResponseSize;
+
+                return result;
+            }
+
+            std::ranges::copy(
+                std::span(datagram).first(response.size()),
+                response.begin());
+            result.status = Lbp16DatagramStatus::Complete;
+
+            return result;
         }
     };
 
@@ -190,9 +262,12 @@ namespace ngc::mesa {
         }
 
 #ifdef _WIN32
+        const auto timeoutMilliseconds =
+            std::chrono::ceil<std::chrono::milliseconds>(
+                configuration.timeout);
         const auto timeout = static_cast<DWORD>(
             std::min<std::int64_t>(
-                configuration.timeout.count(),
+                timeoutMilliseconds.count(),
                 std::numeric_limits<DWORD>::max()));
         if (setsockopt(
                 impl->socket, SOL_SOCKET, SO_RCVTIMEO,
@@ -260,7 +335,7 @@ namespace ngc::mesa {
             const auto size =
                 std::min(remaining.size(), LBP16_MAX_READ_SIZE);
             const auto chunk = remaining.first(size);
-            const auto result = m_impl->exchange(
+            const auto result = m_impl->readExchange(
                 static_cast<std::uint16_t>(currentAddress), chunk);
             if (!result) {
                 return result;
@@ -270,5 +345,11 @@ namespace ngc::mesa {
         }
 
         return {};
+    }
+
+    Lbp16DatagramResult Lbp16UdpTransport::exchange(
+        const std::span<const std::byte> request,
+        const std::span<std::byte> response) noexcept {
+        return m_impl->exchangeDatagram(request, response);
     }
 }

@@ -1104,8 +1104,8 @@ held state.
   `ngc_mesa_discover` executable are complete. The reusable latency
   measurement and thin `ngc_mesa_latency` executable perform absolute-period
   cookie reads, summarize round-trip and wake lateness, and count transport,
-  content, and missed-period anomalies. The transport deliberately exposes no
-  write operation in this first slice. Complete.
+  content, and missed-period anomalies. These utilities deliberately expose no
+  write operation. Complete.
 - Add typed 7I96 HostMot2 discovery and capability validation. Complete. The
   validator checks the supported IDROM topology, required module versions,
   register layouts, clocks and strides, fixed isolated-I/O and
@@ -1113,7 +1113,16 @@ held state.
   typed backend configuration. The read-only discovery utility exercises the
   same validation against hardware with `--validate-7i96`.
 - Add cyclic input, step-generator, output, watchdog, packet-sequence, and fault
-  handling behind a transport interface.
+  handling behind a transport interface. The first write-capable transport
+  checkpoint is complete: `Lbp16CyclicTransaction` constructs bounded
+  multi-command HostMot2 read/write datagrams during NRT setup, executes them
+  through an allocation-free `noexcept` transport call, confirms both read and
+  write sequence values through board scratch registers, checks the LBP16 board
+  error register, and withholds all input data after any failed validation.
+  The production UDP transport detects send, receive, truncation, and response
+  size failures without constructing RT-path diagnostic strings. Typed cyclic
+  input/output images, register behavior, watchdog service, and executor I/O
+  integration remain.
 - Validate on a dedicated Linux RT host and NIC before enabling outputs.
 
 ### Phase 12: Staged physical commissioning
