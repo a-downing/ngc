@@ -174,7 +174,10 @@ backend configuration composes independent Mesa motion and optional spindle
 roles. It passes typed runtime configuration to
 `ProductionExecutorRuntime` and typed motion configuration to the Mesa
 adapter. The Huanyang spindle role remains configured but disabled until its
-serial implementation and physical commissioning are complete. For
+physical commissioning is complete. Its Linux serial implementation uses
+bounded transaction timeouts and the Huanyang proprietary RTU packet shape,
+establishes stop before reading the VFD's stored setup, and validates all
+responses. It has not yet been exercised against physical VFD hardware. For
 bare-board commissioning only, the
 current configuration treats disconnected `fieldin2` as an active-low
 `external_enable` through the named physical operand

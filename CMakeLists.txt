@@ -112,6 +112,16 @@ target_link_libraries(
         PUBLIC ngc_mesa_configuration ngc_configuration)
 ngc_target_defaults(ngc_physical_configuration)
 
+add_library(ngc_spindle_huanyang STATIC
+        src/physical/HuanyangSpindleHardware.cpp
+        src/physical/SerialTransport.cpp)
+target_include_directories(
+        ngc_spindle_huanyang PUBLIC src/include)
+target_link_libraries(
+        ngc_spindle_huanyang
+        PUBLIC ngc_core ngc_physical_configuration)
+ngc_target_defaults(ngc_spindle_huanyang)
+
 add_library(ngc_operator STATIC
         src/operator/OperatorJogController.cpp
         src/operator/PendantTouchOffController.cpp)
@@ -194,7 +204,7 @@ target_compile_definitions(
     PRIVATE NGC_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
 target_link_libraries(
     ngc_physical_backend_tests
-    PRIVATE ngc_core ngc_physical_configuration)
+    PRIVATE ngc_spindle_huanyang)
 ngc_target_defaults(ngc_physical_backend_tests)
 add_test(
     NAME ngc_physical_backend_tests
@@ -240,7 +250,7 @@ add_executable(ngc_mesa_backend tools/ngc_mesa_backend.cpp)
 target_include_directories(ngc_mesa_backend PRIVATE src)
 target_link_libraries(
     ngc_mesa_backend
-    PRIVATE ngc_mesa_executor ngc_physical_configuration)
+    PRIVATE ngc_mesa_executor ngc_spindle_huanyang)
 ngc_target_defaults(ngc_mesa_backend)
 add_test(
     NAME ngc_mesa_backend_configuration

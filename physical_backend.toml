@@ -154,8 +154,8 @@ maximum_generated_step_error = 2.0
 # LinuxCNC hy_vfd protocol. The legacy configuration overrides the serial
 # device, baud rate, and parity; the remaining serial values and target retain
 # the hy_vfd defaults. The physical backend validates this independent role,
-# but it remains disabled until its serial hardware implementation and physical
-# commissioning are complete.
+# and implements that serial protocol behind the NRT spindle worker, but it
+# remains disabled until physical commissioning is complete.
 #
 # The legacy driver did not override the VFD's frequency or motor parameters.
 # Read PD004, PD005, PD011, and PD141 through PD144 from the VFD during NRT

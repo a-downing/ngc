@@ -695,14 +695,19 @@ frontend loss, communication timeout, and backend shutdown establish the
 defined safe spindle state.
 
 Most USB-to-RS-485 adapters are treated as operating-system serial ports rather
-than distinct backend drivers. The reusable layering is serial transport,
-Modbus RTU framing, and VFD behavior. Differences between VFD models should be
-validated register/profile data when possible and a small spindle-interface
-implementation only when their behavior cannot be described safely as data.
-Typed physical-backend and spindle configuration, the generic spindle-hardware
-boundary, and the bounded RT-to-NRT spindle worker are complete. The current
-configuration keeps the spindle disabled. Huanyang serial transport, protocol
-execution, status publication, and physical commissioning remain.
+than distinct backend drivers. The reusable layering is serial transport, RTU
+framing, and VFD behavior. The Huanyang profile uses its proprietary packet
+shape with a Modbus CRC rather than standard Modbus function/register framing.
+Differences between VFD models should be validated register/profile data when
+possible and a small spindle-interface implementation only when their behavior
+cannot be described safely as data. Typed physical-backend and spindle
+configuration, the generic spindle-hardware boundary, the bounded RT-to-NRT
+spindle worker, and the Huanyang hardware implementation are complete. The
+hardware implementation owns a bounded-timeout Linux serial transport,
+establishes stop before reading PD004, PD005, PD011, and PD141 through PD144,
+validates every response, writes frequency before run direction, and polls
+output frequency and current. The current configuration keeps the spindle
+disabled. Broader status presentation and physical commissioning remain.
 
 Frontend loss causes the executor to select a proved constrained-stop path
 rather than continue indefinitely. Backend-process or host loss is covered by
@@ -1223,9 +1228,11 @@ held state.
   disconnected `external_enable_field` as an active-low enable. That mapping
   is explicitly non-fail-safe and must be replaced before any physical output
   is connected.
-  Executor/G-code producers for additional logical-output events, Huanyang
-  serial/protocol integration, application-default selection, and physical
-  commissioning remain.
+  Executor/G-code producers for additional logical-output events, broader
+  spindle-status presentation, application-default selection, and physical
+  commissioning remain. The Huanyang NRT serial/protocol implementation is
+  complete behind the spindle-hardware boundary but remains disabled and has
+  not been exercised against physical hardware.
 - Validate on a dedicated Linux RT host and NIC before enabling outputs.
 
 ### Phase 12: Staged physical commissioning
@@ -1287,7 +1294,7 @@ physical commissioning:
 - steps per revolution, electronic gearing, screw pitch, and axis direction;
 - required step length, step space, direction setup, and direction hold;
 - E-stop, STO, drive-enable, fault, and contactor wiring;
-- Huanyang serial transport, VFD status policy, and spindle-encoder details;
+- VFD status presentation policy and spindle-encoder details;
 - exact allocation of the 7I96 isolated inputs and outputs; and
 - whether an explicit persistent user-parameter range beyond the current
   predefined nonvolatile cells is desired.

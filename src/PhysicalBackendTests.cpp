@@ -1,14 +1,21 @@
 #include <atomic>
+#include <algorithm>
+#include <array>
 #include <chrono>
+#include <cmath>
+#include <cstdint>
 #include <filesystem>
 #include <format>
 #include <memory>
+#include <optional>
 #include <print>
+#include <span>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
 
 #include "machine/PhysicalProductionExecutorIo.h"
+#include "physical/HuanyangSpindleHardware.h"
 #include "physical/PhysicalBackendConfiguration.h"
 
 namespace {
@@ -89,6 +96,138 @@ namespace {
         }
 
         std::atomic<bool> lastEnabled{false};
+    };
+
+    struct HuanyangObservation {
+        std::uint8_t control = 0;
+        std::uint16_t frequency = 0;
+        std::uint16_t outputFrequency = 0;
+        std::uint16_t outputCurrent = 0;
+        std::uint32_t parameterReads = 0;
+        bool failExchange = false;
+        bool corruptCrc = false;
+        bool corruptFunction = false;
+        bool corruptEcho = false;
+    };
+
+    class FakeSerialTransport final
+        : public ngc::physical::SerialTransport {
+    public:
+        explicit FakeSerialTransport(
+            std::shared_ptr<HuanyangObservation> observation)
+            : m_observation(std::move(observation)) { }
+
+        bool exchange(
+            const std::span<const std::uint8_t> request,
+            const std::span<std::uint8_t> response,
+            std::size_t &responseSize) noexcept override {
+            responseSize = 0;
+            if (m_observation->failExchange
+                || request.size() < 6
+                || request[0] != 1) {
+                return false;
+            }
+            const auto requestCrc =
+                ngc::physical::huanyangCrc16(
+                    request.first(request.size() - 2));
+            if (request[request.size() - 2]
+                    != static_cast<std::uint8_t>(requestCrc)
+                || request[request.size() - 1]
+                    != static_cast<std::uint8_t>(
+                        requestCrc >> 8)) {
+                return false;
+            }
+
+            auto payload = std::array<std::uint8_t, 6>{};
+            auto payloadSize = std::size_t{0};
+            switch (request[1]) {
+                case 0x01: {
+                    const auto value = parameter(request[3]);
+                    if (!value.has_value()) {
+                        return false;
+                    }
+                    payload = {
+                        1, 0x01, 3, request[3],
+                        static_cast<std::uint8_t>(*value >> 8),
+                        static_cast<std::uint8_t>(*value),
+                    };
+                    payloadSize = 6;
+                    ++m_observation->parameterReads;
+                    break;
+                }
+                case 0x03:
+                    m_observation->control = request[3];
+                    payload = {
+                        1, 0x03, 1, request[3], 0, 0,
+                    };
+                    payloadSize = 4;
+                    break;
+                case 0x04: {
+                    const auto value = request[3] == 1
+                        ? m_observation->outputFrequency
+                        : m_observation->outputCurrent;
+                    payload = {
+                        1, 0x04, 3, request[3],
+                        static_cast<std::uint8_t>(value >> 8),
+                        static_cast<std::uint8_t>(value),
+                    };
+                    payloadSize = 6;
+                    break;
+                }
+                case 0x05:
+                    m_observation->frequency =
+                        static_cast<std::uint16_t>(
+                            request[3] << 8 | request[4]);
+                    payload = {
+                        1, 0x05, 2, request[3], request[4], 0,
+                    };
+                    payloadSize = 5;
+                    break;
+                default: return false;
+            }
+            if (payloadSize + 2 > response.size()) {
+                return false;
+            }
+            if (m_observation->corruptFunction) {
+                payload[1] ^= 1;
+            }
+            if (m_observation->corruptEcho
+                && payloadSize > 3) {
+                payload[3] ^= 1;
+            }
+            std::ranges::copy(
+                std::span(payload).first(payloadSize),
+                response.begin());
+            auto crc = ngc::physical::huanyangCrc16(
+                response.first(payloadSize));
+            if (m_observation->corruptCrc) {
+                crc ^= 1;
+            }
+            response[payloadSize] =
+                static_cast<std::uint8_t>(crc);
+            response[payloadSize + 1] =
+                static_cast<std::uint8_t>(crc >> 8);
+            responseSize = payloadSize + 2;
+
+            return true;
+        }
+
+    private:
+        static std::optional<std::uint16_t> parameter(
+            const std::uint8_t number) noexcept {
+            switch (number) {
+                case 4: return 40000;
+                case 5: return 40000;
+                case 11: return 1000;
+                case 141: return 2200;
+                case 142: return 100;
+                case 143: return 2;
+                case 144: return 3000;
+                default: return std::nullopt;
+            }
+        }
+
+        std::shared_ptr<HuanyangObservation> m_observation;
     };
 
     void waitFor(
@@ -219,6 +358,132 @@ namespace {
                 std::memory_order_acquire),
             "faulted spindle did not retain safe state");
     }
+
+    ngc::physical::HuanyangSpindleConfiguration
+    huanyangConfiguration() {
+        return {
+            .enabled = true,
+            .device = "fake",
+            .baud = 9600,
+            .dataBits = 8,
+            .parity = ngc::physical::SerialParity::None,
+            .stopBits = 1,
+            .slaveAddress = 1,
+            .maximumSpeed = 24000.0,
+            .atSpeedTolerance = 0.02,
+        };
+    }
+
+    void testHuanyangCrcAndProtocolScaling() {
+        const std::array stopRequest{
+            std::uint8_t{1}, std::uint8_t{3},
+            std::uint8_t{1}, std::uint8_t{8},
+        };
+        require(
+            ngc::physical::huanyangCrc16(stopRequest) == 0x8EF1,
+            "Huanyang CRC changed");
+
+        auto observation =
+            std::make_shared<HuanyangObservation>();
+        auto hardware =
+            ngc::physical::HuanyangSpindleHardware::create(
+                huanyangConfiguration(),
+                std::make_unique<FakeSerialTransport>(
+                    observation));
+        require(
+            hardware.has_value(),
+            hardware.error_or(
+                "Huanyang spindle did not initialize"));
+        require(
+            observation->control == 0x08
+                && observation->parameterReads == 7,
+            "Huanyang initialization did not stop and read setup");
+
+        require(
+            (*hardware)->applyDesired({
+                .enabled = true,
+                .direction = ngc::Direction::CW,
+                .speed = 12000.0,
+            }),
+            "Huanyang forward command failed");
+        require(
+            observation->frequency == 20000
+                && observation->control == 0x01,
+            "Huanyang forward command used incorrect wire values");
+
+        observation->outputFrequency = 20000;
+        observation->outputCurrent = 75;
+        auto status = ngc::SpindleHardwareStatus{};
+        require(
+            (*hardware)->pollStatus(status),
+            "Huanyang status polling failed");
+        require(
+            status.communicationHealthy
+                && status.atSpeed
+                && std::abs(status.speed - 12000.0) < 1e-9
+                && std::abs(status.current - 7.5) < 1e-9,
+            "Huanyang status scaling was incorrect");
+
+        require(
+            (*hardware)->applyDesired({
+                .enabled = true,
+                .direction = ngc::Direction::CCW,
+                .speed = 6000.0,
+            }),
+            "Huanyang reverse command failed");
+        require(
+            observation->frequency == 10000
+                && observation->control == 0x11,
+            "Huanyang reverse command used incorrect wire values");
+        require(
+            (*hardware)->applyDesired({}),
+            "Huanyang stop command failed");
+        require(
+            observation->control == 0x08,
+            "Huanyang stop command used incorrect wire value");
+    }
+
+    void testHuanyangRejectsInvalidResponsesAndCommands() {
+        auto observation =
+            std::make_shared<HuanyangObservation>();
+        auto hardware =
+            ngc::physical::HuanyangSpindleHardware::create(
+                huanyangConfiguration(),
+                std::make_unique<FakeSerialTransport>(
+                    observation));
+        require(
+            hardware.has_value(),
+            "Huanyang spindle did not initialize");
+        require(
+            !(*hardware)->applyDesired({
+                .enabled = true,
+                .direction = ngc::Direction::CW,
+                .speed = 24000.1,
+            }),
+            "Huanyang spindle accepted excessive speed");
+
+        observation->corruptCrc = true;
+        auto status = ngc::SpindleHardwareStatus{};
+        require(
+            !(*hardware)->pollStatus(status),
+            "Huanyang spindle accepted a corrupt response");
+        observation->corruptCrc = false;
+        observation->corruptFunction = true;
+        require(
+            !(*hardware)->pollStatus(status),
+            "Huanyang spindle accepted the wrong function");
+        observation->corruptFunction = false;
+        observation->corruptEcho = true;
+        require(
+            !(*hardware)->pollStatus(status),
+            "Huanyang spindle accepted the wrong selector echo");
+        observation->corruptEcho = false;
+        observation->failExchange = true;
+        (*hardware)->safeStop();
+        require(
+            observation->control == 0x08,
+            "failed Huanyang safe stop changed prior safe state");
+    }
 }
 
 int main() {
@@ -226,6 +491,8 @@ int main() {
         testLoadsPhysicalBackendConfiguration();
         testPhysicalIoPublishesSpindleOffServoThread();
         testSpindleCommunicationFailureEstablishesSafeStop();
+        testHuanyangCrcAndProtocolScaling();
+        testHuanyangRejectsInvalidResponsesAndCommands();
     } catch (const std::exception &error) {
         std::println(
             stderr, "physical backend test failed: {}",

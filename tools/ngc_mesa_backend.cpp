@@ -30,6 +30,7 @@
 #include "mesa/MesaProductionExecutorIo.h"
 #include "mesa/SevenI96Capabilities.h"
 #include "mesa/SevenI96CyclicLayout.h"
+#include "physical/HuanyangSpindleHardware.h"
 #include "physical/PhysicalBackendConfiguration.h"
 
 namespace {
@@ -329,9 +330,13 @@ namespace {
         auto spindle = std::unique_ptr<ngc::SpindleHardware>{};
         if (physical.spindle.has_value()
             && physical.spindle->enabled) {
-            throw std::runtime_error(
-                "enabled Huanyang spindle hardware is not "
-                "implemented");
+            auto hardware =
+                ngc::physical::createHuanyangSpindleHardware(
+                    *physical.spindle);
+            if (!hardware) {
+                throw std::runtime_error(hardware.error());
+            }
+            spindle = std::move(*hardware);
         }
         auto io =
             std::make_unique<ngc::PhysicalProductionExecutorIo>(

@@ -149,7 +149,14 @@ validated but disabled. `PhysicalProductionExecutorIo` composes motion I/O with
 an optional `SpindleHardware` behind a bounded RT-to-NRT `SpindleWorker`;
 serial communication never runs in the servo cycle, and worker shutdown or a
 latched spindle communication fault establishes the spindle safe stop. The
-Huanyang serial transport and protocol implementation remain future work.
+Huanyang spindle hardware uses an NRT Linux serial transport with bounded
+transaction timeouts and the device's proprietary RTU packet shape and Modbus
+CRC. Startup establishes stop before reading and validating PD004, PD005,
+PD011, and PD141 through PD144. Commands write bounded frequency before
+forward/reverse control, status polling reports scaled speed and current, and
+every response is checked for slave, function, payload length, echoed selector
+or command, and CRC. The configured spindle remains disabled pending physical
+commissioning.
 The process discovers and validates the 7I96, compiles the bounded digital-I/O
 program, constructs `MesaProductionExecutorIo`, then starts
 `ProductionExecutorRuntime` and bridges it over the existing production IPC
