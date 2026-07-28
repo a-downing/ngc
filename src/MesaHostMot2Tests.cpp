@@ -5,15 +5,19 @@
 #include <cstdint>
 #include <expected>
 #include <iostream>
+#include <limits>
+#include <memory>
 #include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
 
+#include "mesa/HostMot2CyclicIo.h"
 #include "mesa/HostMot2Discovery.h"
 #include "mesa/HostMot2Latency.h"
 #include "mesa/Lbp16CyclicTransaction.h"
 #include "mesa/SevenI96Capabilities.h"
+#include "mesa/SevenI96CyclicLayout.h"
 
 namespace {
     constexpr std::uint32_t COOKIE_ADDRESS = 0x0100;
@@ -47,6 +51,27 @@ namespace {
         destination[1] = static_cast<std::byte>(value >> 8);
         destination[2] = static_cast<std::byte>(value >> 16);
         destination[3] = static_cast<std::byte>(value >> 24);
+    }
+
+    std::uint16_t littleEndian16(
+        const std::span<const std::byte> source) {
+        require(source.size() >= 2,
+                "little-endian 16-bit source is too small");
+
+        return static_cast<std::uint16_t>(
+            std::to_integer<std::uint16_t>(source[0])
+            | (std::to_integer<std::uint16_t>(source[1]) << 8));
+    }
+
+    std::uint32_t littleEndian32(
+        const std::span<const std::byte> source) {
+        require(source.size() >= 4,
+                "little-endian 32-bit source is too small");
+
+        return std::to_integer<std::uint32_t>(source[0])
+            | (std::to_integer<std::uint32_t>(source[1]) << 8)
+            | (std::to_integer<std::uint32_t>(source[2]) << 16)
+            | (std::to_integer<std::uint32_t>(source[3]) << 24);
     }
 
     std::uint8_t byteValue(
@@ -212,6 +237,66 @@ namespace {
             ngc::mesa::Lbp16DatagramStatus::Complete;
         int m_systemError = 0;
     };
+
+    struct RequestWrite {
+        std::size_t commandOffset = 0;
+        std::span<const std::byte> data;
+    };
+
+    RequestWrite findRequestWrite(
+        const std::span<const std::byte> request,
+        const std::uint16_t address) {
+        auto offset = std::size_t{0};
+        auto found = RequestWrite{};
+        auto hasMatch = false;
+        while (offset + 4 <= request.size()) {
+            const auto command = littleEndian16(request.subspan(offset));
+            const auto commandAddress =
+                littleEndian16(request.subspan(offset + 2));
+            const auto argumentCount = command & 0x7F;
+            const auto argumentSize = (command & 0x0200) != 0
+                ? std::size_t{4}
+                : (command & 0x0100) != 0
+                    ? std::size_t{2}
+                    : std::size_t{1};
+            const auto write = (command & 0x8000) != 0;
+            const auto dataSize = write
+                ? argumentCount * argumentSize
+                : std::size_t{0};
+            require(offset + 4 + dataSize <= request.size(),
+                    "LBP16 fixture request is truncated");
+            if (write && commandAddress == address) {
+                found = {
+                    .commandOffset = offset,
+                    .data = request.subspan(offset + 4, dataSize),
+                };
+                hasMatch = true;
+            }
+            offset += 4 + dataSize;
+        }
+        if (hasMatch) {
+            return found;
+        }
+
+        throw std::runtime_error(
+            "LBP16 fixture request does not contain the expected write");
+    }
+
+    void putCyclicConfirmation(
+        const std::span<std::byte> response,
+        const std::size_t offset,
+        const std::uint32_t readSequence,
+        const std::uint32_t writeSequence,
+        const std::uint16_t boardError = 0) {
+        require(response.size() >= offset + 10,
+                "cyclic confirmation fixture is too small");
+        putLittleEndian32(
+            response.subspan(offset), readSequence);
+        putLittleEndian32(
+            response.subspan(offset + 4), writeSequence);
+        putLittleEndian16(
+            response.subspan(offset + 8), boardError);
+    }
 
     void putModule(
         FixtureReader &reader, const std::size_t index,
@@ -693,6 +778,328 @@ namespace {
         require(!transaction.addHostMot2Read(0x1000, 4).has_value(),
                 "cyclic transaction accepted an operation after finalization");
     }
+
+    std::unique_ptr<ngc::mesa::HostMot2CyclicIo>
+    sevenI96CyclicIo(DatagramFixtureTransport &transport) {
+        const auto capabilities =
+            ngc::mesa::validateSevenI96Capabilities(
+                sevenI96Inventory());
+        require(capabilities.has_value(),
+                "cyclic fixture capability validation failed");
+        const auto layout = ngc::mesa::sevenI96CyclicLayout(
+            *capabilities, {
+                .stepLengthNanoseconds = 1'000,
+                .stepSpaceNanoseconds = 2'000,
+                .directionSetupNanoseconds = 3'000,
+                .directionHoldNanoseconds = 4'000,
+            });
+        auto configuration = ngc::mesa::HostMot2CyclicConfiguration{
+            .watchdogTimeoutNanoseconds = 5'000'000,
+        };
+        configuration.isolatedOutputFrequencyHz[0] = 1'000'000;
+        auto io = ngc::mesa::HostMot2CyclicIo::create(
+            transport, layout, configuration);
+        require(io.has_value(),
+                "valid HostMot2 cyclic fixture was rejected");
+
+        return std::move(*io);
+    }
+
+    void testInitializesHostMot2CyclicIoWithSafeOutputs() {
+        DatagramFixtureTransport transport;
+        auto io = sevenI96CyclicIo(transport);
+        require(io->stepGeneratorCount() == 5
+                && io->digitalInputCount() == 11
+                && io->digitalOutputCount() == 6,
+                "7I96 cyclic adapter exposed incorrect binding counts");
+        auto response = transport.response(10);
+        putCyclicConfirmation(response, 0, 1, 1);
+
+        const auto initialized = io->initializeSafe();
+
+        require(
+            initialized.fault == ngc::mesa::HostMot2CyclicIoFault::None
+                && io->initialized(),
+            "safe HostMot2 initialization failed");
+        const auto request = transport.request();
+        const auto stepRates = findRequestWrite(request, 0x2000);
+        const auto stepModes = findRequestWrite(request, 0x2200);
+        const auto stepLength = findRequestWrite(request, 0x2500);
+        const auto stepSpace = findRequestWrite(request, 0x2600);
+        const auto directionSetup = findRequestWrite(request, 0x2300);
+        const auto directionHold = findRequestWrite(request, 0x2400);
+        const auto masterDds = findRequestWrite(request, 0x2900);
+        const auto alternateSource = findRequestWrite(request, 0x1200);
+        const auto ssrData = findRequestWrite(request, 0x7D00);
+        const auto ssrRate = findRequestWrite(request, 0x7E00);
+        const auto watchdogTimer = findRequestWrite(request, 0x0C00);
+        const auto watchdogReset = findRequestWrite(request, 0x0E00);
+        const auto dataDirection = findRequestWrite(request, 0x1100);
+
+        require(std::ranges::all_of(
+                    stepRates.data,
+                    [](const std::byte value) {
+                        return value == std::byte{};
+                    })
+                && std::ranges::all_of(
+                    stepModes.data,
+                    [](const std::byte value) {
+                        return value == std::byte{};
+                    }),
+                "safe initialization commanded a nonzero StepGen rate or mode");
+        for (std::size_t channel = 0; channel < 5; ++channel) {
+            require(littleEndian32(
+                        stepLength.data.subspan(channel * 4)) == 100
+                    && littleEndian32(
+                        stepSpace.data.subspan(channel * 4)) == 200
+                    && littleEndian32(
+                        directionSetup.data.subspan(channel * 4)) == 300
+                    && littleEndian32(
+                        directionHold.data.subspan(channel * 4)) == 400,
+                    "safe initialization encoded incorrect StepGen timing");
+        }
+        require(littleEndian32(masterDds.data) == 0xFFFF'FFFF,
+                "safe initialization did not set the StepGen master DDS");
+        require(littleEndian32(alternateSource.data) == 0x0001'F800
+                && littleEndian32(
+                    alternateSource.data.subspan(4)) == 0x0000'03FF
+                && littleEndian32(
+                    alternateSource.data.subspan(8)) == 0,
+                "safe initialization routed incorrect HostMot2 pins");
+        require(std::ranges::equal(
+                    alternateSource.data, dataDirection.data)
+                && dataDirection.commandOffset
+                    > alternateSource.commandOffset
+                && dataDirection.commandOffset > ssrRate.commandOffset,
+                "safe initialization did not write matching DDR last");
+        require(littleEndian32(ssrData.data) == 0
+                && littleEndian32(ssrRate.data) == 0,
+                "safe initialization enabled an SSR output");
+        require(littleEndian32(watchdogTimer.data) == 0x8000'0000
+                && littleEndian32(watchdogReset.data) == 0x5A00'0000,
+                "safe initialization encoded incorrect watchdog state");
+    }
+
+    void testAcceptsBoardIndependentHostMot2CyclicLayout() {
+        const auto capabilities =
+            ngc::mesa::validateSevenI96Capabilities(
+                sevenI96Inventory());
+        require(capabilities.has_value(),
+                "generic cyclic layout fixture validation failed");
+        auto layout = ngc::mesa::sevenI96CyclicLayout(
+            *capabilities, {
+                .stepLengthNanoseconds = 1'000,
+                .stepSpaceNanoseconds = 1'000,
+                .directionSetupNanoseconds = 1'000,
+                .directionHoldNanoseconds = 1'000,
+            });
+        layout.ioPort.descriptor.instances = 2;
+        layout.ioPortWidth = 8;
+        layout.stepGenerator.descriptor.instances = 2;
+        layout.stepGeneratorCount = 1;
+        layout.stepGenerators[0] = {
+            .channel = 1,
+            .stepPin = 8,
+            .directionPin = 9,
+            .invertDirection = true,
+            .timing = layout.stepGenerators[0].timing,
+        };
+        layout.digitalInputCount = 1;
+        layout.digitalInputs[0] = {
+            .pin = 0,
+            .activeLow = true,
+        };
+        layout.digitalOutputCount = 1;
+        layout.digitalOutputs[0] = {
+            .instance = 0,
+            .output = 7,
+            .pin = 1,
+            .activeLow = false,
+            .safeState = false,
+        };
+        auto configuration = ngc::mesa::HostMot2CyclicConfiguration{
+            .watchdogTimeoutNanoseconds = 10'000'000,
+        };
+        configuration.isolatedOutputFrequencyHz[0] = 500'000;
+        DatagramFixtureTransport transport;
+
+        auto io = ngc::mesa::HostMot2CyclicIo::create(
+            transport, layout, configuration);
+
+        require(io.has_value()
+                && (*io)->stepGeneratorCount() == 1
+                && (*io)->digitalInputCount() == 1
+                && (*io)->digitalOutputCount() == 1,
+                "HostMot2 cyclic I/O retained a 7I96-specific topology");
+        auto response = transport.response(10);
+        putCyclicConfirmation(response, 0, 1, 1);
+        require(
+            (*io)->initializeSafe().fault
+                == ngc::mesa::HostMot2CyclicIoFault::None,
+            "generic HostMot2 layout failed safe initialization");
+        response = transport.response(30);
+        putLittleEndian32(response.subspan(12), 0x0001'0000);
+        putCyclicConfirmation(response, 20, 2, 2);
+        auto outputs = ngc::mesa::HostMot2CyclicOutputImage{};
+        outputs.stepGeneratorsEnabled = true;
+        outputs.stepGenerators[0] = {
+            .stepsPerSecond = 100.0,
+            .enabled = true,
+        };
+        outputs.digitalOutputsEnabled = true;
+        outputs.digitalOutputs[0] = true;
+        outputs.watchdogEnabled = true;
+
+        const auto result = (*io)->cycle(outputs);
+
+        require(
+            result.fault == ngc::mesa::HostMot2CyclicIoFault::None
+                && result.inputsValid
+                && (*io)->inputImage().digitalInputs[0]
+                && (*io)->inputImage().stepAccumulatorSubcounts[0]
+                    == 65'536,
+            "generic HostMot2 bindings were not applied to cyclic inputs");
+        const auto request = transport.request();
+        const auto stepRates = findRequestWrite(request, 0x2000);
+        require(littleEndian32(stepRates.data) == 0
+                && littleEndian32(stepRates.data.subspan(4))
+                    == static_cast<std::uint32_t>(
+                        static_cast<std::int32_t>(-4'294.967296)),
+                "generic sparse/inverted StepGen binding was not applied");
+        require(littleEndian32(
+                    findRequestWrite(request, 0x7D00).data) == 0x80,
+                "generic SSR output binding was not applied");
+
+        auto noSsrLayout = layout;
+        noSsrLayout.ssr = {};
+        noSsrLayout.digitalOutputCount = 0;
+        DatagramFixtureTransport noSsrTransport;
+        const auto noSsrIo = ngc::mesa::HostMot2CyclicIo::create(
+            noSsrTransport, noSsrLayout, configuration);
+        require(noSsrIo.has_value()
+                && (*noSsrIo)->digitalOutputCount() == 0,
+                "HostMot2 cyclic I/O required a board-specific SSR module");
+    }
+
+    void testExchangesTypedHostMot2CyclicImages() {
+        DatagramFixtureTransport transport;
+        auto io = sevenI96CyclicIo(transport);
+        auto response = transport.response(10);
+        putCyclicConfirmation(response, 0, 1, 1);
+        require(
+            io->initializeSafe().fault
+                == ngc::mesa::HostMot2CyclicIoFault::None,
+            "cyclic image fixture initialization failed");
+
+        response = transport.response(46);
+        putLittleEndian32(response, 0x0000'0401);
+        putLittleEndian32(response.subspan(12), 0x0001'0000);
+        putLittleEndian32(response.subspan(16), 0xFFFF'0000);
+        putLittleEndian32(response.subspan(20), 0);
+        putLittleEndian32(response.subspan(24), 0x7FFF'FFFF);
+        putLittleEndian32(response.subspan(28), 0x8000'0000);
+        putLittleEndian32(response.subspan(32), 0);
+        putCyclicConfirmation(response, 36, 2, 2);
+        auto outputs = ngc::mesa::HostMot2CyclicOutputImage{};
+        outputs.stepGeneratorsEnabled = true;
+        outputs.stepGenerators[0] = {
+            .stepsPerSecond = 1'000.0,
+            .enabled = true,
+        };
+        outputs.stepGenerators[1] = {
+            .stepsPerSecond = -500.0,
+            .enabled = true,
+        };
+        outputs.digitalOutputsEnabled = true;
+        outputs.digitalOutputs[0] = true;
+        outputs.digitalOutputs[5] = true;
+        outputs.watchdogEnabled = true;
+
+        const auto result = io->cycle(outputs);
+
+        require(
+            result.fault == ngc::mesa::HostMot2CyclicIoFault::None
+                && result.inputsValid,
+            "valid HostMot2 cyclic image was rejected");
+        const auto request = transport.request();
+        const auto stepRates = findRequestWrite(request, 0x2000);
+        const auto ssrData = findRequestWrite(request, 0x7D00);
+        const auto ssrRate = findRequestWrite(request, 0x7E00);
+        const auto watchdogTimer = findRequestWrite(request, 0x0C00);
+        require(
+            littleEndian32(stepRates.data)
+                == static_cast<std::uint32_t>(
+                    static_cast<std::int32_t>(42'949.67296))
+                && littleEndian32(stepRates.data.subspan(4))
+                    == static_cast<std::uint32_t>(
+                        static_cast<std::int32_t>(-21'474.83648)),
+            "cyclic StepGen rates use the wrong DDS conversion");
+        require(littleEndian32(ssrData.data) == 0x21
+                && littleEndian32(ssrRate.data) == 0x1030,
+                "cyclic digital outputs use the wrong SSR image");
+        require(littleEndian32(watchdogTimer.data) == 499'999,
+                "cyclic watchdog timeout uses the wrong clock conversion");
+        const auto &inputs = io->inputImage();
+        require(inputs.digitalInputs[0]
+                && inputs.digitalInputs[10]
+                && !inputs.digitalInputs[1],
+                "cyclic digital inputs were decoded incorrectly");
+        require(inputs.rawStepAccumulator[0] == 0x0001'0000
+                && inputs.stepAccumulatorSubcounts[0] == 65'536
+                && inputs.stepAccumulatorSubcounts[1] == -65'536,
+                "cyclic StepGen accumulators were decoded incorrectly");
+    }
+
+    void testLatchesHostMot2WatchdogAndInvalidOutputFaults() {
+        DatagramFixtureTransport watchdogTransport;
+        auto watchdogIo = sevenI96CyclicIo(watchdogTransport);
+        auto response = watchdogTransport.response(10);
+        putCyclicConfirmation(response, 0, 1, 1);
+        require(
+            watchdogIo->initializeSafe().fault
+                == ngc::mesa::HostMot2CyclicIoFault::None,
+            "watchdog fixture initialization failed");
+        response = watchdogTransport.response(46);
+        putLittleEndian32(response.subspan(32), 1);
+        putCyclicConfirmation(response, 36, 2, 2);
+
+        const auto watchdogFault = watchdogIo->cycle({});
+        const auto repeatedWatchdogFault = watchdogIo->cycle({});
+
+        require(
+            watchdogFault.fault
+                == ngc::mesa::HostMot2CyclicIoFault::WatchdogTripped
+                && repeatedWatchdogFault.fault
+                    == ngc::mesa::HostMot2CyclicIoFault::WatchdogTripped
+                && !watchdogFault.inputsValid,
+            "HostMot2 watchdog fault was not latched");
+
+        DatagramFixtureTransport invalidTransport;
+        auto invalidIo = sevenI96CyclicIo(invalidTransport);
+        response = invalidTransport.response(10);
+        putCyclicConfirmation(response, 0, 1, 1);
+        require(
+            invalidIo->initializeSafe().fault
+                == ngc::mesa::HostMot2CyclicIoFault::None,
+            "invalid-output fixture initialization failed");
+        auto invalid = ngc::mesa::HostMot2CyclicOutputImage{};
+        invalid.stepGeneratorsEnabled = true;
+        invalid.watchdogEnabled = true;
+        invalid.stepGenerators[0] = {
+            .stepsPerSecond =
+                std::numeric_limits<double>::infinity(),
+            .enabled = true,
+        };
+
+        const auto invalidFault = invalidIo->cycle(invalid);
+
+        require(
+            invalidFault.fault
+                == ngc::mesa::HostMot2CyclicIoFault::InvalidOutput
+                && invalidIo->fault()
+                    == ngc::mesa::HostMot2CyclicIoFault::InvalidOutput,
+            "invalid HostMot2 output was not rejected and latched");
+    }
 }
 
 int main() {
@@ -710,6 +1117,10 @@ int main() {
         testBuildsAndValidatesCyclicLbp16Transaction();
         testCyclicFailuresInvalidateInputs();
         testRejectsInvalidCyclicTransactionConstruction();
+        testInitializesHostMot2CyclicIoWithSafeOutputs();
+        testAcceptsBoardIndependentHostMot2CyclicLayout();
+        testExchangesTypedHostMot2CyclicImages();
+        testLatchesHostMot2WatchdogAndInvalidOutputFaults();
     } catch (const std::exception &error) {
         std::cerr << "Mesa HostMot2 test failure: "
                   << error.what() << '\n';

@@ -46,6 +46,13 @@ namespace ngc::mesa {
         std::uint32_t multipleRegisterBitmap = 0;
     };
 
+    struct HostMot2ModuleLayout {
+        HostMot2Module descriptor;
+        std::uint32_t clockHz = 0;
+        std::uint32_t instanceStride = 0;
+        std::uint32_t registerStride = 0;
+    };
+
     struct HostMot2Pin {
         std::uint8_t secondaryPin = 0;
         std::uint8_t secondaryTag = 0;

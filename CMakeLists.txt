@@ -63,11 +63,13 @@ target_link_libraries(ngc_core
 ngc_target_defaults(ngc_core)
 
 add_library(ngc_mesa STATIC
+        src/mesa/HostMot2CyclicIo.cpp
         src/mesa/HostMot2Discovery.cpp
         src/mesa/HostMot2Latency.cpp
         src/mesa/Lbp16CyclicTransaction.cpp
         src/mesa/Lbp16UdpTransport.cpp
-        src/mesa/SevenI96Capabilities.cpp)
+        src/mesa/SevenI96Capabilities.cpp
+        src/mesa/SevenI96CyclicLayout.cpp)
 target_include_directories(ngc_mesa PUBLIC src/include)
 if(WIN32)
     target_link_libraries(ngc_mesa PRIVATE ws2_32)

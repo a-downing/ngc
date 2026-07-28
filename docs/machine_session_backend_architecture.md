@@ -1113,16 +1113,27 @@ held state.
   typed backend configuration. The read-only discovery utility exercises the
   same validation against hardware with `--validate-7i96`.
 - Add cyclic input, step-generator, output, watchdog, packet-sequence, and fault
-  handling behind a transport interface. The first write-capable transport
-  checkpoint is complete: `Lbp16CyclicTransaction` constructs bounded
+  handling behind a transport interface. The first two write-capable transport
+  checkpoints are complete. `Lbp16CyclicTransaction` constructs bounded
   multi-command HostMot2 read/write datagrams during NRT setup, executes them
   through an allocation-free `noexcept` transport call, confirms both read and
   write sequence values through board scratch registers, checks the LBP16 board
   error register, and withholds all input data after any failed validation.
   The production UDP transport detects send, receive, truncation, and response
-  size failures without constructing RT-path diagnostic strings. Typed cyclic
-  input/output images, register behavior, watchdog service, and executor I/O
-  integration remain.
+  size failures without constructing RT-path diagnostic strings.
+  `HostMot2CyclicIo` now consumes a board-independent, fixed-capacity layout of
+  discovered modules and configured channel/pin bindings. Its NRT-built safe
+  initialization writes zero StepGen rates, first isolates all I/O directions,
+  writes zero SSR data, disables SSR and the watchdog, configures StepGen
+  timing and alternate pin sources, and writes the final I/O direction last.
+  Its allocation-free `noexcept` cycle converts bounded
+  physical step rates to HostMot2 DDS words, unwraps 16.16 StepGen
+  accumulators, maps polarity-aware digital inputs and SSR outputs, services
+  the watchdog, and latches invalid-output, transport, sequence, board-error,
+  and watchdog faults while withholding typed inputs. Motion-capable outputs
+  require the watchdog to be active. `SevenI96CyclicLayout` is a thin
+  board-specific adapter; the common cyclic layer contains no 7I96 topology.
+  Executor I/O integration and physical-host validation remain.
 - Validate on a dedicated Linux RT host and NIC before enabling outputs.
 
 ### Phase 12: Staged physical commissioning

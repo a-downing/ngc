@@ -50,7 +50,7 @@ namespace ngc::mesa {
             return &*first;
         }
 
-        std::expected<SevenI96ModuleLayout, std::string> validateModule(
+        std::expected<HostMot2ModuleLayout, std::string> validateModule(
             const HostMot2Inventory &inventory,
             const ExpectedModule &expected) {
             const auto found = findModule(inventory, expected);
@@ -120,7 +120,7 @@ namespace ngc::mesa {
                     expected.name));
             }
 
-            return SevenI96ModuleLayout{
+            return HostMot2ModuleLayout{
                 .descriptor = module,
                 .clockHz = clock,
                 .instanceStride = instanceStride,

@@ -22,13 +22,6 @@ namespace ngc::mesa {
         std::optional<std::uint8_t> encoderChannel;
     };
 
-    struct SevenI96ModuleLayout {
-        HostMot2Module descriptor;
-        std::uint32_t clockHz = 0;
-        std::uint32_t instanceStride = 0;
-        std::uint32_t registerStride = 0;
-    };
-
     struct SevenI96StepGeneratorPins {
         std::uint8_t channel = 0;
         std::uint8_t stepPin = 0;
@@ -43,12 +36,12 @@ namespace ngc::mesa {
     };
 
     struct SevenI96Capabilities {
-        SevenI96ModuleLayout dpll;
-        SevenI96ModuleLayout watchdog;
-        SevenI96ModuleLayout ioPort;
-        SevenI96ModuleLayout stepGenerator;
-        SevenI96ModuleLayout encoder;
-        SevenI96ModuleLayout ssr;
+        HostMot2ModuleLayout dpll;
+        HostMot2ModuleLayout watchdog;
+        HostMot2ModuleLayout ioPort;
+        HostMot2ModuleLayout stepGenerator;
+        HostMot2ModuleLayout encoder;
+        HostMot2ModuleLayout ssr;
         std::array<
             SevenI96StepGeneratorPins,
             SEVEN_I96_STEP_GENERATOR_COUNT> stepGenerators;
