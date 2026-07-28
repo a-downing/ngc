@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <format>
 #include <iostream>
 #include <limits>
 #include <memory>
@@ -184,19 +185,32 @@ namespace {
                     .receivedBytes = 0,
                 };
             }
-            if (response.size() != m_responseSize) {
+            const auto queued = m_nextQueuedResponse < m_queuedResponseCount;
+            const auto responseSize = queued
+                ? m_queuedResponseSizes[m_nextQueuedResponse]
+                : m_responseSize;
+            if (response.size() != responseSize) {
                 return {
                     .status =
                         ngc::mesa::Lbp16DatagramStatus::UnexpectedResponseSize,
                     .systemError = 0,
                     .sentBytes = request.size(),
-                    .receivedBytes = m_responseSize,
+                    .receivedBytes = responseSize,
                 };
             }
 
-            std::ranges::copy(
-                std::span(m_response).first(m_responseSize),
-                response.begin());
+            if (queued) {
+                std::ranges::copy(
+                    std::span(
+                        m_queuedResponses[m_nextQueuedResponse])
+                        .first(responseSize),
+                    response.begin());
+                ++m_nextQueuedResponse;
+            } else {
+                std::ranges::copy(
+                    std::span(m_response).first(m_responseSize),
+                    response.begin());
+            }
 
             return {
                 .status = ngc::mesa::Lbp16DatagramStatus::Complete,
@@ -213,6 +227,19 @@ namespace {
             m_responseSize = size;
 
             return std::span(m_response).first(size);
+        }
+
+        std::span<std::byte> queueResponse(const std::size_t size) {
+            require(
+                m_queuedResponseCount < m_queuedResponses.size(),
+                "too many queued datagram fixture responses");
+            require(size <= m_queuedResponses.front().size(),
+                    "queued datagram fixture response is too large");
+            const auto index = m_queuedResponseCount++;
+            m_queuedResponses[index].fill(std::byte{});
+            m_queuedResponseSizes[index] = size;
+
+            return std::span(m_queuedResponses[index]).first(size);
         }
 
         std::span<const std::byte> request() const {
@@ -233,8 +260,16 @@ namespace {
         std::array<
             std::byte,
             ngc::mesa::LBP16_MAX_DATAGRAM_SIZE> m_response{};
+        std::array<
+            std::array<
+                std::byte,
+                ngc::mesa::LBP16_MAX_DATAGRAM_SIZE>,
+            4> m_queuedResponses{};
+        std::array<std::size_t, 4> m_queuedResponseSizes{};
         std::size_t m_requestSize = 0;
         std::size_t m_responseSize = 0;
+        std::size_t m_queuedResponseCount = 0;
+        std::size_t m_nextQueuedResponse = 0;
         ngc::mesa::Lbp16DatagramStatus m_status =
             ngc::mesa::Lbp16DatagramStatus::Complete;
         int m_systemError = 0;
@@ -797,6 +832,7 @@ namespace {
             });
         auto configuration = ngc::mesa::HostMot2CyclicConfiguration{
             .watchdogTimeoutNanoseconds = 5'000'000,
+            .dpll = {},
         };
         configuration.isolatedOutputFrequencyHz[0] = 1'000'000;
         auto io = ngc::mesa::HostMot2CyclicIo::create(
@@ -882,6 +918,119 @@ namespace {
                 "safe initialization encoded incorrect watchdog state");
     }
 
+    void testConfiguresAndGatesHostMot2Dpll() {
+        const auto capabilities =
+            ngc::mesa::validateSevenI96Capabilities(
+                sevenI96Inventory());
+        require(capabilities.has_value(),
+                "DPLL fixture capability validation failed");
+        const auto layout = ngc::mesa::sevenI96CyclicLayout(
+            *capabilities, {
+                .stepLengthNanoseconds = 1'000,
+                .stepSpaceNanoseconds = 2'000,
+                .directionSetupNanoseconds = 3'000,
+                .directionHoldNanoseconds = 4'000,
+            });
+        auto configuration = ngc::mesa::HostMot2CyclicConfiguration{
+            .watchdogTimeoutNanoseconds = 5'000'000,
+            .dpll = {
+                .enabled = true,
+                .stepGeneratorTimer = 1,
+                .stepGeneratorSampleOffsetNanoseconds = -50'000,
+                .servoPeriodNanoseconds = 1'000'000,
+                .maximumPhaseErrorNanoseconds = 25'000,
+                .convergenceCycles = 2,
+            },
+        };
+        configuration.isolatedOutputFrequencyHz[0] = 1'000'000;
+        DatagramFixtureTransport transport;
+        auto created = ngc::mesa::HostMot2CyclicIo::create(
+            transport, layout, configuration);
+        require(created.has_value(),
+                "valid HostMot2 DPLL configuration was rejected");
+        auto io = std::move(*created);
+        auto response = transport.queueResponse(14);
+        putLittleEndian32(response, 48);
+        putCyclicConfirmation(response, 4, 1, 1);
+        response = transport.queueResponse(10);
+        putCyclicConfirmation(response, 0, 2, 2);
+
+        const auto initialized = io->initializeSafe();
+
+        require(
+            initialized.fault == ngc::mesa::HostMot2CyclicIoFault::None,
+            std::format(
+                "HostMot2 DPLL initialization failed with fault {} "
+                "and transaction fault {}",
+                static_cast<int>(initialized.fault),
+                static_cast<int>(initialized.transaction.fault)));
+        const auto setupRequest = transport.request();
+        require(
+            littleEndian32(
+                findRequestWrite(setupRequest, 0x7000).data)
+                    == 2'814'749'767
+                && littleEndian32(
+                    findRequestWrite(setupRequest, 0x7200).data)
+                    == 0x0140'0000
+                && littleEndian32(
+                    findRequestWrite(setupRequest, 0x7300).data)
+                    == 0x07D0'0000,
+            "HostMot2 DPLL base or control registers were encoded incorrectly");
+        require(
+            littleEndian32(
+                findRequestWrite(setupRequest, 0x7400).data) == 0x0000'0CCC
+                && littleEndian32(
+                    findRequestWrite(setupRequest, 0x2A00).data)
+                    == 0x0000'9000,
+            "HostMot2 DPLL timer or StepGen latch selection was incorrect");
+
+        auto outputs = ngc::mesa::HostMot2CyclicOutputImage{};
+        outputs.stepGeneratorsEnabled = true;
+        outputs.stepGenerators[0] = {
+            .stepsPerSecond = 1'000.0,
+            .enabled = true,
+        };
+        outputs.watchdogEnabled = true;
+        for (std::uint32_t sequence = 3; sequence <= 5; ++sequence) {
+            response = transport.response(50);
+            putCyclicConfirmation(response, 40, sequence, sequence);
+
+            const auto result = io->cycle(outputs);
+
+            require(
+                result.fault == ngc::mesa::HostMot2CyclicIoFault::None,
+                "HostMot2 DPLL convergence cycle failed");
+            const auto rate = littleEndian32(
+                findRequestWrite(transport.request(), 0x2000).data);
+            if (sequence < 5) {
+                require(rate == 0,
+                        "StepGen motion escaped before DPLL convergence");
+            } else {
+                require(
+                    rate == static_cast<std::uint32_t>(
+                        static_cast<std::int32_t>(42'949.67296)),
+                    "StepGen motion remained gated after DPLL convergence");
+            }
+        }
+        require(io->inputImage().dpll.enabled
+                && io->inputImage().dpll.ready
+                && io->inputImage().dpll.phaseErrorNanoseconds == 0,
+                "DPLL readiness was not published in the input image");
+
+        response = transport.response(50);
+        putLittleEndian32(response.subspan(36), 128'849'019);
+        putCyclicConfirmation(response, 40, 6, 6);
+
+        const auto phaseFault = io->cycle(outputs);
+
+        require(
+            phaseFault.fault
+                == ngc::mesa::HostMot2CyclicIoFault::DpllPhaseError
+                && io->fault()
+                    == ngc::mesa::HostMot2CyclicIoFault::DpllPhaseError,
+            "out-of-window DPLL phase error was not latched");
+    }
+
     void testAcceptsBoardIndependentHostMot2CyclicLayout() {
         const auto capabilities =
             ngc::mesa::validateSevenI96Capabilities(
@@ -920,6 +1069,7 @@ namespace {
         };
         auto configuration = ngc::mesa::HostMot2CyclicConfiguration{
             .watchdogTimeoutNanoseconds = 10'000'000,
+            .dpll = {},
         };
         configuration.isolatedOutputFrequencyHz[0] = 500'000;
         DatagramFixtureTransport transport;
@@ -1353,6 +1503,7 @@ int main() {
         testCyclicFailuresInvalidateInputs();
         testRejectsInvalidCyclicTransactionConstruction();
         testInitializesHostMot2CyclicIoWithSafeOutputs();
+        testConfiguresAndGatesHostMot2Dpll();
         testAcceptsBoardIndependentHostMot2CyclicLayout();
         testExchangesTypedHostMot2CyclicImages();
         testLatchesHostMot2WatchdogAndInvalidOutputFaults();

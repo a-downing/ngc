@@ -17,6 +17,10 @@ namespace ngc::mesa {
         constexpr std::uint32_t WATCHDOG_PET = 0x5A00'0000;
         constexpr std::uint32_t WATCHDOG_TRIPPED = 0x0000'0001;
         constexpr std::uint32_t STEPGEN_MASTER_DDS = 0xFFFF'FFFF;
+        constexpr std::uint32_t STEPGEN_DPLL_ENABLE = 0x0000'8000;
+        constexpr std::uint32_t DPLL_PHASE_LIMIT = 0x0040'0000;
+        constexpr std::uint32_t DPLL_TIME_CONSTANT = 2'000;
+        constexpr long double DPLL_PHASE_SCALE = 4'294'967'296.0L;
         constexpr std::uint32_t SSR_ENABLE = 0x0000'1000;
         constexpr std::uint32_t SSR_DIVISOR_MASK = 0x0000'0FFF;
 
@@ -292,6 +296,60 @@ namespace ngc::mesa {
 
             return {};
         }
+
+        std::expected<void, std::string> validateDpll(
+            const HostMot2CyclicLayout &layout,
+            const HostMot2DpllConfiguration &configuration) {
+            if (!configuration.enabled) {
+                return {};
+            }
+            if (const auto valid = validateModule(
+                    layout.dpll, 7, 1, "DPLL"); !valid) {
+                return valid;
+            }
+            if (configuration.stepGeneratorTimer < 1
+                || configuration.stepGeneratorTimer > 4) {
+                return std::unexpected(
+                    "HostMot2 DPLL StepGen timer must be in the range 1..4");
+            }
+            if (configuration.servoPeriodNanoseconds == 0
+                || configuration.stepGeneratorSampleOffsetNanoseconds >= 0
+                || static_cast<std::uint64_t>(
+                    -static_cast<std::int64_t>(
+                        configuration.stepGeneratorSampleOffsetNanoseconds))
+                    >= configuration.servoPeriodNanoseconds) {
+                return std::unexpected(
+                    "HostMot2 DPLL StepGen sample offset must be negative "
+                    "and shorter than the servo period");
+            }
+            if (configuration.maximumPhaseErrorNanoseconds == 0
+                || configuration.maximumPhaseErrorNanoseconds
+                    >= static_cast<std::uint64_t>(
+                        -static_cast<std::int64_t>(
+                            configuration
+                                .stepGeneratorSampleOffsetNanoseconds))) {
+                return std::unexpected(
+                    "HostMot2 DPLL maximum phase error must be positive "
+                    "and smaller than the StepGen sample lead");
+            }
+            if (configuration.convergenceCycles == 0) {
+                return std::unexpected(
+                    "HostMot2 DPLL convergence cycle count must be positive");
+            }
+
+            return {};
+        }
+
+        std::uint16_t dpllTimerValue(
+            const HostMot2DpllConfiguration &configuration) noexcept {
+            const auto lead = -static_cast<std::int64_t>(
+                configuration.stepGeneratorSampleOffsetNanoseconds);
+            const auto scaled =
+                lead * 0x1'0000LL
+                / configuration.servoPeriodNanoseconds;
+
+            return static_cast<std::uint16_t>(scaled);
+        }
     }
 
     class HostMot2CyclicIo::Impl {
@@ -300,13 +358,18 @@ namespace ngc::mesa {
             Lbp16DatagramTransport &transport,
             const HostMot2CyclicLayout &layout,
             const HostMot2CyclicConfiguration &configuration) noexcept
-            : setupTransaction(transport),
+            : dpllProbeTransaction(transport),
+              setupTransaction(transport),
               cyclicTransaction(transport),
               layout(layout),
               configuration(configuration) { }
 
         std::expected<void, std::string> build() {
             if (const auto valid = validateLayout(layout); !valid) {
+                return valid;
+            }
+            if (const auto valid = validateDpll(
+                    layout, configuration.dpll); !valid) {
                 return valid;
             }
             if (const auto timer = watchdogTimer(
@@ -380,6 +443,58 @@ namespace ngc::mesa {
             for (std::size_t index = 0;
                  index < layout.digitalOutputCount; ++index) {
                 setOutputPin(layout.digitalOutputs[index].pin);
+            }
+
+            if (configuration.dpll.enabled) {
+                const auto dpllControl = dpllProbeTransaction.addHostMot2Read(
+                    registerAddress(layout.dpll, 3),
+                    sizeof(std::uint32_t));
+                if (!dpllControl) {
+                    return std::unexpected(
+                        "could not construct HostMot2 DPLL probe");
+                }
+                dpllProbeControl = *dpllControl;
+                if (const auto finalized =
+                        dpllProbeTransaction.finalize();
+                    !finalized) {
+                    return finalized;
+                }
+                if (const auto result = addSetupWrite(
+                        setupDpllPhaseError, layout.dpll, 1, 1);
+                    !result) {
+                    return result;
+                }
+                if (const auto result = addSetupWrite(
+                        setupDpllBaseRate, layout.dpll, 0, 1);
+                    !result) {
+                    return result;
+                }
+                if (const auto result = addSetupWrite(
+                        setupDpllControl0, layout.dpll, 2, 1);
+                    !result) {
+                    return result;
+                }
+                if (const auto result = addSetupWrite(
+                        setupDpllControl1, layout.dpll, 3, 1);
+                    !result) {
+                    return result;
+                }
+                if (const auto result = addSetupWrite(
+                        setupDpllTimer12, layout.dpll, 4, 1);
+                    !result) {
+                    return result;
+                }
+                if (const auto result = addSetupWrite(
+                        setupDpllTimer34, layout.dpll, 5, 1);
+                    !result) {
+                    return result;
+                }
+                if (const auto result = addSetupWrite(
+                        setupStepGeneratorDpllTimer,
+                        layout.stepGenerator, 10, 1);
+                    !result) {
+                    return result;
+                }
             }
 
             if (const auto result = addSetupWrite(
@@ -508,6 +623,38 @@ namespace ngc::mesa {
                 setupTransaction.writeData(setupDataDirection),
                 std::span(dataDirectionRegisters).first(
                     ioPortInstances));
+            if (configuration.dpll.enabled) {
+                const auto timerValue = dpllTimerValue(
+                    configuration.dpll);
+                auto timer12 = std::uint32_t{};
+                auto timer34 = std::uint32_t{};
+                const auto timerShift =
+                    ((configuration.dpll.stepGeneratorTimer - 1) % 2) * 16;
+                if (configuration.dpll.stepGeneratorTimer <= 2) {
+                    timer12 = static_cast<std::uint32_t>(
+                        timerValue) << timerShift;
+                } else {
+                    timer34 = static_cast<std::uint32_t>(
+                        timerValue) << timerShift;
+                }
+                putLittleEndian32(
+                    setupTransaction.writeData(setupDpllPhaseError), 0);
+                putLittleEndian32(
+                    setupTransaction.writeData(setupDpllControl1),
+                    DPLL_TIME_CONSTANT << 16);
+                putLittleEndian32(
+                    setupTransaction.writeData(setupDpllTimer12),
+                    timer12);
+                putLittleEndian32(
+                    setupTransaction.writeData(setupDpllTimer34),
+                    timer34);
+                putLittleEndian32(
+                    setupTransaction.writeData(
+                        setupStepGeneratorDpllTimer),
+                    STEPGEN_DPLL_ENABLE
+                        | (static_cast<std::uint32_t>(
+                            configuration.dpll.stepGeneratorTimer) << 12));
+            }
 
             if (const auto result = addCyclicWrite(
                     cyclicStepRates, layout.stepGenerator, 0,
@@ -543,13 +690,25 @@ namespace ngc::mesa {
             const auto watchdogStatus = cyclicTransaction.addHostMot2Read(
                 registerAddress(layout.watchdog, 1),
                 sizeof(std::uint32_t));
-            if (!ioData || !accumulators || !watchdogStatus) {
+            auto dpllSync = std::expected<
+                Lbp16CyclicRead, std::string>{
+                Lbp16CyclicRead{},
+            };
+            if (configuration.dpll.enabled) {
+                dpllSync = cyclicTransaction.addHostMot2Read(
+                    registerAddress(layout.dpll, 6),
+                    sizeof(std::uint32_t));
+            }
+            if (!ioData || !accumulators || !watchdogStatus || !dpllSync) {
                 return std::unexpected(
                     "could not construct HostMot2 cyclic input transaction");
             }
             cyclicIoData = *ioData;
             cyclicStepAccumulators = *accumulators;
             cyclicWatchdogStatus = *watchdogStatus;
+            if (configuration.dpll.enabled) {
+                cyclicDpllSync = *dpllSync;
+            }
             if (const auto finalized = cyclicTransaction.finalize();
                 !finalized) {
                 return finalized;
@@ -567,6 +726,26 @@ namespace ngc::mesa {
             }
 
             auto result = HostMot2CyclicIoResult{};
+            if (configuration.dpll.enabled) {
+                result.transaction = dpllProbeTransaction.exchange(
+                    nextReadSequence, nextWriteSequence);
+                advanceSequences();
+                result.fault = cyclicFault(result.transaction.fault);
+                if (result.fault != HostMot2CyclicIoFault::None) {
+                    return latch(result);
+                }
+                const auto control =
+                    dpllProbeTransaction.readData(dpllProbeControl);
+                if (control.size() != sizeof(std::uint32_t)
+                    || !configureDpll(
+                        littleEndian32(control) & 0xFF)) {
+                    result.fault =
+                        HostMot2CyclicIoFault::BoardProtocolError;
+
+                    return latch(result);
+                }
+            }
+
             result.transaction = setupTransaction.exchange(
                 nextReadSequence, nextWriteSequence);
             advanceSequences();
@@ -645,7 +824,9 @@ namespace ngc::mesa {
                     return latch(result);
                 }
                 stepRates[layout.stepGenerators[index].channel] =
-                    std::bit_cast<std::uint32_t>(
+                    configuration.dpll.enabled && !dpllReady
+                    ? 0
+                    : std::bit_cast<std::uint32_t>(
                         static_cast<std::int32_t>(scaled));
             }
 
@@ -714,6 +895,55 @@ namespace ngc::mesa {
             }
 
             auto nextInput = HostMot2CyclicInputImage{};
+            if (configuration.dpll.enabled) {
+                const auto sync =
+                    cyclicTransaction.readData(cyclicDpllSync);
+                if (sync.size() != sizeof(std::uint32_t)) {
+                    result.fault =
+                        HostMot2CyclicIoFault::BoardProtocolError;
+
+                    return latch(result);
+                }
+                const auto rawPhase = std::bit_cast<std::int32_t>(
+                    littleEndian32(sync));
+                const auto phaseNanoseconds = std::llround(
+                    static_cast<long double>(rawPhase)
+                    * configuration.dpll.servoPeriodNanoseconds
+                    / DPLL_PHASE_SCALE);
+                if (phaseNanoseconds
+                        < std::numeric_limits<std::int32_t>::min()
+                    || phaseNanoseconds
+                        > std::numeric_limits<std::int32_t>::max()) {
+                    result.fault =
+                        HostMot2CyclicIoFault::BoardProtocolError;
+
+                    return latch(result);
+                }
+                const auto phaseMagnitude =
+                    static_cast<std::uint64_t>(std::abs(
+                        phaseNanoseconds));
+                if (phaseMagnitude
+                    > configuration.dpll
+                        .maximumPhaseErrorNanoseconds) {
+                    dpllConvergenceCycles = 0;
+                    if (dpllReady) {
+                        result.fault =
+                            HostMot2CyclicIoFault::DpllPhaseError;
+
+                        return latch(result);
+                    }
+                } else if (!dpllReady) {
+                    ++dpllConvergenceCycles;
+                    dpllReady = dpllConvergenceCycles
+                        >= configuration.dpll.convergenceCycles;
+                }
+                nextInput.dpll = {
+                    .phaseErrorNanoseconds =
+                        static_cast<std::int32_t>(phaseNanoseconds),
+                    .enabled = true,
+                    .ready = dpllReady,
+                };
+            }
             const auto ioData =
                 cyclicTransaction.readData(cyclicIoData);
             for (std::size_t index = 0;
@@ -752,6 +982,46 @@ namespace ngc::mesa {
             result.inputsValid = true;
 
             return result;
+        }
+
+        bool configureDpll(
+            const std::uint32_t accumulatorBits) noexcept {
+            if (accumulatorBits == 0 || accumulatorBits > 62) {
+                return false;
+            }
+            const auto accumulatorScale =
+                static_cast<long double>(
+                    std::uint64_t{1} << accumulatorBits);
+            const auto baseFrequency =
+                static_cast<long double>(NANOSECONDS_PER_SECOND)
+                / configuration.dpll.servoPeriodNanoseconds;
+            const auto prescale = std::max(
+                std::uint64_t{1},
+                static_cast<std::uint64_t>(
+                    (static_cast<long double>(
+                        std::uint64_t{1} << 30)
+                        * layout.dpll.clockHz)
+                    / (accumulatorScale * baseFrequency)));
+            if (prescale > 0xFF) {
+                return false;
+            }
+            const auto baseRate = static_cast<std::uint64_t>(
+                baseFrequency * accumulatorScale * prescale
+                / layout.dpll.clockHz);
+            if (baseRate == 0
+                || baseRate > std::numeric_limits<std::uint32_t>::max()) {
+                return false;
+            }
+
+            putLittleEndian32(
+                setupTransaction.writeData(setupDpllBaseRate),
+                static_cast<std::uint32_t>(baseRate));
+            putLittleEndian32(
+                setupTransaction.writeData(setupDpllControl0),
+                static_cast<std::uint32_t>(prescale << 24)
+                    | DPLL_PHASE_LIMIT);
+
+            return true;
         }
 
         std::expected<void, std::string> addSetupWrite(
@@ -807,11 +1077,20 @@ namespace ngc::mesa {
             return latchedResult;
         }
 
+        Lbp16CyclicTransaction dpllProbeTransaction;
         Lbp16CyclicTransaction setupTransaction;
         Lbp16CyclicTransaction cyclicTransaction;
         HostMot2CyclicLayout layout;
         HostMot2CyclicConfiguration configuration;
 
+        Lbp16CyclicRead dpllProbeControl;
+        Lbp16CyclicWrite setupDpllPhaseError;
+        Lbp16CyclicWrite setupDpllBaseRate;
+        Lbp16CyclicWrite setupDpllControl0;
+        Lbp16CyclicWrite setupDpllControl1;
+        Lbp16CyclicWrite setupDpllTimer12;
+        Lbp16CyclicWrite setupDpllTimer34;
+        Lbp16CyclicWrite setupStepGeneratorDpllTimer;
         Lbp16CyclicWrite setupStepRates;
         Lbp16CyclicWrite setupSafeDataDirection;
         Lbp16CyclicWrite setupStepModes;
@@ -839,6 +1118,7 @@ namespace ngc::mesa {
         Lbp16CyclicRead cyclicIoData;
         Lbp16CyclicRead cyclicStepAccumulators;
         Lbp16CyclicRead cyclicWatchdogStatus;
+        Lbp16CyclicRead cyclicDpllSync;
 
         std::array<
             std::uint32_t,
@@ -882,7 +1162,9 @@ namespace ngc::mesa {
         std::uint32_t watchdogTimerRegister = 0;
         std::uint32_t nextReadSequence = 1;
         std::uint32_t nextWriteSequence = 1;
+        std::uint32_t dpllConvergenceCycles = 0;
         bool isInitialized = false;
+        bool dpllReady = false;
     };
 
     std::expected<std::unique_ptr<HostMot2CyclicIo>, std::string>

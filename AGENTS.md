@@ -109,7 +109,13 @@ be assigned exactly once, and debounce durations written as time are rounded
 up to fixed servo ticks during NRT compilation. Its bounded adapter stages
 commanded joint velocities as StepGen rates, requires
 the watchdog for enabled motion, and converts any invalid cyclic exchange into
-an executor host fault and safe output image. Disabled and faulted executor
+an executor host fault and safe output image. Its optional HostMot2 DPLL path
+reads the firmware-reported phase-accumulator width during safe initialization,
+programs one selected StepGen accumulator-latch timer relative to the servo
+period, holds nonzero StepGen rates until the observed phase error converges
+within a configured guard band, and latches a fault if a ready DPLL later
+leaves that band. Generated-step accumulator correction is a separate future
+control checkpoint. Disabled and faulted executor
 states suppress the watchdog, StepGen motion, and digital outputs. On
 configured Linux hosts, the
 runtime's existing servo thread removes the

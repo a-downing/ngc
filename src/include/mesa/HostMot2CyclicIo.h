@@ -52,6 +52,7 @@ namespace ngc::mesa {
     };
 
     struct HostMot2CyclicLayout {
+        HostMot2ModuleLayout dpll;
         HostMot2ModuleLayout watchdog;
         HostMot2ModuleLayout ioPort;
         HostMot2ModuleLayout stepGenerator;
@@ -71,8 +72,18 @@ namespace ngc::mesa {
         std::size_t digitalOutputCount = 0;
     };
 
+    struct HostMot2DpllConfiguration {
+        bool enabled = false;
+        std::uint8_t stepGeneratorTimer = 0;
+        std::int32_t stepGeneratorSampleOffsetNanoseconds = 0;
+        std::uint32_t servoPeriodNanoseconds = 0;
+        std::uint32_t maximumPhaseErrorNanoseconds = 0;
+        std::uint32_t convergenceCycles = 0;
+    };
+
     struct HostMot2CyclicConfiguration {
         std::uint32_t watchdogTimeoutNanoseconds = 0;
+        HostMot2DpllConfiguration dpll;
         std::array<
             std::uint32_t,
             HOSTMOT2_CYCLIC_SSR_INSTANCE_CAPACITY>
@@ -95,6 +106,12 @@ namespace ngc::mesa {
         bool watchdogEnabled = false;
     };
 
+    struct HostMot2DpllObservation {
+        std::int32_t phaseErrorNanoseconds = 0;
+        bool enabled = false;
+        bool ready = false;
+    };
+
     struct HostMot2CyclicInputImage {
         std::array<
             std::uint32_t,
@@ -105,6 +122,7 @@ namespace ngc::mesa {
             stepAccumulatorSubcounts{};
         std::bitset<
             HOSTMOT2_CYCLIC_DIGITAL_INPUT_CAPACITY> fieldDigitalInputs;
+        HostMot2DpllObservation dpll;
     };
 
     enum class HostMot2CyclicIoFault : std::uint8_t {
@@ -116,6 +134,7 @@ namespace ngc::mesa {
         WriteSequenceMismatch,
         BoardProtocolError,
         WatchdogTripped,
+        DpllPhaseError,
     };
 
     struct HostMot2CyclicIoResult {

@@ -5,6 +5,7 @@ namespace ngc::mesa {
         const SevenI96Capabilities &capabilities,
         const HostMot2StepTiming &stepTiming) {
         auto result = HostMot2CyclicLayout{
+            .dpll = capabilities.dpll,
             .watchdog = capabilities.watchdog,
             .ioPort = capabilities.ioPort,
             .stepGenerator = capabilities.stepGenerator,
