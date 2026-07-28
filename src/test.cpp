@@ -7445,7 +7445,7 @@ G1 F60 X2
                     && repositoryConfiguration->realBackend->realtimeCpu
                         == 15
                     && repositoryConfiguration->realBackend->realtimePriority
-                        == 95
+                        == 98
                     && repositoryConfiguration->realBackend->lockMemory,
                 "machine configuration should enable the external IPC Real backend");
 

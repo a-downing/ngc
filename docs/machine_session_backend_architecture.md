@@ -1098,7 +1098,12 @@ held state.
 
 ### Phase 11: Implement Mesa transport
 
-- Begin with a read-only discovery/IDROM and cyclic-latency utility.
+- Begin with a read-only discovery/IDROM and cyclic-latency utility. The
+  reusable `ngc_mesa` UDP/LBP16 register transport, typed HostMot2
+  cookie/IDROM/module/pin discovery, fixture tests, and thin
+  `ngc_mesa_discover` executable are complete. The transport deliberately
+  exposes no write operation in this first slice. Cyclic-latency measurement
+  remains.
 - Add typed 7I96 HostMot2 discovery and capability validation.
 - Add cyclic input, step-generator, output, watchdog, packet-sequence, and fault
   handling behind a transport interface.

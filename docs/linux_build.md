@@ -114,6 +114,22 @@ The first route must select `enp17s0` with source `10.10.10.1`; the second must
 select `enp24s0u2u4`. The board should answer with sub-millisecond latency on a
 direct cable.
 
+Build and run NGC's read-only HostMot2 discovery utility with:
+
+```bash
+cmake --build build --target ngc_mesa_discover
+./build/ngc_mesa_discover --address 10.10.10.10
+```
+
+The utility and the future physical backend share the `ngc_mesa` library's
+UDP/LBP16 transport, IDROM parser, module and pin descriptor parser, and typed
+capability model. The utility exposes no register-write operation. Compare its
+inventory with MesaFlash while bringing up a board:
+
+```bash
+mesaflash --device 7i96 --addr 10.10.10.10 --readhmid
+```
+
 ## VistaCNC P2-S access
 
 The Linux transport uses HIDAPI's hidraw backend. Install the supplied udev

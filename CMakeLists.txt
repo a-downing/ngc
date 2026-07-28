@@ -62,6 +62,15 @@ target_link_libraries(ngc_core
     PRIVATE PathTempo::PathTempo tomlplusplus::tomlplusplus)
 ngc_target_defaults(ngc_core)
 
+add_library(ngc_mesa STATIC
+        src/mesa/HostMot2Discovery.cpp
+        src/mesa/Lbp16UdpTransport.cpp)
+target_include_directories(ngc_mesa PUBLIC src/include)
+if(WIN32)
+    target_link_libraries(ngc_mesa PRIVATE ws2_32)
+endif()
+ngc_target_defaults(ngc_mesa)
+
 add_library(ngc_operator STATIC
         src/operator/OperatorJogController.cpp
         src/operator/PendantTouchOffController.cpp)
@@ -127,6 +136,11 @@ target_link_libraries(ngc_production_executor_tests PRIVATE ngc_core)
 ngc_target_defaults(ngc_production_executor_tests)
 add_test(NAME ngc_production_executor_tests COMMAND ngc_production_executor_tests)
 
+add_executable(ngc_mesa_tests src/MesaHostMot2Tests.cpp)
+target_link_libraries(ngc_mesa_tests PRIVATE ngc_mesa)
+ngc_target_defaults(ngc_mesa_tests)
+add_test(NAME ngc_mesa_tests COMMAND ngc_mesa_tests)
+
 add_executable(ngc_ipc_backend tools/ngc_ipc_backend.cpp)
 target_include_directories(ngc_ipc_backend PRIVATE src)
 target_link_libraries(ngc_ipc_backend PRIVATE ngc_core)
@@ -146,6 +160,10 @@ add_executable(ngc_simulation_diagnostic tools/ngc_simulation_diagnostic.cpp)
 target_include_directories(ngc_simulation_diagnostic PRIVATE src)
 target_link_libraries(ngc_simulation_diagnostic PRIVATE ngc_core)
 ngc_target_defaults(ngc_simulation_diagnostic)
+
+add_executable(ngc_mesa_discover tools/ngc_mesa_discover.cpp)
+target_link_libraries(ngc_mesa_discover PRIVATE ngc_mesa)
+ngc_target_defaults(ngc_mesa_discover)
 
 add_executable(ngc_g64_geometry_export tools/ngc_g64_geometry_export.cpp)
 target_include_directories(ngc_g64_geometry_export PRIVATE src)
