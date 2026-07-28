@@ -149,14 +149,22 @@ maximum_generated_step_error = 2.0
 # DPLL behavior. The diagnostic combines this file with machine.toml's
 # authoritative Real servo period.
 
-# The existing machine drives a Huanyang VFD independently of Mesa over
-# /dev/ttyUSB0 at 9600 baud with no parity. A bounded serial/Modbus physical-I/O
-# integration is not implemented yet. Its eventual backend configuration
-# should have this shape:
+# The existing machine drives a Huanyang VFD independently of Mesa through the
+# LinuxCNC hy_vfd protocol. The legacy configuration overrides the serial
+# device, baud rate, and parity; the remaining serial values and target retain
+# the hy_vfd defaults. NGC's bounded NRT spindle worker is not implemented yet,
+# so the current physical backend validates but does not consume this table.
 #
-# [spindle]
-# driver = "huanyang_modbus"
-# device = "/dev/ttyUSB0"
-# baud = 9600
-# parity = "none"
-# maximum_speed = 24000
+# The legacy driver did not override the VFD's frequency or motor parameters.
+# Read PD004, PD005, PD011, and PD141 through PD144 from the VFD during NRT
+# startup rather than replacing its stored values from this configuration.
+[spindle]
+driver = "huanyang_modbus"
+device = "/dev/ttyUSB0"
+baud = 9600
+data_bits = 8
+parity = "none"
+stop_bits = 1
+slave_address = 1
+maximum_speed = 24000
+at_speed_tolerance = 0.02
