@@ -123,7 +123,7 @@ cmake --build build --target ngc_mesa_discover
     --validate-7i96
 ```
 
-The utility and the future physical backend share the `ngc_mesa` library's
+The utility and the initial physical backend share the `ngc_mesa` library's
 UDP/LBP16 transport, IDROM parser, module and pin descriptor parser, and typed
 capability model. `--validate-7i96` additionally requires the supported 7I96
 IDROM topology, DPLL, watchdog, I/O-port, StepGen, encoder, and SSR module
@@ -157,6 +157,24 @@ unexpected cookie contents, and periods skipped after an overrun. Exit status
 This is an NRT link and scheduler diagnostic. It does not enable outputs,
 service the watchdog, exercise packet sequencing, prove RT cyclic I/O, or
 commission physical motion.
+
+Build the initial physical backend and validate its two configuration inputs
+without opening the board or starting an RT thread with:
+
+```bash
+cmake --build build --target ngc_mesa_backend
+./build/ngc_mesa_backend \
+    --machine-configuration machine.toml \
+    --mesa-configuration mesa_7i96.toml \
+    --validate-config-only
+```
+
+The executable parses both files only during NRT bootstrap. It then passes
+typed runtime configuration to `ProductionExecutorRuntime` and typed hardware
+configuration to the Mesa adapter. A normal invocation is launched by the
+application's external-runtime IPC boundary and opens the physical 7I96; do
+not select it as the Real target until the staged commissioning checks are
+complete.
 
 ## VistaCNC P2-S access
 

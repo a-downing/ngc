@@ -1182,9 +1182,15 @@ held state.
   through the output side into the configured HostMot2 SSR bindings, requires
   the watchdog for enabled motion, and promotes cyclic failures to executor
   host faults with safe pending outputs. Disabled and faulted states suppress
-  the watchdog, StepGen motion, and digital outputs. Physical-backend
-  configuration parsing and hosting, executor/G-code producers for logical
-  digital-output events, generated-step feedback, and physical-host validation
+  the watchdog, StepGen motion, and digital outputs. The typed Mesa
+  configuration loader, DPLL-latched generated-step feedback, and active
+  StepGen diagnostic are complete. The initial `ngc_mesa_backend` process
+  performs NRT-only machine/Mesa configuration loading and cross-validation,
+  constructs the physical I/O adapter, hosts `ProductionExecutorRuntime`
+  behind the production IPC bridge without synthetic inputs, and faults to
+  safe outputs when its configured external-enable logical input is inactive.
+  Executor/G-code producers for additional logical-output events, spindle
+  integration, application-default selection, and physical commissioning
   remain.
 - Validate on a dedicated Linux RT host and NIC before enabling outputs.
 

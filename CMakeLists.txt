@@ -48,6 +48,7 @@ add_library(ngc_core STATIC
         src/HomingController.cpp
         src/InfiniteJerkTrajectoryTime.cpp
         src/InProcessSimulationRuntime.cpp
+        src/IpcExecutorBridge.cpp
         src/IpcPlatform.cpp
         src/JoggingController.cpp
         src/MachineSession.cpp
@@ -209,6 +210,19 @@ target_link_libraries(
     ngc_mesa_stepgen_diagnostic
     PRIVATE ngc_core ngc_mesa_configuration)
 ngc_target_defaults(ngc_mesa_stepgen_diagnostic)
+
+add_executable(ngc_mesa_backend tools/ngc_mesa_backend.cpp)
+target_include_directories(ngc_mesa_backend PRIVATE src)
+target_link_libraries(
+    ngc_mesa_backend
+    PRIVATE ngc_mesa_executor ngc_mesa_configuration)
+ngc_target_defaults(ngc_mesa_backend)
+add_test(
+    NAME ngc_mesa_backend_configuration
+    COMMAND ngc_mesa_backend
+        --machine-configuration ${CMAKE_SOURCE_DIR}/machine.toml
+        --mesa-configuration ${CMAKE_SOURCE_DIR}/mesa_7i96.toml
+        --validate-config-only)
 
 add_executable(ngc_g64_geometry_export tools/ngc_g64_geometry_export.cpp)
 target_include_directories(ngc_g64_geometry_export PRIVATE src)

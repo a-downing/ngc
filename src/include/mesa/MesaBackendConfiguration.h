@@ -24,6 +24,11 @@ namespace ngc::mesa {
         double maximumGeneratedStepError = 0.0;
     };
 
+    struct MesaSafetyConfiguration {
+        std::string enableInput;
+        bool enableLevel = true;
+    };
+
     struct MesaBackendConfiguration {
         std::string address;
         std::string expectedBoard;
@@ -32,6 +37,7 @@ namespace ngc::mesa {
         HostMot2StepTiming stepTiming;
         std::uint32_t watchdogTimeoutNanoseconds = 0;
         HostMot2DpllConfiguration dpll;
+        MesaSafetyConfiguration safety;
         std::vector<MesaConfiguredStepGenerator> stepGenerators;
     };
 

@@ -45,7 +45,9 @@ namespace ngc::mesa {
         std::unique_ptr<HostMot2CyclicIo> io,
         DigitalIoProgram ioProgram,
         const std::span<const MesaStepGeneratorMapping>
-            stepGenerators) {
+            stepGenerators,
+        const std::optional<MesaExecutorSafetyInput>
+            safetyInput) {
         if (!io) {
             return std::unexpected(
                 "Mesa executor I/O requires HostMot2 cyclic I/O");
@@ -126,17 +128,20 @@ namespace ngc::mesa {
         return std::unique_ptr<MesaProductionExecutorIo>(
             new MesaProductionExecutorIo(
                 std::move(io), std::move(ioProgram),
-                stepGenerators));
+                stepGenerators, safetyInput));
     }
 
     MesaProductionExecutorIo::MesaProductionExecutorIo(
         std::unique_ptr<HostMot2CyclicIo> io,
         DigitalIoProgram ioProgram,
         const std::span<const MesaStepGeneratorMapping>
-            stepGenerators) noexcept
+            stepGenerators,
+        const std::optional<MesaExecutorSafetyInput>
+            safetyInput) noexcept
         : m_io(std::move(io)),
           m_ioProgram(std::move(ioProgram)),
-          m_stepGeneratorCount(stepGenerators.size()) {
+          m_stepGeneratorCount(stepGenerators.size()),
+          m_safetyInput(safetyInput) {
         std::ranges::copy(
             stepGenerators, m_stepGenerators.begin());
     }
@@ -224,6 +229,12 @@ namespace ngc::mesa {
         }
         m_ioProgram.executeInputs(
             m_fieldInputs, m_logicalOutputs, inputs);
+        if (m_safetyInput.has_value()
+            && inputs[m_safetyInput->input]
+                != m_safetyInput->requiredLevel) {
+            inputs.reset();
+            m_faultCode = MESA_EXTERNAL_ENABLE_FAULT;
+        }
     }
 
     void MesaProductionExecutorIo::applyOutputs(

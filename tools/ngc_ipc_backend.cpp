@@ -14,6 +14,7 @@
 
 #include "ExecutionItemOperations.h"
 #include "IpcPlatform.h"
+#include "machine/IpcExecutorBridge.h"
 #include "machine/IpcProtocol.h"
 #include "machine/MachineConfiguration.h"
 #include "machine/ProductionExecutorRuntime.h"
@@ -87,7 +88,9 @@ namespace {
         return options;
     }
 
-    class TemporaryTriggeredInputs final : public ngc::ProductionExecutorIo {
+    class TemporaryTriggeredInputs final
+        : public ngc::ProductionExecutorIo,
+          public ngc::IpcExecutorPolicy {
     public:
         void sampleDigitalInputs(ngc::ProductionExecutorDigitalInputs &inputs) noexcept override {
             inputs.reset();
@@ -100,6 +103,49 @@ namespace {
         }
 
         void applyOutputs(const ngc::ProductionExecutorOutputState &) noexcept override { }
+
+        void prepareExecutionItem(
+            ngc::ExecutionItem &item,
+            const ngc::ExecutionSnapshot &snapshot) noexcept override {
+            m_preparedInputsArmed = false;
+            if (const auto *axisMove =
+                    std::get_if<ngc::TriggeredMove>(&item)) {
+                arm(*axisMove);
+                m_preparedInputsArmed = true;
+            } else if (auto *jointMove =
+                           std::get_if<ngc::TriggeredJointMove>(&item);
+                       jointMove != nullptr
+                       && jointMove->triggers.size != 0) {
+                arm(*jointMove, snapshot.commandedJoints);
+                m_preparedInputsArmed = true;
+            }
+        }
+
+        void executionItemPublished() noexcept override {
+            m_preparedInputsArmed = false;
+        }
+
+        void executionItemRejected() noexcept override {
+            if (m_preparedInputsArmed) {
+                clear();
+            }
+            m_preparedInputsArmed = false;
+        }
+
+        void observeEvent(
+            const ngc::ExecutionEvent &event) noexcept override {
+            if (std::holds_alternative<ngc::TriggeredMoveCompleted>(
+                    event)
+                || std::holds_alternative<
+                    ngc::TriggeredJointMoveCompleted>(event)) {
+                clear();
+            }
+        }
+
+        void observeSnapshot(
+            const ngc::ExecutionSnapshot &snapshot) noexcept override {
+            observe(snapshot);
+        }
 
         void arm(const ngc::TriggeredMove &move) noexcept {
             clear();
@@ -200,6 +246,7 @@ namespace {
         ngc::EpochId m_epoch = 0;
         ngc::ChunkId m_chunk = 0;
         ngc::position_t m_axisTarget{};
+        bool m_preparedInputsArmed = false;
     };
 
     std::unique_ptr<ngc::ProductionExecutorRuntime> makeRuntime(
@@ -226,159 +273,6 @@ namespace {
         return std::make_unique<ngc::ProductionExecutorRuntime>(
             std::move(runtimeConfiguration), std::move(io));
     }
-
-    class IpcExecutorBridge {
-    public:
-        IpcExecutorBridge(ngc::IpcSharedRegion &region,
-                          ngc::ProductionExecutorRuntime &runtime,
-                          ngc::MotionBackend &backend,
-                          TemporaryTriggeredInputs &triggeredInputs)
-            : m_region(region), m_runtime(runtime), m_backend(backend),
-              m_triggeredInputs(triggeredInputs) { }
-
-        bool service(const bool consume) noexcept {
-            auto progressed = publishOutputs();
-            if (consume) {
-                progressed = submitInputs() || progressed;
-            }
-
-            return progressed;
-        }
-
-        [[nodiscard]] std::uint64_t completedControls() const noexcept {
-            return m_completedControls;
-        }
-
-    private:
-        bool publishOutputs() noexcept {
-            auto progressed = false;
-            if (!m_pendingEvent.has_value()) {
-                ngc::ExecutionEvent event;
-                if (m_backend.tryTakeEvent(event)) {
-                    if (std::holds_alternative<ngc::TriggeredMoveCompleted>(event)
-                        || std::holds_alternative<ngc::TriggeredJointMoveCompleted>(event)) {
-                        m_triggeredInputs.clear();
-                    }
-                    m_pendingEvent = event;
-                    progressed = true;
-                }
-            }
-            if (m_pendingEvent.has_value()
-                && ngc::ipcTryPush(m_region.events, *m_pendingEvent)) {
-                if (std::holds_alternative<ngc::RequestCompleted>(
-                        *m_pendingEvent)) {
-                    ++m_completedControls;
-                }
-                m_pendingEvent.reset();
-                progressed = true;
-            }
-
-            if (!m_pendingSnapshot.has_value()) {
-                ngc::ExecutionSnapshot snapshot;
-                if (m_backend.tryTakeSnapshot(snapshot)) {
-                    m_triggeredInputs.observe(snapshot);
-                    m_latestSnapshot = snapshot;
-                    m_pendingSnapshot = snapshot;
-                    progressed = true;
-                }
-            }
-            if (m_pendingSnapshot.has_value()
-                && ngc::ipcTryPush(
-                    m_region.snapshots, *m_pendingSnapshot)) {
-                m_pendingSnapshot.reset();
-                progressed = true;
-            }
-
-            if (!m_pendingTiming.has_value()) {
-                ngc::RealtimeTimingSummary timing;
-                if (m_runtime.tryTakeRealtimeTiming(timing)) {
-                    m_pendingTiming = timing;
-                    progressed = true;
-                }
-            }
-            if (m_pendingTiming.has_value()
-                && ngc::ipcTryPush(
-                    m_region.realtimeTiming, *m_pendingTiming)) {
-                m_pendingTiming.reset();
-                progressed = true;
-            }
-
-            return progressed;
-        }
-
-        bool submitInputs() noexcept {
-            auto progressed = false;
-            if (!m_pendingItem.has_value()) {
-                ngc::ExecutionItem item;
-                if (ngc::ipcTryPop(m_region.executionItems, item)) {
-                    m_pendingItem = item;
-                    progressed = true;
-                }
-            }
-            if (m_pendingItem.has_value()) {
-                const auto *axisMove =
-                    std::get_if<ngc::TriggeredMove>(&*m_pendingItem);
-                auto *jointMove =
-                    std::get_if<ngc::TriggeredJointMove>(&*m_pendingItem);
-                if (!m_pendingInputsArmed && axisMove != nullptr) {
-                    m_triggeredInputs.arm(*axisMove);
-                    m_pendingInputsArmed = true;
-                } else if (!m_pendingInputsArmed && jointMove != nullptr
-                           && jointMove->triggers.size != 0) {
-                    m_triggeredInputs.arm(
-                        *jointMove, m_latestSnapshot.commandedJoints);
-                    m_pendingInputsArmed = true;
-                }
-                const auto result = m_backend.tryPublish(*m_pendingItem);
-                if (result == ngc::PublishResult::Published) {
-                    m_pendingItem.reset();
-                    m_pendingInputsArmed = false;
-                    progressed = true;
-                } else if (result == ngc::PublishResult::Invalid
-                           && !m_pendingEvent.has_value()) {
-                    if (m_pendingInputsArmed) {
-                        m_triggeredInputs.clear();
-                    }
-                    m_pendingEvent = ngc::ChunkRejected{
-                        ngc::execution_item::epoch(*m_pendingItem),
-                        ngc::execution_item::id(*m_pendingItem),
-                    };
-                    m_pendingItem.reset();
-                    m_pendingInputsArmed = false;
-                    progressed = true;
-                }
-            }
-
-            if (!m_pendingControl.has_value()) {
-                ngc::ControlRequest request;
-                if (ngc::ipcTryPop(m_region.controls, request)) {
-                    m_pendingControl = request;
-                    progressed = true;
-                }
-            }
-            if (m_pendingControl.has_value()
-                && m_backend.trySubmit(*m_pendingControl)
-                    == ngc::SubmitResult::Submitted) {
-                m_pendingControl.reset();
-                progressed = true;
-            }
-
-            return progressed;
-        }
-
-        ngc::IpcSharedRegion &m_region;
-        ngc::ProductionExecutorRuntime &m_runtime;
-        ngc::MotionBackend &m_backend;
-        TemporaryTriggeredInputs &m_triggeredInputs;
-        ngc::ExecutionSnapshot m_latestSnapshot;
-        std::optional<ngc::ExecutionItem> m_pendingItem;
-        std::optional<ngc::ControlRequest> m_pendingControl;
-        std::optional<ngc::ExecutionEvent> m_pendingEvent;
-        std::optional<ngc::ExecutionSnapshot> m_pendingSnapshot;
-        std::optional<ngc::RealtimeTimingSummary> m_pendingTiming;
-        std::uint64_t m_completedControls = 0;
-        bool m_pendingInputsArmed = false;
-    };
 
     int run(const Options &options) {
         auto memory = ngc::ipc_detail::SharedMemory::open(
@@ -412,9 +306,9 @@ namespace {
             return 0;
         }
 
-        IpcExecutorBridge bridge(
+        ngc::IpcExecutorBridge bridge(
             region, *runtime, runtime->endpoint(),
-            *triggeredInputsPointer);
+            triggeredInputsPointer);
         const auto started = std::chrono::steady_clock::now();
 
         for (;;) {

@@ -134,8 +134,16 @@ versioned IPC ring into Real session snapshots. Diagnostic backpressure never
 blocks motion. Hardware acquisition and synthetic-input policy remain outside
 the runtime. The runtime is the second backend-conformance target and is paired
 end-to-end with `HomingController`. It is hosted by the external process for
-the configured non-hardware Real target. There is no HAL component or physical
-backend yet. The typed Mesa backend configuration loader shares only generic,
+the configured non-hardware Real target. There is no HAL component.
+`ngc_mesa_backend` is the initial physical executor process: its NRT bootstrap
+loads and cross-validates the typed machine and Mesa configurations, discovers
+and validates the 7I96, compiles the bounded digital-I/O program, constructs
+`MesaProductionExecutorIo`, then starts `ProductionExecutorRuntime` and bridges
+it over the existing production IPC rings without synthetic triggered inputs.
+Loss of the configured external-enable logical input latches a backend fault
+and safe outputs. It is not yet the application's default Real target and has
+not completed staged physical commissioning. The typed Mesa backend
+configuration loader shares only generic,
 source-aware TOML field validation with the frontend machine loader and keeps
 its hardware schema separate. The `ngc_mesa_stepgen_diagnostic` executable
 combines that backend configuration with the authoritative Real servo period,

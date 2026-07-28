@@ -89,12 +89,13 @@ max_velocity = 3.33333333333
 max_acceleration = 5.1
 max_jerk = 101
 
-# Stable logical input IDs. A future physical backend will map these names and
-# IDs to hardware; simulation supplies mock transitions without hardware data.
+# Stable logical input IDs. The physical backend maps these names and IDs to
+# hardware; Simulation supplies mock transitions without hardware data.
 [digital_inputs]
 tool_probe = 0
 shared_home = 1
 y2_home = 2
+external_enable = 3
 
 [probing]
 input = "tool_probe"

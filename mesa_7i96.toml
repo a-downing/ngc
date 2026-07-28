@@ -1,6 +1,7 @@
 # Physical-backend configuration derived from my_LinuxCNC_machine. The typed
-# NRT loader and active StepGen board diagnostic consume this schema; the
-# production physical-backend process does not exist yet.
+# NRT loader, active StepGen board diagnostic, and initial physical-backend
+# process consume this schema. The physical process is not yet the
+# application's default Real target or physically commissioned.
 #
 # Machine topology, trajectory behavior, limits, homing positions, logical
 # input identities, the authoritative servo period, and real-time host policy
@@ -20,7 +21,7 @@ watchdog_timeout = 0.005
 #   in0 = tool_probe
 #   in1 = shared_home
 #   in2 = y2_home
-#   in3 = external_enable (proposed; not yet declared in machine.toml)
+#   in3 = external_enable
 #
 # The LinuxCNC configuration maps:
 #   gpio.001.in_not -> shared home
@@ -45,6 +46,10 @@ debounce in0, r2, 10ms
 
 not in2, fieldin5
 """
+
+[motion.safety]
+enable_input = "external_enable"
+enable_level = true
 
 # These are the units of the physical mechanism and do not depend on the
 # machine.toml internal machine unit. The NRT bootstrap converts each
@@ -127,10 +132,10 @@ maximum_generated_step_error = 2.0
 # remove small host/FPGA phase discrepancies. More than two generated steps of
 # disagreement is a fault rather than a request for aggressive catch-up.
 #
-# GPIO 2 is an enable-permission input in the existing wiring. Publishing it as
-# in3 does not yet make it safety-functional: the production executor still
-# needs a typed safety-input rule that establishes a fault and safe outputs
-# when external_enable becomes inactive.
+# GPIO 2 is an enable-permission input in the existing wiring. The physical
+# executor requires in3 to remain active and latches a fault with safe outputs
+# when it becomes inactive. This userspace interlock does not replace the
+# machine's hardwired E-stop, STO/drive-enable chain, or Mesa watchdog.
 #
 # The generic HostMot2 cyclic layer and active board diagnostic implement this
 # DPLL behavior. The diagnostic combines this file with machine.toml's

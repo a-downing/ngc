@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <span>
 #include <string>
 
@@ -25,10 +26,17 @@ namespace ngc::mesa {
         double maximumGeneratedStepError = 0.0;
     };
 
+    struct MesaExecutorSafetyInput {
+        DigitalInputId input = 0;
+        bool requiredLevel = true;
+    };
+
     inline constexpr std::uint32_t
         MESA_STEPGEN_ALIGNMENT_FAULT = 0x4D53'0100;
     inline constexpr std::uint32_t
         MESA_STEPGEN_FOLLOWING_ERROR_FAULT = 0x4D53'0101;
+    inline constexpr std::uint32_t
+        MESA_EXTERNAL_ENABLE_FAULT = 0x4D53'0102;
 
     class MesaProductionExecutorIo final : public ProductionExecutorIo {
     public:
@@ -38,7 +46,9 @@ namespace ngc::mesa {
             std::unique_ptr<HostMot2CyclicIo> io,
             DigitalIoProgram ioProgram,
             std::span<const MesaStepGeneratorMapping>
-                stepGenerators = {});
+                stepGenerators = {},
+            std::optional<MesaExecutorSafetyInput>
+                safetyInput = std::nullopt);
 
         void sampleDigitalInputs(
             ProductionExecutorDigitalInputs &inputs) noexcept override;
@@ -54,7 +64,9 @@ namespace ngc::mesa {
             std::unique_ptr<HostMot2CyclicIo> io,
             DigitalIoProgram ioProgram,
             std::span<const MesaStepGeneratorMapping>
-                stepGenerators) noexcept;
+                stepGenerators,
+            std::optional<MesaExecutorSafetyInput>
+                safetyInput) noexcept;
 
         std::unique_ptr<HostMot2CyclicIo> m_io;
         DigitalIoProgram m_ioProgram;
@@ -62,6 +74,7 @@ namespace ngc::mesa {
             MesaStepGeneratorMapping,
             MAX_JOINTS> m_stepGenerators{};
         std::size_t m_stepGeneratorCount = 0;
+        std::optional<MesaExecutorSafetyInput> m_safetyInput;
         HostMot2CyclicOutputImage m_pendingOutputs;
         JointMotionState m_lastCommandedJoints;
         std::array<std::int64_t, MAX_JOINTS>

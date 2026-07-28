@@ -112,6 +112,11 @@ namespace ngc::mesa {
             if (dpll == nullptr) {
                 return std::unexpected(tableError);
             }
+            const auto *safety = requiredTable(
+                *motion, "safety", path, tableError);
+            if (safety == nullptr) {
+                return std::unexpected(tableError);
+            }
             const auto *stepGeneratorsNode =
                 motion->get("stepgens");
             const auto *stepGenerators =
@@ -160,6 +165,12 @@ namespace ngc::mesa {
             const auto dpllConvergence =
                 toml_configuration::integer(
                     *dpll, "convergence_cycles", path);
+            const auto enableInput =
+                toml_configuration::requiredString(
+                    *safety, "enable_input", path);
+            const auto enableLevel =
+                toml_configuration::requiredBool(
+                    *safety, "enable_level", path);
             const std::array required{
                 driver.has_value(), address.has_value(),
                 expectedBoard.has_value(), ioProgram.has_value(),
@@ -170,6 +181,7 @@ namespace ngc::mesa {
                 dpllEnabled.has_value(), dpllTimer.has_value(),
                 dpllOffset.has_value(), dpllMaximumPhase.has_value(),
                 dpllConvergence.has_value(),
+                enableInput.has_value(), enableLevel.has_value(),
             };
             if (!std::ranges::all_of(
                     required, [](const bool value) {
@@ -185,6 +197,7 @@ namespace ngc::mesa {
                     dpllEnabled.error_or({}), dpllTimer.error_or({}),
                     dpllOffset.error_or({}), dpllMaximumPhase.error_or({}),
                     dpllConvergence.error_or({}),
+                    enableInput.error_or({}), enableLevel.error_or({}),
                 };
                 const auto found = std::ranges::find_if(
                     errors, [](const std::string &value) {
@@ -249,6 +262,10 @@ namespace ngc::mesa {
                     .convergenceCycles =
                         static_cast<std::uint32_t>(
                             *dpllConvergence),
+                },
+                .safety = {
+                    .enableInput = *enableInput,
+                    .enableLevel = *enableLevel,
                 },
                 .stepGenerators = {},
             };

@@ -565,6 +565,9 @@ namespace {
                     .stepGeneratorSampleOffsetNanoseconds == -500'000
                 && configuration->dpll
                     .maximumPhaseErrorNanoseconds == 400'000
+                && configuration->safety.enableInput
+                    == "external_enable"
+                && configuration->safety.enableLevel
                 && configuration->stepGenerators.size() == 4,
                 "proposed Mesa backend configuration did not load");
         const std::array expectedChannels{
@@ -1487,7 +1490,11 @@ namespace {
             },
         };
         auto adapter = ngc::mesa::MesaProductionExecutorIo::create(
-            std::move(io), std::move(*program), mappings);
+            std::move(io), std::move(*program), mappings,
+            ngc::mesa::MesaExecutorSafetyInput{
+                .input = 0,
+                .requiredLevel = true,
+            });
         require(adapter.has_value(),
                 "valid Mesa executor I/O adapter was rejected");
 
@@ -1566,6 +1573,50 @@ namespace {
                 && !(*adapter)->pendingOutputs().stepGeneratorsEnabled
                 && !(*adapter)->pendingOutputs().digitalOutputsEnabled,
                 "Mesa executor I/O did not latch its fault and stage safe outputs");
+    }
+
+    void testExternalEnableLossFaultsMesaExecutorIo() {
+        DatagramFixtureTransport transport;
+        auto io = sevenI96CyclicIo(transport, false);
+        auto response = transport.queueResponse(10);
+        putCyclicConfirmation(response, 0, 1, 1);
+
+        constexpr std::array<ngc::DigitalInputId, 1> logicalInput{3};
+        constexpr std::array<ngc::DigitalOutputId, 0> logicalOutputs{};
+        auto program = ngc::DigitalIoProgram::compile(
+            "mov in3, fieldin2",
+            11, logicalInput, 0, logicalOutputs, 0.001);
+        require(program.has_value(),
+                "external-enable digital I/O program did not compile");
+        auto adapter = ngc::mesa::MesaProductionExecutorIo::create(
+            std::move(io), std::move(*program), {},
+            ngc::mesa::MesaExecutorSafetyInput{
+                .input = 3,
+                .requiredLevel = true,
+            });
+        require(adapter.has_value(),
+                "external-enable Mesa executor adapter was rejected");
+
+        response = transport.response(46);
+        putCyclicConfirmation(response, 36, 2, 2);
+        auto inputs = ngc::ProductionExecutorDigitalInputs{};
+        inputs.set();
+
+        (*adapter)->sampleDigitalInputs(inputs);
+        auto outputs = ngc::ProductionExecutorOutputState{
+            .digitalOutputs = {},
+            .executorEnabled = true,
+        };
+        (*adapter)->applyOutputs(outputs);
+
+        require(
+            (*adapter)->faultCode()
+                    == ngc::mesa::MESA_EXTERNAL_ENABLE_FAULT
+                && inputs.none()
+                && !(*adapter)->pendingOutputs().watchdogEnabled
+                && !(*adapter)->pendingOutputs().stepGeneratorsEnabled
+                && !(*adapter)->pendingOutputs().digitalOutputsEnabled,
+            "inactive external enable did not latch safe Mesa outputs");
     }
 
     void testRebasesStationaryMesaCoordinatesAndFaultsFollowingError() {
@@ -1766,6 +1817,7 @@ int main() {
         testExecutesBoundedDigitalIoProgram();
         testRejectsInvalidDigitalIoPrograms();
         testBridgesMesaInputsAndStepGeneratorsToExecutorIo();
+        testExternalEnableLossFaultsMesaExecutorIo();
         testRebasesStationaryMesaCoordinatesAndFaultsFollowingError();
         testMesaAccumulatorFeedbackPreventsCumulativeJitterDrift();
     } catch (const std::exception &error) {
