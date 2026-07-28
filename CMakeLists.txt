@@ -64,7 +64,9 @@ ngc_target_defaults(ngc_core)
 
 add_library(ngc_mesa STATIC
         src/mesa/HostMot2Discovery.cpp
-        src/mesa/Lbp16UdpTransport.cpp)
+        src/mesa/HostMot2Latency.cpp
+        src/mesa/Lbp16UdpTransport.cpp
+        src/mesa/SevenI96Capabilities.cpp)
 target_include_directories(ngc_mesa PUBLIC src/include)
 if(WIN32)
     target_link_libraries(ngc_mesa PRIVATE ws2_32)
@@ -164,6 +166,10 @@ ngc_target_defaults(ngc_simulation_diagnostic)
 add_executable(ngc_mesa_discover tools/ngc_mesa_discover.cpp)
 target_link_libraries(ngc_mesa_discover PRIVATE ngc_mesa)
 ngc_target_defaults(ngc_mesa_discover)
+
+add_executable(ngc_mesa_latency tools/ngc_mesa_latency.cpp)
+target_link_libraries(ngc_mesa_latency PRIVATE ngc_mesa)
+ngc_target_defaults(ngc_mesa_latency)
 
 add_executable(ngc_g64_geometry_export tools/ngc_g64_geometry_export.cpp)
 target_include_directories(ngc_g64_geometry_export PRIVATE src)

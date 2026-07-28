@@ -1101,10 +1101,17 @@ held state.
 - Begin with a read-only discovery/IDROM and cyclic-latency utility. The
   reusable `ngc_mesa` UDP/LBP16 register transport, typed HostMot2
   cookie/IDROM/module/pin discovery, fixture tests, and thin
-  `ngc_mesa_discover` executable are complete. The transport deliberately
-  exposes no write operation in this first slice. Cyclic-latency measurement
-  remains.
-- Add typed 7I96 HostMot2 discovery and capability validation.
+  `ngc_mesa_discover` executable are complete. The reusable latency
+  measurement and thin `ngc_mesa_latency` executable perform absolute-period
+  cookie reads, summarize round-trip and wake lateness, and count transport,
+  content, and missed-period anomalies. The transport deliberately exposes no
+  write operation in this first slice. Complete.
+- Add typed 7I96 HostMot2 discovery and capability validation. Complete. The
+  validator checks the supported IDROM topology, required module versions,
+  register layouts, clocks and strides, fixed isolated-I/O and
+  step/direction/encoder pin functions, and unique in-range selections from
+  typed backend configuration. The read-only discovery utility exercises the
+  same validation against hardware with `--validate-7i96`.
 - Add cyclic input, step-generator, output, watchdog, packet-sequence, and fault
   handling behind a transport interface.
 - Validate on a dedicated Linux RT host and NIC before enabling outputs.

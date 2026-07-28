@@ -118,17 +118,45 @@ Build and run NGC's read-only HostMot2 discovery utility with:
 
 ```bash
 cmake --build build --target ngc_mesa_discover
-./build/ngc_mesa_discover --address 10.10.10.10
+./build/ngc_mesa_discover \
+    --address 10.10.10.10 \
+    --validate-7i96
 ```
 
 The utility and the future physical backend share the `ngc_mesa` library's
 UDP/LBP16 transport, IDROM parser, module and pin descriptor parser, and typed
-capability model. The utility exposes no register-write operation. Compare its
-inventory with MesaFlash while bringing up a board:
+capability model. `--validate-7i96` additionally requires the supported 7I96
+IDROM topology, DPLL, watchdog, I/O-port, StepGen, encoder, and SSR module
+versions and layouts together with the five step/direction pairs, eleven
+isolated inputs, six isolated outputs, and encoder pins. The validator also
+accepts backend-selected channels and pins through its typed API so duplicate
+or out-of-range physical mappings fail during NRT startup. The utility exposes
+no register-write operation. Compare its inventory with MesaFlash while
+bringing up a board:
 
 ```bash
 mesaflash --device 7i96 --addr 10.10.10.10 --readhmid
 ```
+
+Build and run the read-only cyclic-latency utility with:
+
+```bash
+cmake --build build --target ngc_mesa_latency
+./build/ngc_mesa_latency \
+    --address 10.10.10.10 \
+    --samples 10000 \
+    --period-us 1000 \
+    --timeout-ms 10
+```
+
+The utility first validates HostMot2 discovery, then reads the cookie register
+at absolute periodic deadlines. It reports round-trip and host wake-lateness
+minimum, mean, p50, p95, p99, and maximum values, together with read failures,
+unexpected cookie contents, and periods skipped after an overrun. Exit status
+2 means the run completed but observed a read failure or content mismatch.
+This is an NRT link and scheduler diagnostic. It does not enable outputs,
+service the watchdog, exercise packet sequencing, prove RT cyclic I/O, or
+commission physical motion.
 
 ## VistaCNC P2-S access
 

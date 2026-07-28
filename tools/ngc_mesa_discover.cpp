@@ -10,11 +10,13 @@
 
 #include "mesa/HostMot2Discovery.h"
 #include "mesa/Lbp16UdpTransport.h"
+#include "mesa/SevenI96Capabilities.h"
 
 namespace {
     struct Options {
         std::string address;
         std::chrono::milliseconds timeout{250};
+        bool validateSevenI96 = false;
     };
 
     std::uint32_t parseUnsigned(
@@ -47,6 +49,8 @@ namespace {
 
             if (option == "--address") {
                 result.address = value();
+            } else if (option == "--validate-7i96") {
+                result.validateSevenI96 = true;
             } else if (option == "--timeout-ms") {
                 const auto milliseconds =
                     parseUnsigned(value(), "--timeout-ms");
@@ -139,6 +143,21 @@ int main(const int argc, char **argv) {
         }
 
         printInventory(*inventory);
+        if (options.validateSevenI96) {
+            const auto capabilities =
+                ngc::mesa::validateSevenI96Capabilities(*inventory);
+            if (!capabilities) {
+                throw std::runtime_error(capabilities.error());
+            }
+            std::println(
+                "\nValidated 7I96 capabilities: {} StepGen channels, "
+                "{} isolated inputs, {} isolated outputs, "
+                "{} encoder channel, watchdog and DPLL",
+                capabilities->stepGenerators.size(),
+                capabilities->isolatedInputPins.size(),
+                capabilities->isolatedOutputPins.size(),
+                capabilities->encoder.descriptor.instances);
+        }
     } catch (const std::exception &error) {
         std::cerr << "Mesa discovery failed: "
                   << error.what() << '\n';
