@@ -707,7 +707,11 @@ hardware implementation owns a bounded-timeout Linux serial transport,
 establishes stop before reading PD004, PD005, PD011, and PD141 through PD144,
 validates every response, writes frequency before run direction, and polls
 output frequency and current. The current configuration keeps the spindle
-disabled. Broader status presentation and physical commissioning remain.
+disabled. The standalone `ngc_huanyang_spindle_diagnostic` opens that disabled
+role explicitly for commissioning. It is stop-only by default, reports the
+validated stored setup, and requires `--command-test-speed` before performing
+CW, Stop-to-zero, CCW, and Stop-to-zero phases. Broader status presentation and
+physical commissioning remain.
 
 Frontend loss causes the executor to select a proved constrained-stop path
 rather than continue indefinitely. Backend-process or host loss is covered by
@@ -1232,7 +1236,8 @@ held state.
   spindle-status presentation, application-default selection, and physical
   commissioning remain. The Huanyang NRT serial/protocol implementation is
   complete behind the spindle-hardware boundary but remains disabled and has
-  not been exercised against physical hardware.
+  not been exercised against physical hardware. Its standalone diagnostic and
+  pseudo-terminal transport tests are complete.
 - Validate on a dedicated Linux RT host and NIC before enabling outputs.
 
 ### Phase 12: Staged physical commissioning

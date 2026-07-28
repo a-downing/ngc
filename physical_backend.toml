@@ -1,7 +1,7 @@
 # Physical-backend configuration derived from my_LinuxCNC_machine. It composes
 # independent Mesa motion and Huanyang spindle roles. The typed NRT loader,
-# active StepGen board diagnostic, and initial physical-backend process consume
-# this schema. The physical process is not yet the
+# active StepGen board diagnostic, Huanyang spindle diagnostic, and initial
+# physical-backend process consume this schema. The physical process is not yet the
 # application's default Real target or physically commissioned.
 #
 # Machine topology, trajectory behavior, limits, homing positions, logical

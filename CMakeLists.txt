@@ -246,6 +246,20 @@ target_link_libraries(
     PRIVATE ngc_core ngc_mesa_configuration)
 ngc_target_defaults(ngc_mesa_stepgen_diagnostic)
 
+add_executable(
+    ngc_huanyang_spindle_diagnostic
+    tools/ngc_huanyang_spindle_diagnostic.cpp)
+target_link_libraries(
+    ngc_huanyang_spindle_diagnostic
+    PRIVATE ngc_spindle_huanyang)
+ngc_target_defaults(ngc_huanyang_spindle_diagnostic)
+add_test(
+    NAME ngc_huanyang_spindle_configuration
+    COMMAND ngc_huanyang_spindle_diagnostic
+        --backend-configuration
+            ${CMAKE_SOURCE_DIR}/physical_backend.toml
+        --validate-config-only)
+
 add_executable(ngc_mesa_backend tools/ngc_mesa_backend.cpp)
 target_include_directories(ngc_mesa_backend PRIVATE src)
 target_link_libraries(

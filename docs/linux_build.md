@@ -203,6 +203,43 @@ This write-capable bare-board test configures Mesa, services the watchdog,
 enables and disables the executor, and requires zero commanded joint motion.
 Run it only with no drives, motors, spindle, or other outputs connected.
 
+Build the standalone Huanyang commissioning diagnostic with:
+
+```bash
+cmake --build build --target ngc_huanyang_spindle_diagnostic
+```
+
+Its default path opens the configured serial device, immediately establishes
+Stop, reads and reports PD004, PD005, PD011, and PD141 through PD144, waits for
+reported zero speed, and polls output speed and current without commanding Run:
+
+```bash
+./build/ngc_huanyang_spindle_diagnostic \
+    --backend-configuration physical_backend.toml \
+    --samples 20
+```
+
+This intentionally opens the configured spindle role even though production
+configuration keeps it disabled. Use the default path first with the motor
+disconnected. A software Stop is not a substitute for verified hardwired
+E-stop, STO, contactor, and drive-enable behavior.
+
+Only after those physical protections are verified, opt into a bounded
+direction test by supplying a speed:
+
+```bash
+./build/ngc_huanyang_spindle_diagnostic \
+    --backend-configuration physical_backend.toml \
+    --command-test-speed 6000 \
+    --command-duration-ms 1000 \
+    --stop-timeout-ms 5000
+```
+
+That path commands CW, requires reported zero speed after Stop, commands CCW,
+and again requires reported zero speed after Stop. Interruption and all normal
+destruction paths attempt Stop. The diagnostic remains uncommissioned until its
+behavior is captured against the physical USB-to-RS-485 adapter and VFD.
+
 ## VistaCNC P2-S access
 
 The Linux transport uses HIDAPI's hidraw backend. Install the supplied udev

@@ -81,6 +81,10 @@ namespace ngc::physical {
         : m_configuration(std::move(configuration)),
           m_transport(std::move(transport)) { }
 
+    HuanyangSpindleHardware::~HuanyangSpindleHardware() {
+        safeStop();
+    }
+
     bool HuanyangSpindleHardware::initialize() noexcept {
         if (!writeControl(CONTROL_STOP)) {
             return false;
@@ -110,20 +114,29 @@ namespace ngc::physical {
             return false;
         }
 
-        m_maximumFrequency = maximumFrequency * 0.01;
-        m_minimumFrequency = minimumFrequency * 0.01;
-        const auto base = baseFrequency * 0.01;
-        m_ratedMaximumSpeed =
-            ratedSpeedAt50Hz / 50.0 * m_maximumFrequency;
-        if (!finitePositive(base)
-            || !finitePositive(m_maximumFrequency)
-            || !std::isfinite(m_minimumFrequency)
-            || m_minimumFrequency < 0.0
-            || m_minimumFrequency > m_maximumFrequency
+        m_setup = {
+            .baseFrequency = baseFrequency * 0.01,
+            .maximumFrequency = maximumFrequency * 0.01,
+            .minimumFrequency = minimumFrequency * 0.01,
+            .ratedVoltage = ratedVoltage * 0.1,
+            .ratedCurrent = ratedCurrent * 0.1,
+            .motorPoles = motorPoles,
+            .ratedSpeedAt50Hz =
+                static_cast<double>(ratedSpeedAt50Hz),
+            .ratedMaximumSpeed =
+                ratedSpeedAt50Hz / 50.0
+                * (maximumFrequency * 0.01),
+        };
+        if (!finitePositive(m_setup.baseFrequency)
+            || !finitePositive(m_setup.maximumFrequency)
+            || !std::isfinite(m_setup.minimumFrequency)
+            || m_setup.minimumFrequency < 0.0
+            || m_setup.minimumFrequency
+                > m_setup.maximumFrequency
             || ratedVoltage == 0
             || ratedCurrent == 0
             || motorPoles == 0
-            || !finitePositive(m_ratedMaximumSpeed)) {
+            || !finitePositive(m_setup.ratedMaximumSpeed)) {
             return false;
         }
 
@@ -146,11 +159,11 @@ namespace ngc::physical {
         }
 
         const auto requestedFrequency =
-            desired.speed / m_ratedMaximumSpeed
-            * m_maximumFrequency;
+            desired.speed / m_setup.ratedMaximumSpeed
+            * m_setup.maximumFrequency;
         const auto limitedFrequency = std::clamp(
-            requestedFrequency, m_minimumFrequency,
-            m_maximumFrequency);
+            requestedFrequency, m_setup.minimumFrequency,
+            m_setup.maximumFrequency);
         const auto hundredths = std::llround(
             limitedFrequency * 100.0);
         if (hundredths <= 0
@@ -185,8 +198,8 @@ namespace ngc::physical {
 
         const auto outputFrequency = frequency * 0.01;
         const auto speed =
-            outputFrequency / m_maximumFrequency
-            * m_ratedMaximumSpeed;
+            outputFrequency / m_setup.maximumFrequency
+            * m_setup.ratedMaximumSpeed;
         auto atSpeed = false;
         if (m_desired.enabled
             && finitePositive(m_desired.speed)) {
@@ -208,6 +221,11 @@ namespace ngc::physical {
     void HuanyangSpindleHardware::safeStop() noexcept {
         static_cast<void>(writeControl(CONTROL_STOP));
         m_desired = {};
+    }
+
+    const HuanyangSpindleSetup &
+    HuanyangSpindleHardware::setup() const noexcept {
+        return m_setup;
     }
 
     bool HuanyangSpindleHardware::readParameter(

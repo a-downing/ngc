@@ -15,6 +15,17 @@ namespace ngc::physical {
     [[nodiscard]] std::uint16_t huanyangCrc16(
         std::span<const std::uint8_t> bytes) noexcept;
 
+    struct HuanyangSpindleSetup {
+        double baseFrequency = 0.0;
+        double maximumFrequency = 0.0;
+        double minimumFrequency = 0.0;
+        double ratedVoltage = 0.0;
+        double ratedCurrent = 0.0;
+        std::uint16_t motorPoles = 0;
+        double ratedSpeedAt50Hz = 0.0;
+        double ratedMaximumSpeed = 0.0;
+    };
+
     class HuanyangSpindleHardware final : public SpindleHardware {
     public:
         [[nodiscard]] static std::expected<
@@ -22,12 +33,15 @@ namespace ngc::physical {
         create(
             const HuanyangSpindleConfiguration &configuration,
             std::unique_ptr<SerialTransport> transport);
+        ~HuanyangSpindleHardware() override;
 
         [[nodiscard]] bool applyDesired(
             const SpindleEvent &desired) noexcept override;
         [[nodiscard]] bool pollStatus(
             SpindleHardwareStatus &status) noexcept override;
         void safeStop() noexcept override;
+        [[nodiscard]] const HuanyangSpindleSetup &setup()
+            const noexcept;
 
     private:
         HuanyangSpindleHardware(
@@ -53,10 +67,8 @@ namespace ngc::physical {
 
         HuanyangSpindleConfiguration m_configuration;
         std::unique_ptr<SerialTransport> m_transport;
+        HuanyangSpindleSetup m_setup;
         SpindleEvent m_desired{};
-        double m_maximumFrequency = 0.0;
-        double m_minimumFrequency = 0.0;
-        double m_ratedMaximumSpeed = 0.0;
     };
 
     [[nodiscard]] std::expected<

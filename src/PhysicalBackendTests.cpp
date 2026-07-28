@@ -14,6 +14,13 @@
 #include <string_view>
 #include <thread>
 
+#ifdef __linux__
+#include <cstdlib>
+#include <fcntl.h>
+#include <poll.h>
+#include <unistd.h>
+#endif
+
 #include "machine/PhysicalProductionExecutorIo.h"
 #include "physical/HuanyangSpindleHardware.h"
 #include "physical/PhysicalBackendConfiguration.h"
@@ -398,6 +405,17 @@ namespace {
             observation->control == 0x08
                 && observation->parameterReads == 7,
             "Huanyang initialization did not stop and read setup");
+        const auto &setup = (*hardware)->setup();
+        require(
+            setup.baseFrequency == 400.0
+                && setup.maximumFrequency == 400.0
+                && setup.minimumFrequency == 10.0
+                && setup.ratedVoltage == 220.0
+                && setup.ratedCurrent == 10.0
+                && setup.motorPoles == 2
+                && setup.ratedSpeedAt50Hz == 3000.0
+                && setup.ratedMaximumSpeed == 24000.0,
+            "Huanyang setup values were scaled incorrectly");
 
         require(
             (*hardware)->applyDesired({
@@ -484,6 +502,102 @@ namespace {
             observation->control == 0x08,
             "failed Huanyang safe stop changed prior safe state");
     }
+
+#ifdef __linux__
+    void testPosixSerialTransportWithPseudoTerminal() {
+        const auto master = posix_openpt(
+            O_RDWR | O_NOCTTY | O_CLOEXEC);
+        require(master >= 0, "failed to open pseudo-terminal");
+        require(
+            grantpt(master) == 0 && unlockpt(master) == 0,
+            "failed to prepare pseudo-terminal");
+        const auto *slaveName = ptsname(master);
+        require(
+            slaveName != nullptr,
+            "failed to resolve pseudo-terminal slave");
+
+        auto configuration = huanyangConfiguration();
+        configuration.device = slaveName;
+        auto transport = ngc::physical::openSerialTransport(
+            configuration, 50ms);
+        require(
+            transport.has_value(),
+            transport.error_or(
+                "failed to open pseudo-terminal transport"));
+
+        const std::array request{
+            std::uint8_t{1}, std::uint8_t{3},
+            std::uint8_t{1}, std::uint8_t{8},
+            std::uint8_t{0xF1}, std::uint8_t{0x8E},
+        };
+        auto responderSucceeded = std::atomic<bool>{false};
+        auto responder = std::thread([&] {
+            auto descriptor = pollfd{
+                .fd = master,
+                .events = POLLIN,
+                .revents = 0,
+            };
+            if (poll(&descriptor, 1, 1000) <= 0) {
+                return;
+            }
+            auto received =
+                std::array<std::uint8_t, request.size()>{};
+            const auto count = read(
+                master, received.data(), received.size());
+            if (count != static_cast<ssize_t>(received.size())
+                || received != request) {
+                return;
+            }
+            auto response = std::array<std::uint8_t, 6>{
+                1, 3, 1, 8, 0, 0,
+            };
+            const auto crc = ngc::physical::huanyangCrc16(
+                std::span(response).first(4));
+            response[4] = static_cast<std::uint8_t>(crc);
+            response[5] =
+                static_cast<std::uint8_t>(crc >> 8);
+            if (write(
+                    master, response.data(), response.size())
+                == static_cast<ssize_t>(response.size())) {
+                responderSucceeded.store(
+                    true, std::memory_order_release);
+            }
+        });
+
+        auto response = std::array<std::uint8_t, 8>{};
+        auto responseSize = std::size_t{0};
+        const auto exchanged = (*transport)->exchange(
+            request, response, responseSize);
+        responder.join();
+        require(
+            exchanged
+                && responderSucceeded.load(
+                    std::memory_order_acquire)
+                && responseSize == 6
+                && response[0] == 1
+                && response[1] == 3
+                && response[2] == 1
+                && response[3] == 8,
+            "pseudo-terminal serial exchange failed");
+
+        const auto timeoutStart =
+            std::chrono::steady_clock::now();
+        require(
+            !(*transport)->exchange(
+                request, response, responseSize),
+            "serial transport did not time out");
+        require(
+            std::chrono::steady_clock::now() - timeoutStart
+                < 500ms,
+            "serial timeout exceeded its bound");
+
+        close(master);
+        require(
+            !(*transport)->exchange(
+                request, response, responseSize),
+            "serial transport accepted a disconnected peer");
+    }
+#endif
 }
 
 int main() {
@@ -493,6 +607,9 @@ int main() {
         testSpindleCommunicationFailureEstablishesSafeStop();
         testHuanyangCrcAndProtocolScaling();
         testHuanyangRejectsInvalidResponsesAndCommands();
+#ifdef __linux__
+        testPosixSerialTransportWithPseudoTerminal();
+#endif
     } catch (const std::exception &error) {
         std::println(
             stderr, "physical backend test failed: {}",

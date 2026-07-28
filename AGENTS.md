@@ -156,7 +156,12 @@ PD011, and PD141 through PD144. Commands write bounded frequency before
 forward/reverse control, status polling reports scaled speed and current, and
 every response is checked for slave, function, payload length, echoed selector
 or command, and CRC. The configured spindle remains disabled pending physical
-commissioning.
+commissioning. `ngc_huanyang_spindle_diagnostic` is the standalone NRT
+commissioning boundary. Its default operation establishes Stop, reports the
+validated setup parameters, and polls status without commanding Run. Only the
+explicit `--command-test-speed` path performs bounded CW, Stop-to-zero, CCW,
+and Stop-to-zero phases. Signal interruption, normal destruction, and failures
+attempt the safe spindle stop.
 The process discovers and validates the 7I96, compiles the bounded digital-I/O
 program, constructs `MesaProductionExecutorIo`, then starts
 `ProductionExecutorRuntime` and bridges it over the existing production IPC
