@@ -565,9 +565,12 @@ namespace {
                     .stepGeneratorSampleOffsetNanoseconds == -500'000
                 && configuration->dpll
                     .maximumPhaseErrorNanoseconds == 400'000
-                && configuration->safety.enableInput
+                && configuration->safety.has_value()
+                && configuration->safety->enableInput
                     == "external_enable"
-                && configuration->safety.enableLevel
+                && configuration->safety->polarity
+                    == ngc::mesa::MesaSafetyPolarity::ActiveLow
+                && configuration->fieldInputs.size() == 5
                 && configuration->stepGenerators.size() == 4,
                 "proposed Mesa backend configuration did not load");
         const std::array expectedChannels{
@@ -924,6 +927,7 @@ namespace {
         const auto ssrData = findRequestWrite(request, 0x7D00);
         const auto ssrRate = findRequestWrite(request, 0x7E00);
         const auto watchdogTimer = findRequestWrite(request, 0x0C00);
+        const auto watchdogStatus = findRequestWrite(request, 0x0D00);
         const auto watchdogReset = findRequestWrite(request, 0x0E00);
         const auto dataDirection = findRequestWrite(request, 0x1100);
 
@@ -967,6 +971,7 @@ namespace {
                 && littleEndian32(ssrRate.data) == 0,
                 "safe initialization enabled an SSR output");
         require(littleEndian32(watchdogTimer.data) == 0x8000'0000
+                && littleEndian32(watchdogStatus.data) == 0
                 && littleEndian32(watchdogReset.data) == 0x5A00'0000,
                 "safe initialization encoded incorrect watchdog state");
     }
@@ -1269,16 +1274,25 @@ namespace {
         putLittleEndian32(response.subspan(32), 1);
         putCyclicConfirmation(response, 36, 2, 2);
 
-        const auto watchdogFault = watchdogIo->cycle({});
+        const auto disabledResult = watchdogIo->cycle({});
+        response = watchdogTransport.response(46);
+        putLittleEndian32(response.subspan(32), 1);
+        putCyclicConfirmation(response, 36, 3, 3);
+        auto enabled = ngc::mesa::HostMot2CyclicOutputImage{};
+        enabled.watchdogEnabled = true;
+        const auto watchdogFault = watchdogIo->cycle(enabled);
         const auto repeatedWatchdogFault = watchdogIo->cycle({});
 
         require(
-            watchdogFault.fault
+            disabledResult.fault
+                    == ngc::mesa::HostMot2CyclicIoFault::None
+                && disabledResult.inputsValid
+                && watchdogFault.fault
                 == ngc::mesa::HostMot2CyclicIoFault::WatchdogTripped
                 && repeatedWatchdogFault.fault
                     == ngc::mesa::HostMot2CyclicIoFault::WatchdogTripped
                 && !watchdogFault.inputsValid,
-            "HostMot2 watchdog fault was not latched");
+            "HostMot2 watchdog state was not gated and latched correctly");
 
         DatagramFixtureTransport invalidTransport;
         auto invalidIo = sevenI96CyclicIo(invalidTransport);
@@ -1314,18 +1328,51 @@ namespace {
         constexpr std::array<ngc::DigitalOutputId, 2> declaredOutputs{
             3, 4,
         };
+        constexpr std::array symbols{
+            ngc::DigitalIoSymbol{
+                .name = "probe_field",
+                .kind = ngc::DigitalIoSymbolKind::FieldInput,
+                .id = 0,
+            },
+            ngc::DigitalIoSymbol{
+                .name = "probe",
+                .kind = ngc::DigitalIoSymbolKind::LogicalInput,
+                .id = 0,
+            },
+            ngc::DigitalIoSymbol{
+                .name = "shared_home",
+                .kind = ngc::DigitalIoSymbolKind::LogicalInput,
+                .id = 1,
+            },
+            ngc::DigitalIoSymbol{
+                .name = "y2_home",
+                .kind = ngc::DigitalIoSymbolKind::LogicalInput,
+                .id = 2,
+            },
+            ngc::DigitalIoSymbol{
+                .name = "spindle_enable",
+                .kind = ngc::DigitalIoSymbolKind::LogicalOutput,
+                .id = 3,
+            },
+            ngc::DigitalIoSymbol{
+                .name = "coolant",
+                .kind = ngc::DigitalIoSymbolKind::LogicalOutput,
+                .id = 4,
+            },
+        };
         auto program = ngc::DigitalIoProgram::compile(
             R"PROGRAM(
-                not r0, fieldin0
+                not r0, probe_field
                 mov r1, fieldin1
                 and r2, r0, r1
-                debounce in0, r2, 3ms
-                or in1, fieldin0, fieldin1
-                xor in2, fieldin0, fieldin1
-                not fieldout0, out3
-                mov fieldout1, out4
+                debounce probe, r2, 3ms
+                or shared_home, fieldin0, fieldin1
+                xor y2_home, fieldin0, fieldin1
+                not fieldout0, spindle_enable
+                mov fieldout1, coolant
             )PROGRAM",
-            2, logicalInputs, 2, declaredOutputs, 0.001);
+            2, logicalInputs, 2, declaredOutputs, 0.001,
+            symbols);
         require(program.has_value()
                 && program->instructionCount() == 8
                 && program->fieldInputCount() == 2
@@ -1379,6 +1426,35 @@ namespace {
     void testRejectsInvalidDigitalIoPrograms() {
         constexpr std::array<ngc::DigitalInputId, 1> logicalInput{0};
         constexpr std::array<ngc::DigitalOutputId, 1> logicalOutput{0};
+        constexpr std::array duplicateSymbols{
+            ngc::DigitalIoSymbol{
+                .name = "duplicate",
+                .kind = ngc::DigitalIoSymbolKind::LogicalInput,
+                .id = 0,
+            },
+            ngc::DigitalIoSymbol{
+                .name = "duplicate",
+                .kind = ngc::DigitalIoSymbolKind::LogicalOutput,
+                .id = 0,
+            },
+        };
+        constexpr std::array reservedSymbol{
+            ngc::DigitalIoSymbol{
+                .name = "in0",
+                .kind = ngc::DigitalIoSymbolKind::LogicalInput,
+                .id = 0,
+            },
+        };
+        const auto duplicateSymbol =
+            ngc::DigitalIoProgram::compile(
+                "mov in0, fieldin0",
+                1, logicalInput, 0, {}, 0.001,
+                duplicateSymbols);
+        const auto reserved =
+            ngc::DigitalIoProgram::compile(
+                "mov in0, fieldin0",
+                1, logicalInput, 0, {}, 0.001,
+                reservedSymbol);
         const auto uninitialized =
             ngc::DigitalIoProgram::compile(
                 "and r0, r1, fieldin0\nmov in0, r0",
@@ -1420,6 +1496,15 @@ namespace {
                 && uninitialized.error().find("uninitialized")
                     != std::string::npos,
                 "input program accepted an uninitialized register");
+        require(!duplicateSymbol.has_value()
+                && duplicateSymbol.error().find(
+                    "declared more than once")
+                    != std::string::npos,
+                "digital I/O program accepted duplicate global names");
+        require(!reserved.has_value()
+                && reserved.error().find("reserved")
+                    != std::string::npos,
+                "digital I/O program accepted a reserved logical name");
         require(!invalidFieldInput.has_value()
                 && invalidFieldInput.error().find("out of range")
                     != std::string::npos,

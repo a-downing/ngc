@@ -171,10 +171,15 @@ cmake --build build --target ngc_mesa_backend
 
 The executable parses both files only during NRT bootstrap. It then passes
 typed runtime configuration to `ProductionExecutorRuntime` and typed hardware
-configuration to the Mesa adapter. A normal invocation is launched by the
-application's external-runtime IPC boundary and opens the physical 7I96; do
-not select it as the Real target until the staged commissioning checks are
-complete.
+configuration to the Mesa adapter. For bare-board commissioning only, the
+current configuration treats disconnected `fieldin2` as an active-low
+`external_enable` through the named physical operand
+`external_enable_field`. This permits a normal physical-peer start but is not
+fail-safe. Replace it with verified E-stop/enable-permission feedback before
+connecting any drive, motor, spindle, or other output. A normal invocation is
+launched by the application's external-runtime IPC boundary; do not select it
+as the Real target beyond this isolated commissioning setup until the staged
+checks are complete.
 
 ## VistaCNC P2-S access
 

@@ -224,6 +224,13 @@ add_test(
         --mesa-configuration ${CMAKE_SOURCE_DIR}/mesa_7i96.toml
         --validate-config-only)
 
+add_executable(
+    ngc_mesa_backend_smoke
+    tools/ngc_mesa_backend_smoke.cpp)
+target_link_libraries(
+    ngc_mesa_backend_smoke PRIVATE ngc_core)
+ngc_target_defaults(ngc_mesa_backend_smoke)
+
 add_executable(ngc_g64_geometry_export tools/ngc_g64_geometry_export.cpp)
 target_include_directories(ngc_g64_geometry_export PRIVATE src)
 target_link_libraries(ngc_g64_geometry_export PRIVATE ngc_core)

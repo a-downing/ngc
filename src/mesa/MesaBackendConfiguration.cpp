@@ -5,6 +5,7 @@
 #include <format>
 #include <limits>
 #include <string_view>
+#include <utility>
 
 #include <toml++/toml.hpp>
 
@@ -112,10 +113,17 @@ namespace ngc::mesa {
             if (dpll == nullptr) {
                 return std::unexpected(tableError);
             }
-            const auto *safety = requiredTable(
-                *motion, "safety", path, tableError);
-            if (safety == nullptr) {
+            const auto *fieldInputs = requiredTable(
+                *motion, "field_inputs", path, tableError);
+            if (fieldInputs == nullptr) {
                 return std::unexpected(tableError);
+            }
+            if (fieldInputs->empty()) {
+                return std::unexpected(
+                    toml_configuration::error(
+                        path, "motion.field_inputs",
+                        "must not be empty",
+                        motion->get("field_inputs")));
             }
             const auto *stepGeneratorsNode =
                 motion->get("stepgens");
@@ -165,12 +173,6 @@ namespace ngc::mesa {
             const auto dpllConvergence =
                 toml_configuration::integer(
                     *dpll, "convergence_cycles", path);
-            const auto enableInput =
-                toml_configuration::requiredString(
-                    *safety, "enable_input", path);
-            const auto enableLevel =
-                toml_configuration::requiredBool(
-                    *safety, "enable_level", path);
             const std::array required{
                 driver.has_value(), address.has_value(),
                 expectedBoard.has_value(), ioProgram.has_value(),
@@ -181,7 +183,6 @@ namespace ngc::mesa {
                 dpllEnabled.has_value(), dpllTimer.has_value(),
                 dpllOffset.has_value(), dpllMaximumPhase.has_value(),
                 dpllConvergence.has_value(),
-                enableInput.has_value(), enableLevel.has_value(),
             };
             if (!std::ranges::all_of(
                     required, [](const bool value) {
@@ -197,7 +198,6 @@ namespace ngc::mesa {
                     dpllEnabled.error_or({}), dpllTimer.error_or({}),
                     dpllOffset.error_or({}), dpllMaximumPhase.error_or({}),
                     dpllConvergence.error_or({}),
-                    enableInput.error_or({}), enableLevel.error_or({}),
                 };
                 const auto found = std::ranges::find_if(
                     errors, [](const std::string &value) {
@@ -237,6 +237,44 @@ namespace ngc::mesa {
                     motion->get("dpll")));
             }
 
+            auto safetyConfiguration =
+                std::optional<MesaSafetyConfiguration>{};
+            if (const auto *safetyNode = motion->get("safety");
+                safetyNode != nullptr) {
+                const auto *safety = safetyNode->as_table();
+                if (safety == nullptr) {
+                    return std::unexpected(
+                        toml_configuration::error(
+                            path, "motion.safety",
+                            "must be a table", safetyNode));
+                }
+                const auto enableInput =
+                    toml_configuration::requiredString(
+                        *safety, "enable_input", path);
+                const auto active =
+                    toml_configuration::requiredString(
+                        *safety, "active", path);
+                if (!enableInput) {
+                    return std::unexpected(enableInput.error());
+                }
+                if (!active) {
+                    return std::unexpected(active.error());
+                }
+                if (*active != "high" && *active != "low") {
+                    return std::unexpected(
+                        toml_configuration::error(
+                            path, "motion.safety.active",
+                            "must be high or low",
+                            safety->get("active")));
+                }
+                safetyConfiguration = {
+                    .enableInput = *enableInput,
+                    .polarity = *active == "high"
+                        ? MesaSafetyPolarity::ActiveHigh
+                        : MesaSafetyPolarity::ActiveLow,
+                };
+            }
+
             MesaBackendConfiguration result{
                 .address = *address,
                 .expectedBoard = *expectedBoard,
@@ -263,12 +301,41 @@ namespace ngc::mesa {
                         static_cast<std::uint32_t>(
                             *dpllConvergence),
                 },
-                .safety = {
-                    .enableInput = *enableInput,
-                    .enableLevel = *enableLevel,
-                },
+                .safety = std::move(safetyConfiguration),
+                .fieldInputs = {},
                 .stepGenerators = {},
             };
+            std::array<bool, SEVEN_I96_ISOLATED_INPUT_COUNT>
+                selectedFieldInputs{};
+            for (const auto &[key, node] : *fieldInputs) {
+                const auto index = node.value<std::int64_t>();
+                const auto name = std::string(key.str());
+                const auto field = std::format(
+                    "motion.field_inputs.{}", name);
+                if (!index.has_value()
+                    || *index < 0
+                    || *index >= static_cast<std::int64_t>(
+                        SEVEN_I96_ISOLATED_INPUT_COUNT)) {
+                    return std::unexpected(
+                        toml_configuration::error(
+                            path, field,
+                            "must be an available 7I96 input index",
+                            &node));
+                }
+                if (selectedFieldInputs[*index]) {
+                    return std::unexpected(
+                        toml_configuration::error(
+                            path, field,
+                            "duplicates another physical input index",
+                            &node));
+                }
+                selectedFieldInputs[*index] = true;
+                result.fieldInputs.push_back({
+                    .name = name,
+                    .index =
+                        static_cast<std::uint16_t>(*index),
+                });
+            }
             std::array<bool, MAX_JOINTS> selectedJoints{};
             std::array<bool, SEVEN_I96_STEP_GENERATOR_COUNT>
                 selectedChannels{};

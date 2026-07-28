@@ -23,6 +23,19 @@ namespace ngc {
     using FieldDigitalOutputImage =
         std::bitset<DIGITAL_IO_PROGRAM_FIELD_OUTPUT_CAPACITY>;
 
+    enum class DigitalIoSymbolKind : std::uint8_t {
+        FieldInput,
+        LogicalInput,
+        LogicalOutput,
+        FieldOutput,
+    };
+
+    struct DigitalIoSymbol {
+        std::string_view name;
+        DigitalIoSymbolKind kind = DigitalIoSymbolKind::LogicalInput;
+        std::uint16_t id = 0;
+    };
+
     class DigitalIoProgram {
     public:
         [[nodiscard]] static std::expected<DigitalIoProgram, std::string>
@@ -32,7 +45,8 @@ namespace ngc {
             std::span<const DigitalInputId> logicalInputs,
             std::size_t fieldOutputCount,
             std::span<const DigitalOutputId> logicalOutputs,
-            double servoPeriod);
+            double servoPeriod,
+            std::span<const DigitalIoSymbol> symbols = {});
 
         void executeInputs(
             const FieldDigitalInputImage &fieldInputs,

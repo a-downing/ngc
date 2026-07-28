@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <cctype>
 #include <cmath>
 #include <format>
 #include <limits>
@@ -76,6 +77,54 @@ namespace ngc {
                 line, text));
         }
 
+        bool validSymbolName(const std::string_view name) {
+            if (name.empty()
+                || (!std::isalpha(
+                        static_cast<unsigned char>(name.front()))
+                    && name.front() != '_')) {
+                return false;
+            }
+            return std::ranges::all_of(
+                name.substr(1), [](const char character) {
+                    return std::isalnum(
+                        static_cast<unsigned char>(character))
+                        || character == '_';
+                });
+        }
+
+        bool reservedSymbolName(const std::string_view name) {
+            constexpr std::array words{
+                std::string_view{"0"}, std::string_view{"1"},
+                std::string_view{"mov"}, std::string_view{"not"},
+                std::string_view{"and"}, std::string_view{"or"},
+                std::string_view{"xor"},
+                std::string_view{"debounce"},
+            };
+            if (std::ranges::contains(words, name)) {
+                return true;
+            }
+            constexpr std::array prefixes{
+                std::string_view{"fieldin"},
+                std::string_view{"fieldout"},
+                std::string_view{"in"},
+                std::string_view{"out"},
+                std::string_view{"r"},
+            };
+            return std::ranges::any_of(
+                prefixes, [&](const std::string_view prefix) {
+                    const auto suffix = name.substr(
+                        std::min(name.size(), prefix.size()));
+                    return name.starts_with(prefix)
+                        && !suffix.empty()
+                        && std::ranges::all_of(
+                            suffix, [](const char character) {
+                                return std::isdigit(
+                                    static_cast<unsigned char>(
+                                        character));
+                            });
+                });
+        }
+
         std::vector<ParsedLine> tokenize(
             const std::string_view source) {
             std::vector<ParsedLine> result;
@@ -115,7 +164,8 @@ namespace ngc {
         const std::span<const DigitalInputId> logicalInputs,
         const std::size_t fieldOutputCount,
         const std::span<const DigitalOutputId> logicalOutputs,
-        const double servoPeriod) {
+        const double servoPeriod,
+        const std::span<const DigitalIoSymbol> symbols) {
         if (fieldInputCount
             > DIGITAL_IO_PROGRAM_FIELD_INPUT_CAPACITY) {
             return std::unexpected(
@@ -151,6 +201,48 @@ namespace ngc {
             }
             declaredOutputs[output] = true;
         }
+        for (std::size_t index = 0;
+             index < symbols.size(); ++index) {
+            const auto &symbol = symbols[index];
+            if (!validSymbolName(symbol.name)
+                || reservedSymbolName(symbol.name)) {
+                return std::unexpected(std::format(
+                    "digital I/O program symbol '{}' is invalid or reserved",
+                    symbol.name));
+            }
+            if (std::ranges::find(
+                    symbols.first(index), symbol.name,
+                    &DigitalIoSymbol::name)
+                != symbols.first(index).end()) {
+                return std::unexpected(std::format(
+                    "digital I/O program symbol '{}' is declared more than once",
+                    symbol.name));
+            }
+            if (symbol.kind == DigitalIoSymbolKind::LogicalInput
+                && !declaredInputs[symbol.id]) {
+                return std::unexpected(std::format(
+                    "digital I/O program symbol '{}' references undeclared logical input {}",
+                    symbol.name, symbol.id));
+            }
+            if (symbol.kind == DigitalIoSymbolKind::LogicalOutput
+                && !declaredOutputs[symbol.id]) {
+                return std::unexpected(std::format(
+                    "digital I/O program symbol '{}' references undeclared logical output {}",
+                    symbol.name, symbol.id));
+            }
+            if (symbol.kind == DigitalIoSymbolKind::FieldInput
+                && symbol.id >= fieldInputCount) {
+                return std::unexpected(std::format(
+                    "digital I/O program symbol '{}' references unavailable field input {}",
+                    symbol.name, symbol.id));
+            }
+            if (symbol.kind == DigitalIoSymbolKind::FieldOutput
+                && symbol.id >= fieldOutputCount) {
+                return std::unexpected(std::format(
+                    "digital I/O program symbol '{}' references unavailable field output {}",
+                    symbol.name, symbol.id));
+            }
+        }
 
         auto result = DigitalIoProgram{};
         result.m_fieldInputCount = fieldInputCount;
@@ -178,6 +270,27 @@ namespace ngc {
                 return Operand{
                     .kind = OperandKind::Constant,
                     .constant = text == "1",
+                };
+            }
+            if (const auto symbol = std::ranges::find(
+                    symbols, text, &DigitalIoSymbol::name);
+                symbol != symbols.end()) {
+                return Operand{
+                    .kind = [&] {
+                        switch (symbol->kind) {
+                            case DigitalIoSymbolKind::FieldInput:
+                                return OperandKind::FieldInput;
+                            case DigitalIoSymbolKind::LogicalInput:
+                                return OperandKind::LogicalInput;
+                            case DigitalIoSymbolKind::LogicalOutput:
+                                return OperandKind::LogicalOutput;
+                            case DigitalIoSymbolKind::FieldOutput:
+                                return OperandKind::FieldOutput;
+                        }
+
+                        return OperandKind::Constant;
+                    }(),
+                    .index = symbol->id,
                 };
             }
             if (text.starts_with("fieldin")) {

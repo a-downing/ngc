@@ -233,9 +233,26 @@ namespace {
         const ngc::MachineConfiguration &machine,
         const ngc::mesa::MesaBackendConfiguration &mesa) {
         std::vector<ngc::DigitalInputId> logicalInputs;
+        std::vector<ngc::DigitalIoSymbol> symbols;
         logicalInputs.reserve(machine.digitalInputs.size());
+        symbols.reserve(
+            machine.digitalInputs.size()
+            + mesa.fieldInputs.size());
         for (const auto &input : machine.digitalInputs) {
             logicalInputs.push_back(input.id);
+            symbols.push_back({
+                .name = input.name,
+                .kind =
+                    ngc::DigitalIoSymbolKind::LogicalInput,
+                .id = input.id,
+            });
+        }
+        for (const auto &input : mesa.fieldInputs) {
+            symbols.push_back({
+                .name = input.name,
+                .kind = ngc::DigitalIoSymbolKind::FieldInput,
+                .id = input.index,
+            });
         }
         const auto logicalOutputs =
             std::span<const ngc::DigitalOutputId>{};
@@ -243,7 +260,7 @@ namespace {
             mesa.ioProgram,
             ngc::mesa::SEVEN_I96_ISOLATED_INPUT_COUNT,
             logicalInputs, 0, logicalOutputs,
-            machine.realBackend->servoPeriod);
+            machine.realBackend->servoPeriod, symbols);
         if (!program) {
             throw std::runtime_error(program.error());
         }
@@ -287,10 +304,16 @@ namespace {
 
         const auto mappings =
             stepGeneratorMappings(machine, mesa);
+        if (!mesa.safety.has_value()) {
+            throw std::runtime_error(
+                "Mesa physical backend requires a configured "
+                "motion.safety enable input");
+        }
         const auto safetyInput = ngc::mesa::MesaExecutorSafetyInput{
             .input = resolveInput(
-                machine, mesa.safety.enableInput),
-            .requiredLevel = mesa.safety.enableLevel,
+                machine, mesa.safety->enableInput),
+            .requiredLevel = mesa.safety->polarity
+                == ngc::mesa::MesaSafetyPolarity::ActiveHigh,
         };
         auto io = ngc::mesa::MesaProductionExecutorIo::create(
             std::move(*cyclic),
@@ -317,13 +340,20 @@ namespace {
             throw std::runtime_error(mesa.error());
         }
         static_cast<void>(servoPeriodNanoseconds(*machine));
-        static_cast<void>(resolveInput(
-            *machine, mesa->safety.enableInput));
+        if (mesa->safety.has_value()) {
+            static_cast<void>(resolveInput(
+                *machine, mesa->safety->enableInput));
+        }
         static_cast<void>(stepGeneratorMappings(*machine, *mesa));
         static_cast<void>(compileDigitalIoProgram(
             *machine, *mesa));
         if (options.validateConfigurationOnly) {
             return 0;
+        }
+        if (!mesa->safety.has_value()) {
+            throw std::runtime_error(
+                "Mesa physical backend requires a configured "
+                "motion.safety enable input");
         }
 #ifndef __linux__
         throw std::runtime_error(

@@ -35,21 +35,34 @@ watchdog_timeout = 0.005
 # intentionally excluded because synthetic GUI policy does not belong in the
 # physical backend.
 io_program = """
-not in1, fieldin1
+not shared_home, shared_home_field
 
-mov in3, fieldin2
+mov external_enable, external_enable_field
 
-not r0, fieldin3
-not r1, fieldin4
+not r0, probe_0_field
+not r1, probe_1_field
 and r2, r0, r1
-debounce in0, r2, 10ms
+debounce tool_probe, r2, 10ms
 
-not in2, fieldin5
+not y2_home, y2_home_field
 """
 
+[motion.field_inputs]
+shared_home_field = 1
+external_enable_field = 2
+probe_0_field = 3
+probe_1_field = 4
+y2_home_field = 5
+
+# Commissioning only: no field input or output is currently wired to the
+# board, so disconnected external_enable_field is inactive. Treating that
+# level as the active external enable permits bare-board executor testing. This
+# polarity is not fail-safe: a wire break would also appear enabled. Replace
+# it with verified E-stop/enable-permission feedback and the verified polarity
+# before connecting any drive, motor, spindle, or other output.
 [motion.safety]
 enable_input = "external_enable"
-enable_level = true
+active = "low"
 
 # These are the units of the physical mechanism and do not depend on the
 # machine.toml internal machine unit. The NRT bootstrap converts each
@@ -131,11 +144,6 @@ maximum_generated_step_error = 2.0
 # proportional correction. Correction is limited to 5 mm/s and exists only to
 # remove small host/FPGA phase discrepancies. More than two generated steps of
 # disagreement is a fault rather than a request for aggressive catch-up.
-#
-# GPIO 2 is an enable-permission input in the existing wiring. The physical
-# executor requires in3 to remain active and latches a fault with safe outputs
-# when it becomes inactive. This userspace interlock does not replace the
-# machine's hardwired E-stop, STO/drive-enable chain, or Mesa watchdog.
 #
 # The generic HostMot2 cyclic layer and active board diagnostic implement this
 # DPLL behavior. The diagnostic combines this file with machine.toml's

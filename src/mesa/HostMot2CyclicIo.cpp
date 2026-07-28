@@ -886,8 +886,14 @@ namespace ngc::mesa {
 
             const auto watchdogStatus =
                 cyclicTransaction.readData(cyclicWatchdogStatus);
-            if (watchdogStatus.size() != sizeof(std::uint32_t)
-                || (littleEndian32(watchdogStatus)
+            if (watchdogStatus.size() != sizeof(std::uint32_t)) {
+                result.fault =
+                    HostMot2CyclicIoFault::BoardProtocolError;
+
+                return latch(result);
+            }
+            if (outputs.watchdogEnabled
+                && (littleEndian32(watchdogStatus)
                     & WATCHDOG_TRIPPED) != 0) {
                 result.fault = HostMot2CyclicIoFault::WatchdogTripped;
 

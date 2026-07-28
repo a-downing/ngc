@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <expected>
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -24,9 +25,20 @@ namespace ngc::mesa {
         double maximumGeneratedStepError = 0.0;
     };
 
+    struct MesaNamedFieldInput {
+        std::string name;
+        std::uint16_t index = 0;
+    };
+
+    enum class MesaSafetyPolarity : std::uint8_t {
+        ActiveHigh,
+        ActiveLow,
+    };
+
     struct MesaSafetyConfiguration {
         std::string enableInput;
-        bool enableLevel = true;
+        MesaSafetyPolarity polarity =
+            MesaSafetyPolarity::ActiveHigh;
     };
 
     struct MesaBackendConfiguration {
@@ -37,7 +49,8 @@ namespace ngc::mesa {
         HostMot2StepTiming stepTiming;
         std::uint32_t watchdogTimeoutNanoseconds = 0;
         HostMot2DpllConfiguration dpll;
-        MesaSafetyConfiguration safety;
+        std::optional<MesaSafetyConfiguration> safety;
+        std::vector<MesaNamedFieldInput> fieldInputs;
         std::vector<MesaConfiguredStepGenerator> stepGenerators;
     };
 

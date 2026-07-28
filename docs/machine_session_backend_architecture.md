@@ -520,14 +520,18 @@ driver = "mesa_hostmot2"
 address = "10.10.10.10"
 expected_board = "7i96"
 io_program = """
-not r0, fieldin0
-mov r1, fieldin1
+not r0, probe_0_field
+mov r1, probe_1_field
 and r2, r0, r1
 debounce r3, r2, 10ms
-mov in0, r3
+mov tool_probe, r3
 
-mov fieldout0, out0
+mov fieldout0, spindle_enable
 """
+
+[motion.field_inputs]
+probe_0_field = 3
+probe_1_field = 4
 
 [[motion.field_outputs]]
 channel = 0
@@ -566,17 +570,21 @@ The digital-I/O assembly namespaces describe direction at the machine and
 field boundaries:
 
 ```text
-fieldinN -> program -> inN
-outN     -> program -> fieldoutN
+field_input_name  -> program -> logical_input_name
+logical_output_name -> program -> fieldoutN
 ```
 
-`fieldinN` is a read-only sampled field input and `inN` is a write-only logical
-input supplied atomically to the executor. `outN` is a read-only logical output
-carried by the executor output state and `fieldoutN` is a write-only field
-output staged for the cyclic HostMot2 adapter. Registers `rN` remain read/write
-temporaries. The assembler rejects operands used against their direction,
-requires every configured logical input and field output to be assigned
-exactly once, and rejects reads from undeclared logical outputs.
+A bare field input name is a read-only sampled physical input and a bare
+logical input name is a write-only value supplied atomically to the executor.
+A bare logical output name is read-only and carried by the executor output
+state; `fieldoutN` is write-only and staged for the cyclic HostMot2 adapter.
+Configured field-input names and logical names share one global namespace and
+resolve to fixed numeric IDs during NRT compilation. Numeric `fieldinN`,
+`inN`, `outN`, and `fieldoutN` aliases remain available for low-level programs
+and tests. Registers `rN` remain read/write temporaries. The assembler rejects
+operands used against their direction, requires every configured logical input
+and field output to be assigned exactly once, and rejects reads from
+undeclared logical outputs.
 
 Assembly source expresses debounce in time, for example
 `debounce r0, fieldin0, 10ms`. NRT compilation rounds the duration up to an
@@ -1188,7 +1196,13 @@ held state.
   performs NRT-only machine/Mesa configuration loading and cross-validation,
   constructs the physical I/O adapter, hosts `ProductionExecutorRuntime`
   behind the production IPC bridge without synthetic inputs, and faults to
-  safe outputs when its configured external-enable logical input is inactive.
+  safe outputs when its configured external-enable logical input is outside
+  its explicitly configured `high` or `low` active polarity.
+  A normal physical-peer start requires that verified safety input; the
+  current unwired-board commissioning configuration temporarily treats
+  disconnected `external_enable_field` as an active-low enable. That mapping
+  is explicitly non-fail-safe and must be replaced before any physical output
+  is connected.
   Executor/G-code producers for additional logical-output events, spindle
   integration, application-default selection, and physical commissioning
   remain.

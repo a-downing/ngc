@@ -98,15 +98,20 @@ machine configuration, owns fixed-period ticking and stopped-state synchronous
 service stepping, samples a fixed-size digital-input image before each tick,
 and applies the fixed-size output state afterward through an injected I/O
 boundary. The physical Mesa integration slice exposes unmodified board input
-levels as `fieldinN`, executes an NRT-compiled, fixed-capacity Boolean input
+levels through globally unique bare field-input names, executes an NRT-compiled, fixed-capacity Boolean input
 program with `mov`, `not`, `and`, `or`, `xor`, and stateful `debounce`
-instructions, and atomically supplies its `inN` logical-input image to the
+instructions, and atomically supplies its logical-input image to the
 executor. The same program maps the executor-carried `outN` logical-output
 image into `fieldoutN` outputs staged for the configured HostMot2 SSR bindings.
-`fieldinN` and `outN` operands are read-only, while `inN` and `fieldoutN`
+Configured field-input names and logical input/output names share one global
+namespace and appear as bare assembly operands; NRT compilation resolves them
+to fixed numeric IDs. Numeric `fieldinN`, `inN`, `outN`, and `fieldoutN`
+aliases remain available for low-level programs and tests. Field-input and
+logical-output operands are read-only, while logical-input and field-output
 operands are write-only. Every configured logical input and field output must
-be assigned exactly once, and debounce durations written as time are rounded
-up to fixed servo ticks during NRT compilation. Its bounded adapter stages
+be assigned exactly once, and
+debounce durations written as time are rounded up to fixed servo ticks during
+NRT compilation. Its bounded adapter stages
 commanded joint velocities as StepGen rates, requires
 the watchdog for enabled motion, and converts any invalid cyclic exchange into
 an executor host fault and safe output image. Its optional HostMot2 DPLL path
@@ -140,9 +145,17 @@ loads and cross-validates the typed machine and Mesa configurations, discovers
 and validates the 7I96, compiles the bounded digital-I/O program, constructs
 `MesaProductionExecutorIo`, then starts `ProductionExecutorRuntime` and bridges
 it over the existing production IPC rings without synthetic triggered inputs.
-Loss of the configured external-enable logical input latches a backend fault
-and safe outputs. It is not yet the application's default Real target and has
-not completed staged physical commissioning. The typed Mesa backend
+When `motion.safety` identifies a verified external-enable logical input and
+its explicit `high` or `low` active polarity, loss of that level latches a
+backend fault and safe outputs. A normal physical-peer
+start is rejected when that safety input is not configured. For bare-board
+commissioning only, the current configuration maps the physical field-input
+name `external_enable_field` to logical `external_enable` with active-low
+polarity. This deliberately non-fail-safe mapping must be replaced with
+verified E-stop/enable feedback before any drive, motor, spindle, or other
+output is connected. The process is not yet the
+application's default Real target and has not completed staged physical
+commissioning. The typed Mesa backend
 configuration loader shares only generic,
 source-aware TOML field validation with the frontend machine loader and keeps
 its hardware schema separate. The `ngc_mesa_stepgen_diagnostic` executable
