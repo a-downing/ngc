@@ -1114,19 +1114,15 @@ namespace {
                 not r0, fieldin0
                 mov r1, fieldin1
                 and r2, r0, r1
-                or r3, fieldin0, fieldin1
-                xor r4, fieldin0, fieldin1
-                debounce r5, r2, 3ms
-                mov in0, r5
-                mov in1, r3
-                mov in2, r4
-                not r6, out3
-                mov fieldout0, r6
+                debounce in0, r2, 3ms
+                or in1, fieldin0, fieldin1
+                xor in2, fieldin0, fieldin1
+                not fieldout0, out3
                 mov fieldout1, out4
             )PROGRAM",
             2, logicalInputs, 2, declaredOutputs, 0.001);
         require(program.has_value()
-                && program->instructionCount() == 12
+                && program->instructionCount() == 8
                 && program->fieldInputCount() == 2
                 && program->logicalInputCount() == 3
                 && program->fieldOutputCount() == 2
@@ -1190,7 +1186,7 @@ namespace {
             ngc::DigitalIoProgram::compile(
                 "mov in0, fieldin0\nmov in0, 1",
                 1, logicalInput, 0, {}, 0.001);
-        const auto statefulOutput =
+        const auto directDebounceOutput =
             ngc::DigitalIoProgram::compile(
                 "debounce in0, fieldin0, 10ms",
                 1, logicalInput, 0, {}, 0.001);
@@ -1227,10 +1223,8 @@ namespace {
                 && duplicateOutput.error().find("more than once")
                     != std::string::npos,
                 "input program accepted duplicate logical output");
-        require(!statefulOutput.has_value()
-                && statefulOutput.error().find("invalid destination")
-                    != std::string::npos,
-                "debounce accepted a logical-input destination");
+        require(directDebounceOutput.has_value(),
+                "digital I/O program rejected a direct debounce destination");
         require(!invalidDuration.has_value()
                 && invalidDuration.error().find("invalid duration")
                     != std::string::npos,

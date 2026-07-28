@@ -272,7 +272,6 @@ namespace ngc {
 
         const auto assignDestination = [&](
             const Operand &operand,
-            const bool logicalAllowed,
             const std::size_t line)
             -> std::expected<void, std::string> {
             if (operand.kind == OperandKind::Register) {
@@ -280,9 +279,8 @@ namespace ngc {
 
                 return {};
             }
-            if (!logicalAllowed
-                || (operand.kind != OperandKind::LogicalInput
-                    && operand.kind != OperandKind::FieldOutput)) {
+            if (operand.kind != OperandKind::LogicalInput
+                && operand.kind != OperandKind::FieldOutput) {
                 return std::unexpected(std::format(
                     "digital I/O program line {} has an invalid destination",
                     line));
@@ -401,11 +399,8 @@ namespace ngc {
                     static_cast<std::uint32_t>(ticks);
             }
 
-            const auto logicalDestinationAllowed =
-                instruction.opcode == Opcode::Move;
             if (const auto valid = assignDestination(
-                    instruction.destination,
-                    logicalDestinationAllowed, line.number);
+                    instruction.destination, line.number);
                 !valid) {
                 return std::unexpected(valid.error());
             }

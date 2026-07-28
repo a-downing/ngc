@@ -1,0 +1,118 @@
+# Proposed physical-backend configuration derived from
+# my_LinuxCNC_machine. This file is for schema review; the NGC physical
+# backend loader does not exist yet.
+#
+# Machine topology, trajectory behavior, limits, homing positions, logical
+# input identities, the authoritative servo period, and real-time host policy
+# remain in machine.toml.
+
+[motion]
+driver = "mesa_hostmot2"
+address = "10.10.10.10"
+expected_board = "7i96"
+
+# LinuxCNC: hm2_7i96.0.watchdog.timeout_ns = 5000000
+watchdog_timeout = 0.005
+
+# fieldinN is the unmodified level of 7I96 isolated input N.
+#
+# Logical input IDs come from machine.toml:
+#   in0 = tool_probe
+#   in1 = shared_home
+#   in2 = y2_home
+#   in3 = external_enable (proposed; not yet declared in machine.toml)
+#
+# The LinuxCNC configuration maps:
+#   gpio.001.in_not -> shared home
+#   gpio.002.in     -> external machine-enable permission
+#   gpio.003.in_not -> probe channel 0
+#   gpio.004.in_not -> probe channel 1
+#   gpio.005.in_not -> Y2 home
+#
+# Its physical probe is the AND of the two active-low channels, debounced for
+# 10 one-millisecond servo samples. The PyVCP manual probe trigger is
+# intentionally excluded because synthetic GUI policy does not belong in the
+# physical backend.
+io_program = """
+not in1, fieldin1
+
+mov in3, fieldin2
+
+not r0, fieldin3
+not r1, fieldin4
+and r2, r0, r1
+debounce in0, r2, 10ms
+
+not in2, fieldin5
+"""
+
+# These are the units of the physical mechanism and do not depend on the
+# machine.toml internal machine unit. The NRT bootstrap converts each
+# steps_per_unit value once into the executor's steps-per-machine-unit scale.
+[motion.units]
+linear = "mm"
+angular = "degree"
+
+# LinuxCNC uses the same timing for all four configured StepGens.
+[motion.step_timing]
+step_length = 0.000005
+step_space = 0.000005
+direction_setup = 0.000010
+direction_hold = 0.000010
+
+# X: LinuxCNC joint 0 -> hm2_7i96.0.stepgen.01
+[[motion.stepgens]]
+joint = 0
+channel = 1
+steps_per_unit = 160.0
+invert_direction = false
+
+# Y1: LinuxCNC joint 1 -> hm2_7i96.0.stepgen.02
+[[motion.stepgens]]
+joint = 1
+channel = 2
+steps_per_unit = 160.0
+invert_direction = false
+
+# Y2: LinuxCNC joint 2 -> hm2_7i96.0.stepgen.03
+[[motion.stepgens]]
+joint = 2
+channel = 3
+steps_per_unit = 160.0
+invert_direction = false
+
+# Z: LinuxCNC joint 3 -> hm2_7i96.0.stepgen.00
+[[motion.stepgens]]
+joint = 3
+channel = 0
+steps_per_unit = 160.0
+invert_direction = false
+
+# StepGen channel 4 is unused. The LinuxCNC configuration has no Mesa isolated
+# field outputs, so this proposal deliberately has no motion.field_outputs
+# entries.
+#
+# The metric scale is the exact conversion of the previous LinuxCNC setting:
+# 4064 steps/inch / 25.4 mm/inch = 160 steps/mm. With the machine's 5 mm-pitch
+# ball screws, this is 800 commanded steps per screw revolution.
+#
+# GPIO 2 is an enable-permission input in the existing wiring. Publishing it as
+# in3 does not yet make it safety-functional: the production executor still
+# needs a typed safety-input rule that establishes a fault and safe outputs
+# when external_enable becomes inactive.
+#
+# LinuxCNC also sets DPLL timer 1 to -50 microseconds. The current NGC cyclic
+# Mesa layer does not implement DPLL scheduling, so this proposal does not
+# pretend that the setting is active.
+
+# The existing machine drives a Huanyang VFD independently of Mesa over
+# /dev/ttyUSB0 at 9600 baud with no parity. A bounded serial/Modbus physical-I/O
+# integration is not implemented yet. Its eventual backend configuration
+# should have this shape:
+#
+# [spindle]
+# driver = "huanyang_modbus"
+# device = "/dev/ttyUSB0"
+# baud = 9600
+# parity = "none"
+# maximum_speed = 24000
