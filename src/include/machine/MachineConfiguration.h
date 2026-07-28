@@ -69,7 +69,6 @@ namespace ngc {
     struct ProbingConfiguration {
         DigitalInputId input = 0;
         InputCondition condition = InputCondition::Active;
-        double debounce = 0.0;
     };
 
     struct JointHomingConfiguration {
@@ -80,7 +79,6 @@ namespace ngc {
         double searchVelocity = 0.0;
         double latchVelocity = 0.0;
         double backoffDistance = 0.0;
-        double debounce = 0.0;
         double finalVelocity = 0.0;
         bool useIndex = false;
     };

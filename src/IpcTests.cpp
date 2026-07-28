@@ -455,7 +455,7 @@ namespace {
         move.limits.acceleration[0] = 5.0;
         move.limits.jerk[0] = 100.0;
         require(move.triggers.push({
-                    0, 1, ngc::InputCondition::Active, 0.0,
+                    0, 1, ngc::InputCondition::Active,
                 }),
                 "triggered-joint IPC fixture should fit its input");
         move.triggerRequired = true;

@@ -737,9 +737,9 @@ namespace {
         auto move = triggeredJointMove(70, 701, 0, 801, 901);
         move.triggerRequired = true;
         require(move.triggers.push({
-                    0, firstInput, ngc::InputCondition::Active, 0.02,
+                    0, firstInput, ngc::InputCondition::Active,
                 }) && move.triggers.push({
-                    1, secondInput, ngc::InputCondition::RisingEdge, 0.0,
+                    1, secondInput, ngc::InputCondition::RisingEdge,
                 }),
                 "joint-trigger fixtures did not fit");
         require(core->tryPublish(ngc::ExecutionItem{move})
@@ -764,13 +764,17 @@ namespace {
                     && approaching.commandedJoints.velocity[1] > 0.0,
                 "joint trigger fixture did not establish moving joint state");
 
-        core->setDigitalInputSample(firstInput, true);
         core->setDigitalInputSample(secondInput, true);
         std::vector<ngc::ExecutionEvent> events;
+        core->servoTick();
+        auto firstEvents = takeEvents(*core);
+        events.insert(events.end(), firstEvents.begin(), firstEvents.end());
+        auto afterSecondTrigger = latestSnapshot(*core);
+        core->setDigitalInputSample(firstInput, true);
         ngc::ExecutionSnapshot completed;
         auto previousAcceleration = std::array{
-            approaching.commandedJoints.acceleration[0],
-            approaching.commandedJoints.acceleration[1],
+            afterSecondTrigger.commandedJoints.acceleration[0],
+            afterSecondTrigger.commandedJoints.acceleration[1],
         };
         for (auto tick = 0; tick < 1'000; ++tick) {
             core->servoTick();
@@ -808,7 +812,7 @@ namespace {
                 "joint inputs did not complete every selected joint as triggered");
         require(completions[0].triggerState.position[0]
                     > completions[0].triggerState.position[1],
-                "debounced joint did not continue independently after the edge-triggered joint stopped");
+                "first joint did not continue independently after the second joint triggered");
         for (ngc::JointId joint = 0; joint < 2; ++joint) {
             requireNear(completions[0].stoppedState.velocity[joint], 0.0,
                         "triggered joint retained velocity");
@@ -892,7 +896,7 @@ namespace {
         fast.target[0] = 0.5;
         fast.triggerRequired = true;
         require(fast.triggers.push({
-                    0, input, ngc::InputCondition::Active, 0.0,
+                    0, input, ngc::InputCondition::Active,
                 }),
                 "fast-search trigger did not fit");
         const auto fastRun =
@@ -929,7 +933,7 @@ namespace {
         slow.limits.velocity[0] = 0.1;
         slow.triggerRequired = true;
         require(slow.triggers.push({
-                    0, input, ngc::InputCondition::Active, 0.0,
+                    0, input, ngc::InputCondition::Active,
                 }),
                 "slow-latch trigger did not fit");
         const auto slowTrigger =
@@ -2267,7 +2271,7 @@ namespace {
             triggeredJointMove(1, 1, 0, 1, 1);
         triggeredJoint.triggerRequired = true;
         require(triggeredJoint.triggers.push({
-                    0, 1, ngc::InputCondition::Active, 0.0,
+                    0, 1, ngc::InputCondition::Active,
                 }),
                 "required joint trigger fixture did not fit");
         require(core->tryPublish(ngc::ExecutionItem{triggeredJoint})
@@ -2276,7 +2280,7 @@ namespace {
 
         triggeredJoint.triggerRequired = false;
         require(triggeredJoint.triggers.push({
-                    0, 2, ngc::InputCondition::Active, 0.0,
+                    0, 2, ngc::InputCondition::Active,
                 }),
                 "duplicate joint trigger fixture did not fit");
         require(core->tryPublish(ngc::ExecutionItem{triggeredJoint})

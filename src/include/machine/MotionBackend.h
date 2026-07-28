@@ -191,7 +191,6 @@ namespace ngc {
         JointId joint = 0;
         DigitalInputId input = 0;
         InputCondition condition = InputCondition::Active;
-        double debounce = 0.0;
     };
 
     enum class JointTargetMode : std::uint8_t { Absolute, Relative };

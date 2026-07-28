@@ -99,7 +99,6 @@ y2_home = 2
 [probing]
 input = "tool_probe"
 condition = "active"
-debounce = 0.010
 
 [[joints]]
 id = 0
@@ -120,7 +119,6 @@ switch_position = 13.85
 search_velocity = 2
 latch_velocity = 0.2
 backoff_distance = 0.25
-debounce = 0.010
 final_velocity = 0.0
 use_index = false
 
@@ -143,7 +141,6 @@ switch_position = -0.1
 search_velocity = -2
 latch_velocity = -0.2
 backoff_distance = 0.25
-debounce = 0.010
 final_velocity = 0.0
 use_index = false
 
@@ -166,7 +163,6 @@ switch_position = -0.140
 search_velocity = -2
 latch_velocity = -0.2
 backoff_distance = 0.25
-debounce = 0.010
 final_velocity = 0.0
 use_index = false
 
@@ -189,7 +185,6 @@ switch_position = 0.1
 search_velocity = 2
 latch_velocity = 0.2
 backoff_distance = 0.25
-debounce = 0.010
 final_velocity = 0.0
 use_index = false
 

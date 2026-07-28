@@ -124,13 +124,11 @@ namespace ngc {
         struct TriggeredJointRuntime {
             double target = 0.0;
             double elapsed = 0.0;
-            double debounceElapsed = 0.0;
             double triggerPosition = 0.0;
             double triggerVelocity = 0.0;
             double triggerAcceleration = 0.0;
             bool stopping = false;
             bool finished = false;
-            bool triggerPending = false;
             ruckig::Trajectory<1> trajectory;
         };
 
@@ -206,8 +204,8 @@ namespace ngc {
                                       JointId joint) noexcept;
         bool beginTriggeredJointStop(const TriggeredJointMove &move,
                                      JointId joint, bool triggered) noexcept;
-        bool triggeredJointInputQualified(const JointTrigger &trigger,
-                                          TriggeredJointRuntime &runtime) noexcept;
+        [[nodiscard]] bool triggeredJointInputConditionMet(
+            const JointTrigger &trigger) const noexcept;
         void advanceTriggeredJoints(double &seconds) noexcept;
         void completeTriggeredJoints() noexcept;
         [[nodiscard]] bool validJogTarget(const JogTarget &target) const noexcept;

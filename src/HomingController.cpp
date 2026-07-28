@@ -233,7 +233,6 @@ namespace ngc {
             if (triggered) {
                 (void)move.triggers.push({
                     id, joint->homing.input, joint->homing.condition,
-                    joint->homing.debounce,
                 });
             }
         }

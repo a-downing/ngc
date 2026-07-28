@@ -174,9 +174,7 @@ namespace ngc::execution_item {
             JointMask triggeredJoints = 0;
             for (const auto &trigger : move.triggers) {
                 if (trigger.joint >= MAX_JOINTS
-                    || !validInputCondition(trigger.condition)
-                    || !std::isfinite(trigger.debounce)
-                    || trigger.debounce < 0.0) {
+                    || !validInputCondition(trigger.condition)) {
                     return false;
                 }
 

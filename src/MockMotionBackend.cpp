@@ -131,7 +131,6 @@ namespace ngc {
             double triggerPosition = 0.0;
             double triggerVelocity = 0.0;
             double triggerAcceleration = 0.0;
-            double debounceElapsed = 0.0;
             ruckig::Trajectory<1> trajectory;
         };
         std::array<JointRuntime, MAX_JOINTS> m_jointRuntime;
@@ -1189,12 +1188,6 @@ namespace ngc {
             return std::nullopt;
         }
 
-        double jointTriggerDebounce(const TriggeredJointMove &move, const JointId joint) const {
-            for(const auto &trigger : move.triggers)
-                if(trigger.joint == joint) return trigger.debounce;
-            return 0.0;
-        }
-
         bool calculateJointApproach(const TriggeredJointMove &move, const JointId joint) {
             auto &runtime = m_jointRuntime[joint];
             runtime = {};
@@ -1331,11 +1324,8 @@ namespace ngc {
                     const auto transition = syntheticJointTransition(move.moveId, joint);
                     const auto crossed = transition && runtime.direction * (position - *transition) >= -1e-12;
                     if(crossed) {
-                        runtime.debounceElapsed += elapsed;
-                        if(runtime.debounceElapsed + 1e-12 >= jointTriggerDebounce(move, joint)
-                           && !beginJointStop(move, joint)) { faultTriggered(); return; }
+                        if(!beginJointStop(move, joint)) { faultTriggered(); return; }
                     } else {
-                        runtime.debounceElapsed = 0.0;
                         if(runtime.elapsed + 1e-12 >= duration) {
                             m_snapshot.commandedJoints.position[joint] = runtime.target;
                             m_snapshot.commandedJoints.velocity[joint] = 0.0;

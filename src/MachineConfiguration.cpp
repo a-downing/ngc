@@ -521,10 +521,8 @@ namespace ngc {
 
             const auto probeInputName = requiredString(*probing, "input", path);
             const auto probeConditionName = requiredString(*probing, "condition", path);
-            const auto probeDebounce = number(*probing, "debounce", path);
             if(!probeInputName) return std::unexpected(probeInputName.error());
             if(!probeConditionName) return std::unexpected(probeConditionName.error());
-            if(!probeDebounce) return std::unexpected(probeDebounce.error());
             const auto *probeInput = findInput(result.digitalInputs, *probeInputName);
             if(!probeInput)
                 return std::unexpected(configurationError(path, "probing.input", "references an unknown input",
@@ -532,10 +530,7 @@ namespace ngc {
             const auto probeCondition = parseCondition(*probeConditionName, path, "probing.condition",
                                                        probing->get("condition"));
             if(!probeCondition) return std::unexpected(probeCondition.error());
-            if(*probeDebounce < 0.0)
-                return std::unexpected(configurationError(path, "probing.debounce", "must not be negative",
-                                                          probing->get("debounce")));
-            result.probing = { probeInput->id, *probeCondition, *probeDebounce };
+            result.probing = { probeInput->id, *probeCondition };
 
             std::unordered_set<JointId> configuredJointIds;
             std::unordered_set<std::string> jointNames;
@@ -591,7 +586,6 @@ namespace ngc {
                 auto searchVelocity = number(*home, "search_velocity", path);
                 auto latchVelocity = number(*home, "latch_velocity", path);
                 auto backoffDistance = positiveNumber(*home, "backoff_distance", path);
-                auto debounce = number(*home, "debounce", path);
                 auto finalVelocity = number(*home, "final_velocity", path);
                 auto useIndex = requiredBool(*home, "use_index", path);
                 if(!inputName) return std::unexpected(inputName.error());
@@ -601,15 +595,11 @@ namespace ngc {
                 if(!searchVelocity) return std::unexpected(searchVelocity.error());
                 if(!latchVelocity) return std::unexpected(latchVelocity.error());
                 if(!backoffDistance) return std::unexpected(backoffDistance.error());
-                if(!debounce) return std::unexpected(debounce.error());
                 if(!finalVelocity) return std::unexpected(finalVelocity.error());
                 if(!useIndex) return std::unexpected(useIndex.error());
                 if(*searchVelocity == 0.0 || *latchVelocity == 0.0)
                     return std::unexpected(configurationError(
                         path, "joints.homing", "search_velocity and latch_velocity must be nonzero", home));
-                if(*debounce < 0.0)
-                    return std::unexpected(configurationError(path, "joints.homing.debounce",
-                                                              "must not be negative", home->get("debounce")));
                 const auto *input = findInput(result.digitalInputs, *inputName);
                 if(!input)
                     return std::unexpected(configurationError(path, "joints.homing.input",
@@ -621,7 +611,7 @@ namespace ngc {
                 result.joints.push_back({ id, *name, *axis, *coordinateScale, *minimum, *maximum,
                     *maxVelocity, *maxAcceleration, *maxJerk,
                     { input->id, *condition, *homePosition, *switchPosition, *searchVelocity,
-                      *latchVelocity, *backoffDistance, *debounce, *finalVelocity, *useIndex } });
+                      *latchVelocity, *backoffDistance, *finalVelocity, *useIndex } });
             }
 
             if(configuredJointIds != axisJointIds)

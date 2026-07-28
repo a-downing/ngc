@@ -994,7 +994,7 @@ platform-independent, fixed-period execution slice. It owns only fixed-capacity
 execution-item, control, event, input-sample, and snapshot storage and executes
 validated normal `PlanChunk` polynomials, dependent continuations, axis-space
 `TriggeredMove` approaches and constrained stops, joint-space
-`TriggeredJointMove` approaches with independently debounced triggers and
+`TriggeredJointMove` approaches with independent triggers and
 constrained stops, same-epoch resume between service moves, stationary masked
 joint-coordinate assignment, constrained controlled-stop cancellation of
 triggered moves, constrained ordinary-plan controlled stop, executor-owned

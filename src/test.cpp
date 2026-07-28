@@ -256,7 +256,6 @@ y2_home = 2
 [probing]
 input = "tool_probe"
 condition = "active"
-debounce = 0.010
 [[joints]]
 id = 0
 name = "x"
@@ -275,7 +274,6 @@ switch_position = 13.85
 search_velocity = 2
 latch_velocity = 0.2
 backoff_distance = 0.25
-debounce = 0.010
 final_velocity = 0.0
 use_index = false
 [[joints]]
@@ -296,7 +294,6 @@ switch_position = -0.1
 search_velocity = -2
 latch_velocity = -0.2
 backoff_distance = 0.25
-debounce = 0.010
 final_velocity = 0.0
 use_index = false
 [[joints]]
@@ -317,7 +314,6 @@ switch_position = -0.14
 search_velocity = -2
 latch_velocity = -0.2
 backoff_distance = 0.25
-debounce = 0.010
 final_velocity = 0.0
 use_index = false
 [[joints]]
@@ -338,7 +334,6 @@ switch_position = 0.1
 search_velocity = 2
 latch_velocity = 0.2
 backoff_distance = 0.25
-debounce = 0.010
 final_velocity = 0.0
 use_index = false
 [homing]
@@ -6203,7 +6198,7 @@ G1 F60 X2
                 move.limits.acceleration[0] = 5.0;
                 move.limits.jerk[0] = 100.0;
                 require(move.triggers.push({
-                            0, 1, ngc::InputCondition::Active, 0.010}),
+                            0, 1, ngc::InputCondition::Active}),
                         "backend conformance joint trigger should fit");
                 move.triggerRequired = true;
 
@@ -6235,7 +6230,7 @@ G1 F60 X2
                 move.limits.acceleration[0] = 5.0;
                 move.limits.jerk[0] = 100.0;
                 require(move.triggers.push({
-                            0, 1, ngc::InputCondition::Active, 0.010}),
+                            0, 1, ngc::InputCondition::Active}),
                         "production backend conformance joint trigger should fit");
                 move.triggerRequired = true;
 
@@ -7488,8 +7483,6 @@ G1 F60 X2
             &ngc::DigitalInputConfiguration::id);
         require(probingInput!=configuration->digitalInputs.end(),
                 "probing should resolve to a configured digital input");
-        require(configuration->probing.debounce>=0.0,
-                "probing should load a non-negative debounce duration");
         const auto joint = [&](const ngc::JointId id) -> const ngc::JointConfiguration & {
             const auto found = std::ranges::find(configuration->joints, id, &ngc::JointConfiguration::id);
             require(found != configuration->joints.end(), "configured joint should exist");
@@ -7509,8 +7502,7 @@ G1 F60 X2
                     "each joint should load a valid range and positive motion limits");
             require(configuredJoint.homing.searchVelocity!=0.0
                         &&configuredJoint.homing.latchVelocity!=0.0
-                        &&configuredJoint.homing.backoffDistance>0.0
-                        &&configuredJoint.homing.debounce>=0.0,
+                        &&configuredJoint.homing.backoffDistance>0.0,
                     "each joint should load valid homing motion values");
             require(std::ranges::find(configuration->digitalInputs,
                         configuredJoint.homing.input,&ngc::DigitalInputConfiguration::id)
@@ -7834,9 +7826,9 @@ G1 F60 X2
             move.limits.acceleration[joint] = 2.0;
             move.limits.jerk[joint] = 10.0;
         }
-        require(move.triggers.push({ 0, 10, ngc::InputCondition::Active, 0.010 }),
+        require(move.triggers.push({ 0, 10, ngc::InputCondition::Active }),
                 "first Y joint trigger should fit");
-        require(move.triggers.push({ 1, 11, ngc::InputCondition::Active, 0.010 }),
+        require(move.triggers.push({ 1, 11, ngc::InputCondition::Active }),
                 "second Y joint trigger should fit");
         move.triggerRequired = true;
 

@@ -75,8 +75,8 @@ incremental jogs use a fixed-capacity logical-axis-to-joint mapping,
 jerk-limited scalar trajectories, token-matched velocity updates and stops,
 bounded dead-man leases, travel limits, and physical stop limits. Its hosting
 servo thread supplies sampled digital-input levels before each tick; the core
-detects configured levels or edges, debounces joint inputs, and generates
-jerk-limited independent triggered stops without importing hardware
+detects configured levels or edges and generates jerk-limited independent
+triggered stops without importing hardware
 acquisition or synthetic input policy. The core also provides the executor
 mechanics needed by homing: same-epoch resume between triggered joint moves,
 stationary masked joint-coordinate assignment, and constrained controlled-stop

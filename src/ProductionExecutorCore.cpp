@@ -1330,53 +1330,20 @@ namespace ngc {
             == ruckig::Result::Working;
     }
 
-    bool ProductionExecutorCore::triggeredJointInputQualified(
-        const JointTrigger &trigger,
-        TriggeredJointRuntime &runtime) noexcept {
+    bool ProductionExecutorCore::triggeredJointInputConditionMet(
+        const JointTrigger &trigger) const noexcept {
         const auto current =
             static_cast<bool>(m_digitalInputs[trigger.input]);
         const auto previous =
             static_cast<bool>(m_previousDigitalInputs[trigger.input]);
-        const auto edgeCondition =
-            trigger.condition == InputCondition::RisingEdge
-            || trigger.condition == InputCondition::FallingEdge;
-        const auto conditionStarted = [&] {
-            switch (trigger.condition) {
-                case InputCondition::Active: return current;
-                case InputCondition::Inactive: return !current;
-                case InputCondition::RisingEdge: return current && !previous;
-                case InputCondition::FallingEdge: return !current && previous;
-            }
-
-            return false;
-        }();
-        const auto resultingLevel = [&] {
-            switch (trigger.condition) {
-                case InputCondition::Active:
-                case InputCondition::RisingEdge: return current;
-                case InputCondition::Inactive:
-                case InputCondition::FallingEdge: return !current;
-            }
-
-            return false;
-        }();
-
-        if (edgeCondition && conditionStarted) {
-            runtime.triggerPending = true;
-            runtime.debounceElapsed = 0.0;
-        } else if (!edgeCondition) {
-            runtime.triggerPending = conditionStarted;
-        }
-        if (!runtime.triggerPending || !resultingLevel) {
-            runtime.triggerPending = false;
-            runtime.debounceElapsed = 0.0;
-
-            return false;
+        switch (trigger.condition) {
+            case InputCondition::Active: return current;
+            case InputCondition::Inactive: return !current;
+            case InputCondition::RisingEdge: return current && !previous;
+            case InputCondition::FallingEdge: return !current && previous;
         }
 
-        runtime.debounceElapsed += m_servoPeriod;
-
-        return runtime.debounceElapsed + 1e-12 >= trigger.debounce;
+        return false;
     }
 
     void ProductionExecutorCore::advanceTriggeredJoints(
@@ -1385,7 +1352,7 @@ namespace ngc {
         for (const auto &trigger : move.triggers) {
             auto &runtime = m_triggeredJoints[trigger.joint];
             if (!runtime.finished && !runtime.stopping
-                && triggeredJointInputQualified(trigger, runtime)
+                && triggeredJointInputConditionMet(trigger)
                 && !beginTriggeredJointStop(
                     move, trigger.joint, true)) {
                 faultTriggered();
