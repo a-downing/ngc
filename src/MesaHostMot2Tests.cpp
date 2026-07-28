@@ -817,7 +817,9 @@ namespace {
     }
 
     std::unique_ptr<ngc::mesa::HostMot2CyclicIo>
-    sevenI96CyclicIo(DatagramFixtureTransport &transport) {
+    sevenI96CyclicIo(
+        DatagramFixtureTransport &transport,
+        const bool enableDpll = false) {
         const auto capabilities =
             ngc::mesa::validateSevenI96Capabilities(
                 sevenI96Inventory());
@@ -832,7 +834,16 @@ namespace {
             });
         auto configuration = ngc::mesa::HostMot2CyclicConfiguration{
             .watchdogTimeoutNanoseconds = 5'000'000,
-            .dpll = {},
+            .dpll = enableDpll
+                ? ngc::mesa::HostMot2DpllConfiguration{
+                    .enabled = true,
+                    .stepGeneratorTimer = 1,
+                    .stepGeneratorSampleOffsetNanoseconds = -50'000,
+                    .servoPeriodNanoseconds = 1'000'000,
+                    .maximumPhaseErrorNanoseconds = 25'000,
+                    .convergenceCycles = 1,
+                }
+                : ngc::mesa::HostMot2DpllConfiguration{},
         };
         configuration.isolatedOutputFrequencyHz[0] = 1'000'000;
         auto io = ngc::mesa::HostMot2CyclicIo::create(
@@ -1401,9 +1412,12 @@ namespace {
 
     void testBridgesMesaInputsAndStepGeneratorsToExecutorIo() {
         DatagramFixtureTransport transport;
-        auto io = sevenI96CyclicIo(transport);
-        auto response = transport.response(10);
-        putCyclicConfirmation(response, 0, 1, 1);
+        auto io = sevenI96CyclicIo(transport, true);
+        auto response = transport.queueResponse(14);
+        putLittleEndian32(response, 48);
+        putCyclicConfirmation(response, 4, 1, 1);
+        response = transport.queueResponse(10);
+        putCyclicConfirmation(response, 0, 2, 2);
 
         constexpr std::array<ngc::DigitalInputId, 1> logicalInput{0};
         constexpr std::array<ngc::DigitalOutputId, 1> logicalOutput{0};
@@ -1426,6 +1440,9 @@ namespace {
                 .joint = 0,
                 .stepGenerator = 0,
                 .stepsPerMachineUnit = 4'000.0,
+                .positionGainPerSecond = 1'000.0,
+                .maximumCorrectionVelocity = 0.1,
+                .maximumGeneratedStepError = 2.0,
             },
         };
         auto adapter = ngc::mesa::MesaProductionExecutorIo::create(
@@ -1442,21 +1459,29 @@ namespace {
             "disabled Mesa executor I/O did not retain safe outputs");
 
         outputs.executorEnabled = true;
-        outputs.commandedJoints.velocity[0] = 0.25;
         outputs.digitalOutputs[0] = true;
         (*adapter)->applyOutputs(outputs);
         require(
             (*adapter)->pendingOutputs().digitalOutputsEnabled
                 && (*adapter)->pendingOutputs().digitalOutputs[0],
             "Mesa executor I/O did not stage its field output");
-        response = transport.response(46);
-        putCyclicConfirmation(response, 36, 2, 2);
+        response = transport.response(50);
+        putCyclicConfirmation(response, 40, 3, 3);
         auto inputs = ngc::ProductionExecutorDigitalInputs{};
 
         (*adapter)->sampleDigitalInputs(inputs);
 
         require(inputs[0] && (*adapter)->faultCode() == 0,
                 "Mesa field input program did not publish logical input zero");
+        outputs.commandedJoints.position[0] = 0.000'012'5;
+        outputs.commandedJoints.velocity[0] = 0.25;
+        (*adapter)->applyOutputs(outputs);
+        response = transport.response(50);
+        putLittleEndian32(response.subspan(12), 3 * 65'536);
+        putCyclicConfirmation(response, 40, 4, 4);
+
+        (*adapter)->sampleDigitalInputs(inputs);
+
         const auto stepRates = findRequestWrite(
             transport.request(), 0x2000);
         require(littleEndian32(stepRates.data)
@@ -1468,9 +1493,25 @@ namespace {
                         transport.request(), 0x7D00).data) == 1,
                 "Mesa executor I/O did not map the field output to SSR data");
 
-        response = transport.response(46);
+        outputs.commandedJoints.position[0] = 0.001'012'5;
+        (*adapter)->applyOutputs(outputs);
+        response = transport.response(50);
+        putLittleEndian32(response.subspan(12), 3 * 65'536);
+        putCyclicConfirmation(response, 40, 5, 5);
+
+        (*adapter)->sampleDigitalInputs(inputs);
+
+        require(
+            littleEndian32(
+                findRequestWrite(
+                    transport.request(), 0x2000).data)
+                == static_cast<std::uint32_t>(
+                    static_cast<std::int32_t>(60'129.542144)),
+            "Mesa StepGen position error did not produce bounded correction");
+
+        response = transport.response(50);
         putLittleEndian32(response.subspan(32), 1);
-        putCyclicConfirmation(response, 36, 3, 3);
+        putCyclicConfirmation(response, 40, 6, 6);
         inputs.set();
         (*adapter)->sampleDigitalInputs(inputs);
         (*adapter)->applyOutputs(outputs);
@@ -1484,6 +1525,179 @@ namespace {
                 && !(*adapter)->pendingOutputs().stepGeneratorsEnabled
                 && !(*adapter)->pendingOutputs().digitalOutputsEnabled,
                 "Mesa executor I/O did not latch its fault and stage safe outputs");
+    }
+
+    void testRebasesStationaryMesaCoordinatesAndFaultsFollowingError() {
+        DatagramFixtureTransport transport;
+        auto io = sevenI96CyclicIo(transport, true);
+        auto response = transport.queueResponse(14);
+        putLittleEndian32(response, 48);
+        putCyclicConfirmation(response, 4, 1, 1);
+        response = transport.queueResponse(10);
+        putCyclicConfirmation(response, 0, 2, 2);
+        constexpr std::array<ngc::DigitalInputId, 0> logicalInputs{};
+        constexpr std::array<ngc::DigitalOutputId, 0> logicalOutputs{};
+        auto program = ngc::DigitalIoProgram::compile(
+            "", 0, logicalInputs, 0, logicalOutputs, 0.001);
+        require(program.has_value(),
+                "empty Mesa digital I/O program did not compile");
+        constexpr std::array mappings{
+            ngc::mesa::MesaStepGeneratorMapping{
+                .joint = 0,
+                .stepGenerator = 0,
+                .stepsPerMachineUnit = 4'000.0,
+                .positionGainPerSecond = 100.0,
+                .maximumCorrectionVelocity = 0.1,
+                .maximumGeneratedStepError = 2.0,
+            },
+        };
+        auto adapter = ngc::mesa::MesaProductionExecutorIo::create(
+            std::move(io), std::move(*program), mappings);
+        require(adapter.has_value(),
+                "following-error Mesa adapter fixture was rejected");
+        auto outputs = ngc::ProductionExecutorOutputState{};
+        outputs.executorEnabled = true;
+        (*adapter)->applyOutputs(outputs);
+        response = transport.response(50);
+        putCyclicConfirmation(response, 40, 3, 3);
+        auto inputs = ngc::ProductionExecutorDigitalInputs{};
+        (*adapter)->sampleDigitalInputs(inputs);
+
+        outputs.commandedJoints.position[0] = 0.2;
+        (*adapter)->applyOutputs(outputs);
+
+        require((*adapter)->faultCode() == 0
+                && (*adapter)->pendingOutputs()
+                    .stepGenerators[0].stepsPerSecond == 0.0,
+                "stationary joint-coordinate assignment did not rebase "
+                "Mesa accumulator feedback");
+
+        outputs.commandedJoints.position[0] = 0.4;
+        outputs.commandedJoints.velocity[0] = 0.1;
+        (*adapter)->applyOutputs(outputs);
+
+        require(
+            (*adapter)->faultCode()
+                == ngc::mesa::MESA_STEPGEN_FOLLOWING_ERROR_FAULT
+                && !(*adapter)->pendingOutputs().watchdogEnabled
+                && !(*adapter)->pendingOutputs()
+                    .stepGeneratorsEnabled,
+            "Mesa following error did not latch a safe-output fault");
+    }
+
+    void testMesaAccumulatorFeedbackPreventsCumulativeJitterDrift() {
+        DatagramFixtureTransport transport;
+        auto io = sevenI96CyclicIo(transport, true);
+        auto response = transport.queueResponse(14);
+        putLittleEndian32(response, 48);
+        putCyclicConfirmation(response, 4, 1, 1);
+        response = transport.queueResponse(10);
+        putCyclicConfirmation(response, 0, 2, 2);
+        constexpr std::array<ngc::DigitalInputId, 0> logicalInputs{};
+        constexpr std::array<ngc::DigitalOutputId, 0> logicalOutputs{};
+        auto program = ngc::DigitalIoProgram::compile(
+            "", 0, logicalInputs, 0, logicalOutputs, 0.001);
+        require(program.has_value(),
+                "jitter-feedback digital I/O program did not compile");
+        constexpr auto stepsPerUnit = 4'000.0;
+        constexpr std::array mappings{
+            ngc::mesa::MesaStepGeneratorMapping{
+                .joint = 0,
+                .stepGenerator = 0,
+                .stepsPerMachineUnit = stepsPerUnit,
+                .positionGainPerSecond = 100.0,
+                .maximumCorrectionVelocity = 0.1,
+                .maximumGeneratedStepError = 2.0,
+            },
+        };
+        auto adapter = ngc::mesa::MesaProductionExecutorIo::create(
+            std::move(io), std::move(*program), mappings);
+        require(adapter.has_value(),
+                "jitter-feedback Mesa adapter fixture was rejected");
+        auto outputs = ngc::ProductionExecutorOutputState{};
+        outputs.executorEnabled = true;
+        (*adapter)->applyOutputs(outputs);
+        response = transport.response(50);
+        putCyclicConfirmation(response, 40, 3, 3);
+        auto inputs = ngc::ProductionExecutorDigitalInputs{};
+        (*adapter)->sampleDigitalInputs(inputs);
+
+        constexpr auto servoPeriod = 0.001;
+        constexpr auto velocity = 0.25;
+        constexpr auto iterationCount = 200;
+        auto accumulatorSubcounts = 0.0;
+        auto midpointTrackingOffset = 0.0;
+        auto lastStepsPerSecond = 0.0;
+        for (auto iteration = 1;
+             iteration <= iterationCount; ++iteration) {
+            outputs.commandedJoints.position[0] =
+                velocity * servoPeriod * iteration;
+            outputs.commandedJoints.velocity[0] = velocity;
+            (*adapter)->applyOutputs(outputs);
+            response = transport.response(50);
+            putLittleEndian32(
+                response.subspan(12),
+                static_cast<std::uint32_t>(
+                    std::llround(accumulatorSubcounts)));
+            const auto phaseErrorNanoseconds =
+                iteration % 3 == 0
+                ? 10'000
+                : iteration % 3 == 1
+                    ? -10'000
+                    : 0;
+            const auto rawPhase = static_cast<std::int32_t>(
+                static_cast<double>(phaseErrorNanoseconds)
+                * 4'294'967'296.0 / 1'000'000.0);
+            putLittleEndian32(
+                response.subspan(36),
+                std::bit_cast<std::uint32_t>(rawPhase));
+            const auto sequence =
+                static_cast<std::uint32_t>(iteration + 3);
+            putCyclicConfirmation(
+                response, 40, sequence, sequence);
+
+            (*adapter)->sampleDigitalInputs(inputs);
+
+            require((*adapter)->faultCode() == 0,
+                    "bounded DPLL phase variation faulted accumulator feedback");
+            const auto rateWord = littleEndian32(
+                findRequestWrite(
+                    transport.request(), 0x2000).data);
+            const auto rate = std::bit_cast<std::int32_t>(
+                rateWord);
+            const auto stepsPerSecond =
+                static_cast<double>(rate)
+                * 100'000'000.0 / 4'294'967'296.0;
+            lastStepsPerSecond = stepsPerSecond;
+            accumulatorSubcounts +=
+                stepsPerSecond * 65'536.0 * servoPeriod;
+            if (iteration == iterationCount / 2) {
+                midpointTrackingOffset =
+                    accumulatorSubcounts
+                        / (stepsPerUnit * 65'536.0)
+                    - outputs.commandedJoints.position[0];
+            }
+        }
+
+        const auto actualPosition =
+            accumulatorSubcounts
+            / (stepsPerUnit * 65'536.0);
+        const auto finalTrackingOffset =
+            actualPosition
+            - outputs.commandedJoints.position[0];
+        require(
+            std::abs(
+                finalTrackingOffset - midpointTrackingOffset)
+                < 2.0 / (stepsPerUnit * 65'536.0),
+            std::format(
+                "DPLL-latched accumulator feedback accumulated position "
+                "drift: midpoint offset {} final offset {}",
+                midpointTrackingOffset, finalTrackingOffset));
+        require(std::abs(finalTrackingOffset)
+                    < velocity * servoPeriod * 2.1
+                && std::abs(lastStepsPerSecond - 1'000.0) < 0.1,
+                "Mesa accumulator feedback did not settle to bounded "
+                "nominal-rate tracking");
     }
 }
 
@@ -1510,6 +1724,8 @@ int main() {
         testExecutesBoundedDigitalIoProgram();
         testRejectsInvalidDigitalIoPrograms();
         testBridgesMesaInputsAndStepGeneratorsToExecutorIo();
+        testRebasesStationaryMesaCoordinatesAndFaultsFollowingError();
+        testMesaAccumulatorFeedbackPreventsCumulativeJitterDrift();
     } catch (const std::exception &error) {
         std::cerr << "Mesa HostMot2 test failure: "
                   << error.what() << '\n';

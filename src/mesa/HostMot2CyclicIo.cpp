@@ -1221,4 +1221,9 @@ namespace ngc::mesa {
     std::size_t HostMot2CyclicIo::digitalOutputCount() const noexcept {
         return m_impl->layout.digitalOutputCount;
     }
+
+    const HostMot2DpllConfiguration &
+    HostMot2CyclicIo::dpllConfiguration() const noexcept {
+        return m_impl->configuration.dpll;
+    }
 }

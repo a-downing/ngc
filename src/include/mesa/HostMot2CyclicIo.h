@@ -167,6 +167,8 @@ namespace ngc::mesa {
         [[nodiscard]] std::size_t stepGeneratorCount() const noexcept;
         [[nodiscard]] std::size_t digitalInputCount() const noexcept;
         [[nodiscard]] std::size_t digitalOutputCount() const noexcept;
+        [[nodiscard]] const HostMot2DpllConfiguration &
+        dpllConfiguration() const noexcept;
 
     private:
         class Impl;

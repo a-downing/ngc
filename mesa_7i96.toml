@@ -78,6 +78,9 @@ joint = 0
 channel = 1
 steps_per_unit = 160.0
 invert_direction = false
+position_gain = 1000.0
+maximum_correction_velocity = 5.0
+maximum_generated_step_error = 2.0
 
 # Y1: LinuxCNC joint 1 -> hm2_7i96.0.stepgen.02
 [[motion.stepgens]]
@@ -85,6 +88,9 @@ joint = 1
 channel = 2
 steps_per_unit = 160.0
 invert_direction = false
+position_gain = 1000.0
+maximum_correction_velocity = 5.0
+maximum_generated_step_error = 2.0
 
 # Y2: LinuxCNC joint 2 -> hm2_7i96.0.stepgen.03
 [[motion.stepgens]]
@@ -92,6 +98,9 @@ joint = 2
 channel = 3
 steps_per_unit = 160.0
 invert_direction = false
+position_gain = 1000.0
+maximum_correction_velocity = 5.0
+maximum_generated_step_error = 2.0
 
 # Z: LinuxCNC joint 3 -> hm2_7i96.0.stepgen.00
 [[motion.stepgens]]
@@ -99,6 +108,9 @@ joint = 3
 channel = 0
 steps_per_unit = 160.0
 invert_direction = false
+position_gain = 1000.0
+maximum_correction_velocity = 5.0
+maximum_generated_step_error = 2.0
 
 # StepGen channel 4 is unused. The LinuxCNC configuration has no Mesa isolated
 # field outputs, so this proposal deliberately has no motion.field_outputs
@@ -107,6 +119,11 @@ invert_direction = false
 # The metric scale is the exact conversion of the previous LinuxCNC setting:
 # 4064 steps/inch / 25.4 mm/inch = 160 steps/mm. With the machine's 5 mm-pitch
 # ball screws, this is 800 commanded steps per screw revolution.
+#
+# The position loop uses commanded velocity as feed-forward and P=1000
+# proportional correction. Correction is limited to 5 mm/s and exists only to
+# remove small host/FPGA phase discrepancies. More than two generated steps of
+# disagreement is a fault rather than a request for aggressive catch-up.
 #
 # GPIO 2 is an enable-permission input in the existing wiring. Publishing it as
 # in3 does not yet make it safety-functional: the production executor still

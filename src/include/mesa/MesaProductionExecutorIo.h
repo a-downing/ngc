@@ -20,7 +20,15 @@ namespace ngc::mesa {
         JointId joint = 0;
         std::size_t stepGenerator = 0;
         double stepsPerMachineUnit = 0.0;
+        double positionGainPerSecond = 0.0;
+        double maximumCorrectionVelocity = 0.0;
+        double maximumGeneratedStepError = 0.0;
     };
+
+    inline constexpr std::uint32_t
+        MESA_STEPGEN_ALIGNMENT_FAULT = 0x4D53'0100;
+    inline constexpr std::uint32_t
+        MESA_STEPGEN_FOLLOWING_ERROR_FAULT = 0x4D53'0101;
 
     class MesaProductionExecutorIo final : public ProductionExecutorIo {
     public:
@@ -55,8 +63,16 @@ namespace ngc::mesa {
             MAX_JOINTS> m_stepGenerators{};
         std::size_t m_stepGeneratorCount = 0;
         HostMot2CyclicOutputImage m_pendingOutputs;
+        JointMotionState m_lastCommandedJoints;
+        std::array<std::int64_t, MAX_JOINTS>
+            m_sampledAccumulatorSubcounts{};
+        std::array<double, MAX_JOINTS>
+            m_accumulatorOriginSubcounts{};
         FieldDigitalInputImage m_fieldInputs;
         LogicalDigitalOutputImage m_logicalOutputs;
         std::uint32_t m_faultCode = 0;
+        bool m_lastExecutorEnabled = false;
+        bool m_accumulatorFeedbackAvailable = false;
+        bool m_accumulatorFeedbackAligned = false;
     };
 }

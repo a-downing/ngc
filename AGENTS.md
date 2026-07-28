@@ -114,8 +114,12 @@ reads the firmware-reported phase-accumulator width during safe initialization,
 programs one selected StepGen accumulator-latch timer relative to the servo
 period, holds nonzero StepGen rates until the observed phase error converges
 within a configured guard band, and latches a fault if a ready DPLL later
-leaves that band. Generated-step accumulator correction is a separate future
-control checkpoint. Disabled and faulted executor
+leaves that band. The Mesa executor adapter aligns returned accumulator
+subcounts to commanded joint coordinates only while stationary, rebases
+deliberate stationary coordinate assignments, and otherwise applies bounded
+proportional position correction on top of commanded joint velocity. It holds
+motion until DPLL-backed feedback is aligned and faults on moving alignment or
+following-error violations. Disabled and faulted executor
 states suppress the watchdog, StepGen motion, and digital outputs. On
 configured Linux hosts, the
 runtime's existing servo thread removes the
