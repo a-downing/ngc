@@ -30,7 +30,6 @@ namespace ngc::mesa {
              index < result.digitalInputCount; ++index) {
             result.digitalInputs[index] = {
                 .pin = capabilities.isolatedInputPins[index],
-                .activeLow = false,
             };
         }
 

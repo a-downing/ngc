@@ -2,8 +2,10 @@
 
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <cstddef>
 #include <cstdint>
+#include <limits>
 #include <optional>
 #include <type_traits>
 #include <variant>
@@ -155,6 +157,10 @@ namespace ngc {
     static_assert(std::is_trivially_copyable_v<PlanChunk>);
 
     using DigitalInputId = std::uint16_t;
+    inline constexpr std::size_t LOGICAL_DIGITAL_INPUT_CAPACITY =
+        std::numeric_limits<DigitalInputId>::max() + std::size_t{1};
+    using LogicalDigitalInputImage =
+        std::bitset<LOGICAL_DIGITAL_INPUT_CAPACITY>;
     using TriggeredMoveId = std::uint64_t;
     using JointId = std::uint8_t;
     using JointMask = std::uint16_t;

@@ -228,6 +228,33 @@ namespace {
         return configuration;
     }
 
+    void testPublishesFixedExecutorIoState() {
+        ngc::ProductionExecutorCore core(0.001);
+        auto commandedJoints = ngc::JointMotionState{};
+        commandedJoints.position[0] = 1.25;
+        commandedJoints.velocity[0] = 0.5;
+        core.restoreStationaryState(
+            {}, {}, commandedJoints, commandedJoints);
+
+        auto outputs = core.outputState();
+        require(!outputs.executorEnabled
+                    && outputs.commandedJoints.position[0] == 1.25
+                    && outputs.commandedJoints.velocity[0] == 0.5,
+                "disabled executor output omitted commanded joint state");
+
+        require(core.trySubmit(ngc::EnableRequest{1})
+                    == ngc::SubmitResult::Submitted,
+                "executor I/O state fixture did not accept enable");
+        core.serviceImmediate();
+        outputs = core.outputState();
+        require(outputs.executorEnabled,
+                "held executor output did not retain hardware enable");
+
+        core.reportHostFault(0x1020'3040);
+        require(!core.outputState().executorEnabled,
+                "faulted executor output retained hardware enable");
+    }
+
     JogRun runJogUntilHeld(ngc::ProductionExecutorCore &core,
                            const std::size_t maximumTicks = 4'000) {
         JogRun result;
@@ -2410,6 +2437,7 @@ int main() {
         std::declval<ngc::ProductionExecutorCore &>().servoTick()));
 
     try {
+        testPublishesFixedExecutorIoState();
         testFixedTickExecutionAndAccounting();
         testEnabledResetRetainsPoweredHeldState();
         testContinuationMarkersAndTerminalStop();

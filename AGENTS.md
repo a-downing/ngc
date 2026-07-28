@@ -97,7 +97,17 @@ the core. It derives fixed-capacity executor mappings and limits from typed
 machine configuration, owns fixed-period ticking and stopped-state synchronous
 service stepping, samples a fixed-size digital-input image before each tick,
 and applies the fixed-size output state afterward through an injected I/O
-boundary. On configured Linux hosts, its existing servo thread removes the
+boundary. The physical Mesa integration slice exposes unmodified board input
+levels as `fieldinN`, executes an NRT-compiled, fixed-capacity Boolean input
+program with `mov`, `not`, `and`, `or`, `xor`, and stateful `debounce`
+instructions, and atomically supplies its `inN` logical-input image to the
+executor. `fieldinN` operands are read-only, `inN` operands are write-only, and
+debounce durations written as time are rounded up to fixed servo ticks during
+NRT compilation. Its bounded adapter stages commanded joint velocities as
+StepGen rates, requires
+the watchdog for enabled motion, and converts any invalid cyclic exchange into
+an executor host fault and safe output image. On configured Linux hosts, the
+runtime's existing servo thread removes the
 calling NRT host from the selected CPU, locks process memory, pins itself,
 enters `SCHED_FIFO`, prefaults its stack, and sleeps to absolute monotonic
 deadlines. Host setup failure is fatal rather than falling back to ordinary

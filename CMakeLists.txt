@@ -35,6 +35,7 @@ add_subdirectory(path_tempo)
 
 add_library(ngc_core STATIC
         src/ArcInterpolation.cpp
+        src/DigitalIoProgram.cpp
         src/ExecutionItemOperations.cpp
         src/ExternalRealtimeRuntime.cpp
         src/HomingController.cpp
@@ -75,6 +76,12 @@ if(WIN32)
     target_link_libraries(ngc_mesa PRIVATE ws2_32)
 endif()
 ngc_target_defaults(ngc_mesa)
+
+add_library(ngc_mesa_executor STATIC
+        src/mesa/MesaProductionExecutorIo.cpp)
+target_include_directories(ngc_mesa_executor PUBLIC src/include)
+target_link_libraries(ngc_mesa_executor PUBLIC ngc_core ngc_mesa)
+ngc_target_defaults(ngc_mesa_executor)
 
 add_library(ngc_operator STATIC
         src/operator/OperatorJogController.cpp
@@ -142,7 +149,7 @@ ngc_target_defaults(ngc_production_executor_tests)
 add_test(NAME ngc_production_executor_tests COMMAND ngc_production_executor_tests)
 
 add_executable(ngc_mesa_tests src/MesaHostMot2Tests.cpp)
-target_link_libraries(ngc_mesa_tests PRIVATE ngc_mesa)
+target_link_libraries(ngc_mesa_tests PRIVATE ngc_mesa_executor)
 ngc_target_defaults(ngc_mesa_tests)
 add_test(NAME ngc_mesa_tests COMMAND ngc_mesa_tests)
 

@@ -519,14 +519,20 @@ lock_memory = true
 driver = "mesa_hostmot2"
 address = "10.10.10.10"
 expected_board = "7i96"
+io_program = """
+not r0, fieldin0
+mov r1, fieldin1
+and r2, r0, r1
+debounce r3, r2, 10ms
+mov in0, r3
 
-[motion.inputs.tool_probe]
-pin = 0
-active_low = false
+# Planned logical-output mapping:
+mov fieldout0, out0
+"""
 
-[motion.outputs.drive_enable]
+[[motion.field_outputs]]
+channel = 0
 pin = 0
-active_low = false
 safe_state = false
 
 [[motion.stepgens]]
@@ -540,7 +546,11 @@ The physical configuration owns:
 
 - board address and expected identity/firmware capabilities;
 - HostMot2 module and pin assignments;
-- logical-input/output-to-pin mapping and electrical polarity;
+- a bounded digital-I/O program that owns field-input-to-logical-input and
+  logical-output-to-field-output mapping, input and output polarity, Boolean
+  composition, and input debounce;
+- field-output pin assignments and safe states, enforced independently of the
+  digital-I/O program;
 - joint-to-step-generator mapping;
 - steps per machine unit;
 - step length, space, direction setup, and direction hold;
@@ -552,6 +562,27 @@ combines it with the authoritative parameters and topology supplied by the
 front end, validates the composition completely, and passes typed
 configuration to the physical runtime. The physical runtime, device drivers,
 and RT executor never parse TOML or access configuration files.
+
+The digital-I/O assembly namespaces describe direction at the machine and
+field boundaries:
+
+```text
+fieldinN -> program -> inN
+outN     -> program -> fieldoutN
+```
+
+`fieldinN` is a read-only sampled field input and `inN` is a write-only logical
+input supplied atomically to the executor. The planned output extension makes
+`outN` a read-only logical output produced by the executor or G-code and
+`fieldoutN` a write-only field output. Registers `rN` remain read/write
+temporaries. The assembler rejects operands used against their direction.
+
+Assembly source expresses debounce in time, for example
+`debounce r0, fieldin0, 10ms`. NRT compilation rounds the duration up to an
+integer number of servo ticks. RT execution stores only that integer count and
+requires the candidate level to be observed for that many consecutive servo
+samples; `0ms` propagates immediately. This preserves the configured debounce
+time when the servo period changes.
 
 ## Physical backend process
 
@@ -1128,12 +1159,28 @@ held state.
   timing and alternate pin sources, and writes the final I/O direction last.
   Its allocation-free `noexcept` cycle converts bounded
   physical step rates to HostMot2 DDS words, unwraps 16.16 StepGen
-  accumulators, maps polarity-aware digital inputs and SSR outputs, services
-  the watchdog, and latches invalid-output, transport, sequence, board-error,
-  and watchdog faults while withholding typed inputs. Motion-capable outputs
-  require the watchdog to be active. `SevenI96CyclicLayout` is a thin
+  accumulators, exposes unmodified field digital inputs, maps SSR outputs,
+  services the watchdog, and latches invalid-output, transport, sequence,
+  board-error, and watchdog faults while withholding typed inputs.
+  Motion-capable outputs require the watchdog to be active.
+  `SevenI96CyclicLayout` is a thin
   board-specific adapter; the common cyclic layer contains no 7I96 topology.
-  Executor I/O integration and physical-host validation remain.
+  The third write-capable checkpoint adds `DigitalIoProgram`, whose NRT
+  assembler validates a fixed instruction and register budget, definite
+  register assignment, field and logical indices, single assignment of every
+  required logical input, and time durations rounded up to servo ticks. Its
+  allocation-free execution supports `mov`, `not`, `and`, `or`, `xor`, and
+  symmetric stateful `debounce dest, src, time`, then commits the complete
+  logical image atomically. `MesaProductionExecutorIo` safely initializes the
+  cyclic layer, runs that program on every valid field sample, stages configured
+  joint velocities as StepGen rates, requires the watchdog for enabled motion,
+  and promotes cyclic failures to executor host faults with safe pending
+  outputs. The current compiler and executor adapter implement only
+  `fieldinN -> inN`; they do not yet accept `outN` or `fieldoutN`.
+  Physical-backend configuration parsing and hosting, the planned
+  `outN -> fieldoutN` program path for executor/G-code digital outputs,
+  generated-step feedback, configured SSR output integration, and
+  physical-host validation remain.
 - Validate on a dedicated Linux RT host and NIC before enabling outputs.
 
 ### Phase 12: Staged physical commissioning

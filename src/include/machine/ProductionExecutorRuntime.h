@@ -19,8 +19,7 @@ namespace ngc {
     inline constexpr std::uint32_t
         PRODUCTION_EXECUTOR_DEADLINE_MISS_FAULT = 0x52540001;
 
-    using ProductionExecutorDigitalInputs =
-        std::bitset<ProductionExecutorCore::DIGITAL_INPUT_CAPACITY>;
+    using ProductionExecutorDigitalInputs = LogicalDigitalInputImage;
 
     class ProductionExecutorIo {
     public:
@@ -30,6 +29,9 @@ namespace ngc {
             ProductionExecutorDigitalInputs &inputs) noexcept = 0;
         virtual void applyOutputs(
             const ProductionExecutorOutputState &outputs) noexcept = 0;
+        [[nodiscard]] virtual std::uint32_t faultCode() const noexcept {
+            return 0;
+        }
         [[nodiscard]] virtual bool prepareTriggeredJointMove(
             const TriggeredJointMove &) noexcept {
             return true;

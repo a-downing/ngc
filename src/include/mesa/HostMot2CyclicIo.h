@@ -41,7 +41,6 @@ namespace ngc::mesa {
 
     struct HostMot2DigitalInputBinding {
         std::uint16_t pin = 0;
-        bool activeLow = false;
     };
 
     struct HostMot2DigitalOutputBinding {
@@ -105,7 +104,7 @@ namespace ngc::mesa {
             HOSTMOT2_CYCLIC_STEP_GENERATOR_CAPACITY>
             stepAccumulatorSubcounts{};
         std::bitset<
-            HOSTMOT2_CYCLIC_DIGITAL_INPUT_CAPACITY> digitalInputs;
+            HOSTMOT2_CYCLIC_DIGITAL_INPUT_CAPACITY> fieldDigitalInputs;
     };
 
     enum class HostMot2CyclicIoFault : std::uint8_t {

@@ -522,8 +522,12 @@ namespace ngc {
     void ProductionExecutorRuntime::tick(
         const bool publishSnapshot) noexcept {
         m_io->sampleDigitalInputs(m_inputs);
-        m_core->setDigitalInputSamples(m_inputs);
-        m_core->servoTick(publishSnapshot);
+        if (const auto fault = m_io->faultCode(); fault != 0) {
+            m_core->reportHostFault(fault);
+        } else {
+            m_core->setDigitalInputSamples(m_inputs);
+            m_core->servoTick(publishSnapshot);
+        }
         m_io->applyOutputs(m_core->outputState());
 
         m_servoTicks.fetch_add(1, std::memory_order_relaxed);

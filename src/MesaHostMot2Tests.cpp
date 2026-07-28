@@ -12,10 +12,12 @@
 #include <string>
 #include <string_view>
 
+#include "machine/DigitalIoProgram.h"
 #include "mesa/HostMot2CyclicIo.h"
 #include "mesa/HostMot2Discovery.h"
 #include "mesa/HostMot2Latency.h"
 #include "mesa/Lbp16CyclicTransaction.h"
+#include "mesa/MesaProductionExecutorIo.h"
 #include "mesa/SevenI96Capabilities.h"
 #include "mesa/SevenI96CyclicLayout.h"
 
@@ -907,7 +909,6 @@ namespace {
         layout.digitalInputCount = 1;
         layout.digitalInputs[0] = {
             .pin = 0,
-            .activeLow = true,
         };
         layout.digitalOutputCount = 1;
         layout.digitalOutputs[0] = {
@@ -955,7 +956,7 @@ namespace {
         require(
             result.fault == ngc::mesa::HostMot2CyclicIoFault::None
                 && result.inputsValid
-                && (*io)->inputImage().digitalInputs[0]
+                && !(*io)->inputImage().fieldDigitalInputs[0]
                 && (*io)->inputImage().stepAccumulatorSubcounts[0]
                     == 65'536,
             "generic HostMot2 bindings were not applied to cyclic inputs");
@@ -1040,10 +1041,10 @@ namespace {
         require(littleEndian32(watchdogTimer.data) == 499'999,
                 "cyclic watchdog timeout uses the wrong clock conversion");
         const auto &inputs = io->inputImage();
-        require(inputs.digitalInputs[0]
-                && inputs.digitalInputs[10]
-                && !inputs.digitalInputs[1],
-                "cyclic digital inputs were decoded incorrectly");
+        require(inputs.fieldDigitalInputs[0]
+                && inputs.fieldDigitalInputs[10]
+                && !inputs.fieldDigitalInputs[1],
+                "cyclic field digital inputs were decoded incorrectly");
         require(inputs.rawStepAccumulator[0] == 0x0001'0000
                 && inputs.stepAccumulatorSubcounts[0] == 65'536
                 && inputs.stepAccumulatorSubcounts[1] == -65'536,
@@ -1100,6 +1101,158 @@ namespace {
                     == ngc::mesa::HostMot2CyclicIoFault::InvalidOutput,
             "invalid HostMot2 output was not rejected and latched");
     }
+
+    void testExecutesBoundedDigitalIoProgram() {
+        constexpr std::array<ngc::DigitalInputId, 3> logicalInputs{
+            0, 1, 2,
+        };
+        auto program = ngc::DigitalIoProgram::compile(
+            R"PROGRAM(
+                not r0, fieldin0
+                mov r1, fieldin1
+                and r2, r0, r1
+                or r3, fieldin0, fieldin1
+                xor r4, fieldin0, fieldin1
+                debounce r5, r2, 3ms
+                mov in0, r5
+                mov in1, r3
+                mov in2, r4
+            )PROGRAM",
+            2, logicalInputs, 0.001);
+        require(program.has_value()
+                && program->instructionCount() == 9
+                && program->fieldInputCount() == 2
+                && program->logicalInputCount() == 3,
+                "valid digital-input program was rejected");
+
+        auto fieldInputs = ngc::FieldDigitalInputImage{};
+        fieldInputs[1] = true;
+        auto logical = ngc::LogicalDigitalInputImage{};
+        program->execute(fieldInputs, logical);
+        require(logical[0] && logical[1] && logical[2],
+                "digital-input program produced incorrect Boolean outputs");
+
+        fieldInputs[1] = false;
+        program->execute(fieldInputs, logical);
+        require(logical[0] && !logical[1] && !logical[2],
+                "debounce changed before its stable-time threshold");
+        program->execute(fieldInputs, logical);
+        require(logical[0],
+                "debounce changed one tick before its threshold");
+        program->execute(fieldInputs, logical);
+        require(!logical[0],
+                "debounce did not change at its stable-time threshold");
+
+        program->reset();
+        program->execute(fieldInputs, logical);
+        require(!logical[0],
+                "digital-input program reset retained debounce state");
+    }
+
+    void testRejectsInvalidDigitalIoPrograms() {
+        constexpr std::array<ngc::DigitalInputId, 1> logicalInput{0};
+        const auto uninitialized =
+            ngc::DigitalIoProgram::compile(
+                "and r0, r1, fieldin0\nmov in0, r0",
+                1, logicalInput, 0.001);
+        const auto invalidFieldInput =
+            ngc::DigitalIoProgram::compile(
+                "mov in0, fieldin1",
+                1, logicalInput, 0.001);
+        const auto duplicateOutput =
+            ngc::DigitalIoProgram::compile(
+                "mov in0, fieldin0\nmov in0, 1",
+                1, logicalInput, 0.001);
+        const auto statefulOutput =
+            ngc::DigitalIoProgram::compile(
+                "debounce in0, fieldin0, 10ms",
+                1, logicalInput, 0.001);
+        const auto invalidDuration =
+            ngc::DigitalIoProgram::compile(
+                "debounce r0, fieldin0, forever\nmov in0, r0",
+                1, logicalInput, 0.001);
+
+        require(!uninitialized.has_value()
+                && uninitialized.error().find("uninitialized")
+                    != std::string::npos,
+                "input program accepted an uninitialized register");
+        require(!invalidFieldInput.has_value()
+                && invalidFieldInput.error().find("out of range")
+                    != std::string::npos,
+                "input program accepted an unavailable field input");
+        require(!duplicateOutput.has_value()
+                && duplicateOutput.error().find("more than once")
+                    != std::string::npos,
+                "input program accepted duplicate logical output");
+        require(!statefulOutput.has_value()
+                && statefulOutput.error().find("invalid destination")
+                    != std::string::npos,
+                "debounce accepted a logical-input destination");
+        require(!invalidDuration.has_value()
+                && invalidDuration.error().find("invalid duration")
+                    != std::string::npos,
+                "input program accepted an invalid duration");
+    }
+
+    void testBridgesMesaInputsAndStepGeneratorsToExecutorIo() {
+        DatagramFixtureTransport transport;
+        auto io = sevenI96CyclicIo(transport);
+        auto response = transport.response(10);
+        putCyclicConfirmation(response, 0, 1, 1);
+
+        constexpr std::array<ngc::DigitalInputId, 1> logicalInput{0};
+        auto program = ngc::DigitalIoProgram::compile(
+            "not r0, fieldin0\nmov in0, r0",
+            11, logicalInput, 0.001);
+        require(program.has_value(),
+                "Mesa executor input program did not compile");
+        constexpr std::array mappings{
+            ngc::mesa::MesaStepGeneratorMapping{
+                .joint = 0,
+                .stepGenerator = 0,
+                .stepsPerMachineUnit = 4'000.0,
+            },
+        };
+        auto adapter = ngc::mesa::MesaProductionExecutorIo::create(
+            std::move(io), std::move(*program), mappings);
+        require(adapter.has_value(),
+                "valid Mesa executor I/O adapter was rejected");
+
+        auto outputs = ngc::ProductionExecutorOutputState{};
+        outputs.executorEnabled = true;
+        outputs.commandedJoints.velocity[0] = 0.25;
+        (*adapter)->applyOutputs(outputs);
+        response = transport.response(46);
+        putCyclicConfirmation(response, 36, 2, 2);
+        auto inputs = ngc::ProductionExecutorDigitalInputs{};
+
+        (*adapter)->sampleDigitalInputs(inputs);
+
+        require(inputs[0] && (*adapter)->faultCode() == 0,
+                "Mesa field input program did not publish logical input zero");
+        const auto stepRates = findRequestWrite(
+            transport.request(), 0x2000);
+        require(littleEndian32(stepRates.data)
+                    == static_cast<std::uint32_t>(
+                        static_cast<std::int32_t>(42'949.67296)),
+                "Mesa executor I/O mapped the wrong joint StepGen rate");
+
+        response = transport.response(46);
+        putLittleEndian32(response.subspan(32), 1);
+        putCyclicConfirmation(response, 36, 3, 3);
+        inputs.set();
+        (*adapter)->sampleDigitalInputs(inputs);
+        (*adapter)->applyOutputs(outputs);
+
+        require((*adapter)->faultCode()
+                    == (ngc::mesa::MESA_PRODUCTION_EXECUTOR_IO_FAULT_BASE
+                        | static_cast<std::uint32_t>(
+                            ngc::mesa::HostMot2CyclicIoFault::WatchdogTripped))
+                && inputs.none()
+                && !(*adapter)->pendingOutputs().watchdogEnabled
+                && !(*adapter)->pendingOutputs().stepGeneratorsEnabled,
+                "Mesa executor I/O did not latch its fault and stage safe outputs");
+    }
 }
 
 int main() {
@@ -1121,6 +1274,9 @@ int main() {
         testAcceptsBoardIndependentHostMot2CyclicLayout();
         testExchangesTypedHostMot2CyclicImages();
         testLatchesHostMot2WatchdogAndInvalidOutputFaults();
+        testExecutesBoundedDigitalIoProgram();
+        testRejectsInvalidDigitalIoPrograms();
+        testBridgesMesaInputsAndStepGeneratorsToExecutorIo();
     } catch (const std::exception &error) {
         std::cerr << "Mesa HostMot2 test failure: "
                   << error.what() << '\n';

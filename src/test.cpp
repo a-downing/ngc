@@ -140,6 +140,27 @@ namespace {
         std::uint32_t m_ticksUntilTrigger = 0;
     };
 
+    class FaultingProductionExecutorIo final
+        : public ngc::ProductionExecutorIo {
+    public:
+        void sampleDigitalInputs(
+            ngc::ProductionExecutorDigitalInputs &inputs) noexcept override {
+            inputs.reset();
+        }
+
+        void applyOutputs(
+            const ngc::ProductionExecutorOutputState &outputs) noexcept override {
+            lastOutputs = outputs;
+        }
+
+        [[nodiscard]] std::uint32_t faultCode() const noexcept override {
+            return fault;
+        }
+
+        static constexpr std::uint32_t fault = 0x1234'5678;
+        ngc::ProductionExecutorOutputState lastOutputs;
+    };
+
     constexpr std::string_view HELLO_FIXTURE=R"NGC(
 %
 let #hello = 12345
@@ -1766,6 +1787,25 @@ final_move_together = true
                 "production timing histograms should account for every measured tick");
 
         runtime.stop();
+    }
+
+    void testProductionExecutorRuntimeReportsIoFault() {
+        ngc::ProductionExecutorRuntimeConfiguration configuration;
+        auto io = std::make_unique<FaultingProductionExecutorIo>();
+        const auto *observation = io.get();
+        ngc::ProductionExecutorRuntime runtime(
+            configuration, std::move(io));
+
+        require(runtime.advanceServiceMotionPeriod() == 1,
+                "production runtime did not execute its faulting I/O period");
+        ngc::ExecutionSnapshot snapshot;
+        require(runtime.endpoint().tryTakeSnapshot(snapshot)
+                    && snapshot.state == ngc::BackendState::Faulted
+                    && snapshot.faultCode
+                        == FaultingProductionExecutorIo::fault,
+                "production runtime did not report its I/O fault");
+        require(!observation->lastOutputs.executorEnabled,
+                "production runtime retained enabled outputs after an I/O fault");
     }
 
     void testProductionExecutorTimingBackpressureDoesNotBlockServo() {
@@ -7959,6 +7999,7 @@ int main() {
         testInProcessSimulationRuntimePersistsAcrossTimedEpochs();
         testProductionExecutorRuntimeOwnsFixedPeriodLifecycle();
         testProductionExecutorRuntimePublishesBoundedTiming();
+        testProductionExecutorRuntimeReportsIoFault();
         testProductionExecutorTimingBackpressureDoesNotBlockServo();
         testHomingControllerOwnsBackendNeutralSequence();
         testProductionExecutorRuntimeRunsHomingController();

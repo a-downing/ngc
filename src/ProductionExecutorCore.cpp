@@ -296,7 +296,7 @@ namespace ngc {
     }
 
     void ProductionExecutorCore::setDigitalInputSamples(
-        const std::bitset<DIGITAL_INPUT_CAPACITY> &inputs) noexcept {
+        const LogicalDigitalInputImage &inputs) noexcept {
         m_digitalInputs = inputs;
     }
 
@@ -337,7 +337,13 @@ namespace ngc {
     }
 
     ProductionExecutorOutputState ProductionExecutorCore::outputState() const noexcept {
-        return m_outputState;
+        auto result = m_outputState;
+        result.commandedJoints = m_snapshot.commandedJoints;
+        result.executorEnabled =
+            m_snapshot.state != BackendState::Disabled
+            && m_snapshot.state != BackendState::Faulted;
+
+        return result;
     }
 
     void ProductionExecutorCore::serviceControls() noexcept {

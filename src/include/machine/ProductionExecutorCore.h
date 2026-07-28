@@ -55,7 +55,9 @@ namespace ngc {
         std::is_trivially_copyable_v<ProductionExecutorConfiguration>);
 
     struct ProductionExecutorOutputState {
+        JointMotionState commandedJoints{};
         SpindleEvent spindle{};
+        bool executorEnabled = false;
     };
     static_assert(std::is_trivially_copyable_v<ProductionExecutorOutputState>);
 
@@ -68,7 +70,7 @@ namespace ngc {
             + CONTROL_CAPACITY;
         static constexpr std::size_t SNAPSHOT_CAPACITY = 4;
         static constexpr std::size_t DIGITAL_INPUT_CAPACITY =
-            std::numeric_limits<DigitalInputId>::max() + std::size_t{1};
+            LOGICAL_DIGITAL_INPUT_CAPACITY;
 
         explicit ProductionExecutorCore(
             double servoPeriod,
@@ -92,7 +94,7 @@ namespace ngc {
         // preceding tick; hardware acquisition remains outside this core.
         void setDigitalInputSample(DigitalInputId input, bool active) noexcept;
         void setDigitalInputSamples(
-            const std::bitset<DIGITAL_INPUT_CAPACITY> &inputs) noexcept;
+            const LogicalDigitalInputImage &inputs) noexcept;
         void servoTick(bool publishSnapshot = true) noexcept;
         void reportHostFault(std::uint32_t code) noexcept;
         [[nodiscard]] double servoPeriod() const noexcept;
@@ -288,8 +290,8 @@ namespace ngc {
         TriggeredMoveStatus m_triggeredJointCompletionStatus =
             TriggeredMoveStatus::ReachedTarget;
         EpochId m_controlledStoppedEpoch = 0;
-        std::bitset<DIGITAL_INPUT_CAPACITY> m_digitalInputs;
-        std::bitset<DIGITAL_INPUT_CAPACITY> m_previousDigitalInputs;
+        LogicalDigitalInputImage m_digitalInputs;
+        LogicalDigitalInputImage m_previousDigitalInputs;
         bool m_stopping = false;
         bool m_faultEventEmitted = false;
     };

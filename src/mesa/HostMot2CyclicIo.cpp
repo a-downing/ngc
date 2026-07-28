@@ -725,8 +725,7 @@ namespace ngc::mesa {
                     ioData.subspan(port * sizeof(std::uint32_t)));
                 const auto physicalLevel =
                     (word & (std::uint32_t{1} << portPin)) != 0;
-                nextInput.digitalInputs[index] =
-                    physicalLevel != binding.activeLow;
+                nextInput.fieldDigitalInputs[index] = physicalLevel;
             }
 
             auto nextExtended = extendedStepAccumulator;
