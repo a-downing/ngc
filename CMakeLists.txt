@@ -33,6 +33,13 @@ unset(BUILD_TESTS)
 
 add_subdirectory(path_tempo)
 
+add_library(ngc_configuration STATIC
+        src/TomlConfiguration.cpp)
+target_include_directories(ngc_configuration PUBLIC src/include)
+target_link_libraries(
+        ngc_configuration PUBLIC tomlplusplus::tomlplusplus)
+ngc_target_defaults(ngc_configuration)
+
 add_library(ngc_core STATIC
         src/ArcInterpolation.cpp
         src/DigitalIoProgram.cpp
@@ -48,6 +55,7 @@ add_library(ngc_core STATIC
         src/ProgramExecutionController.cpp
         src/ProductionExecutorCore.cpp
         src/ProductionExecutorRuntime.cpp
+        src/RealtimeHost.cpp
         src/PreparedGeometry.cpp
         src/SplineReconstruction.cpp
         src/TrajectoryCompiler.cpp
@@ -60,7 +68,7 @@ add_library(ngc_core STATIC
 target_include_directories(ngc_core PUBLIC src/include)
 target_link_libraries(ngc_core
     PUBLIC ruckig::ruckig
-    PRIVATE PathTempo::PathTempo tomlplusplus::tomlplusplus)
+    PRIVATE PathTempo::PathTempo ngc_configuration)
 ngc_target_defaults(ngc_core)
 
 add_library(ngc_mesa STATIC
@@ -82,6 +90,15 @@ add_library(ngc_mesa_executor STATIC
 target_include_directories(ngc_mesa_executor PUBLIC src/include)
 target_link_libraries(ngc_mesa_executor PUBLIC ngc_core ngc_mesa)
 ngc_target_defaults(ngc_mesa_executor)
+
+add_library(ngc_mesa_configuration STATIC
+        src/mesa/MesaBackendConfiguration.cpp)
+target_include_directories(
+        ngc_mesa_configuration PUBLIC src/include)
+target_link_libraries(
+        ngc_mesa_configuration
+        PUBLIC ngc_mesa ngc_configuration)
+ngc_target_defaults(ngc_mesa_configuration)
 
 add_library(ngc_operator STATIC
         src/operator/OperatorJogController.cpp
@@ -149,7 +166,11 @@ ngc_target_defaults(ngc_production_executor_tests)
 add_test(NAME ngc_production_executor_tests COMMAND ngc_production_executor_tests)
 
 add_executable(ngc_mesa_tests src/MesaHostMot2Tests.cpp)
-target_link_libraries(ngc_mesa_tests PRIVATE ngc_mesa_executor)
+target_compile_definitions(
+    ngc_mesa_tests PRIVATE NGC_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(
+    ngc_mesa_tests PRIVATE
+    ngc_mesa_executor ngc_mesa_configuration)
 ngc_target_defaults(ngc_mesa_tests)
 add_test(NAME ngc_mesa_tests COMMAND ngc_mesa_tests)
 
@@ -180,6 +201,14 @@ ngc_target_defaults(ngc_mesa_discover)
 add_executable(ngc_mesa_latency tools/ngc_mesa_latency.cpp)
 target_link_libraries(ngc_mesa_latency PRIVATE ngc_mesa)
 ngc_target_defaults(ngc_mesa_latency)
+
+add_executable(
+    ngc_mesa_stepgen_diagnostic
+    tools/ngc_mesa_stepgen_diagnostic.cpp)
+target_link_libraries(
+    ngc_mesa_stepgen_diagnostic
+    PRIVATE ngc_core ngc_mesa_configuration)
+ngc_target_defaults(ngc_mesa_stepgen_diagnostic)
 
 add_executable(ngc_g64_geometry_export tools/ngc_g64_geometry_export.cpp)
 target_include_directories(ngc_g64_geometry_export PRIVATE src)

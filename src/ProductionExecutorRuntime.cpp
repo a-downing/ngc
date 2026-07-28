@@ -1,31 +1,19 @@
 #include "machine/ProductionExecutorRuntime.h"
 
 #include <algorithm>
-#include <array>
 #include <bit>
-#include <cerrno>
 #include <chrono>
 #include <cmath>
 #include <cstddef>
 #include <limits>
 #include <ranges>
 #include <stdexcept>
-#include <system_error>
 #include <utility>
 
-#ifdef __linux__
-#include <pthread.h>
-#include <sched.h>
-#include <sys/mman.h>
-#include <time.h>
-#endif
+#include "machine/RealtimeHost.h"
 
 namespace ngc {
     namespace {
-#ifdef __linux__
-        constexpr std::size_t SERVO_STACK_PREFAULT_BYTES = 128 * 1024;
-#endif
-
         class NullProductionExecutorIo final : public ProductionExecutorIo {
         public:
             void sampleDigitalInputs(
@@ -73,73 +61,6 @@ namespace ngc {
                 REALTIME_TIMING_HISTOGRAM_BUCKETS - 1);
         }
 
-#ifdef __linux__
-        void excludeCpuFromCurrentThread(
-            const std::uint32_t cpu) {
-            if (cpu >= CPU_SETSIZE) {
-                throw std::runtime_error(
-                    "production executor real-time CPU exceeds CPU_SETSIZE");
-            }
-
-            cpu_set_t affinity;
-            CPU_ZERO(&affinity);
-            if (const auto error = pthread_getaffinity_np(
-                    pthread_self(), sizeof(affinity), &affinity);
-                error != 0) {
-                throw std::system_error(
-                    error, std::generic_category(),
-                    "failed to read production executor host affinity");
-            }
-
-            CPU_CLR(cpu, &affinity);
-            auto hasHousekeepingCpu = false;
-            for (auto candidate = 0;
-                 candidate < CPU_SETSIZE; ++candidate) {
-                hasHousekeepingCpu =
-                    hasHousekeepingCpu
-                    || CPU_ISSET(candidate, &affinity);
-            }
-            if (!hasHousekeepingCpu) {
-                throw std::runtime_error(
-                    "production executor host has no housekeeping CPU after isolation");
-            }
-            if (const auto error = pthread_setaffinity_np(
-                    pthread_self(), sizeof(affinity), &affinity);
-                error != 0) {
-                throw std::system_error(
-                    error, std::generic_category(),
-                    "failed to isolate the production executor host thread");
-            }
-        }
-
-        void prefaultServoStack() noexcept {
-            std::array<std::byte, SERVO_STACK_PREFAULT_BYTES> stack{};
-            volatile auto *pages = stack.data();
-            constexpr auto pageSize = std::size_t{4096};
-            for (auto offset = std::size_t{0};
-                 offset < stack.size(); offset += pageSize) {
-                pages[offset] = std::byte{0};
-            }
-        }
-
-        void sleepUntil(
-            const std::chrono::steady_clock::time_point deadline) noexcept {
-            const auto nanoseconds =
-                std::chrono::duration_cast<std::chrono::nanoseconds>(
-                    deadline.time_since_epoch()).count();
-            const timespec target{
-                .tv_sec = static_cast<time_t>(
-                    nanoseconds / 1'000'000'000),
-                .tv_nsec = static_cast<long>(
-                    nanoseconds % 1'000'000'000),
-            };
-
-            while (clock_nanosleep(
-                       CLOCK_MONOTONIC, TIMER_ABSTIME,
-                       &target, nullptr)
-                   == EINTR) { }
-        }
-#endif
     }
 
     struct ProductionExecutorRuntime::TimingAccumulator {
@@ -267,20 +188,10 @@ namespace ngc {
         }
 
         if (m_realtime.enabled) {
-#ifdef __linux__
             excludeCpuFromCurrentThread(m_realtime.cpu);
-            if (m_realtime.lockMemory
-                && mlockall(MCL_CURRENT | MCL_FUTURE) != 0) {
-                throw std::system_error(
-                    errno, std::generic_category(),
-                    "failed to lock production executor memory");
-            }
-#else
             if (m_realtime.lockMemory) {
-                throw std::runtime_error(
-                    "production executor memory locking is unavailable on this platform");
+                lockProcessMemory();
             }
-#endif
         }
 
         m_stopping.store(false, std::memory_order_release);
@@ -405,44 +316,12 @@ namespace ngc {
     }
 
     void ProductionExecutorRuntime::configureServoThread() {
-#ifdef __linux__
         if (!m_realtime.enabled) {
             return;
         }
 
-        if (m_realtime.cpu >= CPU_SETSIZE) {
-            throw std::runtime_error(
-                "production executor real-time CPU exceeds CPU_SETSIZE");
-        }
-
-        cpu_set_t affinity;
-        CPU_ZERO(&affinity);
-        CPU_SET(m_realtime.cpu, &affinity);
-        if (const auto error = pthread_setaffinity_np(
-                pthread_self(), sizeof(affinity), &affinity);
-            error != 0) {
-            throw std::system_error(
-                error, std::generic_category(),
-                "failed to set production executor CPU affinity");
-        }
-
-        prefaultServoStack();
-
-        sched_param parameters{};
-        parameters.sched_priority = m_realtime.priority;
-        if (const auto error = pthread_setschedparam(
-                pthread_self(), SCHED_FIFO, &parameters);
-            error != 0) {
-            throw std::system_error(
-                error, std::generic_category(),
-                "failed to set production executor SCHED_FIFO policy");
-        }
-#else
-        if (m_realtime.enabled) {
-            throw std::runtime_error(
-                "production executor real-time hosting is unavailable on this platform");
-        }
-#endif
+        configureCurrentRealtimeThread(
+            m_realtime.cpu, m_realtime.priority);
     }
 
     void ProductionExecutorRuntime::runServoLoop() {
@@ -472,15 +351,11 @@ namespace ngc {
         auto deadline = clock::now();
         for (;;) {
             deadline += period;
-#ifdef __linux__
             if (m_realtime.enabled) {
-                sleepUntil(deadline);
+                sleepUntilMonotonic(deadline);
             } else {
                 std::this_thread::sleep_until(deadline);
             }
-#else
-            std::this_thread::sleep_until(deadline);
-#endif
             if (m_stopping.load(std::memory_order_acquire)) {
                 break;
             }

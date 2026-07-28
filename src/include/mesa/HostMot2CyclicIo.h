@@ -140,7 +140,9 @@ namespace ngc::mesa {
     struct HostMot2CyclicIoResult {
         HostMot2CyclicIoFault fault = HostMot2CyclicIoFault::None;
         Lbp16CyclicResult transaction;
+        std::int32_t dpllPhaseErrorNanoseconds = 0;
         bool inputsValid = false;
+        bool dpllPhaseErrorValid = false;
     };
 
     class HostMot2CyclicIo {

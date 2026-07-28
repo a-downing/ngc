@@ -4,6 +4,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <expected>
+#include <filesystem>
 #include <format>
 #include <iostream>
 #include <limits>
@@ -18,6 +19,7 @@
 #include "mesa/HostMot2Discovery.h"
 #include "mesa/HostMot2Latency.h"
 #include "mesa/Lbp16CyclicTransaction.h"
+#include "mesa/MesaBackendConfiguration.h"
 #include "mesa/MesaProductionExecutorIo.h"
 #include "mesa/SevenI96Capabilities.h"
 #include "mesa/SevenI96CyclicLayout.h"
@@ -546,6 +548,43 @@ namespace {
                 "7I96 encoder capabilities are incorrect");
     }
 
+    void testLoadsProposedMesaBackendConfiguration() {
+        const auto configuration =
+            ngc::mesa::loadMesaBackendConfiguration(
+                std::filesystem::path(NGC_SOURCE_DIR)
+                    / "mesa_7i96.toml");
+
+        require(configuration.has_value()
+                && configuration->address == "10.10.10.10"
+                && configuration->linearUnit
+                    == ngc::mesa::MesaLinearUnit::Millimeter
+                && configuration->watchdogTimeoutNanoseconds
+                    == 5'000'000
+                && configuration->dpll.stepGeneratorTimer == 1
+                && configuration->dpll
+                    .stepGeneratorSampleOffsetNanoseconds == -500'000
+                && configuration->dpll
+                    .maximumPhaseErrorNanoseconds == 400'000
+                && configuration->stepGenerators.size() == 4,
+                "proposed Mesa backend configuration did not load");
+        const std::array expectedChannels{
+            std::uint8_t{1}, std::uint8_t{2},
+            std::uint8_t{3}, std::uint8_t{0},
+        };
+        for (std::size_t index = 0;
+             index < expectedChannels.size(); ++index) {
+            const auto &stepGenerator =
+                configuration->stepGenerators[index];
+            require(stepGenerator.joint == index
+                    && stepGenerator.channel
+                        == expectedChannels[index]
+                    && stepGenerator.stepsPerUnit == 160.0
+                    && stepGenerator.maximumCorrectionVelocity == 5.0
+                    && stepGenerator.maximumGeneratedStepError == 2.0,
+                    "Mesa StepGen configuration was decoded incorrectly");
+        }
+    }
+
     void testRejectsIncompatibleSevenI96IdentityAndModules() {
         auto wrongBoard = sevenI96Inventory();
         wrongBoard.idrom.boardName = "MESA7I95";
@@ -1037,6 +1076,8 @@ namespace {
         require(
             phaseFault.fault
                 == ngc::mesa::HostMot2CyclicIoFault::DpllPhaseError
+                && phaseFault.dpllPhaseErrorValid
+                && phaseFault.dpllPhaseErrorNanoseconds == 30'000
                 && io->fault()
                     == ngc::mesa::HostMot2CyclicIoFault::DpllPhaseError,
             "out-of-window DPLL phase error was not latched");
@@ -1709,6 +1750,7 @@ int main() {
         testRejectsUnterminatedModuleDescriptors();
         testRejectsOverflowingDescriptorOffset();
         testValidatesSevenI96CapabilitiesAndSelections();
+        testLoadsProposedMesaBackendConfiguration();
         testRejectsIncompatibleSevenI96IdentityAndModules();
         testRejectsIncompatibleSevenI96PinsAndSelections();
         testMeasuresReadOnlyCyclicLatencyAndAnomalies();

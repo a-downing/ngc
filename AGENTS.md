@@ -135,7 +135,25 @@ blocks motion. Hardware acquisition and synthetic-input policy remain outside
 the runtime. The runtime is the second backend-conformance target and is paired
 end-to-end with `HomingController`. It is hosted by the external process for
 the configured non-hardware Real target. There is no HAL component or physical
-backend yet. `ExternalRealtimeRuntime`
+backend yet. The typed Mesa backend configuration loader shares only generic,
+source-aware TOML field validation with the frontend machine loader and keeps
+its hardware schema separate. The `ngc_mesa_stepgen_diagnostic` executable
+combines that backend configuration with the authoritative Real servo period,
+discovers and validates a physical 7I96, configures DPLL, watchdog, pin routing,
+and selected StepGens, actively commands bounded positive and negative rates,
+and checks DPLL-latched accumulator travel. By default it applies the Real
+backend's configured memory-lock, CPU-affinity, FIFO-priority, stack-prefault,
+and absolute-deadline host policy through the same reusable Linux facilities as
+`ProductionExecutorRuntime`; `--ordinary-scheduler` explicitly selects an
+adverse-condition run. Fixed-size diagnostic accumulators report host wake
+lateness, period jitter, UDP exchange duration, missed deadlines, and signed
+DPLL phase error after convergence, including the faulting phase and lead-up to
+a failed run. It
+disables watchdog and rates on normal or signal-interrupted shutdown while a
+cyclic exchange remains valid; a latched transport, protocol, watchdog, or DPLL
+fault instead relies on the configured hardware watchdog to remove enable. It
+is a board bring-up tool, not the production physical backend.
+`ExternalRealtimeRuntime`
 implements the NRT side of the versioned shared-memory IPC boundary and owns a
 bounded `MotionBackend` proxy. The `ngc_ipc_backend` executable is a
 non-hardware executor-in-the-loop peer: it validates typed machine

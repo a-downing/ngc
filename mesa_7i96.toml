@@ -1,6 +1,6 @@
-# Proposed physical-backend configuration derived from
-# my_LinuxCNC_machine. This file is for schema review; the NGC physical
-# backend loader does not exist yet.
+# Physical-backend configuration derived from my_LinuxCNC_machine. The typed
+# NRT loader and active StepGen board diagnostic consume this schema; the
+# production physical-backend process does not exist yet.
 #
 # Machine topology, trajectory behavior, limits, homing positions, logical
 # input identities, the authoritative servo period, and real-time host policy
@@ -60,16 +60,18 @@ step_space = 0.000005
 direction_setup = 0.000010
 direction_hold = 0.000010
 
-# Latch all StepGen accumulators on DPLL timer 1, 50 microseconds before the
-# FPGA's predicted HostMot2 read phase. The physical-backend loader must derive
-# the DPLL base frequency from machine.toml's authoritative servo period.
+# Latch all StepGen accumulators on DPLL timer 1, 500 microseconds before the
+# FPGA's predicted HostMot2 read phase. This exceeds the observed roughly
+# 275 microsecond non-PREEMPT_RT host variation. The physical-backend loader
+# must derive the DPLL base frequency from machine.toml's authoritative servo
+# period.
 [motion.dpll]
 enabled = true
 stepgen_timer = 1
-stepgen_sample_offset = -0.000050
-# Require the observed phase error to remain within half of the 50 us lead for
-# 100 consecutive servo cycles before allowing a nonzero StepGen rate.
-maximum_phase_error = 0.000025
+stepgen_sample_offset = -0.000500
+# Preserve 100 microseconds of margin inside the 500 us latch lead. Require
+# 100 consecutive cycles in this guard before allowing a nonzero StepGen rate.
+maximum_phase_error = 0.000400
 convergence_cycles = 100
 
 # X: LinuxCNC joint 0 -> hm2_7i96.0.stepgen.01
@@ -130,9 +132,9 @@ maximum_generated_step_error = 2.0
 # needs a typed safety-input rule that establishes a fault and safe outputs
 # when external_enable becomes inactive.
 #
-# The generic HostMot2 cyclic layer implements this DPLL behavior. The future
-# physical-backend bootstrap still needs to parse this file, supply its
-# authoritative servo period, and construct that typed cyclic configuration.
+# The generic HostMot2 cyclic layer and active board diagnostic implement this
+# DPLL behavior. The diagnostic combines this file with machine.toml's
+# authoritative Real servo period.
 
 # The existing machine drives a Huanyang VFD independently of Mesa over
 # /dev/ttyUSB0 at 9600 baud with no parity. A bounded serial/Modbus physical-I/O

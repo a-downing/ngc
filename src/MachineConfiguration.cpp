@@ -10,60 +10,23 @@
 
 #include <toml++/toml.hpp>
 
+#include "config/TomlConfiguration.h"
+
 namespace ngc {
     namespace {
-        std::string configurationError(const std::filesystem::path &path, const std::string_view field,
-                                       const std::string_view message, const toml::node *node = nullptr) {
-            if(node) {
-                const auto source = node->source();
-                return std::format("{}:{}:{}: {}: {}", path.string(), source.begin.line,
-                                   source.begin.column, field, message);
-            }
-            return std::format("{}: {}: {}", path.string(), field, message);
-        }
+        using toml_configuration::integer;
+        using toml_configuration::number;
+        using toml_configuration::positiveNumber;
+        using toml_configuration::requiredBool;
+        using toml_configuration::requiredString;
 
-        std::expected<double, std::string> number(const toml::table &table, const std::string_view name,
-                                                  const std::filesystem::path &path) {
-            const auto *node = table.get(name);
-            const auto value = node ? node->value<double>() : std::optional<double>{};
-            if(!value || !std::isfinite(*value))
-                return std::unexpected(configurationError(path, name, "must be a finite number", node));
-            return *value;
-        }
-
-        std::expected<double, std::string> positiveNumber(
-            const toml::table &table, const std::string_view name, const std::filesystem::path &path) {
-            auto value = number(table, name, path);
-            if(!value) return value;
-            if(*value <= 0.0)
-                return std::unexpected(configurationError(path, name, "must be greater than zero",
-                                                          table.get(name)));
-            return value;
-        }
-
-        std::expected<std::string, std::string> requiredString(
-            const toml::table &table, const std::string_view name, const std::filesystem::path &path) {
-            const auto *node = table.get(name);
-            const auto value = node ? node->value<std::string>() : std::optional<std::string>{};
-            if(!value || value->empty())
-                return std::unexpected(configurationError(path, name, "must be a non-empty string", node));
-            return *value;
-        }
-
-        std::expected<bool, std::string> requiredBool(
-            const toml::table &table, const std::string_view name, const std::filesystem::path &path) {
-            const auto *node = table.get(name);
-            const auto value = node ? node->value<bool>() : std::optional<bool>{};
-            if(!value) return std::unexpected(configurationError(path, name, "must be a boolean", node));
-            return *value;
-        }
-
-        std::expected<std::int64_t, std::string> integer(
-            const toml::table &table, const std::string_view name, const std::filesystem::path &path) {
-            const auto *node = table.get(name);
-            const auto value = node ? node->value<std::int64_t>() : std::optional<std::int64_t>{};
-            if(!value) return std::unexpected(configurationError(path, name, "must be an integer", node));
-            return *value;
+        std::string configurationError(
+            const std::filesystem::path &path,
+            const std::string_view field,
+            const std::string_view message,
+            const toml::node *node = nullptr) {
+            return toml_configuration::error(
+                path, field, message, node);
         }
 
         std::expected<Machine::Axis, std::string> parseAxis(

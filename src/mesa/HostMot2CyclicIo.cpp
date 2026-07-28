@@ -919,6 +919,9 @@ namespace ngc::mesa {
 
                     return latch(result);
                 }
+                result.dpllPhaseErrorNanoseconds =
+                    static_cast<std::int32_t>(phaseNanoseconds);
+                result.dpllPhaseErrorValid = true;
                 const auto phaseMagnitude =
                     static_cast<std::uint64_t>(std::abs(
                         phaseNanoseconds));
