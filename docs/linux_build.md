@@ -61,6 +61,308 @@ from the selected CPU, pin the servo thread, or enter the configured
 selected CPU's SMT sibling free of ordinary work and route routine IRQs to
 housekeeping CPUs.
 
+### Proven Arch Linux RT host configuration
+
+The physical Mesa development host is an AMD Ryzen 7 7700X with eight cores
+and two hardware threads per core. The configuration below was validated on
+`6.18.40-rt6-arch2-3-rt-lts` with a one-millisecond servo period. CPU numbering
+and cpuidle state numbering are host-specific; inspect another machine rather
+than copying them blindly.
+
+The relevant sibling pairs and assigned roles are:
+
+| Physical core | Logical CPUs | Role |
+| --- | --- | --- |
+| Core 6 | 6, 14 | CPU 6 handles the dedicated Mesa NIC IRQ; CPU 14 is kept idle |
+| Core 7 | 7, 15 | CPU 15 hosts the executor servo thread; CPU 7 is kept idle |
+| Remaining cores | 0-5, 8-13 | Housekeeping and ordinary NRT work |
+
+Isolating both hardware threads of each RT-facing core prevents ordinary work
+on an SMT sibling from competing for shared core resources. CPU 6 is isolated
+from scheduler domains even though it deliberately handles the Mesa NIC IRQ.
+CPU 15 should normally see only its local timer interrupt, unavoidable kernel
+IPIs, and the wakeups required by the executor.
+
+The RT-LTS GRUB entry appends:
+
+```text
+isolcpus=domain,managed_irq,6,7,14,15
+nohz_full=6,7,14,15
+irqaffinity=0-5,8-13
+rcu_nocbs=6,7,14,15
+```
+
+The options have distinct purposes:
+
+- `isolcpus=domain,managed_irq,...` removes the CPUs from ordinary scheduler
+  load balancing and directs compatible managed interrupts away from them.
+- `nohz_full=...` suppresses the periodic scheduler tick while an isolated CPU
+  runs one eligible task.
+- `irqaffinity=...` gives ordinary IRQs a housekeeping default.
+- `rcu_nocbs=...` moves RCU callback processing away from the isolated CPUs.
+
+On this Arch installation the entry is stored in `/etc/grub.d/40_custom` and
+the generated `/boot/grub/grub.cfg` is refreshed with:
+
+```bash
+sudo grub-mkconfig -o /boot/grub/grub.cfg
+```
+
+After reboot, verify the selected kernel and effective command line rather
+than assuming the menu entry was used:
+
+```bash
+uname -r
+cat /proc/cmdline
+```
+
+Boot-time isolation is complemented by
+`/usr/local/sbin/ngc-realtime-cpus`. The current host script is:
+
+```sh
+#!/bin/sh
+set -eu
+
+isolated_cpus="6 7 14 15"
+housekeeping_mask="3f3f"
+
+set_cpu_policy() {
+    cpu="$1"
+    governor="$2"
+    preference="$3"
+    idle_state_3_disabled="$4"
+    cpu_root="/sys/devices/system/cpu/cpu${cpu}"
+
+    printf '%s\n' "$governor" \
+        > "${cpu_root}/cpufreq/scaling_governor"
+    if [ -w "${cpu_root}/cpufreq/energy_performance_preference" ]; then
+        printf '%s\n' "$preference" \
+            > "${cpu_root}/cpufreq/energy_performance_preference"
+    fi
+    if [ -w "${cpu_root}/cpuidle/state3/disable" ]; then
+        printf '%s\n' "$idle_state_3_disabled" \
+            > "${cpu_root}/cpuidle/state3/disable"
+    fi
+}
+
+mesa_irq() {
+    awk '$NF == "enp17s0" {
+        sub(/:$/, "", $1)
+        print $1
+        exit
+    }' /proc/interrupts
+}
+
+start() {
+    printf '0\n' > /proc/sys/kernel/timer_migration
+
+    for cpu in $isolated_cpus; do
+        set_cpu_policy "$cpu" performance performance 1
+    done
+
+    printf '%s\n' "$housekeeping_mask" \
+        > /sys/devices/virtual/workqueue/cpumask
+    printf '%s\n' "$housekeeping_mask" \
+        > /sys/bus/workqueue/devices/writeback/cpumask
+
+    attempts=0
+    irq=""
+    while [ -z "$irq" ] && [ "$attempts" -lt 50 ]; do
+        irq="$(mesa_irq)"
+        if [ -z "$irq" ]; then
+            sleep 0.1
+        fi
+        attempts=$((attempts + 1))
+    done
+    if [ -z "$irq" ]; then
+        echo "could not find the enp17s0 interrupt" >&2
+        exit 1
+    fi
+    printf '6\n' > "/proc/irq/${irq}/smp_affinity_list"
+}
+
+stop() {
+    printf '1\n' > /proc/sys/kernel/timer_migration
+
+    for cpu in $isolated_cpus; do
+        set_cpu_policy "$cpu" powersave balance_performance 0
+    done
+
+    printf 'ffff\n' > /sys/devices/virtual/workqueue/cpumask
+    printf 'ffff\n' > /sys/bus/workqueue/devices/writeback/cpumask
+}
+
+case "${1:-}" in
+    start)
+        start
+        ;;
+    stop)
+        stop
+        ;;
+    *)
+        echo "usage: $0 start|stop" >&2
+        exit 2
+        ;;
+esac
+```
+
+On this processor `cpuidle/state3` is C3 with a reported 350-microsecond exit
+latency. The service disables C3 on CPUs 6, 7, 14, and 15, while leaving POLL,
+C1, and C2 available. It also selects the `performance` frequency governor and
+`performance` energy-performance preference on those CPUs. Disabling C2 did
+not provide a useful improvement during commissioning, so the shallower state
+remains enabled.
+
+The hexadecimal workqueue mask `3f3f` selects CPUs 0-5 and 8-13. Both the
+general and writeback workqueues are restricted to those housekeeping CPUs.
+The Mesa NIC's MSI-X IRQ number is discovered from `/proc/interrupts` on every
+start because IRQ numbers are not stable across boots, then its affinity is
+set to CPU 6.
+
+The systemd unit is:
+
+```ini
+[Unit]
+Description=Tune NGC isolated real-time CPUs and Mesa IRQ
+After=systemd-modules-load.service
+ConditionPathExists=/sys/devices/system/cpu/cpu15/cpufreq/scaling_governor
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/sbin/ngc-realtime-cpus start
+ExecStop=/usr/local/sbin/ngc-realtime-cpus stop
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target
+```
+
+Install the script as `/usr/local/sbin/ngc-realtime-cpus` with mode `0755` and
+the unit as `/etc/systemd/system/ngc-realtime-cpus.service`, then enable and
+apply the unit with:
+
+```bash
+sudo systemctl daemon-reload
+sudo systemctl enable --now ngc-realtime-cpus.service
+```
+
+#### Why timer migration is disabled
+
+NGC sleeps to absolute `CLOCK_MONOTONIC` deadlines with
+`clock_nanosleep()`. Because the thread is `SCHED_FIFO`, PREEMPT_RT delivers
+its hrtimer wakeup from hard-IRQ context. Unlike the timerlat tracer, however,
+the userspace API does not request `HRTIMER_MODE_PINNED`; the kernel can move
+the timer to a housekeeping CPU and wake CPU 15 with an IPI.
+
+A trace of 916 periodic NGC sleeps with the default
+`kernel.timer_migration=1` found 662 expirations on CPU 15 and 254 expirations
+on other CPUs. Disabling timer migration kept all 916 expirations on CPU 15.
+In the corresponding short tests, maximum wake lateness fell from 12.518
+microseconds to 3.106 microseconds and maximum period jitter fell from 9.510
+microseconds to 1.100 microseconds. This closes the most important behavioral
+gap between NGC's userspace sleeper and timerlat's pinned kernel hrtimer.
+
+`kernel.timer_migration` is a runtime sysctl, not a kernel command-line
+option. The host service writes zero when RT tuning starts and restores one
+when it stops. This setting is system-wide and can reduce timer coalescing,
+although CPU 15 must wake every millisecond for this workload in either case.
+
+Verify the complete active policy with:
+
+```bash
+systemctl is-active ngc-realtime-cpus.service
+cat /proc/sys/kernel/timer_migration
+cat /sys/devices/virtual/workqueue/cpumask
+cat /sys/bus/workqueue/devices/writeback/cpumask
+cat /sys/devices/system/cpu/cpu15/cpufreq/scaling_governor
+cat /sys/devices/system/cpu/cpu15/cpufreq/energy_performance_preference
+awk '$NF == "enp17s0" { print }' /proc/interrupts
+```
+
+The expected values are `active`, timer migration `0`, both workqueue masks
+`3f3f`, governor and energy preference `performance`, and all `enp17s0`
+interrupts counted on CPU 6. Also inspect storage IRQ counts after a test; no
+NVMe queue assigned to an isolated CPU should be active there.
+
+#### StepGen timing validation
+
+Build and run the active diagnostic only on an isolated bare board with the
+commissioning safety conditions described below:
+
+```bash
+cmake --build build --target ngc_mesa_stepgen_diagnostic
+./build/ngc_mesa_stepgen_diagnostic
+```
+
+With timer migration disabled, the ordinary 8,016-exchange run measured:
+
+| Measurement | Average | Maximum absolute |
+| --- | ---: | ---: |
+| Wake lateness | 1.896 us | 4.802 us |
+| Period jitter | approximately 0 us | 3.053 us |
+| UDP exchange duration | 79.698 us | 91.263 us |
+| DPLL phase error | 2.071 us absolute | 43.199 us |
+
+There were no missed deadlines, and all StepGen channel checks passed.
+
+The longer validation saturates only the housekeeping CPUs while executing
+10,000 cycles in each direction on every configured StepGen:
+
+```bash
+taskset -c 0-5,8-13 \
+    stress-ng --cpu 12 --cpu-method all \
+    --timeout 90s --verify --metrics-brief &
+stress_pid=$!
+trap 'kill "$stress_pid" 2>/dev/null || true' EXIT INT TERM
+sleep 1
+./build/ngc_mesa_stepgen_diagnostic --cycles 10000
+wait "$stress_pid"
+trap - EXIT INT TERM
+```
+
+The 80,016-exchange stressed run measured:
+
+| Measurement | Average | Maximum absolute |
+| --- | ---: | ---: |
+| Wake lateness | 1.993 us | 11.981 us |
+| Period jitter | approximately 0 us | 10.129 us |
+| UDP exchange duration | 80.382 us | 88.598 us |
+| DPLL phase error | 0.761 us absolute | 48.157 us |
+
+There were no missed deadlines, the watchdog remained serviced, and all 12
+CPU stress workers and all StepGen channel checks passed. Before timer
+migration was disabled, a comparable 80,016-exchange CPU-stressed run reached
+119.049 microseconds of wake lateness.
+
+The commissioning progression makes the effect of each host-level change
+visible. These were separate long stressed runs, so treat the numbers as
+observed tails rather than deterministic bounds:
+
+| Host policy | Maximum wake lateness | Maximum UDP exchange |
+| --- | ---: | ---: |
+| Before CPU 14, the CPU 6 NIC sibling, was also isolated | 267.725 us | 339.316 us |
+| CPUs 6, 7, 14, and 15 isolated; NIC IRQ on CPU 6; timer migration enabled | 119.049 us | 91.954 us |
+| Same CPU and IRQ policy; timer migration disabled | 11.981 us | 88.598 us |
+
+The native timerlat tracer and oslat were useful independent checks. Under
+housekeeping-CPU load, timerlat completed 120,000 one-millisecond periods
+without crossing its 100-microsecond stop threshold, while oslat reported a
+five-microsecond maximum continuous interruption. Those results indicated
+that hardware and kernel latency were already small and motivated comparing
+timerlat's pinned hrtimer with NGC's migratable userspace sleeper.
+
+Do not interpret CPU saturation as proof that arbitrary memory pressure is
+safe. An intentionally extreme run added four cache workers and four VM
+workers manipulating approximately 10.8 GB while the 12 CPU workers ran. It
+produced one 11.983-millisecond wake delay, a 2.054-millisecond UDP maximum,
+85 missed deadlines, and the expected Mesa watchdog trip after 38,550
+exchanges. There were no NIC errors, packet drops, OOM reports, or kernel
+warnings, so the test did not identify a specific cause. Possible contributors
+include memory-controller contention, page allocation and faults, TLB
+shootdown IPIs, kernel memory-management contention, or firmware latency.
+Avoid unbounded memory churn on the production host and retain the watchdog as
+the final safety response.
+
 `ngc_ipc_test_peer` is a hardware-free test fixture, not a selectable Real
 backend. Run the ordinary portable IPC suite with:
 
