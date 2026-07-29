@@ -1977,7 +1977,7 @@ public:
         const auto toolPose = ngc::simulationToolPose(simulation);
         if(toolPose.geometry.number == 0) {
             drawNoToolCrosshair(simulation.machinePosition);
-        } else if(simulation.status != ngc::SimulationStatus::Stopped) {
+        } else {
             drawToolWireframe(toolPose);
         }
     }
