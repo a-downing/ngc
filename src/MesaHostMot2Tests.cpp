@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <expected>
@@ -828,6 +829,36 @@ namespace {
                 && byteValue(request, 32) == 0x01
                 && byteValue(request, 33) == 0x59,
                 "cyclic validation read commands are incorrect");
+    }
+
+    void testEncodesHostMot2StepRatesWithoutHidingQuantization() {
+        constexpr auto clockHz = std::uint32_t{100'000'000};
+        const auto positive =
+            ngc::mesa::encodeHostMot2StepRate(800.0, clockHz);
+        const auto negative =
+            ngc::mesa::encodeHostMot2StepRate(-800.0, clockHz);
+
+        require(
+            positive.has_value()
+                && positive->registerValue == 34'359
+                && std::abs(
+                    positive->effectiveStepsPerSecond
+                    - 799.982'808'530'331) < 1e-12,
+            "positive HostMot2 StepGen rate encoding changed");
+        require(
+            negative.has_value()
+                && negative->registerValue == -34'359
+                && std::abs(
+                    negative->effectiveStepsPerSecond
+                    + 799.982'808'530'331) < 1e-12,
+            "negative HostMot2 StepGen rate encoding changed");
+        require(
+            !ngc::mesa::encodeHostMot2StepRate(
+                std::numeric_limits<double>::infinity(),
+                clockHz)
+                && !ngc::mesa::encodeHostMot2StepRate(
+                    800.0, 0),
+            "invalid HostMot2 StepGen rate encoding was accepted");
     }
 
     void testCyclicFailuresInvalidateInputs() {
@@ -1992,6 +2023,7 @@ int main() {
         testMeasuresReadOnlyCyclicLatencyAndAnomalies();
         testRejectsInvalidLatencyConfiguration();
         testBuildsAndValidatesCyclicLbp16Transaction();
+        testEncodesHostMot2StepRatesWithoutHidingQuantization();
         testCyclicFailuresInvalidateInputs();
         testRejectsInvalidCyclicTransactionConstruction();
         testInitializesHostMot2CyclicIoWithSafeOutputs();

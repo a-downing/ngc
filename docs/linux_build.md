@@ -294,6 +294,30 @@ cmake --build build --target ngc_mesa_stepgen_diagnostic
 ./build/ngc_mesa_stepgen_diagnostic
 ```
 
+The diagnostic primes each requested rate, captures the first DPLL-latched
+accumulator sample after that rate is active, and measures an exact number of
+latch-to-latch intervals. Its output keeps three quantities distinct:
+
+- `ideal_error` compares measured travel with the requested floating-point
+  rate, so duration-dependent FPGA rate quantization remains visible.
+- `quantization_error` reports the expected difference introduced by the
+  signed 32-bit DDS word and its effective representable rate.
+- `residual` is measured travel minus the DDS-encoded expectation. Only this
+  unexplained component is used for the diagnostic fault. Its tolerance is a
+  small fixed margin plus the travel represented by the measured start-to-end
+  DPLL phase displacement.
+
+Per-interval accumulator delta range and worst residual are also reported. Do
+not replace the residual check with the production
+`maximum_generated_step_error`: that setting bounds instantaneous closed-loop
+executor following error, while this diagnostic deliberately commands an
+uncorrected constant raw StepGen rate.
+
+The diagnostic also reports the accumulator travel across rate activation and
+stop. These command-transition samples retain evidence of a stale or
+unexpected boundary latch that would otherwise disappear when only the aligned
+steady-rate interval is examined.
+
 With timer migration disabled, the ordinary 8,016-exchange run measured:
 
 | Measurement | Average | Maximum absolute |
@@ -333,6 +357,31 @@ There were no missed deadlines, the watchdog remained serviced, and all 12
 CPU stress workers and all StepGen channel checks passed. Before timer
 migration was disabled, a comparable 80,016-exchange CPU-stressed run reached
 119.049 microseconds of wake lateness.
+
+After aligning the accumulator measurement with the DPLL latch and separating
+DDS quantization from unexplained error, another 80,016-exchange stressed run
+at 800 steps/s measured 0.182-0.190 step of visible ideal-rate error. The
+known ten-second DDS contribution was 0.171915 step; unexplained residuals
+were 0.010-0.018 step against phase-aware thresholds of 0.050-0.054 step.
+Every individual one-millisecond interval was within 0.000132 step of its
+DDS-encoded expectation. This check would still reject the earlier
+approximately 3.42-step observation: after removing its known approximately
+0.572-step accounting and quantization contribution, approximately 2.85 steps
+would remain unexplained.
+
+The earlier diagnostic retained only the accumulator values at the two ends of
+an unaligned host-cycle window, so it did not preserve enough evidence to
+identify which boundary produced that remaining discrepancy. Repeating the
+exact CPU, VM, cache, fork, and context-switch workload with the aligned
+diagnostic did not reproduce it. With timer migration disabled, unexplained
+residual stayed below 0.044 step, activation and stop travel stayed between
+0.392 and 0.426 step in the commanded direction, and every steady interval
+stayed within 0.000331 step of the encoded expectation. Re-enabling timer
+migration for the same workload increased maximum wake lateness from 11.845
+microseconds to 232.948 microseconds but produced the same correct accumulator
+intervals and transitions. Timer migration is therefore a demonstrated source
+of wake-latency tail growth, but it is not sufficient to produce the historical
+accumulator discrepancy.
 
 The commissioning progression makes the effect of each host-level change
 visible. These were separate long stressed runs, so treat the numbers as

@@ -352,6 +352,32 @@ namespace ngc::mesa {
         }
     }
 
+    std::optional<HostMot2StepRateEncoding>
+    encodeHostMot2StepRate(
+        const double stepsPerSecond,
+        const std::uint32_t clockHz) noexcept {
+        if (!std::isfinite(stepsPerSecond) || clockHz == 0) {
+            return std::nullopt;
+        }
+        const auto scaled =
+            stepsPerSecond * 4'294'967'296.0
+            / static_cast<double>(clockHz);
+        if (scaled < std::numeric_limits<std::int32_t>::min()
+            || scaled > std::numeric_limits<std::int32_t>::max()) {
+            return std::nullopt;
+        }
+        const auto registerValue =
+            static_cast<std::int32_t>(scaled);
+
+        return HostMot2StepRateEncoding{
+            .registerValue = registerValue,
+            .effectiveStepsPerSecond =
+                static_cast<double>(registerValue)
+                * static_cast<double>(clockHz)
+                / 4'294'967'296.0,
+        };
+    }
+
     class HostMot2CyclicIo::Impl {
     public:
         Impl(
@@ -808,16 +834,12 @@ namespace ngc::mesa {
                 const auto maximumStepsPerSecond =
                     static_cast<double>(NANOSECONDS_PER_SECOND)
                     / minimumStepPeriod;
-                const auto scaled =
-                    stepsPerSecond * 4'294'967'296.0
-                    / layout.stepGenerator.clockHz;
-                if (!std::isfinite(scaled)
-                    || std::abs(stepsPerSecond)
+                const auto encoded = encodeHostMot2StepRate(
+                    stepsPerSecond,
+                    layout.stepGenerator.clockHz);
+                if (std::abs(stepsPerSecond)
                         > maximumStepsPerSecond
-                    || scaled
-                        < std::numeric_limits<std::int32_t>::min()
-                    || scaled
-                        > std::numeric_limits<std::int32_t>::max()) {
+                    || !encoded) {
                     auto result = HostMot2CyclicIoResult{};
                     result.fault = HostMot2CyclicIoFault::InvalidOutput;
 
@@ -827,7 +849,7 @@ namespace ngc::mesa {
                     configuration.dpll.enabled && !dpllReady
                     ? 0
                     : std::bit_cast<std::uint32_t>(
-                        static_cast<std::int32_t>(scaled));
+                        encoded->registerValue);
             }
 
             std::array<

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <expected>
 #include <memory>
+#include <optional>
 #include <string>
 
 #include "mesa/HostMot2Discovery.h"
@@ -94,6 +95,16 @@ namespace ngc::mesa {
         double stepsPerSecond = 0.0;
         bool enabled = false;
     };
+
+    struct HostMot2StepRateEncoding {
+        std::int32_t registerValue = 0;
+        double effectiveStepsPerSecond = 0.0;
+    };
+
+    [[nodiscard]] std::optional<HostMot2StepRateEncoding>
+    encodeHostMot2StepRate(
+        double stepsPerSecond,
+        std::uint32_t clockHz) noexcept;
 
     struct HostMot2CyclicOutputImage {
         std::array<

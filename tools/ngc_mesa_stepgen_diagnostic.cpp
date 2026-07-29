@@ -25,6 +25,9 @@
 #include "mesa/SevenI96CyclicLayout.h"
 
 namespace {
+    constexpr double STEPGEN_SUBCOUNTS_PER_STEP = 65'536.0;
+    constexpr double BASE_RESIDUAL_TOLERANCE_STEPS = 0.05;
+
     volatile std::sig_atomic_t interrupted = 0;
 
     struct Options {
@@ -202,6 +205,28 @@ namespace {
         ScalarTimingDiagnostics exchangeDuration;
         ScalarTimingDiagnostics dpllPhaseOffset;
         std::uint64_t missedDeadlines = 0;
+    };
+
+    struct AccumulatorIntervalDiagnostics {
+        std::uint64_t samples = 0;
+        std::int64_t minimumDelta =
+            std::numeric_limits<std::int64_t>::max();
+        std::int64_t maximumDelta =
+            std::numeric_limits<std::int64_t>::min();
+        double maximumAbsoluteResidualSubcounts = 0.0;
+
+        void observe(
+            const std::int64_t delta,
+            const double expectedDelta) noexcept {
+            ++samples;
+            minimumDelta = std::min(minimumDelta, delta);
+            maximumDelta = std::max(maximumDelta, delta);
+            maximumAbsoluteResidualSubcounts = std::max(
+                maximumAbsoluteResidualSubcounts,
+                std::abs(
+                    static_cast<double>(delta)
+                    - expectedDelta));
+        }
     };
 
     class SafeOutputGuard {
@@ -557,56 +582,181 @@ int main(const int argc, char **argv) {
         const auto periodSeconds =
             static_cast<double>(periodNanoseconds)
             / 1'000'000'000.0;
+        const auto stepGeneratorClockHz =
+            layout.stepGenerator.clockHz;
         for (std::size_t index = 0;
              index < mesa->stepGenerators.size(); ++index) {
             const auto &configured =
                 mesa->stepGenerators[index];
             for (const auto direction : {1.0, -1.0}) {
+                const auto physicalRequestedRate =
+                    direction * options.rateStepsPerSecond
+                    * (configured.invertDirection ? -1.0 : 1.0);
+                const auto encoded =
+                    ngc::mesa::encodeHostMot2StepRate(
+                        physicalRequestedRate,
+                        stepGeneratorClockHz);
+                if (!encoded) {
+                    throw std::runtime_error(std::format(
+                        "StepGen channel {} rate cannot be encoded",
+                        configured.channel));
+                }
+
+                outputs.stepGenerators[index].stepsPerSecond =
+                    direction * options.rateStepsPerSecond;
+                static_cast<void>(scheduled.cycle(outputs));
+                const auto commandBoundary =
+                    io->inputImage()
+                        .stepAccumulatorSubcounts[index];
                 static_cast<void>(scheduled.cycle(outputs));
                 const auto start =
                     io->inputImage()
                         .stepAccumulatorSubcounts[index];
-                outputs.stepGenerators[index].stepsPerSecond =
-                    direction * options.rateStepsPerSecond;
+                const auto activationTravelSteps =
+                    static_cast<double>(
+                        start - commandBoundary)
+                    / STEPGEN_SUBCOUNTS_PER_STEP;
+                const auto startPhaseError =
+                    io->inputImage().dpll.phaseErrorNanoseconds;
+                auto previous = start;
+                auto intervals = AccumulatorIntervalDiagnostics{};
+                const auto expectedIntervalSubcounts =
+                    encoded->effectiveStepsPerSecond
+                    * periodSeconds
+                    * STEPGEN_SUBCOUNTS_PER_STEP;
                 for (std::uint32_t cycle = 0;
                      cycle < options.cyclesPerDirection; ++cycle) {
                     if (interrupted != 0) {
                         throw std::runtime_error(
                             "diagnostic interrupted");
                     }
+                    if (cycle + 1
+                        == options.cyclesPerDirection) {
+                        outputs.stepGenerators[index]
+                            .stepsPerSecond = 0.0;
+                    }
                     static_cast<void>(scheduled.cycle(outputs));
+                    const auto current =
+                        io->inputImage()
+                            .stepAccumulatorSubcounts[index];
+                    intervals.observe(
+                        current - previous,
+                        expectedIntervalSubcounts);
+                    previous = current;
                 }
-                outputs.stepGenerators[index].stepsPerSecond = 0.0;
+                const auto end = previous;
+                const auto endPhaseError =
+                    io->inputImage().dpll.phaseErrorNanoseconds;
                 static_cast<void>(scheduled.cycle(outputs));
-                const auto end =
+                const auto settledStop =
                     io->inputImage()
                         .stepAccumulatorSubcounts[index];
+                const auto stopTravelSteps =
+                    static_cast<double>(
+                        settledStop - end)
+                    / STEPGEN_SUBCOUNTS_PER_STEP;
                 const auto actual =
                     static_cast<double>(end - start);
-                const auto expected =
-                    direction * options.rateStepsPerSecond
+                const auto ideal =
+                    physicalRequestedRate
                     * options.cyclesPerDirection
-                    * periodSeconds * 65'536.0
-                    * (configured.invertDirection ? -1.0 : 1.0);
-                const auto errorSteps =
-                    std::abs(actual - expected) / 65'536.0;
-                if (errorSteps
-                    > configured.maximumGeneratedStepError) {
-                    throw std::runtime_error(std::format(
-                        "StepGen channel {} accumulator error "
-                        "{:.6f} steps exceeds {:.6f}",
-                        configured.channel, errorSteps,
-                        configured.maximumGeneratedStepError));
-                }
+                    * periodSeconds
+                    * STEPGEN_SUBCOUNTS_PER_STEP;
+                const auto encodedExpected =
+                    encoded->effectiveStepsPerSecond
+                    * options.cyclesPerDirection
+                    * periodSeconds
+                    * STEPGEN_SUBCOUNTS_PER_STEP;
+                const auto idealErrorSteps =
+                    std::abs(actual - ideal)
+                    / STEPGEN_SUBCOUNTS_PER_STEP;
+                const auto quantizationErrorSteps =
+                    std::abs(encodedExpected - ideal)
+                    / STEPGEN_SUBCOUNTS_PER_STEP;
+                const auto residualSteps =
+                    (actual - encodedExpected)
+                    / STEPGEN_SUBCOUNTS_PER_STEP;
+                const auto phaseDisplacementSeconds =
+                    std::abs(
+                        static_cast<double>(
+                            endPhaseError
+                            - startPhaseError))
+                    / 1'000'000'000.0;
+                const auto residualToleranceSteps =
+                    BASE_RESIDUAL_TOLERANCE_STEPS
+                    + std::abs(
+                        encoded->effectiveStepsPerSecond)
+                        * phaseDisplacementSeconds;
+                const auto maximumTransitionTravelSteps =
+                    1.25 * std::abs(
+                        expectedIntervalSubcounts)
+                        / STEPGEN_SUBCOUNTS_PER_STEP
+                    + BASE_RESIDUAL_TOLERANCE_STEPS;
+
                 std::println(
                     "channel {} {:>8.3f} steps/s: "
-                    "delta={:.6f} steps expected={:.6f} "
-                    "error={:.6f}",
+                    "delta={:.6f} ideal={:.6f} "
+                    "ideal_error={:.6f}",
                     configured.channel,
                     direction * options.rateStepsPerSecond,
-                    actual / 65'536.0,
-                    expected / 65'536.0,
-                    errorSteps);
+                    actual / STEPGEN_SUBCOUNTS_PER_STEP,
+                    ideal / STEPGEN_SUBCOUNTS_PER_STEP,
+                    idealErrorSteps);
+                std::println(
+                    "  DDS word={} effective_rate={:.9f} "
+                    "quantization_error={:.6f} "
+                    "residual={:+.6f} tolerance={:.6f}",
+                    encoded->registerValue,
+                    encoded->effectiveStepsPerSecond,
+                    quantizationErrorSteps,
+                    residualSteps,
+                    residualToleranceSteps);
+                std::println(
+                    "  intervals={} delta_range="
+                    "[{:.6f}, {:.6f}] steps "
+                    "worst_interval_residual={:.6f} steps "
+                    "phase_start={} ns phase_end={} ns",
+                    intervals.samples,
+                    static_cast<double>(
+                        intervals.minimumDelta)
+                        / STEPGEN_SUBCOUNTS_PER_STEP,
+                    static_cast<double>(
+                        intervals.maximumDelta)
+                        / STEPGEN_SUBCOUNTS_PER_STEP,
+                    intervals
+                        .maximumAbsoluteResidualSubcounts
+                        / STEPGEN_SUBCOUNTS_PER_STEP,
+                    startPhaseError,
+                    endPhaseError);
+                std::println(
+                    "  transition_travel activation={:+.6f} "
+                    "stop={:+.6f} steps maximum_abs={:.6f}",
+                    activationTravelSteps,
+                    stopTravelSteps,
+                    maximumTransitionTravelSteps);
+
+                if (std::abs(residualSteps)
+                    > residualToleranceSteps) {
+                    throw std::runtime_error(std::format(
+                        "StepGen channel {} unexplained accumulator "
+                        "residual {:.6f} steps exceeds {:.6f}",
+                        configured.channel,
+                        std::abs(residualSteps),
+                        residualToleranceSteps));
+                }
+                if (std::abs(activationTravelSteps)
+                        > maximumTransitionTravelSteps
+                    || std::abs(stopTravelSteps)
+                        > maximumTransitionTravelSteps
+                    || activationTravelSteps
+                        * physicalRequestedRate < 0.0
+                    || stopTravelSteps
+                        * physicalRequestedRate < 0.0) {
+                    throw std::runtime_error(std::format(
+                        "StepGen channel {} command-transition "
+                        "travel is inconsistent with the encoded rate",
+                        configured.channel));
+                }
             }
         }
 
