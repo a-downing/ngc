@@ -6,6 +6,7 @@
 #include <optional>
 #include <string>
 
+#include "config/BackendRuntimeConfiguration.h"
 #include "mesa/MesaBackendConfiguration.h"
 
 namespace ngc::physical {
@@ -28,6 +29,7 @@ namespace ngc::physical {
     };
 
     struct PhysicalBackendConfiguration {
+        BackendRuntimeHostConfiguration runtime;
         mesa::MesaBackendConfiguration motion;
         std::optional<HuanyangSpindleConfiguration> spindle;
     };

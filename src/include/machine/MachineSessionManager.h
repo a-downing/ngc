@@ -56,14 +56,12 @@ class SessionBackendRuntime final : public ngc::BackendRuntime {
                 backend.machineConfiguration.string(),
             },
         };
-        if (!backend.realtimeEnabled) {
-            result.peerArguments.push_back("--non-realtime");
+        if (backend.backendConfiguration.has_value()) {
+            result.peerArguments.push_back(
+                "--backend-configuration");
+            result.peerArguments.push_back(
+                backend.backendConfiguration->string());
         }
-#ifndef __linux__
-        if (backend.realtimeEnabled) {
-            result.peerArguments.push_back("--non-realtime");
-        }
-#endif
 
         return result;
     }

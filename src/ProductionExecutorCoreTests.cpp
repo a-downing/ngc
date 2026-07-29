@@ -632,6 +632,77 @@ namespace {
                 "target completion did not establish the terminal hold");
     }
 
+    void testPublishesTriggeredMotionContext() {
+        auto axisCore =
+            std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        initialize(*axisCore, 41);
+        const auto axisMove =
+            triggeredMove(41, 411, 0, 511, 611, 0.2);
+        require(axisCore->tryPublish(ngc::ExecutionItem{axisMove})
+                    == ngc::PublishResult::Published
+                && axisCore->trySubmit(
+                    ngc::StartRequest{3, axisMove.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "axis motion-context fixture did not start");
+        axisCore->servoTick();
+        const auto axis = axisCore->motionContext();
+        require(
+            axis.flags == ngc::PRODUCTION_EXECUTOR_MOTION_IS_PROBE
+                && axis.moveJoints == 0
+                && axis.triggerJoints == 0,
+            "axis motion context reported incorrect activity");
+        requireNear(
+            axis.axisStart.x, 0.0,
+            "axis motion context omitted the move start");
+        requireNear(
+            axis.axisTarget.x, axisMove.target.x,
+            "axis motion context omitted the move target");
+        requireNear(
+            axis.axisPosition.x,
+            latestSnapshot(*axisCore).commanded.position.x,
+            "axis motion context omitted the commanded position");
+
+        auto jointCore =
+            std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        initialize(*jointCore, 42);
+        auto jointMove =
+            triggeredJointMove(42, 421, 0, 521, 621);
+        jointMove.targetMode = ngc::JointTargetMode::Relative;
+        jointMove.joints = ngc::JointMask{1} << 1;
+        require(jointMove.triggers.push({
+                    1, 7, ngc::InputCondition::Active,
+                }),
+                "joint motion-context trigger did not fit");
+        jointMove.triggerRequired = true;
+        require(jointCore->tryPublish(
+                    ngc::ExecutionItem{jointMove})
+                    == ngc::PublishResult::Published
+                && jointCore->trySubmit(
+                    ngc::StartRequest{3, jointMove.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "joint motion-context fixture did not start");
+        jointCore->servoTick();
+        const auto joints = jointCore->motionContext();
+        require(
+            joints.flags
+                    == ngc::PRODUCTION_EXECUTOR_MOTION_IS_HOMING
+                && joints.moveJoints == jointMove.joints
+                && joints.triggerJoints
+                    == ngc::JointMask{1} << 1,
+            "joint motion context reported incorrect activity");
+        requireNear(
+            joints.jointStart[1], 0.0,
+            "joint motion context omitted the move start");
+        requireNear(
+            joints.jointTarget[1], jointMove.target[1],
+            "joint motion context did not resolve the relative target");
+        requireNear(
+            joints.jointPosition[1],
+            latestSnapshot(*jointCore)
+                .commandedJoints.position[1],
+            "joint motion context omitted the commanded position");
+    }
+
     void testSampledTriggerGeneratesConstrainedStop() {
         auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
         initialize(*core, 50);
@@ -2445,6 +2516,7 @@ int main() {
         testAbortSuppressesFutureScheduledEvents();
         testMismatchedContinuationStopsSafely();
         testTriggeredMoveReachesTargetAtRest();
+        testPublishesTriggeredMotionContext();
         testSampledTriggerGeneratesConstrainedStop();
         testPlanContinuesIntoTriggeredMove();
         testTriggeredJointsStopIndependentlyAndRetainState();

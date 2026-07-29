@@ -336,9 +336,49 @@ namespace ngc {
         return m_servoPeriod;
     }
 
+    ProductionExecutorMotionContext
+    ProductionExecutorCore::motionContext() const noexcept {
+        ProductionExecutorMotionContext result;
+        result.axisPosition = m_snapshot.commanded.position;
+        result.jointPosition = m_snapshot.commandedJoints.position;
+        if (!m_active.has_value()) {
+            return result;
+        }
+
+        const auto &item = m_planSlots[*m_active].item;
+        if (const auto *move = std::get_if<TriggeredMove>(&item)) {
+            result.flags |= PRODUCTION_EXECUTOR_MOTION_IS_PROBE;
+            result.axisStart = m_triggered.start;
+            result.axisTarget = move->target;
+        } else if (const auto *move =
+                       std::get_if<TriggeredJointMove>(&item)) {
+            result.flags |= PRODUCTION_EXECUTOR_MOTION_IS_HOMING;
+            result.moveJoints = move->joints;
+            for (const auto &trigger : move->triggers) {
+                result.triggerJoints |=
+                    static_cast<JointMask>(
+                        JointMask{1} << trigger.joint);
+            }
+            for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+                const auto mask =
+                    static_cast<JointMask>(JointMask{1} << joint);
+                if ((move->joints & mask) == 0) {
+                    continue;
+                }
+                result.jointStart[joint] =
+                    m_triggeredJoints[joint].start;
+                result.jointTarget[joint] =
+                    m_triggeredJoints[joint].target;
+            }
+        }
+
+        return result;
+    }
+
     ProductionExecutorOutputState ProductionExecutorCore::outputState() const noexcept {
         auto result = m_outputState;
         result.commandedJoints = m_snapshot.commandedJoints;
+        result.motion = motionContext();
         result.executorEnabled =
             m_snapshot.state != BackendState::Disabled
             && m_snapshot.state != BackendState::Faulted;
@@ -1269,6 +1309,7 @@ namespace ngc {
         auto &runtime = m_triggeredJoints[joint];
         runtime = {};
         const auto &state = m_snapshot.commandedJoints;
+        runtime.start = state.position[joint];
         runtime.target = move.targetMode == JointTargetMode::Relative
             ? state.position[joint] + move.target[joint] : move.target[joint];
         if (std::abs(runtime.target - state.position[joint]) <= 1e-12

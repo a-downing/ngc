@@ -26,8 +26,9 @@ namespace ngc {
     }
 
     void PhysicalProductionExecutorIo::sampleDigitalInputs(
+        const ProductionExecutorMotionContext &motion,
         ProductionExecutorDigitalInputs &inputs) noexcept {
-        m_motion->sampleDigitalInputs(inputs);
+        m_motion->sampleDigitalInputs(motion, inputs);
     }
 
     void PhysicalProductionExecutorIo::applyOutputs(

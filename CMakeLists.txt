@@ -34,6 +34,7 @@ unset(BUILD_TESTS)
 add_subdirectory(path_tempo)
 
 add_library(ngc_configuration STATIC
+        src/BackendRuntimeConfiguration.cpp
         src/TomlConfiguration.cpp)
 target_include_directories(ngc_configuration PUBLIC src/include)
 target_link_libraries(
@@ -217,6 +218,13 @@ ngc_target_defaults(ngc_ipc_backend)
 if(NOT WIN32)
     set_target_properties(ngc_ipc_backend PROPERTIES SUFFIX ".exe")
 endif()
+add_test(
+    NAME ngc_ipc_backend_configuration
+    COMMAND ngc_ipc_backend
+        --machine-configuration ${CMAKE_SOURCE_DIR}/machine.toml
+        --backend-configuration
+            ${CMAKE_SOURCE_DIR}/ipc_backend.toml
+        --validate-config-only)
 
 add_executable(ngc_ipc_tests src/IpcTests.cpp)
 target_include_directories(ngc_ipc_tests PRIVATE src)
@@ -245,6 +253,14 @@ target_link_libraries(
     ngc_mesa_stepgen_diagnostic
     PRIVATE ngc_core ngc_mesa_configuration)
 ngc_target_defaults(ngc_mesa_stepgen_diagnostic)
+
+add_executable(
+    ngc_mesa_io_program_benchmark
+    tools/ngc_mesa_io_program_benchmark.cpp)
+target_link_libraries(
+    ngc_mesa_io_program_benchmark
+    PRIVATE ngc_mesa_executor ngc_physical_configuration)
+ngc_target_defaults(ngc_mesa_io_program_benchmark)
 
 add_executable(
     ngc_huanyang_spindle_diagnostic

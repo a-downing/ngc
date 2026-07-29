@@ -12,6 +12,8 @@
 #include "machine/MotionBackend.h"
 
 namespace ngc {
+    struct ProductionExecutorMotionContext;
+
     inline constexpr std::size_t
         DIGITAL_IO_PROGRAM_FIELD_INPUT_CAPACITY = 128;
     inline constexpr std::size_t
@@ -52,9 +54,19 @@ namespace ngc {
             const FieldDigitalInputImage &fieldInputs,
             const LogicalDigitalOutputImage &logicalOutputs,
             LogicalDigitalInputImage &logicalInputs) noexcept;
+        void executeInputs(
+            const FieldDigitalInputImage &fieldInputs,
+            const LogicalDigitalOutputImage &logicalOutputs,
+            const ProductionExecutorMotionContext &motion,
+            LogicalDigitalInputImage &logicalInputs) noexcept;
         void executeOutputs(
             const FieldDigitalInputImage &fieldInputs,
             const LogicalDigitalOutputImage &logicalOutputs,
+            FieldDigitalOutputImage &fieldOutputs) const noexcept;
+        void executeOutputs(
+            const FieldDigitalInputImage &fieldInputs,
+            const LogicalDigitalOutputImage &logicalOutputs,
+            const ProductionExecutorMotionContext &motion,
             FieldDigitalOutputImage &fieldOutputs) const noexcept;
         void reset() noexcept;
 
@@ -72,6 +84,11 @@ namespace ngc {
             Or,
             Xor,
             Debounce,
+            Subtract,
+            Absolute,
+            LessEqual,
+            GreaterEqual,
+            Test,
         };
 
         enum class OperandKind : std::uint8_t {
@@ -81,12 +98,21 @@ namespace ngc {
             LogicalOutput,
             FieldOutput,
             Constant,
+            MotionFlags,
+            MoveJoints,
+            TriggerJoints,
+            AxisPosition,
+            AxisStart,
+            AxisTarget,
+            JointPosition,
+            JointStart,
+            JointTarget,
         };
 
         struct Operand {
             OperandKind kind = OperandKind::Constant;
             std::uint16_t index = 0;
-            bool constant = false;
+            double constant = 0.0;
         };
 
         struct Instruction {
@@ -104,15 +130,18 @@ namespace ngc {
             std::uint32_t stableTicks = 0;
         };
 
-        [[nodiscard]] bool value(
+        [[nodiscard]] double value(
             const Operand &operand,
             const FieldDigitalInputImage &fieldInputs,
             const LogicalDigitalOutputImage &logicalOutputs,
-            const std::bitset<
+            const ProductionExecutorMotionContext &motion,
+            const std::array<
+                double,
                 DIGITAL_IO_PROGRAM_REGISTER_CAPACITY> &registers) const noexcept;
         void evaluate(
             const FieldDigitalInputImage &fieldInputs,
             const LogicalDigitalOutputImage &logicalOutputs,
+            const ProductionExecutorMotionContext &motion,
             LogicalDigitalInputImage &logicalInputs,
             FieldDigitalOutputImage &fieldOutputs,
             std::array<

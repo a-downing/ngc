@@ -89,6 +89,7 @@ namespace {
     class NullMotionIo final : public ngc::ProductionExecutorIo {
     public:
         void sampleDigitalInputs(
+            const ngc::ProductionExecutorMotionContext &,
             ngc::ProductionExecutorDigitalInputs
                 &inputs) noexcept override {
             inputs = {};
@@ -264,6 +265,12 @@ namespace {
         require(
             configuration->motion.expectedBoard == "7i96",
             "physical configuration lost its Mesa motion role");
+        require(
+            configuration->runtime.realtimeEnabled
+                && configuration->runtime.realtimeCpu == 15
+                && configuration->runtime.realtimePriority == 98
+                && configuration->runtime.lockMemory,
+            "physical configuration lost its executor host policy");
         require(
             configuration->spindle.has_value(),
             "physical configuration lost its spindle role");

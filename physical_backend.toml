@@ -5,8 +5,13 @@
 # application's default Real target or physically commissioned.
 #
 # Machine topology, trajectory behavior, limits, homing positions, logical
-# input identities, the authoritative servo period, and real-time host policy
-# remain in machine.toml.
+# input identities, and the authoritative servo period remain in machine.toml.
+# This backend file owns its executor host policy and physical hardware roles.
+
+[runtime]
+realtime_cpu = 15
+realtime_priority = 98
+lock_memory = true
 
 [motion]
 driver = "mesa_hostmot2"
@@ -31,21 +36,60 @@ watchdog_timeout = 0.005
 #   gpio.004.in_not -> probe channel 1
 #   gpio.005.in_not -> Y2 home
 #
-# Its physical probe is the AND of the two active-low channels, debounced for
-# 10 one-millisecond servo samples. The PyVCP manual probe trigger is
-# intentionally excluded because synthetic GUI policy does not belong in the
-# physical backend.
+# The eventual physical probe is the AND of the two active-low channels,
+# debounced for 10 one-millisecond servo samples.
+#
+# TEMPORARY BARE-BOARD COMMISSIONING POLICY: the program currently replaces
+# the disconnected probe and homing field inputs. It synthesizes a probe
+# transition 0.5 machine units before the Z target of a Z-moving axis-space
+# triggered move and synthesizes each requested homing input after its joint
+# moves 0.2 backend joint units from the phase start. This exercises tool
+# probing and homing through the physical executor without switches. Restore
+# the physical mappings before a drive, motor, spindle, or other output is
+# connected.
 io_program = """
-not shared_home, shared_home_field
-
 mov external_enable, external_enable_field
 
-not r0, probe_0_field
-not r1, probe_1_field
-and r2, r0, r1
-debounce tool_probe, r2, 10ms
+test r0, motion_flags, IS_PROBE
+sub r1, atarget_z, apos_z
+abs r1, r1
+le r2, r1, 0.5
+sub r3, atarget_z, astart_z
+abs r3, r3
+ge r4, r3, 0.000000001
+and r5, r0, r4
+and tool_probe, r5, r2
 
-not y2_home, y2_home_field
+test r3, motion_flags, IS_HOMING
+
+test r4, trigger_joints, JOINT_0
+sub r5, jpos_0, jstart_0
+abs r5, r5
+ge r6, r5, 0.2
+and r7, r4, r6
+
+test r8, trigger_joints, JOINT_1
+sub r9, jpos_1, jstart_1
+abs r9, r9
+ge r10, r9, 0.2
+and r11, r8, r10
+
+test r12, trigger_joints, JOINT_3
+sub r13, jpos_3, jstart_3
+abs r13, r13
+ge r14, r13, 0.2
+and r15, r12, r14
+
+or r16, r7, r11
+or r17, r16, r15
+and shared_home, r3, r17
+
+test r18, trigger_joints, JOINT_2
+sub r19, jpos_2, jstart_2
+abs r19, r19
+ge r20, r19, 0.2
+and r21, r18, r20
+and y2_home, r3, r21
 """
 
 [motion.field_inputs]

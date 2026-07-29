@@ -54,10 +54,30 @@ namespace ngc {
     static_assert(
         std::is_trivially_copyable_v<ProductionExecutorConfiguration>);
 
+    inline constexpr std::uint32_t
+        PRODUCTION_EXECUTOR_MOTION_IS_PROBE = 1U << 0;
+    inline constexpr std::uint32_t
+        PRODUCTION_EXECUTOR_MOTION_IS_HOMING = 1U << 1;
+
+    struct ProductionExecutorMotionContext {
+        position_t axisPosition{};
+        position_t axisStart{};
+        position_t axisTarget{};
+        JointVector jointPosition{};
+        JointVector jointStart{};
+        JointVector jointTarget{};
+        JointMask moveJoints = 0;
+        JointMask triggerJoints = 0;
+        std::uint32_t flags = 0;
+    };
+    static_assert(
+        std::is_trivially_copyable_v<ProductionExecutorMotionContext>);
+
     struct ProductionExecutorOutputState {
         JointMotionState commandedJoints{};
         SpindleEvent spindle{};
         LogicalDigitalOutputImage digitalOutputs;
+        ProductionExecutorMotionContext motion;
         bool executorEnabled = false;
     };
     static_assert(std::is_trivially_copyable_v<ProductionExecutorOutputState>);
@@ -99,6 +119,8 @@ namespace ngc {
         void servoTick(bool publishSnapshot = true) noexcept;
         void reportHostFault(std::uint32_t code) noexcept;
         [[nodiscard]] double servoPeriod() const noexcept;
+        [[nodiscard]] ProductionExecutorMotionContext
+        motionContext() const noexcept;
         // The hosting servo thread reads this after servoTick() and maps it to
         // physical outputs. It is not an NRT communication endpoint.
         [[nodiscard]] ProductionExecutorOutputState outputState() const noexcept;
@@ -125,6 +147,7 @@ namespace ngc {
         };
 
         struct TriggeredJointRuntime {
+            double start = 0.0;
             double target = 0.0;
             double elapsed = 0.0;
             double triggerPosition = 0.0;

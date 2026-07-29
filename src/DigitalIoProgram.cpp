@@ -6,8 +6,11 @@
 #include <cmath>
 #include <format>
 #include <limits>
+#include <optional>
 #include <sstream>
 #include <vector>
+
+#include "machine/ProductionExecutorCore.h"
 
 namespace ngc {
     namespace {
@@ -77,6 +80,57 @@ namespace ngc {
                 line, text));
         }
 
+        std::optional<double> parseNumber(
+            const std::string_view text) noexcept {
+            auto value = 0.0;
+            const auto [end, error] = std::from_chars(
+                text.data(), text.data() + text.size(), value);
+            if (error != std::errc{}
+                || end != text.data() + text.size()
+                || !std::isfinite(value)) {
+                return std::nullopt;
+            }
+
+            return value;
+        }
+
+        double axisComponent(
+            const position_t &position,
+            const std::size_t axis) noexcept {
+            switch (static_cast<AxisId>(axis)) {
+                case AxisId::X: return position.x;
+                case AxisId::Y: return position.y;
+                case AxisId::Z: return position.z;
+                case AxisId::A: return position.a;
+                case AxisId::B: return position.b;
+                case AxisId::C: return position.c;
+            }
+
+            return 0.0;
+        }
+
+        bool booleanValue(const double value) noexcept {
+            return std::isfinite(value) && value != 0.0;
+        }
+
+        bool testMask(
+            const double value, const double mask) noexcept {
+            constexpr auto maximumExactInteger =
+                std::uint64_t{1} << 53;
+            if (!std::isfinite(value) || !std::isfinite(mask)
+                || value < 0.0 || mask < 0.0
+                || value > static_cast<double>(maximumExactInteger)
+                || mask > static_cast<double>(maximumExactInteger)
+                || std::trunc(value) != value
+                || std::trunc(mask) != mask) {
+                return false;
+            }
+
+            return (static_cast<std::uint64_t>(value)
+                    & static_cast<std::uint64_t>(mask))
+                != 0;
+        }
+
         bool validSymbolName(const std::string_view name) {
             if (name.empty()
                 || (!std::isalpha(
@@ -99,8 +153,33 @@ namespace ngc {
                 std::string_view{"and"}, std::string_view{"or"},
                 std::string_view{"xor"},
                 std::string_view{"debounce"},
+                std::string_view{"sub"},
+                std::string_view{"abs"},
+                std::string_view{"le"},
+                std::string_view{"ge"},
+                std::string_view{"test"},
+                std::string_view{"motion_flags"},
+                std::string_view{"move_joints"},
+                std::string_view{"trigger_joints"},
+                std::string_view{"IS_PROBE"},
+                std::string_view{"IS_HOMING"},
             };
             if (std::ranges::contains(words, name)) {
+                return true;
+            }
+            constexpr std::array axisPrefixes{
+                std::string_view{"apos_"},
+                std::string_view{"astart_"},
+                std::string_view{"atarget_"},
+            };
+            constexpr std::string_view axisSuffixes = "xyzabc";
+            if (std::ranges::any_of(
+                    axisPrefixes,
+                    [&](const std::string_view prefix) {
+                        return name.size() == prefix.size() + 1
+                            && name.starts_with(prefix)
+                            && axisSuffixes.contains(name.back());
+                    })) {
                 return true;
             }
             constexpr std::array prefixes{
@@ -109,6 +188,10 @@ namespace ngc {
                 std::string_view{"in"},
                 std::string_view{"out"},
                 std::string_view{"r"},
+                std::string_view{"jpos_"},
+                std::string_view{"jstart_"},
+                std::string_view{"jtarget_"},
+                std::string_view{"JOINT_"},
             };
             return std::ranges::any_of(
                 prefixes, [&](const std::string_view prefix) {
@@ -266,10 +349,109 @@ namespace ngc {
         const auto parseOperand = [&](const std::string_view text,
                                       const std::size_t line)
             -> std::expected<Operand, std::string> {
-            if (text == "0" || text == "1") {
+            if (const auto number = parseNumber(text)) {
                 return Operand{
                     .kind = OperandKind::Constant,
-                    .constant = text == "1",
+                    .constant = *number,
+                };
+            }
+            if (text == "IS_PROBE") {
+                return Operand{
+                    .kind = OperandKind::Constant,
+                    .constant = static_cast<double>(
+                        PRODUCTION_EXECUTOR_MOTION_IS_PROBE),
+                };
+            }
+            if (text == "IS_HOMING") {
+                return Operand{
+                    .kind = OperandKind::Constant,
+                    .constant = static_cast<double>(
+                        PRODUCTION_EXECUTOR_MOTION_IS_HOMING),
+                };
+            }
+            if (text == "motion_flags") {
+                return Operand{.kind = OperandKind::MotionFlags};
+            }
+            if (text == "move_joints") {
+                return Operand{.kind = OperandKind::MoveJoints};
+            }
+            if (text == "trigger_joints") {
+                return Operand{.kind = OperandKind::TriggerJoints};
+            }
+            if (text.starts_with("JOINT_")) {
+                const auto index = parseIndex(
+                    text, "JOINT_", MAX_JOINTS, line);
+                if (!index) {
+                    return std::unexpected(index.error());
+                }
+
+                return Operand{
+                    .kind = OperandKind::Constant,
+                    .constant = static_cast<double>(
+                        std::uint64_t{1} << *index),
+                };
+            }
+            constexpr std::array axisNames{
+                std::string_view{"x"}, std::string_view{"y"},
+                std::string_view{"z"}, std::string_view{"a"},
+                std::string_view{"b"}, std::string_view{"c"},
+            };
+            const auto parseAxis = [&](
+                const std::string_view prefix,
+                const OperandKind kind)
+                -> std::optional<Operand> {
+                if (!text.starts_with(prefix)) {
+                    return std::nullopt;
+                }
+                const auto suffix = text.substr(prefix.size());
+                const auto found =
+                    std::ranges::find(axisNames, suffix);
+                if (found == axisNames.end()) {
+                    return std::nullopt;
+                }
+
+                return Operand{
+                    .kind = kind,
+                    .index = static_cast<std::uint16_t>(
+                        found - axisNames.begin()),
+                };
+            };
+            if (const auto operand =
+                    parseAxis("apos_", OperandKind::AxisPosition)) {
+                return *operand;
+            }
+            if (const auto operand =
+                    parseAxis("astart_", OperandKind::AxisStart)) {
+                return *operand;
+            }
+            if (const auto operand =
+                    parseAxis("atarget_", OperandKind::AxisTarget)) {
+                return *operand;
+            }
+            constexpr std::array jointPrefixes{
+                std::pair{
+                    std::string_view{"jpos_"},
+                    OperandKind::JointPosition},
+                std::pair{
+                    std::string_view{"jstart_"},
+                    OperandKind::JointStart},
+                std::pair{
+                    std::string_view{"jtarget_"},
+                    OperandKind::JointTarget},
+            };
+            for (const auto &[prefix, kind] : jointPrefixes) {
+                if (!text.starts_with(prefix)) {
+                    continue;
+                }
+                const auto index = parseIndex(
+                    text, prefix, MAX_JOINTS, line);
+                if (!index) {
+                    return std::unexpected(index.error());
+                }
+
+                return Operand{
+                    .kind = kind,
+                    .index = *index,
                 };
             }
             if (const auto symbol = std::ranges::find(
@@ -445,6 +627,21 @@ namespace ngc {
             } else if (tokens[0] == "debounce") {
                 instruction.opcode = Opcode::Debounce;
                 expectedTokens = 4;
+            } else if (tokens[0] == "sub") {
+                instruction.opcode = Opcode::Subtract;
+                expectedTokens = 4;
+            } else if (tokens[0] == "abs") {
+                instruction.opcode = Opcode::Absolute;
+                expectedTokens = 3;
+            } else if (tokens[0] == "le") {
+                instruction.opcode = Opcode::LessEqual;
+                expectedTokens = 4;
+            } else if (tokens[0] == "ge") {
+                instruction.opcode = Opcode::GreaterEqual;
+                expectedTokens = 4;
+            } else if (tokens[0] == "test") {
+                instruction.opcode = Opcode::Test;
+                expectedTokens = 4;
             } else {
                 return std::unexpected(std::format(
                     "digital I/O program line {} has unknown opcode '{}'",
@@ -476,7 +673,11 @@ namespace ngc {
 
             if (instruction.opcode == Opcode::And
                 || instruction.opcode == Opcode::Or
-                || instruction.opcode == Opcode::Xor) {
+                || instruction.opcode == Opcode::Xor
+                || instruction.opcode == Opcode::Subtract
+                || instruction.opcode == Opcode::LessEqual
+                || instruction.opcode == Opcode::GreaterEqual
+                || instruction.opcode == Opcode::Test) {
                 const auto second =
                     parseOperand(tokens[3], line.number);
                 if (!second) {
@@ -541,11 +742,13 @@ namespace ngc {
         return result;
     }
 
-    bool DigitalIoProgram::value(
+    double DigitalIoProgram::value(
         const Operand &operand,
         const FieldDigitalInputImage &fieldInputs,
         const LogicalDigitalOutputImage &logicalOutputs,
-        const std::bitset<
+        const ProductionExecutorMotionContext &motion,
+        const std::array<
+            double,
             DIGITAL_IO_PROGRAM_REGISTER_CAPACITY> &registers) const noexcept {
         switch (operand.kind) {
             case OperandKind::Register:
@@ -556,25 +759,48 @@ namespace ngc {
                 return logicalOutputs[operand.index];
             case OperandKind::Constant:
                 return operand.constant;
+            case OperandKind::MotionFlags:
+                return static_cast<double>(motion.flags);
+            case OperandKind::MoveJoints:
+                return static_cast<double>(motion.moveJoints);
+            case OperandKind::TriggerJoints:
+                return static_cast<double>(motion.triggerJoints);
+            case OperandKind::AxisPosition:
+                return axisComponent(
+                    motion.axisPosition, operand.index);
+            case OperandKind::AxisStart:
+                return axisComponent(
+                    motion.axisStart, operand.index);
+            case OperandKind::AxisTarget:
+                return axisComponent(
+                    motion.axisTarget, operand.index);
+            case OperandKind::JointPosition:
+                return motion.jointPosition[operand.index];
+            case OperandKind::JointStart:
+                return motion.jointStart[operand.index];
+            case OperandKind::JointTarget:
+                return motion.jointTarget[operand.index];
             case OperandKind::LogicalInput:
             case OperandKind::FieldOutput:
-                return false;
+                return 0.0;
         }
 
-        return false;
+        return 0.0;
     }
 
     void DigitalIoProgram::evaluate(
         const FieldDigitalInputImage &fieldInputs,
         const LogicalDigitalOutputImage &logicalOutputs,
+        const ProductionExecutorMotionContext &motion,
         LogicalDigitalInputImage &logicalInputs,
         FieldDigitalOutputImage &fieldOutputs,
         std::array<
             DebounceState,
             DIGITAL_IO_PROGRAM_INSTRUCTION_CAPACITY> &debounce,
         const bool advanceDebounce) const noexcept {
-        auto registers =
-            std::bitset<DIGITAL_IO_PROGRAM_REGISTER_CAPACITY>{};
+        auto registers = std::array<
+            double,
+            DIGITAL_IO_PROGRAM_REGISTER_CAPACITY>{};
         auto nextInputs = LogicalDigitalInputImage{};
         auto nextFieldOutputs = FieldDigitalOutputImage{};
         for (std::size_t index = 0;
@@ -583,49 +809,71 @@ namespace ngc {
             const auto first =
                 value(
                     instruction.first, fieldInputs,
-                    logicalOutputs, registers);
-            auto result = false;
+                    logicalOutputs, motion, registers);
+            auto result = 0.0;
             switch (instruction.opcode) {
                 case Opcode::Move:
                     result = first;
                     break;
                 case Opcode::Not:
-                    result = !first;
+                    result = std::isfinite(first)
+                            && !booleanValue(first)
+                        ? 1.0 : 0.0;
                     break;
-                case Opcode::And:
-                    result = first && value(
+                case Opcode::And: {
+                    const auto second = value(
                         instruction.second, fieldInputs,
-                        logicalOutputs, registers);
+                        logicalOutputs, motion, registers);
+                    result = std::isfinite(first)
+                            && std::isfinite(second)
+                            && booleanValue(first)
+                            && booleanValue(second)
+                        ? 1.0 : 0.0;
                     break;
-                case Opcode::Or:
-                    result = first || value(
+                }
+                case Opcode::Or: {
+                    const auto second = value(
                         instruction.second, fieldInputs,
-                        logicalOutputs, registers);
+                        logicalOutputs, motion, registers);
+                    result = std::isfinite(first)
+                            && std::isfinite(second)
+                            && (booleanValue(first)
+                                || booleanValue(second))
+                        ? 1.0 : 0.0;
                     break;
-                case Opcode::Xor:
-                    result = first != value(
+                }
+                case Opcode::Xor: {
+                    const auto second = value(
                         instruction.second, fieldInputs,
-                        logicalOutputs, registers);
+                        logicalOutputs, motion, registers);
+                    result = std::isfinite(first)
+                            && std::isfinite(second)
+                            && (booleanValue(first)
+                                != booleanValue(second))
+                        ? 1.0 : 0.0;
                     break;
+                }
                 case Opcode::Debounce: {
+                    const auto firstBoolean =
+                        booleanValue(first);
                     auto &state = debounce[index];
                     if (!advanceDebounce) {
-                        result = state.output;
+                        result = state.output ? 1.0 : 0.0;
                         break;
                     }
                     if (!state.initialized) {
                         state.initialized = true;
-                        state.output = first;
-                        state.candidate = first;
+                        state.output = firstBoolean;
+                        state.candidate = firstBoolean;
                         state.stableTicks = 0;
                     } else if (instruction.debounceTicks == 0
-                               || first == state.output) {
-                        state.output = first;
-                        state.candidate = first;
+                               || firstBoolean == state.output) {
+                        state.output = firstBoolean;
+                        state.candidate = firstBoolean;
                         state.stableTicks = 0;
                     } else {
-                        if (first != state.candidate) {
-                            state.candidate = first;
+                        if (firstBoolean != state.candidate) {
+                            state.candidate = firstBoolean;
                             state.stableTicks = 1;
                         } else if (
                             state.stableTicks
@@ -638,9 +886,45 @@ namespace ngc {
                             state.stableTicks = 0;
                         }
                     }
-                    result = state.output;
+                    result = state.output ? 1.0 : 0.0;
                     break;
                 }
+                case Opcode::Subtract:
+                    result = first - value(
+                        instruction.second, fieldInputs,
+                        logicalOutputs, motion, registers);
+                    break;
+                case Opcode::Absolute:
+                    result = std::abs(first);
+                    break;
+                case Opcode::LessEqual: {
+                    const auto second = value(
+                        instruction.second, fieldInputs,
+                        logicalOutputs, motion, registers);
+                    result = std::isfinite(first)
+                            && std::isfinite(second)
+                            && first <= second
+                        ? 1.0 : 0.0;
+                    break;
+                }
+                case Opcode::GreaterEqual: {
+                    const auto second = value(
+                        instruction.second, fieldInputs,
+                        logicalOutputs, motion, registers);
+                    result = std::isfinite(first)
+                            && std::isfinite(second)
+                            && first >= second
+                        ? 1.0 : 0.0;
+                    break;
+                }
+                case Opcode::Test:
+                    result = testMask(
+                            first,
+                            value(
+                                instruction.second, fieldInputs,
+                                logicalOutputs, motion, registers))
+                        ? 1.0 : 0.0;
+                    break;
             }
 
             if (instruction.destination.kind
@@ -648,9 +932,11 @@ namespace ngc {
                 registers[instruction.destination.index] = result;
             } else if (instruction.destination.kind
                        == OperandKind::LogicalInput) {
-                nextInputs[instruction.destination.index] = result;
+                nextInputs[instruction.destination.index] =
+                    booleanValue(result);
             } else {
-                nextFieldOutputs[instruction.destination.index] = result;
+                nextFieldOutputs[instruction.destination.index] =
+                    booleanValue(result);
             }
         }
 
@@ -662,9 +948,19 @@ namespace ngc {
         const FieldDigitalInputImage &fieldInputs,
         const LogicalDigitalOutputImage &logicalOutputs,
         LogicalDigitalInputImage &logicalInputs) noexcept {
+        executeInputs(
+            fieldInputs, logicalOutputs,
+            ProductionExecutorMotionContext{}, logicalInputs);
+    }
+
+    void DigitalIoProgram::executeInputs(
+        const FieldDigitalInputImage &fieldInputs,
+        const LogicalDigitalOutputImage &logicalOutputs,
+        const ProductionExecutorMotionContext &motion,
+        LogicalDigitalInputImage &logicalInputs) noexcept {
         auto unusedFieldOutputs = FieldDigitalOutputImage{};
         evaluate(
-            fieldInputs, logicalOutputs, logicalInputs,
+            fieldInputs, logicalOutputs, motion, logicalInputs,
             unusedFieldOutputs, m_debounce, true);
     }
 
@@ -672,10 +968,20 @@ namespace ngc {
         const FieldDigitalInputImage &fieldInputs,
         const LogicalDigitalOutputImage &logicalOutputs,
         FieldDigitalOutputImage &fieldOutputs) const noexcept {
+        executeOutputs(
+            fieldInputs, logicalOutputs,
+            ProductionExecutorMotionContext{}, fieldOutputs);
+    }
+
+    void DigitalIoProgram::executeOutputs(
+        const FieldDigitalInputImage &fieldInputs,
+        const LogicalDigitalOutputImage &logicalOutputs,
+        const ProductionExecutorMotionContext &motion,
+        FieldDigitalOutputImage &fieldOutputs) const noexcept {
         auto unusedInputs = LogicalDigitalInputImage{};
         auto debounce = m_debounce;
         evaluate(
-            fieldInputs, logicalOutputs, unusedInputs,
+            fieldInputs, logicalOutputs, motion, unusedInputs,
             fieldOutputs, debounce, false);
     }
 

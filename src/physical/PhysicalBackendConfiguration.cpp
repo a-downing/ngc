@@ -55,6 +55,11 @@ namespace ngc::physical {
     std::expected<PhysicalBackendConfiguration, std::string>
     loadPhysicalBackendConfiguration(
         const std::filesystem::path &path) {
+        auto runtime =
+            loadBackendRuntimeHostConfiguration(path);
+        if (!runtime) {
+            return std::unexpected(runtime.error());
+        }
         auto motion = mesa::loadMesaBackendConfiguration(path);
         if (!motion) {
             return std::unexpected(motion.error());
@@ -63,6 +68,7 @@ namespace ngc::physical {
         try {
             const auto document = toml::parse_file(path.string());
             auto result = PhysicalBackendConfiguration{
+                .runtime = *runtime,
                 .motion = std::move(*motion),
                 .spindle = std::nullopt,
             };

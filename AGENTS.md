@@ -98,9 +98,14 @@ machine configuration, owns fixed-period ticking and stopped-state synchronous
 service stepping, samples a fixed-size digital-input image before each tick,
 and applies the fixed-size output state afterward through an injected I/O
 boundary. The physical Mesa integration slice exposes unmodified board input
-levels through globally unique bare field-input names, executes an NRT-compiled, fixed-capacity Boolean input
-program with `mov`, `not`, `and`, `or`, `xor`, and stateful `debounce`
-instructions, and atomically supplies its logical-input image to the
+levels through globally unique bare field-input names and executes an
+NRT-compiled, fixed-capacity double-register program. In addition to Boolean
+`mov`, `not`, `and`, `or`, `xor`, and stateful `debounce`, the program provides
+`sub`, `abs`, `le`, `ge`, and integral-mask `test`. Before input sampling, it
+can read the executor's fixed-size motion context through `motion_flags`,
+`move_joints`, `trigger_joints`, `apos_*`, `astart_*`, `atarget_*`, `jpos_*`,
+`jstart_*`, and `jtarget_*`; uppercase probe, homing, and joint-mask constants
+are compile-time values. It atomically supplies its logical-input image to the
 executor. The same program maps the executor-carried `outN` logical-output
 image into `fieldoutN` outputs staged for the configured HostMot2 SSR bindings.
 Configured field-input names and logical input/output names share one global
@@ -111,7 +116,10 @@ logical-output operands are read-only, while logical-input and field-output
 operands are write-only. Every configured logical input and field output must
 be assigned exactly once, and
 debounce durations written as time are rounded up to fixed servo ticks during
-NRT compilation. Its bounded adapter stages
+NRT compilation. The current bare-board commissioning program temporarily
+replaces the disconnected probe and homing field inputs with
+motion-context-derived levels; the physical mappings must be restored before
+any motion or spindle hardware is connected. Its bounded adapter stages
 commanded joint velocities as StepGen rates, requires
 the watchdog for enabled motion, and converts any invalid cyclic exchange into
 an executor host fault and safe output image. Its optional HostMot2 DPLL path
@@ -142,9 +150,10 @@ end-to-end with `HomingController`. It is hosted by the external process for
 the configured non-hardware Real target. There is no HAL component.
 `ngc_mesa_backend` is the initial physical executor process: its NRT bootstrap
 loads and cross-validates the typed machine and physical-backend
-configurations. The physical-backend configuration composes independent Mesa
-motion and optional spindle roles; `MesaBackendConfiguration` remains limited
-to Mesa motion hardware. The current Huanyang spindle role is typed and
+configurations. The physical-backend configuration owns the executor host
+policy and composes independent Mesa motion and optional spindle roles;
+`MesaBackendConfiguration` remains limited to Mesa motion hardware. The
+current Huanyang spindle role is typed and
 validated but disabled. `PhysicalProductionExecutorIo` composes motion I/O with
 an optional `SpindleHardware` behind a bounded RT-to-NRT `SpindleWorker`;
 serial communication never runs in the servo cycle, and worker shutdown or a
@@ -198,6 +207,11 @@ disables watchdog and rates on normal or signal-interrupted shutdown while a
 cyclic exchange remains valid; a latched transport, protocol, watchdog, or DPLL
 fault instead relies on the configured hardware watchdog to remove enable. It
 is a board bring-up tool, not the production physical backend.
+`ngc_mesa_io_program_benchmark` compiles the configured digital-I/O program
+through the same production helper and measures batched input, output, and
+combined passes entirely outside the servo cycle; timing instrumentation must
+not be added to `DigitalIoProgram::executeInputs()` or
+`executeOutputs()`.
 `ExternalRealtimeRuntime`
 implements the NRT side of the versioned shared-memory IPC boundary and owns a
 bounded `MotionBackend` proxy. The `ngc_ipc_backend` executable is a
@@ -312,15 +326,17 @@ Tests are framework-free executables, with the core suite in `src/test.cpp`. The
 
 ## Configuration and interpreter semantics
 
-`machine.toml` is loaded and validated once at startup through `MachineConfiguration`. Keep toml++ and disk access inside that loader. Planners, workers, and backends receive typed configuration; configuration parsing must never enter the RT-facing backend.
+`machine.toml` is loaded and validated during NRT startup through `MachineConfiguration`. The application passes its resolved path to the selected external Real peer, which independently loads it before starting its RT thread. Keep toml++ and disk access inside configuration loaders. Planners, workers, and RT-facing backends receive typed configuration; configuration parsing must never enter the RT cycle.
 
 - `machine.units` selects the fixed internal `Machine::Unit`.
 - Trajectory, axis, joint, jogging, probing, simulation, and homing values use the configured machine unit and seconds as documented in `machine.toml` and `MachineConfiguration`.
 - `rapid_velocity` is converted at the loader boundary to the per-minute representation expected by canonical motion.
 - `simulation.scheduler_period` must be an integer multiple of `servo_period`.
-- `[real_backend]` owns the external executor's independent `servo_period` and
-  optional Linux-only `realtime_cpu`, `realtime_priority`, and `lock_memory`
-  host policy. Configuring one of the CPU/priority pair requires both.
+- `[real_backend]` owns the external executor path, optional resolved
+  backend-configuration path, and independent authoritative `servo_period`.
+  The selected backend configuration's `[runtime]` table owns the optional
+  Linux-only `realtime_cpu`, `realtime_priority`, and `lock_memory` host
+  policy. Configuring one of the CPU/priority pair requires both.
 - The loader owns and validates logical axes, axis-to-joint topology, digital-input IDs, probing input, per-joint motion/homing values, and ordered homing groups. Logical coordinates without configured axes, duplicate or out-of-range IDs, and incomplete joint/group mappings are startup errors.
 - A positive homing `backoff_distance` means clearance behind the fast-trigger position. `switch_position` is assigned at the slow latch and `home_position` is the final post-latch destination.
 - Jog start limits come from `[jogging]`; jog stop and lease-expiry authority comes from the physical axis/joint limits carried in `stopLimits`.

@@ -28,15 +28,22 @@ ctest --test-dir build -E '^ngc_tests$' --output-on-failure
 
 The configured Linux IPC executor uses the existing
 `ProductionExecutorRuntime` servo thread as its RT thread. The Real backend
-settings select its period, CPU, FIFO priority, and memory-locking policy:
+selection names the executable and its backend-owned configuration, while
+`machine.toml` remains authoritative for the shared servo period:
 
 ```toml
 [real_backend]
-type = "ipc_executor"
 executable = "build/ngc_ipc_backend.exe"
+configuration = "ipc_backend.toml"
 servo_period = 0.001
+```
+
+The selected backend configuration owns the host policy:
+
+```toml
+[runtime]
 realtime_cpu = 15
-realtime_priority = 95
+realtime_priority = 98
 lock_memory = true
 ```
 
@@ -170,8 +177,8 @@ cmake --build build --target ngc_mesa_backend
 ```
 
 The executable parses both files only during NRT bootstrap. The physical
-backend configuration composes independent Mesa motion and optional spindle
-roles. It passes typed runtime configuration to
+backend configuration owns the executor host policy and composes independent
+Mesa motion and optional spindle roles. It passes typed runtime configuration to
 `ProductionExecutorRuntime` and typed motion configuration to the Mesa
 adapter. The Huanyang spindle role remains configured but disabled until its
 physical commissioning is complete. Its Linux serial implementation uses
@@ -189,6 +196,23 @@ Replace it before powering any drive, motor, spindle, or other output. A normal
 invocation is launched by the application's external-runtime IPC boundary; do
 not select it as the Real target beyond this isolated commissioning setup until
 the staged checks are complete.
+
+Measure the exact configured digital-I/O assembly program without opening the
+board or adding clock reads to the servo cycle:
+
+```bash
+cmake --build build --target ngc_mesa_io_program_benchmark
+./build/ngc_mesa_io_program_benchmark \
+    --machine-config machine.toml \
+    --backend-config physical_backend.toml
+```
+
+The benchmark uses the same compiler entry point as `ngc_mesa_backend`, warms
+the stateful debounce instructions, and reports batched input-pass,
+output-pass, and combined-pass nanoseconds together with their fraction of the
+configured Real servo period. Batch timing amortizes clock overhead and does
+not subtract a synthetic baseline. `--batches` and
+`--iterations-per-batch` control the sample count.
 
 Exercise the same physical process through the production IPC boundary without
 commanding motion with:

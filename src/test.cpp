@@ -104,6 +104,7 @@ namespace {
         : public ngc::ProductionExecutorIo {
     public:
         void sampleDigitalInputs(
+            const ngc::ProductionExecutorMotionContext &,
             ngc::ProductionExecutorDigitalInputs &inputs) noexcept override {
             std::scoped_lock lock(m_mutex);
             if (m_ticksUntilTrigger != 0 && --m_ticksUntilTrigger == 0) {
@@ -144,6 +145,7 @@ namespace {
         : public ngc::ProductionExecutorIo {
     public:
         void sampleDigitalInputs(
+            const ngc::ProductionExecutorMotionContext &,
             ngc::ProductionExecutorDigitalInputs &inputs) noexcept override {
             inputs.reset();
         }
@@ -7469,20 +7471,22 @@ G1 F60 X2
                 repositoryConfiguration
                     ? "" : repositoryConfiguration.error());
         require(repositoryConfiguration->realBackend.has_value()
-                    && repositoryConfiguration->realBackend->executable.filename()
-                        == "ngc_ipc_backend.exe"
+                    && repositoryConfiguration->realBackend
+                           ->executable.is_absolute()
+                    && !repositoryConfiguration->realBackend
+                            ->executable.filename().empty()
                     && repositoryConfiguration->realBackend
                            ->machineConfiguration.filename()
                         == "machine.toml"
+                    && repositoryConfiguration->realBackend
+                           ->backendConfiguration.has_value()
+                    && repositoryConfiguration->realBackend
+                           ->backendConfiguration->is_absolute()
+                    && !repositoryConfiguration->realBackend
+                            ->backendConfiguration->filename().empty()
                     && repositoryConfiguration->realBackend->servoPeriod
-                        == 0.001
-                    && repositoryConfiguration->realBackend->realtimeEnabled
-                    && repositoryConfiguration->realBackend->realtimeCpu
-                        == 15
-                    && repositoryConfiguration->realBackend->realtimePriority
-                        == 98
-                    && repositoryConfiguration->realBackend->lockMemory,
-                "machine configuration should enable the external IPC Real backend");
+                        == 0.001,
+                "machine configuration should enable a resolved external Real backend");
 
         require(!configuration->coordinates.empty(),
                 "machine configuration should load at least one logical coordinate");

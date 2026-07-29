@@ -9,6 +9,7 @@
 #include <string>
 #include <thread>
 
+#include "config/BackendRuntimeConfiguration.h"
 #include "machine/BackendRuntime.h"
 #include "machine/MachineConfiguration.h"
 #include "machine/ProductionExecutorCore.h"
@@ -26,6 +27,7 @@ namespace ngc {
         virtual ~ProductionExecutorIo() = default;
 
         virtual void sampleDigitalInputs(
+            const ProductionExecutorMotionContext &motion,
             ProductionExecutorDigitalInputs &inputs) noexcept = 0;
         virtual void applyOutputs(
             const ProductionExecutorOutputState &outputs) noexcept = 0;
@@ -43,12 +45,7 @@ namespace ngc {
         std::uint32_t serviceTicksPerPeriod = 1;
         std::uint32_t timingPublicationTicks = 100;
         ProductionExecutorConfiguration executor;
-        struct RealtimeHost {
-            bool enabled = false;
-            std::uint32_t cpu = 0;
-            int priority = 0;
-            bool lockMemory = false;
-        } realtime;
+        BackendRuntimeHostConfiguration realtime;
     };
 
     [[nodiscard]] ProductionExecutorRuntimeConfiguration
@@ -109,7 +106,7 @@ namespace ngc {
         double m_servoPeriod;
         std::uint32_t m_serviceTicksPerPeriod;
         std::uint32_t m_timingPublicationTicks;
-        ProductionExecutorRuntimeConfiguration::RealtimeHost m_realtime;
+        BackendRuntimeHostConfiguration m_realtime;
         SpscChannel<RealtimeTimingSummary, TIMING_CAPACITY> m_timing;
         mutable std::mutex m_lifecycleMutex;
         std::condition_variable m_lifecycleCv;

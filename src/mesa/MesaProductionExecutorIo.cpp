@@ -5,6 +5,9 @@
 #include <cmath>
 #include <format>
 #include <utility>
+#include <vector>
+
+#include "mesa/SevenI96Capabilities.h"
 
 namespace ngc::mesa {
     namespace {
@@ -37,6 +40,47 @@ namespace ngc::mesa {
                 && std::abs(state.acceleration[joint])
                     <= STATIONARY_TOLERANCE;
         }
+    }
+
+    std::expected<DigitalIoProgram, std::string>
+    compileMesaDigitalIoProgram(
+        const MachineConfiguration &machine,
+        const MesaBackendConfiguration &mesa) {
+        if (!machine.realBackend.has_value()) {
+            return std::unexpected(
+                "Mesa digital I/O program requires a configured "
+                "Real backend servo period");
+        }
+
+        std::vector<DigitalInputId> logicalInputs;
+        std::vector<DigitalIoSymbol> symbols;
+        logicalInputs.reserve(machine.digitalInputs.size());
+        symbols.reserve(
+            machine.digitalInputs.size()
+            + mesa.fieldInputs.size());
+        for (const auto &input : machine.digitalInputs) {
+            logicalInputs.push_back(input.id);
+            symbols.push_back({
+                .name = input.name,
+                .kind = DigitalIoSymbolKind::LogicalInput,
+                .id = input.id,
+            });
+        }
+        for (const auto &input : mesa.fieldInputs) {
+            symbols.push_back({
+                .name = input.name,
+                .kind = DigitalIoSymbolKind::FieldInput,
+                .id = input.index,
+            });
+        }
+        const auto logicalOutputs =
+            std::span<const DigitalOutputId>{};
+
+        return DigitalIoProgram::compile(
+            mesa.ioProgram,
+            SEVEN_I96_ISOLATED_INPUT_COUNT,
+            logicalInputs, 0, logicalOutputs,
+            machine.realBackend->servoPeriod, symbols);
     }
 
     std::expected<
@@ -147,6 +191,7 @@ namespace ngc::mesa {
     }
 
     void MesaProductionExecutorIo::sampleDigitalInputs(
+        const ProductionExecutorMotionContext &motion,
         ProductionExecutorDigitalInputs &inputs) noexcept {
         inputs.reset();
         if (m_faultCode != 0) {
@@ -228,7 +273,7 @@ namespace ngc::mesa {
             m_fieldInputs[index] = fieldDigitalInputs[index];
         }
         m_ioProgram.executeInputs(
-            m_fieldInputs, m_logicalOutputs, inputs);
+            m_fieldInputs, m_logicalOutputs, motion, inputs);
         if (m_safetyInput.has_value()
             && inputs[m_safetyInput->input]
                 != m_safetyInput->requiredLevel) {
@@ -332,7 +377,8 @@ namespace ngc::mesa {
         }
         auto fieldOutputs = FieldDigitalOutputImage{};
         m_ioProgram.executeOutputs(
-            m_fieldInputs, m_logicalOutputs, fieldOutputs);
+            m_fieldInputs, m_logicalOutputs,
+            outputs.motion, fieldOutputs);
         next.digitalOutputsEnabled =
             m_ioProgram.fieldOutputCount() != 0;
         for (std::size_t index = 0;

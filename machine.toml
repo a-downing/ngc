@@ -13,7 +13,7 @@ rapid_velocity = 3.33
 # machine-units
 arc_chord_tolerance = 0.0001
 # minimum seconds of provisional G64 motion before a proven rolling split
-lookahead_duration = 400
+lookahead_duration = 2
 
 [simulation]
 # seconds per mock executor servo tick
@@ -22,13 +22,9 @@ servo_period = 0.001
 scheduler_period = 0.01
 
 [real_backend]
-type = "ipc_executor"
-executable = "build/ngc_ipc_backend.exe"
-# Linux production executor host settings.
+executable = "build/ngc_mesa_backend"
+configuration = "physical_backend.toml"
 servo_period = 0.001
-realtime_cpu = 15
-realtime_priority = 98
-lock_memory = true
 
 [feed_hold]
 # Experimental mock-backend on-path feed hold. These bound the requested

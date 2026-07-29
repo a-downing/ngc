@@ -9,7 +9,6 @@
 #include <limits>
 #include <memory>
 #include <ranges>
-#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -18,7 +17,6 @@
 #include <vector>
 
 #include "IpcPlatform.h"
-#include "machine/DigitalIoProgram.h"
 #include "machine/IpcExecutorBridge.h"
 #include "machine/IpcProtocol.h"
 #include "machine/MachineConfiguration.h"
@@ -232,47 +230,6 @@ namespace {
         return result;
     }
 
-    ngc::DigitalIoProgram compileDigitalIoProgram(
-        const ngc::MachineConfiguration &machine,
-        const ngc::mesa::MesaBackendConfiguration &mesa) {
-        std::vector<ngc::DigitalInputId> logicalInputs;
-        std::vector<ngc::DigitalIoSymbol> symbols;
-        logicalInputs.reserve(machine.digitalInputs.size());
-        symbols.reserve(
-            machine.digitalInputs.size()
-            + mesa.fieldInputs.size());
-        for (const auto &input : machine.digitalInputs) {
-            logicalInputs.push_back(input.id);
-            symbols.push_back({
-                .name = input.name,
-                .kind =
-                    ngc::DigitalIoSymbolKind::LogicalInput,
-                .id = input.id,
-            });
-        }
-        for (const auto &input : mesa.fieldInputs) {
-            symbols.push_back({
-                .name = input.name,
-                .kind = ngc::DigitalIoSymbolKind::FieldInput,
-                .id = input.index,
-            });
-        }
-        const auto logicalOutputs =
-            std::span<const ngc::DigitalOutputId>{};
-        auto program = ngc::DigitalIoProgram::compile(
-            mesa.ioProgram,
-            ngc::mesa::SEVEN_I96_ISOLATED_INPUT_COUNT,
-            logicalInputs, 0, logicalOutputs,
-            machine.realBackend->servoPeriod, symbols);
-        if (!program) {
-            throw std::runtime_error(program.error());
-        }
-
-        auto result = std::move(*program);
-
-        return result;
-    }
-
     std::unique_ptr<ngc::ProductionExecutorRuntime> makeRuntime(
         const ngc::MachineConfiguration &machine,
         const ngc::physical::PhysicalBackendConfiguration
@@ -320,9 +277,15 @@ namespace {
             .requiredLevel = mesa.safety->polarity
                 == ngc::mesa::MesaSafetyPolarity::ActiveHigh,
         };
+        auto ioProgram =
+            ngc::mesa::compileMesaDigitalIoProgram(
+                machine, mesa);
+        if (!ioProgram) {
+            throw std::runtime_error(ioProgram.error());
+        }
         auto motion = ngc::mesa::MesaProductionExecutorIo::create(
             std::move(*cyclic),
-            compileDigitalIoProgram(machine, mesa),
+            std::move(*ioProgram),
             mappings, safetyInput);
         if (!motion) {
             throw std::runtime_error(motion.error());
@@ -342,9 +305,12 @@ namespace {
             std::make_unique<ngc::PhysicalProductionExecutorIo>(
                 std::move(*motion), std::move(spindle));
 
+        auto runtimeConfiguration =
+            ngc::productionExecutorRuntimeConfiguration(machine);
+        runtimeConfiguration.realtime = physical.runtime;
+
         return std::make_unique<ngc::ProductionExecutorRuntime>(
-            ngc::productionExecutorRuntimeConfiguration(machine),
-            std::move(io));
+            std::move(runtimeConfiguration), std::move(io));
     }
 
     int run(const Options &options) {
@@ -366,8 +332,12 @@ namespace {
                 *machine, mesa.safety->enableInput));
         }
         static_cast<void>(stepGeneratorMappings(*machine, mesa));
-        static_cast<void>(compileDigitalIoProgram(
-            *machine, mesa));
+        const auto ioProgram =
+            ngc::mesa::compileMesaDigitalIoProgram(
+                *machine, mesa);
+        if (!ioProgram) {
+            throw std::runtime_error(ioProgram.error());
+        }
         if (options.validateConfigurationOnly) {
             return 0;
         }
@@ -380,7 +350,7 @@ namespace {
         throw std::runtime_error(
             "the Mesa physical backend requires Linux");
 #else
-        if (!machine->realBackend->realtimeEnabled) {
+        if (!physical->runtime.realtimeEnabled) {
             throw std::runtime_error(
                 "the Mesa physical backend requires configured "
                 "real-time CPU and priority");

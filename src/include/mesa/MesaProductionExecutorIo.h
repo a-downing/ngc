@@ -10,8 +10,10 @@
 #include <string>
 
 #include "machine/DigitalIoProgram.h"
+#include "machine/MachineConfiguration.h"
 #include "machine/ProductionExecutorRuntime.h"
 #include "mesa/HostMot2CyclicIo.h"
+#include "mesa/MesaBackendConfiguration.h"
 
 namespace ngc::mesa {
     inline constexpr std::uint32_t
@@ -38,6 +40,11 @@ namespace ngc::mesa {
     inline constexpr std::uint32_t
         MESA_EXTERNAL_ENABLE_FAULT = 0x4D53'0102;
 
+    [[nodiscard]] std::expected<DigitalIoProgram, std::string>
+    compileMesaDigitalIoProgram(
+        const MachineConfiguration &machine,
+        const MesaBackendConfiguration &mesa);
+
     class MesaProductionExecutorIo final : public ProductionExecutorIo {
     public:
         [[nodiscard]] static std::expected<
@@ -51,6 +58,7 @@ namespace ngc::mesa {
                 safetyInput = std::nullopt);
 
         void sampleDigitalInputs(
+            const ProductionExecutorMotionContext &motion,
             ProductionExecutorDigitalInputs &inputs) noexcept override;
         void applyOutputs(
             const ProductionExecutorOutputState &outputs) noexcept override;

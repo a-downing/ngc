@@ -17,6 +17,7 @@ namespace ngc {
         ~PhysicalProductionExecutorIo() override;
 
         void sampleDigitalInputs(
+            const ProductionExecutorMotionContext &motion,
             ProductionExecutorDigitalInputs &inputs) noexcept override;
         void applyOutputs(
             const ProductionExecutorOutputState &outputs) noexcept override;

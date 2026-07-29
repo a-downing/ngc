@@ -14,6 +14,7 @@
 #include <string_view>
 #include <thread>
 
+#include "config/BackendRuntimeConfiguration.h"
 #include "machine/MachineConfiguration.h"
 #include "machine/RealtimeHost.h"
 #include "mesa/HostMot2CyclicIo.h"
@@ -433,6 +434,12 @@ int main(const int argc, char **argv) {
         if (!mesa) {
             throw std::runtime_error(mesa.error());
         }
+        const auto host =
+            ngc::loadBackendRuntimeHostConfiguration(
+                options.mesaConfiguration);
+        if (!host) {
+            throw std::runtime_error(host.error());
+        }
         const auto periodNanoseconds =
             servoPeriodNanoseconds(*machine);
         if (options.validateConfigurationOnly) {
@@ -496,20 +503,19 @@ int main(const int argc, char **argv) {
             "Connected to {} at {}; configured {} StepGens",
             inventory->idrom.boardName, mesa->address,
             mesa->stepGenerators.size());
-        const auto &realBackend = *machine->realBackend;
         if (!options.ordinaryScheduler
-            && realBackend.realtimeEnabled) {
-            if (realBackend.lockMemory) {
+            && host->realtimeEnabled) {
+            if (host->lockMemory) {
                 ngc::lockProcessMemory();
             }
             ngc::configureCurrentRealtimeThread(
-                realBackend.realtimeCpu,
-                realBackend.realtimePriority);
+                host->realtimeCpu,
+                host->realtimePriority);
             std::println(
                 "Using CPU {} with SCHED_FIFO priority {}{}",
-                realBackend.realtimeCpu,
-                realBackend.realtimePriority,
-                realBackend.lockMemory
+                host->realtimeCpu,
+                host->realtimePriority,
+                host->lockMemory
                     ? " and locked memory"
                     : "");
         } else {

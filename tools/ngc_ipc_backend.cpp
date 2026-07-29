@@ -14,6 +14,7 @@
 
 #include "ExecutionItemOperations.h"
 #include "IpcPlatform.h"
+#include "config/BackendRuntimeConfiguration.h"
 #include "machine/IpcExecutorBridge.h"
 #include "machine/IpcProtocol.h"
 #include "machine/MachineConfiguration.h"
@@ -26,8 +27,10 @@ namespace {
         std::string mapping;
         ngc::IpcIdentity expected{};
         std::optional<std::filesystem::path> machineConfiguration;
+        std::optional<std::filesystem::path> backendConfiguration;
         bool consume = true;
         bool nonRealtime = false;
+        bool validateConfigurationOnly = false;
         std::optional<std::uint64_t> exitAfterControls;
         std::optional<std::chrono::milliseconds> exitAfterHandshake;
     };
@@ -68,10 +71,14 @@ namespace {
                 options.expected.authorityGeneration = parseUnsigned(value());
             } else if (option == "--machine-configuration") {
                 options.machineConfiguration = value();
+            } else if (option == "--backend-configuration") {
+                options.backendConfiguration = value();
             } else if (option == "--no-consume") {
                 options.consume = false;
             } else if (option == "--non-realtime") {
                 options.nonRealtime = true;
+            } else if (option == "--validate-config-only") {
+                options.validateConfigurationOnly = true;
             } else if (option == "--exit-after-controls") {
                 options.exitAfterControls = parseUnsigned(value());
             } else if (option == "--exit-after-handshake-ms") {
@@ -81,7 +88,8 @@ namespace {
                 throw std::runtime_error("unknown option: " + std::string(option));
             }
         }
-        if (options.mapping.empty()) {
+        if (!options.validateConfigurationOnly
+            && options.mapping.empty()) {
             throw std::runtime_error("--mapping is required");
         }
 
@@ -92,7 +100,9 @@ namespace {
         : public ngc::ProductionExecutorIo,
           public ngc::IpcExecutorPolicy {
     public:
-        void sampleDigitalInputs(ngc::ProductionExecutorDigitalInputs &inputs) noexcept override {
+        void sampleDigitalInputs(
+            const ngc::ProductionExecutorMotionContext &,
+            ngc::ProductionExecutorDigitalInputs &inputs) noexcept override {
             inputs.reset();
             for (auto &input : m_inputs) {
                 if (input.enabled.load(std::memory_order_acquire)) {
@@ -251,30 +261,54 @@ namespace {
 
     std::unique_ptr<ngc::ProductionExecutorRuntime> makeRuntime(
         const Options &options, std::unique_ptr<ngc::ProductionExecutorIo> io) {
-        if (!options.machineConfiguration.has_value()) {
-            return std::make_unique<ngc::ProductionExecutorRuntime>(
-                ngc::ProductionExecutorRuntimeConfiguration{}, std::move(io));
-        }
-
-        const auto configuration =
-            ngc::loadMachineConfiguration(*options.machineConfiguration);
-        if (!configuration.has_value()) {
-            throw std::runtime_error(
-                "failed to load machine configuration: "
-                + configuration.error());
-        }
-
         auto runtimeConfiguration =
-            ngc::productionExecutorRuntimeConfiguration(*configuration);
+            ngc::ProductionExecutorRuntimeConfiguration{};
+        if (options.machineConfiguration.has_value()) {
+            const auto configuration =
+                ngc::loadMachineConfiguration(
+                    *options.machineConfiguration);
+            if (!configuration.has_value()) {
+                throw std::runtime_error(
+                    "failed to load machine configuration: "
+                    + configuration.error());
+            }
+            runtimeConfiguration =
+                ngc::productionExecutorRuntimeConfiguration(
+                    *configuration);
+        }
+
+        if (options.backendConfiguration.has_value()) {
+            const auto host =
+                ngc::loadBackendRuntimeHostConfiguration(
+                    *options.backendConfiguration);
+            if (!host) {
+                throw std::runtime_error(
+                    "failed to load backend configuration: "
+                    + host.error());
+            }
+            runtimeConfiguration.realtime = *host;
+        }
+#ifndef __linux__
+        runtimeConfiguration.realtime = {};
+#else
         if (options.nonRealtime) {
             runtimeConfiguration.realtime = {};
         }
+#endif
 
         return std::make_unique<ngc::ProductionExecutorRuntime>(
             std::move(runtimeConfiguration), std::move(io));
     }
 
     int run(const Options &options) {
+        if (options.validateConfigurationOnly) {
+            static_cast<void>(makeRuntime(
+                options,
+                std::make_unique<TemporaryTriggeredInputs>()));
+
+            return 0;
+        }
+
         auto memory = ngc::ipc_detail::SharedMemory::open(
             options.mapping, sizeof(ngc::IpcSharedRegion));
         auto &region = *static_cast<ngc::IpcSharedRegion *>(memory.data());

@@ -486,35 +486,35 @@ table.
 - logical digital-input identities;
 - probing input identity;
 - Simulation timing and typed Simulation startup state; and
-- the optional Real backend kind, executable, backend-configuration path, and
+- the optional Real backend executable, backend-configuration path, and
   authoritative Real servo period.
 
 Illustrative selection:
 
 ```toml
 [real_backend]
-type = "mesa_hostmot2"
-executable = "build/ngc_rt_backend.exe"
+executable = "build/ngc_mesa_backend"
 configuration = "physical_backend.toml"
 servo_period = 0.001
 ```
 
 The entire `[real_backend]` section may be absent. Simulation remains
-available. The front end passes the resolved backend-configuration path and
-the servo period as separate typed command-line arguments to the backend
-executable. The servo period is part of the shared planning and execution
-contract, so `machine.toml` is its single source of truth. The backend may
-validate hardware timing against that supplied period but must not override it
-or define a duplicate value in its own file. The effective IPC configuration
-fingerprint includes the servo period.
+available. The front end always passes the resolved machine-configuration
+path and, when configured, the resolved backend-configuration path to the
+backend executable. The servo period is part of the shared planning and
+execution contract, so `machine.toml` is its single source of truth. The
+backend reads and validates that period from the machine configuration but
+must not override it or define a duplicate value in its own file. The
+effective IPC configuration fingerprint includes both configuration inputs
+and the servo period.
 
-The physical-backend file composes independently configured hardware roles
-and maps the logical machine to physical hardware:
+The physical-backend file owns the executor host policy, composes independently
+configured hardware roles, and maps the logical machine to physical hardware:
 
 ```toml
-[realtime]
-cpu = 15
-priority = 98
+[runtime]
+realtime_cpu = 15
+realtime_priority = 98
 lock_memory = true
 
 [motion]
@@ -564,8 +564,9 @@ The physical configuration owns:
 - board address and expected identity/firmware capabilities;
 - HostMot2 module and pin assignments;
 - a bounded digital-I/O program that owns field-input-to-logical-input and
-  logical-output-to-field-output mapping, input and output polarity, Boolean
-  composition, and input debounce;
+  logical-output-to-field-output mapping, input and output polarity, numeric
+  and Boolean composition, input debounce, and optional commissioning-only
+  synthesis from executor motion context;
 - field-output pin assignments and safe states, enforced independently of the
   digital-I/O program;
 - joint-to-step-generator mapping;
@@ -603,6 +604,17 @@ and tests. Registers `rN` remain read/write temporaries. The assembler rejects
 operands used against their direction, requires every configured logical input
 and field output to be assigned exactly once, and rejects reads from
 undeclared logical outputs.
+
+Every temporary register stores a `double`; Boolean instructions normalize
+their results to `0.0` or `1.0`, and non-finite values cannot assert a digital
+destination. `sub`, `abs`, `le`, and `ge` provide the bounded numeric operations
+needed for position comparisons. `test` performs an integral mask test.
+`motion_flags`, `move_joints`, and `trigger_joints` expose executor activity,
+while `apos_*`, `astart_*`, and `atarget_*` expose axis-space commanded,
+starting, and target coordinates in machine units. `jpos_*`, `jstart_*`, and
+`jtarget_*` expose the corresponding joint-space values in backend joint
+coordinates. `IS_PROBE`, `IS_HOMING`, and `JOINT_N` are read-only compile-time
+mask constants. Inactive move start and target values are zero.
 
 Assembly source expresses debounce in time, for example
 `debounce r0, fieldin0, 10ms`. NRT compilation rounds the duration up to an

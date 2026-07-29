@@ -17,6 +17,7 @@ namespace ngc {
         class NullProductionExecutorIo final : public ProductionExecutorIo {
         public:
             void sampleDigitalInputs(
+                const ProductionExecutorMotionContext &,
                 ProductionExecutorDigitalInputs &inputs) noexcept override {
                 inputs.reset();
             }
@@ -75,12 +76,6 @@ namespace ngc {
         if (configuration.realBackend.has_value()) {
             result.servoPeriod = configuration.realBackend->servoPeriod;
             result.serviceTicksPerPeriod = 1;
-            result.realtime = {
-                .enabled = configuration.realBackend->realtimeEnabled,
-                .cpu = configuration.realBackend->realtimeCpu,
-                .priority = configuration.realBackend->realtimePriority,
-                .lockMemory = configuration.realBackend->lockMemory,
-            };
         } else {
             result.servoPeriod = configuration.simulation.servoPeriod;
             result.serviceTicksPerPeriod = static_cast<std::uint32_t>(std::max(
@@ -159,8 +154,9 @@ namespace ngc {
             throw std::invalid_argument(
                 "production executor timing publication period must contain at least one tick");
         }
-        if (m_realtime.enabled
-            && (m_realtime.priority < 1 || m_realtime.priority > 99)) {
+        if (m_realtime.realtimeEnabled
+            && (m_realtime.realtimePriority < 1
+                || m_realtime.realtimePriority > 99)) {
             throw std::invalid_argument(
                 "production executor real-time priority must be between 1 and 99");
         }
@@ -187,8 +183,9 @@ namespace ngc {
             return;
         }
 
-        if (m_realtime.enabled) {
-            excludeCpuFromCurrentThread(m_realtime.cpu);
+        if (m_realtime.realtimeEnabled) {
+            excludeCpuFromCurrentThread(
+                m_realtime.realtimeCpu);
             if (m_realtime.lockMemory) {
                 lockProcessMemory();
             }
@@ -316,12 +313,13 @@ namespace ngc {
     }
 
     void ProductionExecutorRuntime::configureServoThread() {
-        if (!m_realtime.enabled) {
+        if (!m_realtime.realtimeEnabled) {
             return;
         }
 
         configureCurrentRealtimeThread(
-            m_realtime.cpu, m_realtime.priority);
+            m_realtime.realtimeCpu,
+            m_realtime.realtimePriority);
     }
 
     void ProductionExecutorRuntime::runServoLoop() {
@@ -351,7 +349,7 @@ namespace ngc {
         auto deadline = clock::now();
         for (;;) {
             deadline += period;
-            if (m_realtime.enabled) {
+            if (m_realtime.realtimeEnabled) {
                 sleepUntilMonotonic(deadline);
             } else {
                 std::this_thread::sleep_until(deadline);
@@ -381,7 +379,7 @@ namespace ngc {
                 m_servoTicks.load(std::memory_order_relaxed),
                 wakeLateness, static_cast<std::uint64_t>(execution),
                 slack, skippedPeriods);
-            if (m_realtime.enabled && slack < 0) {
+            if (m_realtime.realtimeEnabled && slack < 0) {
                 m_core->reportHostFault(
                     PRODUCTION_EXECUTOR_DEADLINE_MISS_FAULT);
                 m_io->applyOutputs(m_core->outputState());
@@ -396,7 +394,8 @@ namespace ngc {
 
     void ProductionExecutorRuntime::tick(
         const bool publishSnapshot) noexcept {
-        m_io->sampleDigitalInputs(m_inputs);
+        m_io->sampleDigitalInputs(
+            m_core->motionContext(), m_inputs);
         if (const auto fault = m_io->faultCode(); fault != 0) {
             m_core->reportHostFault(fault);
         } else {

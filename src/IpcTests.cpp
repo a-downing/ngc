@@ -3,6 +3,7 @@
 #include <cmath>
 #include <filesystem>
 #include <format>
+#include <fstream>
 #include <iostream>
 #include <memory>
 #include <stdexcept>
@@ -507,11 +508,28 @@ namespace {
                 configuration ? "" : configuration.error());
         require(configuration->realBackend.has_value(),
                 "IPC test machine configuration should enable Real");
-        require(configuration->realBackend->executable
-                    == std::filesystem::absolute(peer).lexically_normal(),
-                "repository Real backend path should select the built IPC executor");
+        configuration->realBackend->executable =
+            std::filesystem::absolute(peer).lexically_normal();
+        auto ordinaryBackendConfiguration =
+            std::optional<std::filesystem::path>{};
         if (!realtime) {
-            configuration->realBackend->realtimeEnabled = false;
+            ordinaryBackendConfiguration =
+                std::filesystem::temp_directory_path()
+                / "ngc-ipc-backend-ordinary.toml";
+            std::ofstream file(
+                *ordinaryBackendConfiguration,
+                std::ios::binary | std::ios::trunc);
+            file << "[runtime]\nlock_memory = false\n";
+            require(
+                static_cast<bool>(file),
+                "could not write the ordinary IPC backend "
+                "configuration");
+            configuration->realBackend->backendConfiguration =
+                *ordinaryBackendConfiguration;
+        } else {
+            configuration->realBackend->backendConfiguration =
+                std::filesystem::absolute(
+                    "ipc_backend.toml").lexically_normal();
         }
 
         ngc::MachineSessionManager manager(*configuration);
@@ -852,6 +870,11 @@ sub _tool_change[#tool_number] {
         std::filesystem::remove(temporaryToolStore, cleanupError);
         cleanupError.clear();
         std::filesystem::remove(temporaryParameterStore, cleanupError);
+        if (ordinaryBackendConfiguration.has_value()) {
+            cleanupError.clear();
+            std::filesystem::remove(
+                *ordinaryBackendConfiguration, cleanupError);
+        }
     }
 
     void testExternalRuntimeRejectsStaleHandshake(

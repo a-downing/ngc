@@ -553,8 +553,22 @@ namespace {
             ngc::mesa::loadMesaBackendConfiguration(
                 std::filesystem::path(NGC_SOURCE_DIR)
                     / "physical_backend.toml");
+        const auto machine = ngc::loadMachineConfiguration(
+            std::filesystem::path(NGC_SOURCE_DIR)
+                / "machine.toml");
+        auto ioProgram =
+            configuration && machine
+            ? ngc::mesa::compileMesaDigitalIoProgram(
+                *machine, *configuration)
+            : std::expected<
+                ngc::DigitalIoProgram,
+                std::string>{std::unexpected(
+                    "configuration did not load")};
 
         require(configuration.has_value()
+                && machine.has_value()
+                && ioProgram.has_value()
+                && ioProgram->instructionCount() == 35
                 && configuration->address == "10.10.10.10"
                 && configuration->linearUnit
                     == ngc::mesa::MesaLinearUnit::Millimeter
@@ -589,6 +603,40 @@ namespace {
                     && stepGenerator.maximumGeneratedStepError == 2.0,
                     "Mesa StepGen configuration was decoded incorrectly");
         }
+
+        auto fieldInputs = ngc::FieldDigitalInputImage{};
+        fieldInputs[2] = true;
+        auto logicalInputs = ngc::LogicalDigitalInputImage{};
+        auto motion = ngc::ProductionExecutorMotionContext{};
+        ioProgram->executeInputs({}, {}, motion, logicalInputs);
+        require(logicalInputs.none(),
+                "commissioning program asserted a disconnected input");
+
+        motion.flags =
+            ngc::PRODUCTION_EXECUTOR_MOTION_IS_PROBE;
+        motion.axisStart.z = 1.0;
+        motion.axisTarget.z = -1.0;
+        motion.axisPosition.z = -0.6;
+        ioProgram->executeInputs(
+            fieldInputs, {}, motion, logicalInputs);
+        require(logicalInputs[0] && logicalInputs[3]
+                    && !logicalInputs[1]
+                    && !logicalInputs[2],
+                "commissioning program did not synthesize tool probing");
+
+        motion = {};
+        motion.flags =
+            ngc::PRODUCTION_EXECUTOR_MOTION_IS_HOMING;
+        motion.moveJoints = ngc::JointMask{1} << 2;
+        motion.triggerJoints = ngc::JointMask{1} << 2;
+        motion.jointStart[2] = 1.0;
+        motion.jointPosition[2] = 0.79;
+        ioProgram->executeInputs(
+            fieldInputs, {}, motion, logicalInputs);
+        require(logicalInputs[2] && logicalInputs[3]
+                    && !logicalInputs[0]
+                    && !logicalInputs[1],
+                "commissioning program did not synthesize joint homing");
     }
 
     void testRejectsIncompatibleSevenI96IdentityAndModules() {
@@ -1423,6 +1471,57 @@ namespace {
                 "digital I/O program reset retained debounce state");
     }
 
+    void testExecutesMotionContextDigitalIoProgram() {
+        constexpr std::array<ngc::DigitalInputId, 2> logicalInputs{
+            0, 1,
+        };
+        auto program = ngc::DigitalIoProgram::compile(
+            R"PROGRAM(
+                test r0, motion_flags, IS_PROBE
+                sub r1, atarget_z, apos_z
+                abs r1, r1
+                le r2, r1, 0.5
+                and in0, r0, r2
+
+                test r3, motion_flags, IS_HOMING
+                test r4, trigger_joints, JOINT_2
+                sub r5, jpos_2, jstart_2
+                abs r5, r5
+                ge r6, r5, 0.5
+                and r7, r3, r4
+                and in1, r7, r6
+            )PROGRAM",
+            0, logicalInputs, 0, {}, 0.001);
+        require(program.has_value(),
+                "motion-context digital I/O program did not compile");
+
+        auto motion = ngc::ProductionExecutorMotionContext{};
+        motion.flags = ngc::PRODUCTION_EXECUTOR_MOTION_IS_PROBE;
+        motion.axisPosition.z = 4.6;
+        motion.axisStart.z = 10.0;
+        motion.axisTarget.z = 5.0;
+        auto logical = ngc::LogicalDigitalInputImage{};
+        program->executeInputs({}, {}, motion, logical);
+        require(logical[0] && !logical[1],
+                "axis motion context did not synthesize the probe input");
+
+        motion = {};
+        motion.flags = ngc::PRODUCTION_EXECUTOR_MOTION_IS_HOMING;
+        motion.moveJoints = ngc::JointMask{1} << 2;
+        motion.triggerJoints = ngc::JointMask{1} << 2;
+        motion.jointPosition[2] = -0.4;
+        motion.jointStart[2] = -1.0;
+        motion.jointTarget[2] = 5.0;
+        program->executeInputs({}, {}, motion, logical);
+        require(!logical[0] && logical[1],
+                "joint motion context did not synthesize the homing input");
+
+        motion.triggerJoints = 0;
+        program->executeInputs({}, {}, motion, logical);
+        require(logical.none(),
+                "non-triggered joint motion synthesized a homing input");
+    }
+
     void testRejectsInvalidDigitalIoPrograms() {
         constexpr std::array<ngc::DigitalInputId, 1> logicalInput{0};
         constexpr std::array<ngc::DigitalOutputId, 1> logicalOutput{0};
@@ -1602,7 +1701,7 @@ namespace {
         putCyclicConfirmation(response, 40, 3, 3);
         auto inputs = ngc::ProductionExecutorDigitalInputs{};
 
-        (*adapter)->sampleDigitalInputs(inputs);
+        (*adapter)->sampleDigitalInputs({}, inputs);
 
         require(inputs[0] && (*adapter)->faultCode() == 0,
                 "Mesa field input program did not publish logical input zero");
@@ -1613,7 +1712,7 @@ namespace {
         putLittleEndian32(response.subspan(12), 3 * 65'536);
         putCyclicConfirmation(response, 40, 4, 4);
 
-        (*adapter)->sampleDigitalInputs(inputs);
+        (*adapter)->sampleDigitalInputs({}, inputs);
 
         const auto stepRates = findRequestWrite(
             transport.request(), 0x2000);
@@ -1632,7 +1731,7 @@ namespace {
         putLittleEndian32(response.subspan(12), 3 * 65'536);
         putCyclicConfirmation(response, 40, 5, 5);
 
-        (*adapter)->sampleDigitalInputs(inputs);
+        (*adapter)->sampleDigitalInputs({}, inputs);
 
         require(
             littleEndian32(
@@ -1646,7 +1745,7 @@ namespace {
         putLittleEndian32(response.subspan(32), 1);
         putCyclicConfirmation(response, 40, 6, 6);
         inputs.set();
-        (*adapter)->sampleDigitalInputs(inputs);
+        (*adapter)->sampleDigitalInputs({}, inputs);
         (*adapter)->applyOutputs(outputs);
 
         require((*adapter)->faultCode()
@@ -1687,9 +1786,10 @@ namespace {
         auto inputs = ngc::ProductionExecutorDigitalInputs{};
         inputs.set();
 
-        (*adapter)->sampleDigitalInputs(inputs);
+        (*adapter)->sampleDigitalInputs({}, inputs);
         auto outputs = ngc::ProductionExecutorOutputState{
             .digitalOutputs = {},
+            .motion = {},
             .executorEnabled = true,
         };
         (*adapter)->applyOutputs(outputs);
@@ -1738,7 +1838,7 @@ namespace {
         response = transport.response(50);
         putCyclicConfirmation(response, 40, 3, 3);
         auto inputs = ngc::ProductionExecutorDigitalInputs{};
-        (*adapter)->sampleDigitalInputs(inputs);
+        (*adapter)->sampleDigitalInputs({}, inputs);
 
         outputs.commandedJoints.position[0] = 0.2;
         (*adapter)->applyOutputs(outputs);
@@ -1797,7 +1897,7 @@ namespace {
         response = transport.response(50);
         putCyclicConfirmation(response, 40, 3, 3);
         auto inputs = ngc::ProductionExecutorDigitalInputs{};
-        (*adapter)->sampleDigitalInputs(inputs);
+        (*adapter)->sampleDigitalInputs({}, inputs);
 
         constexpr auto servoPeriod = 0.001;
         constexpr auto velocity = 0.25;
@@ -1833,7 +1933,7 @@ namespace {
             putCyclicConfirmation(
                 response, 40, sequence, sequence);
 
-            (*adapter)->sampleDigitalInputs(inputs);
+            (*adapter)->sampleDigitalInputs({}, inputs);
 
             require((*adapter)->faultCode() == 0,
                     "bounded DPLL phase variation faulted accumulator feedback");
@@ -1900,6 +2000,7 @@ int main() {
         testExchangesTypedHostMot2CyclicImages();
         testLatchesHostMot2WatchdogAndInvalidOutputFaults();
         testExecutesBoundedDigitalIoProgram();
+        testExecutesMotionContextDigitalIoProgram();
         testRejectsInvalidDigitalIoPrograms();
         testBridgesMesaInputsAndStepGeneratorsToExecutorIo();
         testExternalEnableLossFaultsMesaExecutorIo();
