@@ -346,9 +346,9 @@ namespace {
                 "Mesa physical backend requires a configured "
                 "motion.safety enable input");
         }
-#ifndef __linux__
+#if !defined(__linux__) && !defined(_WIN32)
         throw std::runtime_error(
-            "the Mesa physical backend requires Linux");
+            "the Mesa physical backend requires Linux or Windows");
 #else
         if (!physical->runtime.realtimeEnabled) {
             throw std::runtime_error(

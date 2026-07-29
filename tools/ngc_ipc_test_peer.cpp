@@ -288,13 +288,12 @@ namespace {
             }
             runtimeConfiguration.realtime = *host;
         }
-#ifndef __linux__
+#if !defined(__linux__) && !defined(_WIN32)
         runtimeConfiguration.realtime = {};
-#else
+#endif
         if (options.nonRealtime) {
             runtimeConfiguration.realtime = {};
         }
-#endif
 
         return std::make_unique<ngc::ProductionExecutorRuntime>(
             std::move(runtimeConfiguration), std::move(io));

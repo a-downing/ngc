@@ -134,13 +134,18 @@ proportional position correction on top of commanded joint velocity. It holds
 motion until DPLL-backed feedback is aligned and faults on moving alignment or
 following-error violations. Disabled and faulted executor
 states suppress the watchdog, StepGen motion, and digital outputs. On
-configured Linux hosts, the
-runtime's existing servo thread removes the
+configured Linux hosts, the runtime's existing servo thread removes the
 calling NRT host from the selected CPU, locks process memory, pins itself,
 enters `SCHED_FIFO`, prefaults its stack, and sleeps to absolute monotonic
 deadlines. Host setup failure is fatal rather than falling back to ordinary
 scheduling. A missed hosted deadline faults the executor and reapplies safe
-outputs instead of issuing catch-up ticks. The servo thread aggregates
+outputs instead of issuing catch-up ticks. On Windows, the same configured
+host policy is best effort: the host and servo threads request CPU affinity,
+the servo thread requests time-critical priority with priority boosting
+disabled and HighQoS power policy, and absolute pacing uses a high-resolution
+waitable timer followed by a short deadline spin. Unsupported or rejected
+Windows host requests fall back without failing startup, and deadline misses
+remain diagnostic rather than faulting the executor. The servo thread aggregates
 fixed-size timing summaries and publishes them through a bounded SPSC
 diagnostic channel; the NRT peer bridges those summaries through a separate
 versioned IPC ring into Real session snapshots. Diagnostic backpressure never
@@ -217,8 +222,9 @@ bounded `MotionBackend` proxy. `ngc_ipc_test_peer` is test-only infrastructure,
 not a selectable product backend. It validates typed machine configuration
 during startup, hosts `ProductionExecutorRuntime`, and bridges bounded
 execution items, controls, events, and snapshots across the production IPC
-path. On Windows its ordinary scheduler thread proves functional executor and
-process behavior. On configured Linux RT hosts, its RT scheduler and
+path. On Windows its best-effort priority, affinity, and high-resolution
+scheduler prove functional executor and process behavior without claiming
+real-time latency. On configured Linux RT hosts, its RT scheduler and
 hardware-free I/O boundary prove the production execution and diagnostic path,
 not physical I/O or hardware safety. The peer temporarily fakes axis-space
 probe and joint-space homing inputs. Probe input triggers 0.5 machine units

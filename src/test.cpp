@@ -1822,6 +1822,31 @@ final_move_together = true
                     "production runtime should restore commanded joint position");
     }
 
+#ifdef _WIN32
+    void testProductionExecutorRuntimeUsesBestEffortWindowsHostPolicy() {
+        auto configuration = ngc::ProductionExecutorRuntimeConfiguration{};
+        configuration.timingPublicationTicks = 1;
+        configuration.realtime = {
+            .realtimeEnabled = true,
+            .realtimeCpu = std::numeric_limits<std::uint32_t>::max(),
+            .realtimePriority = 98,
+            .lockMemory = true,
+        };
+        ngc::ProductionExecutorRuntime runtime(std::move(configuration));
+
+        runtime.start();
+        for (auto attempt = 0;
+             attempt < 1000 && runtime.servoTicks() < 2; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(runtime.started() && runtime.servoTicks() >= 2,
+                "Windows best-effort host policy should tolerate unavailable "
+                "affinity and memory-lock requests");
+
+        runtime.stop();
+    }
+#endif
+
     void testProductionExecutorRuntimePublishesBoundedTiming() {
         ngc::ProductionExecutorRuntimeConfiguration configuration;
         configuration.servoPeriod = 0.0001;
@@ -8069,6 +8094,9 @@ int main() {
         testMachineSessionViewDerivesOperatorControls();
         testInProcessSimulationRuntimePersistsAcrossTimedEpochs();
         testProductionExecutorRuntimeOwnsFixedPeriodLifecycle();
+#ifdef _WIN32
+        testProductionExecutorRuntimeUsesBestEffortWindowsHostPolicy();
+#endif
         testProductionExecutorRuntimePublishesBoundedTiming();
         testProductionExecutorRuntimeReportsIoFault();
         testProductionExecutorTimingBackpressureDoesNotBlockServo();

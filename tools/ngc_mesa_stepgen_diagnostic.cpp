@@ -511,6 +511,15 @@ int main(const int argc, char **argv) {
             ngc::configureCurrentRealtimeThread(
                 host->realtimeCpu,
                 host->realtimePriority);
+#ifdef _WIN32
+            std::println(
+                "Using CPU {} with best-effort Windows time-critical "
+                "priority{}",
+                host->realtimeCpu,
+                host->lockMemory
+                    ? "; process memory locking is unavailable"
+                    : "");
+#else
             std::println(
                 "Using CPU {} with SCHED_FIFO priority {}{}",
                 host->realtimeCpu,
@@ -518,6 +527,7 @@ int main(const int argc, char **argv) {
                 host->lockMemory
                     ? " and locked memory"
                     : "");
+#endif
         } else {
             std::println(
                 "Using the ordinary scheduler{}",
