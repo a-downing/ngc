@@ -569,7 +569,7 @@ namespace {
                 && configuration->safety->enableInput
                     == "external_enable"
                 && configuration->safety->polarity
-                    == ngc::mesa::MesaSafetyPolarity::ActiveLow
+                    == ngc::mesa::MesaSafetyPolarity::ActiveHigh
                 && configuration->fieldInputs.size() == 5
                 && configuration->stepGenerators.size() == 4,
                 "proposed Mesa backend configuration did not load");

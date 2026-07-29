@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
 #include <filesystem>
 #include <format>
 #include <print>
@@ -10,6 +11,7 @@
 #include <variant>
 
 #include "machine/ExternalRealtimeRuntime.h"
+#include "mesa/MesaProductionExecutorIo.h"
 
 namespace {
     using namespace std::chrono_literals;
@@ -19,6 +21,7 @@ namespace {
         std::filesystem::path machine = "machine.toml";
         std::filesystem::path backend =
             "physical_backend.toml";
+        bool expectExternalEnableLoss = false;
     };
 
     Options parseOptions(const int argc, char **argv) {
@@ -41,6 +44,8 @@ namespace {
                 result.machine = value();
             } else if (option == "--backend-config") {
                 result.backend = value();
+            } else if (option == "--expect-external-enable-loss") {
+                result.expectExternalEnableLoss = true;
             } else {
                 throw std::runtime_error(
                     "unknown option: " + std::string(option));
@@ -122,6 +127,57 @@ namespace {
             "timed out waiting for physical backend timing");
     }
 
+    ngc::ExecutionSnapshot waitForExternalEnableLoss(
+        ngc::ExternalRealtimeRuntime &runtime) {
+        const auto deadline =
+            std::chrono::steady_clock::now()
+            + std::chrono::minutes(2);
+        auto eventSeen = false;
+        auto snapshot = ngc::ExecutionSnapshot{};
+        auto snapshotSeen = false;
+        while (std::chrono::steady_clock::now() < deadline) {
+            runtime.serviceImmediate();
+            ngc::ExecutionEvent event;
+            while (runtime.endpoint().tryTakeEvent(event)) {
+                if (const auto *fault =
+                        std::get_if<ngc::BackendFault>(&event)) {
+                    if (fault->code
+                        != ngc::mesa::MESA_EXTERNAL_ENABLE_FAULT) {
+                        throw std::runtime_error(std::format(
+                            "physical backend faulted with unexpected "
+                            "code 0x{:08X}",
+                            fault->code));
+                    }
+                    eventSeen = true;
+                }
+            }
+            ngc::ExecutionSnapshot candidate;
+            while (runtime.endpoint().tryTakeSnapshot(candidate)) {
+                if (candidate.faultCode != 0
+                    && candidate.faultCode
+                        != ngc::mesa::MESA_EXTERNAL_ENABLE_FAULT) {
+                    throw std::runtime_error(std::format(
+                        "physical backend snapshot faulted with "
+                        "unexpected code 0x{:08X}",
+                        candidate.faultCode));
+                }
+                if (candidate.state == ngc::BackendState::Faulted
+                    && candidate.faultCode
+                        == ngc::mesa::MESA_EXTERNAL_ENABLE_FAULT) {
+                    snapshot = candidate;
+                    snapshotSeen = true;
+                }
+            }
+            if (eventSeen && snapshotSeen) {
+                return snapshot;
+            }
+            std::this_thread::sleep_for(1ms);
+        }
+
+        throw std::runtime_error(
+            "timed out waiting for external-enable loss");
+    }
+
     void requireRequest(
         ngc::ExternalRealtimeRuntime &runtime,
         const ngc::ControlRequest &request,
@@ -184,6 +240,28 @@ namespace {
         }
 
         const auto timing = waitForTiming(runtime);
+        if (options.expectExternalEnableLoss) {
+            std::println(
+                "READY: remove +5V from INPUT2 now; "
+                "waiting for external-enable loss");
+            std::fflush(stdout);
+            const auto faulted =
+                waitForExternalEnableLoss(runtime);
+            if (!zero(faulted.commandedJoints.velocity)
+                || !zero(faulted.commandedJoints.acceleration)) {
+                throw std::runtime_error(
+                    "external-enable fault retained commanded motion");
+            }
+            runtime.stop();
+            std::println(
+                "Mesa external-enable loss passed: "
+                "fault=0x{:08X} commanded joint velocity and "
+                "acceleration remained zero",
+                faulted.faultCode);
+
+            return 0;
+        }
+
         requireRequest(
             runtime, ngc::DisableRequest{3}, 3);
         static_cast<void>(waitForState(

@@ -55,15 +55,15 @@ probe_0_field = 3
 probe_1_field = 4
 y2_home_field = 5
 
-# Commissioning only: no field input or output is currently wired to the
-# board, so disconnected external_enable_field is inactive. Treating that
-# level as the active external enable permits bare-board executor testing. This
-# polarity is not fail-safe: a wire break would also appear enabled. Replace
-# it with verified E-stop/enable-permission feedback and the verified polarity
-# before connecting any drive, motor, spindle, or other output.
+# Bare-board commissioning maps INPUT2 to external enable. INPUT2 is energized
+# from the board's PTC-protected +5VP supply with INPUT COMMON grounded. Loss
+# of that voltage is therefore the inactive/faulted state. This temporary wire
+# proves input polarity and executor fault handling only; replace it with
+# verified E-stop/enable-permission feedback before powering any drive, motor,
+# spindle, or other output.
 [motion.safety]
 enable_input = "external_enable"
-active = "low"
+active = "high"
 
 # These are the units of the physical mechanism and do not depend on the
 # machine.toml internal machine unit. The NRT bootstrap converts each

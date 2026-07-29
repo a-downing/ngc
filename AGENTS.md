@@ -171,10 +171,13 @@ its explicit `high` or `low` active polarity, loss of that level latches a
 backend fault and safe outputs. A normal physical-peer
 start is rejected when that safety input is not configured. For bare-board
 commissioning only, the current configuration maps the physical field-input
-name `external_enable_field` to logical `external_enable` with active-low
-polarity. This deliberately non-fail-safe mapping must be replaced with
-verified E-stop/enable feedback before any drive, motor, spindle, or other
-output is connected. The process is not yet the
+name `external_enable_field` to logical `external_enable` with active-high
+polarity. INPUT2 is temporarily energized from the board's PTC-protected +5VP
+supply with INPUT COMMON grounded; removing that voltage must latch
+`MESA_EXTERNAL_ENABLE_FAULT` and safe outputs. This commissioning wire proves
+input polarity and executor response only and must be replaced with verified
+E-stop/enable feedback before any drive, motor, spindle, or other output is
+powered. The process is not yet the
 application's default Real target and has not completed staged physical
 commissioning. The typed Mesa backend
 configuration loader shares only generic,

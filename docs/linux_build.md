@@ -179,14 +179,16 @@ bounded transaction timeouts and the Huanyang proprietary RTU packet shape,
 establishes stop before reading the VFD's stored setup, and validates all
 responses. It has not yet been exercised against physical VFD hardware. For
 bare-board commissioning only, the
-current configuration treats disconnected `fieldin2` as an active-low
+current configuration treats energized INPUT2 as the active-high
 `external_enable` through the named physical operand
-`external_enable_field`. This permits a normal physical-peer start but is not
-fail-safe. Replace it with verified E-stop/enable-permission feedback before
-connecting any drive, motor, spindle, or other output. A normal invocation is
-launched by the application's external-runtime IPC boundary; do not select it
-as the Real target beyond this isolated commissioning setup until the staged
-checks are complete.
+`external_enable_field`. For isolated bare-board testing, INPUT COMMON is
+grounded and INPUT2 is energized from the board's PTC-protected +5VP supply.
+Removing that voltage must latch the external-enable fault and safe outputs.
+This temporary wire is not verified E-stop or enable-permission feedback.
+Replace it before powering any drive, motor, spindle, or other output. A normal
+invocation is launched by the application's external-runtime IPC boundary; do
+not select it as the Real target beyond this isolated commissioning setup until
+the staged checks are complete.
 
 Exercise the same physical process through the production IPC boundary without
 commanding motion with:
@@ -202,6 +204,22 @@ cmake --build build --target ngc_mesa_backend ngc_mesa_backend_smoke
 This write-capable bare-board test configures Mesa, services the watchdog,
 enables and disables the executor, and requires zero commanded joint motion.
 Run it only with no drives, motors, spindle, or other outputs connected.
+
+To prove active-high external-enable loss, energize INPUT2 before startup and
+run the same test with:
+
+```bash
+./build/ngc_mesa_backend_smoke \
+    --peer build/ngc_mesa_backend \
+    --machine-config machine.toml \
+    --backend-config physical_backend.toml \
+    --expect-external-enable-loss
+```
+
+Wait for its `READY` message, then remove only the +5VP connection from INPUT2.
+Success requires the exact `MESA_EXTERNAL_ENABLE_FAULT`, a faulted snapshot,
+and zero commanded joint velocity and acceleration. The mode times out after
+two minutes and treats every other backend fault as failure.
 
 Build the standalone Huanyang commissioning diagnostic with:
 

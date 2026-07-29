@@ -1228,10 +1228,12 @@ held state.
   safe outputs when its configured external-enable logical input is outside
   its explicitly configured `high` or `low` active polarity.
   A normal physical-peer start requires that verified safety input; the
-  current unwired-board commissioning configuration temporarily treats
-  disconnected `external_enable_field` as an active-low enable. That mapping
-  is explicitly non-fail-safe and must be replaced before any physical output
-  is connected.
+  current bare-board commissioning configuration temporarily energizes
+  INPUT2 from the board's PTC-protected +5VP supply and treats
+  `external_enable_field` as active-high. Removing that voltage must latch the
+  external-enable fault and safe outputs. That temporary wire proves polarity
+  and executor response only and must be replaced before any physical output
+  is powered.
   Executor/G-code producers for additional logical-output events, broader
   spindle-status presentation, application-default selection, and physical
   commissioning remain. The Huanyang NRT serial/protocol implementation is
