@@ -2150,8 +2150,13 @@ public:
         const auto compiledMode = m_programPaneMode == ProgramPaneMode::Compiled;
         const auto canPreview = compiledMode && !m_programSource.empty() && !m_worker.busy() && !m_previewAfterCompile;
         ImGui::BeginDisabled(!canPreview);
-        if(ImGui::Button("Preview")) {
-            if(m_worker.compile(m_programSource)) m_previewAfterCompile = true;
+        if (ImGui::Button("Preview")) {
+            const auto parameters = m_simulation.parameterSnapshot();
+            if (!m_worker.setPersistentParameters(parameters)) {
+                m_errorMessage = "Preview could not copy the controlled session's persistent parameters";
+            } else if (m_worker.compile(m_programSource)) {
+                m_previewAfterCompile = true;
+            }
         }
         ImGui::EndDisabled();
         ImGui::SameLine();

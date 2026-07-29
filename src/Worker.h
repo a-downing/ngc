@@ -1,11 +1,13 @@
 #pragma once
 
 #include <condition_variable>
+#include <cstdint>
 #include <format>
 #include <mutex>
 #include <optional>
 #include <thread>
 #include <unordered_map>
+#include <vector>
 
 #include "evaluator/InterpreterSession.h"
 #include "machine/GeometryStreamProducer.h"
@@ -72,6 +74,34 @@ public:
         }
 
         m_session.machine().toolTable() = tools;
+        return true;
+    }
+
+    bool setPersistentParameters(const std::unordered_map<ngc::Var, double> &parameters) {
+        std::scoped_lock lock(m_mutex);
+        if (m_busy) {
+            return false;
+        }
+
+        auto &memory = m_session.machine().memory();
+        auto persistent = std::vector<ngc::Memory::PersistentParameter>{};
+        persistent.reserve(parameters.size());
+        for (const auto &[var, _name, _address, _flags, _value] : ngc::gVars) {
+            const auto address = static_cast<std::uint32_t>(memory.deref(var));
+            if (!memory.isPersistentParameter(address)) {
+                continue;
+            }
+            const auto found = parameters.find(var);
+            if (found == parameters.end()) {
+                return false;
+            }
+            persistent.push_back({address, found->second});
+        }
+        if (!memory.applyPersistentParameters(persistent)) {
+            return false;
+        }
+        refreshParameterSnapshot();
+
         return true;
     }
 

@@ -1485,6 +1485,72 @@ final_move_together = true
         manager.join();
     }
 
+    void testPreviewImportsSelectedPersistentWorkOffsets() {
+        auto parameters = std::unordered_map<ngc::Var, double>{};
+        for (const auto &[var, _name, _address, _flags, value] : ngc::gVars) {
+            parameters.emplace(var, value);
+        }
+        parameters[ngc::Var::G54_X] = 7.0;
+        parameters[ngc::Var::G54_Y] = -2.0;
+
+        Worker preview(UNIT);
+        require(preview.setPersistentParameters(parameters),
+                "Preview should accept the selected session's persistent parameters");
+        require(preview.compile({{
+                    "G54\nG61\nG0 X1 Y3\nG53 G0 X2 Y4\n",
+                    "preview-work-offset.ngc",
+                }}),
+                "work-offset Preview should compile");
+        for (auto attempt = 0; attempt < 3000 && !preview.compiled(); ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(preview.compiled(), "work-offset Preview compilation should finish");
+
+        const auto initialRevision = preview.lock([&] {
+            return preview.preparedPreview().revision;
+        });
+        require(preview.execute(), "work-offset Preview should execute");
+        auto finished = false;
+        for (auto attempt = 0; attempt < 3000; ++attempt) {
+            if (preview.lock([&] {
+                    return preview.preparedPreview().revision > initialRevision;
+                }) && !preview.busy()) {
+                finished = true;
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        require(finished, "work-offset Preview should finish");
+
+        preview.lock([&] {
+            const auto &scene = preview.preparedPreview();
+            auto moves = std::vector<const ngc::MoveLine *>{};
+            for (const auto &slice : scene.continuousSlices) {
+                for (const auto &record : slice.commands) {
+                    if (const auto *move = std::get_if<ngc::MoveLine>(&record.command)) {
+                        moves.push_back(move);
+                    }
+                }
+            }
+
+            require(moves.size() == 2,
+                    "work-offset Preview should retain both source moves");
+            requireNear(moves[0]->to().x, 8.0,
+                        "Preview should apply the selected session's G54 X offset");
+            requireNear(moves[0]->to().y, 1.0,
+                        "Preview should apply the selected session's G54 Y offset");
+            require(!moves[0]->machineCoordinates(),
+                    "ordinary Preview motion should remain work-coordinate motion");
+            requireNear(moves[1]->to().x, 2.0,
+                        "Preview G53 motion should bypass the selected G54 X offset");
+            requireNear(moves[1]->to().y, 4.0,
+                        "Preview G53 motion should bypass the selected G54 Y offset");
+            require(moves[1]->machineCoordinates(),
+                    "Preview G53 motion should retain machine-coordinate metadata");
+        });
+        preview.join();
+    }
+
     void testMachineSessionViewDerivesOperatorControls() {
         ngc::MachineSessionManagerState managerState;
         require(ngc::gui::controlTargetName(managerState.authority.target) == "Simulation"
@@ -7999,6 +8065,7 @@ int main() {
         testMachineSessionManagerBranchesRealIntoIsolatedSimulation();
         testMachineSessionCheckpointRequiresAndCopiesHoming();
         testMachineSessionManagerPublishesOwnedParameterSnapshot();
+        testPreviewImportsSelectedPersistentWorkOffsets();
         testMachineSessionViewDerivesOperatorControls();
         testInProcessSimulationRuntimePersistsAcrossTimedEpochs();
         testProductionExecutorRuntimeOwnsFixedPeriodLifecycle();
