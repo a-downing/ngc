@@ -10,7 +10,7 @@
 namespace ngc {
     struct ToolTableStorePaths {
         std::filesystem::path legacy = "tool_table.txt";
-        std::filesystem::path real = "real_tool_table.txt";
+        std::filesystem::path machine = "machine_tool_table.txt";
         std::filesystem::path simulation = "simulation_tool_table.txt";
     };
 

@@ -4,17 +4,17 @@
 #include <memory>
 #include <optional>
 
-#include "machine/ProductionExecutorRuntime.h"
+#include "machine/HostedExecutorRuntime.h"
 #include "machine/SpindleHardware.h"
 
 namespace ngc {
-    class PhysicalProductionExecutorIo final
+    class PhysicalExecutorIo final
         : public ProductionExecutorIo {
     public:
-        PhysicalProductionExecutorIo(
+        PhysicalExecutorIo(
             std::unique_ptr<ProductionExecutorIo> motion,
             std::unique_ptr<SpindleHardware> spindle = {});
-        ~PhysicalProductionExecutorIo() override;
+        ~PhysicalExecutorIo() override;
 
         void sampleDigitalInputs(
             const ProductionExecutorMotionContext &motion,

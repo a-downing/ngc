@@ -46,10 +46,10 @@ namespace ngc::mesa {
     compileMesaDigitalIoProgram(
         const MachineConfiguration &machine,
         const MesaBackendConfiguration &mesa) {
-        if (!machine.realBackend.has_value()) {
+        if (!machine.machineExecutor.has_value()) {
             return std::unexpected(
                 "Mesa digital I/O program requires a configured "
-                "Real backend servo period");
+                "Machine executor servo period");
         }
 
         std::vector<DigitalInputId> logicalInputs;
@@ -80,7 +80,7 @@ namespace ngc::mesa {
             mesa.ioProgram,
             SEVEN_I96_ISOLATED_INPUT_COUNT,
             logicalInputs, 0, logicalOutputs,
-            machine.realBackend->servoPeriod, symbols);
+            machine.machineExecutor->servoPeriod, symbols);
     }
 
     std::expected<

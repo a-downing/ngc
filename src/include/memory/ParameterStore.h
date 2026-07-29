@@ -12,7 +12,7 @@
 
 namespace ngc {
     struct ParameterStorePaths {
-        std::filesystem::path real = "real_parameters.var";
+        std::filesystem::path machine = "machine_parameters.var";
         std::filesystem::path simulation = "simulation_parameters.var";
     };
 

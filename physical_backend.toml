@@ -2,7 +2,7 @@
 # independent Mesa motion and Huanyang spindle roles. The typed NRT loader,
 # active StepGen board diagnostic, Huanyang spindle diagnostic, and initial
 # physical-backend process consume this schema. The physical process is not yet the
-# application's default Real target or physically commissioned.
+# application's default Machine target or physically commissioned.
 #
 # Machine topology, trajectory behavior, limits, homing positions, logical
 # input identities, and the authoritative servo period remain in machine.toml.
@@ -192,7 +192,7 @@ maximum_generated_step_error = 2.0
 #
 # The generic HostMot2 cyclic layer and active board diagnostic implement this
 # DPLL behavior. The diagnostic combines this file with machine.toml's
-# authoritative Real servo period.
+# authoritative Machine servo period.
 
 # The existing machine drives a Huanyang VFD independently of Mesa through the
 # LinuxCNC hy_vfd protocol. The legacy configuration overrides the serial

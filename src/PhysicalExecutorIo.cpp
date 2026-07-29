@@ -1,10 +1,10 @@
-#include "machine/PhysicalProductionExecutorIo.h"
+#include "machine/PhysicalExecutorIo.h"
 
 #include <stdexcept>
 #include <utility>
 
 namespace ngc {
-    PhysicalProductionExecutorIo::PhysicalProductionExecutorIo(
+    PhysicalExecutorIo::PhysicalExecutorIo(
         std::unique_ptr<ProductionExecutorIo> motion,
         std::unique_ptr<SpindleHardware> spindle)
         : m_motion(std::move(motion)) {
@@ -19,19 +19,19 @@ namespace ngc {
         }
     }
 
-    PhysicalProductionExecutorIo::~PhysicalProductionExecutorIo() {
+    PhysicalExecutorIo::~PhysicalExecutorIo() {
         if (m_spindle) {
             m_spindle->stop();
         }
     }
 
-    void PhysicalProductionExecutorIo::sampleDigitalInputs(
+    void PhysicalExecutorIo::sampleDigitalInputs(
         const ProductionExecutorMotionContext &motion,
         ProductionExecutorDigitalInputs &inputs) noexcept {
         m_motion->sampleDigitalInputs(motion, inputs);
     }
 
-    void PhysicalProductionExecutorIo::applyOutputs(
+    void PhysicalExecutorIo::applyOutputs(
         const ProductionExecutorOutputState &outputs) noexcept {
         m_motion->applyOutputs(outputs);
         if (!m_spindle
@@ -46,7 +46,7 @@ namespace ngc {
     }
 
     std::uint32_t
-    PhysicalProductionExecutorIo::faultCode() const noexcept {
+    PhysicalExecutorIo::faultCode() const noexcept {
         const auto motionFault = m_motion->faultCode();
         if (motionFault != 0) {
             return motionFault;
@@ -55,12 +55,12 @@ namespace ngc {
         return m_spindle ? m_spindle->faultCode() : 0;
     }
 
-    bool PhysicalProductionExecutorIo::prepareTriggeredJointMove(
+    bool PhysicalExecutorIo::prepareTriggeredJointMove(
         const TriggeredJointMove &move) noexcept {
         return m_motion->prepareTriggeredJointMove(move);
     }
 
-    bool PhysicalProductionExecutorIo::sameSpindle(
+    bool PhysicalExecutorIo::sameSpindle(
         const SpindleEvent &left,
         const SpindleEvent &right) noexcept {
         return left.enabled == right.enabled

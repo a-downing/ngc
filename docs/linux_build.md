@@ -24,15 +24,15 @@ through CTest:
 ctest --test-dir build -E '^ngc_tests$' --output-on-failure
 ```
 
-## Real-time executor host
+## Machine-time executor host
 
-The configured Mesa Real backend uses the existing
-`ProductionExecutorRuntime` servo thread as its RT thread. The Real backend
+The configured Mesa Machine executor uses the existing
+`HostedExecutorRuntime` servo thread as its RT thread. The Machine executor
 selection names the executable and its backend-owned configuration, while
 `machine.toml` remains authoritative for the shared servo period:
 
 ```toml
-[real_backend]
+[machine_executor]
 executable = "build/ngc_mesa_backend"
 configuration = "physical_backend.toml"
 servo_period = 0.001
@@ -412,14 +412,14 @@ shootdown IPIs, kernel memory-management contention, or firmware latency.
 Avoid unbounded memory churn on the production host and retain the watchdog as
 the final safety response.
 
-`ngc_ipc_test_peer` is a hardware-free test fixture, not a selectable Real
+`ngc_ipc_test_peer` is a hardware-free test fixture, not a selectable Machine
 backend. Run the ordinary portable IPC suite with:
 
 ```bash
 ./build/ngc_ipc_tests ./build/ngc_ipc_test_peer.exe
 ```
 
-On a configured RT development host, exercise the same Real-session path with
+On a configured RT development host, exercise the same Machine-session path with
 RT hosting enabled:
 
 ```bash
@@ -531,7 +531,7 @@ cmake --build build --target ngc_mesa_backend
 The executable parses both files only during NRT bootstrap. The physical
 backend configuration owns the executor host policy and composes independent
 Mesa motion and optional spindle roles. It passes typed runtime configuration to
-`ProductionExecutorRuntime` and typed motion configuration to the Mesa
+`HostedExecutorRuntime` and typed motion configuration to the Mesa
 adapter. The Huanyang spindle role remains configured but disabled until its
 physical commissioning is complete. Its Linux serial implementation uses
 bounded transaction timeouts and the Huanyang proprietary RTU packet shape,
@@ -546,7 +546,7 @@ Removing that voltage must latch the external-enable fault and safe outputs.
 This temporary wire is not verified E-stop or enable-permission feedback.
 Replace it before powering any drive, motor, spindle, or other output. A normal
 invocation is launched by the application's external-runtime IPC boundary; do
-not select it as the Real target beyond this isolated commissioning setup until
+not select it as the Machine target beyond this isolated commissioning setup until
 the staged checks are complete.
 
 Measure the exact configured digital-I/O assembly program without opening the
@@ -562,7 +562,7 @@ cmake --build build --target ngc_mesa_io_program_benchmark
 The benchmark uses the same compiler entry point as `ngc_mesa_backend`, warms
 the stateful debounce instructions, and reports batched input-pass,
 output-pass, and combined-pass nanoseconds together with their fraction of the
-configured Real servo period. Batch timing amortizes clock overhead and does
+configured Machine servo period. Batch timing amortizes clock overhead and does
 not subtract a synthetic baseline. `--batches` and
 `--iterations-per-batch` control the sample count.
 

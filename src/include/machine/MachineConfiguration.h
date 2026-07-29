@@ -110,7 +110,7 @@ namespace ngc {
         std::vector<HomingGroupConfiguration> groups;
     };
 
-    struct RealBackendConfiguration {
+    struct MachineExecutorConfiguration {
         std::filesystem::path executable;
         std::filesystem::path machineConfiguration;
         std::optional<std::filesystem::path> backendConfiguration;
@@ -132,7 +132,7 @@ namespace ngc {
         HomingConfiguration homing;
         ParameterStorePaths parameterStores;
         ToolTableStorePaths toolTableStores;
-        std::optional<RealBackendConfiguration> realBackend;
+        std::optional<MachineExecutorConfiguration> machineExecutor;
     };
 
     std::expected<MachineConfiguration, std::string>

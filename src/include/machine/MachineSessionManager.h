@@ -20,7 +20,9 @@
 #include <vector>
 
 #include "machine/GeometryStreamProducer.h"
-#include "machine/ExternalRealtimeRuntime.h"
+#ifdef __linux__
+#include "machine/ExternalExecutorRuntime.h"
+#endif
 #include "machine/InProcessSimulationRuntime.h"
 #include "machine/MachineControl.h"
 #include "machine/MachineConfiguration.h"
@@ -36,9 +38,10 @@ namespace ngc {
 namespace detail {
 
 class SessionBackendRuntime final : public ngc::BackendRuntime {
-    static ngc::ExternalRealtimeRuntimeConfiguration externalConfiguration(
+#ifdef __linux__
+    static ngc::ExternalExecutorRuntimeConfiguration externalConfiguration(
             const ngc::MachineConfiguration &configuration) {
-        const auto &backend = *configuration.realBackend;
+        const auto &backend = *configuration.machineExecutor;
         const ngc::IpcIdentity identity{
             .configurationFingerprint = 1,
             .topologyFingerprint = 1,
@@ -47,7 +50,7 @@ class SessionBackendRuntime final : public ngc::BackendRuntime {
             .authorityGeneration = 1,
         };
 
-        ngc::ExternalRealtimeRuntimeConfiguration result{
+        ngc::ExternalExecutorRuntimeConfiguration result{
             .peerExecutable = backend.executable,
             .identity = identity,
             .peerExpectedIdentity = identity,
@@ -65,6 +68,26 @@ class SessionBackendRuntime final : public ngc::BackendRuntime {
 
         return result;
     }
+#endif
+
+    static std::unique_ptr<ngc::BackendRuntime> configuredRuntime(
+            const ngc::MachineConfiguration &configuration,
+            const bool external) {
+#ifdef __linux__
+        if (external) {
+            return std::make_unique<ngc::ExternalExecutorRuntime>(
+                externalConfiguration(configuration));
+        }
+#else
+        if (external) {
+            throw std::runtime_error(
+                "the external Machine executor is supported only on Linux");
+        }
+#endif
+
+        return std::make_unique<ngc::InProcessSimulationRuntime>(
+            configuration);
+    }
 
 public:
     explicit SessionBackendRuntime(
@@ -79,19 +102,13 @@ public:
     SessionBackendRuntime(
             const ngc::MachineConfiguration &configuration,
             const bool external)
-        : m_runtime(external
-              ? std::unique_ptr<ngc::BackendRuntime>(
-                    std::make_unique<ngc::ExternalRealtimeRuntime>(
-                        externalConfiguration(configuration)))
-              : std::unique_ptr<ngc::BackendRuntime>(
-                    std::make_unique<ngc::InProcessSimulationRuntime>(
-                        configuration))),
+        : m_runtime(configuredRuntime(configuration, external)),
           m_simulation(external ? nullptr
                                 : static_cast<ngc::InProcessSimulationRuntime *>(
                                       m_runtime.get())),
           m_external(external),
           m_servoPeriod(external
-              ? configuration.realBackend->servoPeriod
+              ? configuration.machineExecutor->servoPeriod
               : configuration.simulation.servoPeriod) { }
 
     ngc::MotionBackend &endpoint() noexcept override {
@@ -322,7 +339,7 @@ public:
         : m_runtime(limits, timing),
           m_machineSession(unit, target == MachineControlTarget::Simulation
                                     ? ngc::InterpretationMode::Simulation
-                                    : ngc::InterpretationMode::RealRun, m_runtime,
+                                    : ngc::InterpretationMode::MachineRun, m_runtime,
                            limits, geometryPolicy(limits)),
           m_limits(limits) {
         m_controlAuthority.target = target;
@@ -334,12 +351,12 @@ public:
     explicit MachineSessionHost(
             const ngc::MachineConfiguration &configuration,
             const MachineControlTarget target = MachineControlTarget::Simulation,
-            const bool useConfiguredRealBackend = false)
-        : m_runtime(configuration, useConfiguredRealBackend),
+            const bool useConfiguredMachineExecutor = false)
+        : m_runtime(configuration, useConfiguredMachineExecutor),
           m_machineSession(configuration.unit,
                            target == MachineControlTarget::Simulation
                                ? ngc::InterpretationMode::Simulation
-                               : ngc::InterpretationMode::RealRun, m_runtime, configuration.trajectory,
+                               : ngc::InterpretationMode::MachineRun, m_runtime, configuration.trajectory,
                            geometryPolicy(configuration.trajectory)),
           m_limits(configuration.trajectory),
           m_axes(configuration.axes), m_joints(configuration.joints),
@@ -365,7 +382,7 @@ public:
             .authority = m_controlAuthority,
             .simulationAvailable =
                 m_controlAuthority.target == MachineControlTarget::Simulation,
-            .realAvailable = m_controlAuthority.target == MachineControlTarget::Real,
+            .machineAvailable = m_controlAuthority.target == MachineControlTarget::Machine,
         };
     }
 
@@ -926,20 +943,20 @@ public:
         }
         if (m_machineSession.coordinator().powerState() != ngc::MachinePowerState::On) {
             return std::unexpected(
-                "Real-to-Simulation branching requires Real to be powered on");
+                "Machine-to-Simulation branching requires Machine to be powered on");
         }
         if (motionOwnedOrQueued() || m_snapshot.hasActiveMotion
             || m_snapshot.trajectoryBackendQueuedExecutionItems != 0
             || m_snapshot.trajectoryBackendVelocity > 1e-9
             || m_snapshot.trajectoryBackendAcceleration > 1e-9) {
             return std::unexpected(
-                "Real-to-Simulation branching requires Real to be stationary and idle");
+                "Machine-to-Simulation branching requires Machine to be stationary and idle");
         }
         if (m_snapshot.status == ngc::SimulationStatus::Error
             || m_snapshot.trajectoryBackendState == ngc::BackendState::Faulted
             || m_snapshot.trajectoryBackendFaultCode != 0) {
             return std::unexpected(
-                "Real-to-Simulation branching requires fault-free Real position confidence");
+                "Machine-to-Simulation branching requires fault-free Machine position confidence");
         }
 
         ngc::JointMask configuredJoints = 0;
@@ -948,7 +965,7 @@ public:
         }
         if ((m_machineSession.homedJoints() & configuredJoints) != configuredJoints) {
             return std::unexpected(
-                "Real-to-Simulation branching requires every configured Real joint to be homed");
+                "Machine-to-Simulation branching requires every configured Machine joint to be homed");
         }
 
         const ngc::StationaryBackendState backend {
@@ -971,7 +988,7 @@ public:
         if (m_machineSession.coordinator().powerState() != ngc::MachinePowerState::Off
             || motionOwnedOrQueued()) {
             return std::unexpected(
-                "Real-to-Simulation import requires Simulation to be powered off and idle");
+                "Machine-to-Simulation import requires Simulation to be powered off and idle");
         }
 
         auto restored = m_machineSession.restoreCheckpoint(checkpoint);
@@ -1844,7 +1861,7 @@ private:
 
 struct MachineSessionManagerSnapshots {
     std::optional<ngc::SimulationSnapshot> simulation;
-    std::optional<ngc::MachineSessionSnapshot> real;
+    std::optional<ngc::MachineSessionSnapshot> machine;
 };
 
 class MachineSessionManager {
@@ -1855,7 +1872,7 @@ public:
 private:
     mutable std::mutex m_mutex;
     std::unique_ptr<detail::MachineSessionHost> m_simulation;
-    std::unique_ptr<detail::MachineSessionHost> m_real;
+    std::unique_ptr<detail::MachineSessionHost> m_machine;
     MachineControlAuthority m_controlAuthority {
         .target = MachineControlTarget::Simulation,
         .generation = 1,
@@ -1863,12 +1880,12 @@ private:
 
     [[nodiscard]] detail::MachineSessionHost *sessionLocked(
             const MachineControlTarget target) {
-        return target == MachineControlTarget::Simulation ? m_simulation.get() : m_real.get();
+        return target == MachineControlTarget::Simulation ? m_simulation.get() : m_machine.get();
     }
 
     [[nodiscard]] const detail::MachineSessionHost *sessionLocked(
             const MachineControlTarget target) const {
-        return target == MachineControlTarget::Simulation ? m_simulation.get() : m_real.get();
+        return target == MachineControlTarget::Simulation ? m_simulation.get() : m_machine.get();
     }
 
     [[nodiscard]] detail::MachineSessionHost *controlledSessionLocked(
@@ -1915,12 +1932,18 @@ public:
               unit, limits, timing)) {}
 
     explicit MachineSessionManager(const ngc::MachineConfiguration &configuration)
+#ifdef __linux__
         : m_simulation(
               std::make_unique<detail::MachineSessionHost>(configuration)),
-          m_real(configuration.realBackend
+          m_machine(configuration.machineExecutor
               ? std::make_unique<detail::MachineSessionHost>(
-                    configuration, MachineControlTarget::Real, true)
-              : nullptr) {}
+                    configuration, MachineControlTarget::Machine, true)
+              : nullptr)
+#else
+        : m_simulation(
+              std::make_unique<detail::MachineSessionHost>(configuration))
+#endif
+          {}
 
     explicit MachineSessionManager(const InProcessDualSessionTestTag,
                                    const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch,
@@ -1928,15 +1951,15 @@ public:
                                    const ngc::SimulationTiming timing = {})
         : m_simulation(std::make_unique<detail::MachineSessionHost>(
               unit, limits, timing, MachineControlTarget::Simulation)),
-          m_real(std::make_unique<detail::MachineSessionHost>(
-              unit, limits, timing, MachineControlTarget::Real)) {}
+          m_machine(std::make_unique<detail::MachineSessionHost>(
+              unit, limits, timing, MachineControlTarget::Machine)) {}
 
     explicit MachineSessionManager(const InProcessDualSessionTestTag,
                                    const ngc::MachineConfiguration &configuration)
         : m_simulation(std::make_unique<detail::MachineSessionHost>(
               configuration, MachineControlTarget::Simulation)),
-          m_real(std::make_unique<detail::MachineSessionHost>(
-              configuration, MachineControlTarget::Real)) {}
+          m_machine(std::make_unique<detail::MachineSessionHost>(
+              configuration, MachineControlTarget::Machine)) {}
 
     ~MachineSessionManager() { join(); }
     MachineSessionManager(const MachineSessionManager &) = delete;
@@ -1948,7 +1971,7 @@ public:
         return {
             .authority = m_controlAuthority,
             .simulationAvailable = m_simulation != nullptr,
-            .realAvailable = m_real != nullptr,
+            .machineAvailable = m_machine != nullptr,
         };
     }
 
@@ -1957,9 +1980,9 @@ public:
         std::scoped_lock lock(m_mutex);
         auto *targetSession = sessionLocked(target);
         if (!targetSession) {
-            return std::unexpected(target == MachineControlTarget::Real
-                ? "the Real machine session is not configured"
-                : "the Simulation machine session is not configured");
+            return std::unexpected(target == MachineControlTarget::Machine
+                ? "the Machine session is not configured"
+                : "the Simulation session is not configured");
         }
         if (target == m_controlAuthority.target) {
             return m_controlAuthority;
@@ -1976,27 +1999,27 @@ public:
         return m_controlAuthority;
     }
 
-    std::expected<MachineControlAuthority, std::string> simulateFromReal(
+    std::expected<MachineControlAuthority, std::string> simulateFromMachine(
             const MachineControlAuthority authority) {
         std::scoped_lock lock(m_mutex);
         if (authority != m_controlAuthority
-            || authority.target != MachineControlTarget::Real) {
+            || authority.target != MachineControlTarget::Machine) {
             return std::unexpected(
                 "control has transferred or the request targets another session");
         }
-        if (!m_real) {
-            return std::unexpected("the Real machine session is not configured");
+        if (!m_machine) {
+            return std::unexpected("the Machine session is not configured");
         }
         if (!m_simulation) {
-            return std::unexpected("the Simulation machine session is not configured");
+            return std::unexpected("the Simulation session is not configured");
         }
         if (m_simulation->snapshot().powerState != ngc::MachinePowerState::Off
             || !m_simulation->controllerDataMutable()) {
             return std::unexpected(
-                "Real-to-Simulation import requires Simulation to be powered off and idle");
+                "Machine-to-Simulation import requires Simulation to be powered off and idle");
         }
 
-        const auto checkpoint = m_real->checkpoint(localAuthority(*m_real));
+        const auto checkpoint = m_machine->checkpoint(localAuthority(*m_machine));
         if (!checkpoint) {
             return std::unexpected(checkpoint.error());
         }
@@ -2195,8 +2218,8 @@ public:
         if (m_simulation) {
             result.simulation = m_simulation->snapshot();
         }
-        if (m_real) {
-            result.real = m_real->snapshot();
+        if (m_machine) {
+            result.machine = m_machine->snapshot();
         }
 
         return result;
@@ -2303,8 +2326,8 @@ public:
         if (m_simulation) {
             m_simulation->join();
         }
-        if (m_real) {
-            m_real->join();
+        if (m_machine) {
+            m_machine->join();
         }
     }
 };

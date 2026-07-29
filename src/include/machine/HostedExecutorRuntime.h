@@ -40,7 +40,7 @@ namespace ngc {
         }
     };
 
-    struct ProductionExecutorRuntimeConfiguration {
+    struct HostedExecutorRuntimeConfiguration {
         double servoPeriod = 0.001;
         std::uint32_t serviceTicksPerPeriod = 1;
         std::uint32_t timingPublicationTicks = 100;
@@ -48,22 +48,22 @@ namespace ngc {
         BackendRuntimeHostConfiguration realtime;
     };
 
-    [[nodiscard]] ProductionExecutorRuntimeConfiguration
-    productionExecutorRuntimeConfiguration(
+    [[nodiscard]] HostedExecutorRuntimeConfiguration
+    hostedExecutorRuntimeConfiguration(
         const MachineConfiguration &configuration);
 
-    class ProductionExecutorRuntime final : public BackendRuntime {
+    class HostedExecutorRuntime final : public BackendRuntime {
     public:
-        explicit ProductionExecutorRuntime(
-            ProductionExecutorRuntimeConfiguration configuration,
+        explicit HostedExecutorRuntime(
+            HostedExecutorRuntimeConfiguration configuration,
             std::unique_ptr<ProductionExecutorIo> io = {});
-        explicit ProductionExecutorRuntime(
+        explicit HostedExecutorRuntime(
             const MachineConfiguration &configuration,
             std::unique_ptr<ProductionExecutorIo> io = {});
-        ~ProductionExecutorRuntime() override;
-        ProductionExecutorRuntime(const ProductionExecutorRuntime &) = delete;
-        ProductionExecutorRuntime &operator=(
-            const ProductionExecutorRuntime &) = delete;
+        ~HostedExecutorRuntime() override;
+        HostedExecutorRuntime(const HostedExecutorRuntime &) = delete;
+        HostedExecutorRuntime &operator=(
+            const HostedExecutorRuntime &) = delete;
 
         MotionBackend &endpoint() noexcept override;
         void start() override;

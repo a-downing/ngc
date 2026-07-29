@@ -10,7 +10,7 @@
 #include "machine/IpcProtocol.h"
 
 namespace ngc {
-    struct ExternalRealtimeRuntimeConfiguration {
+    struct ExternalExecutorRuntimeConfiguration {
         std::filesystem::path peerExecutable;
         IpcIdentity identity{};
         IpcIdentity peerExpectedIdentity{};
@@ -19,12 +19,12 @@ namespace ngc {
         std::vector<std::string> peerArguments;
     };
 
-    class ExternalRealtimeRuntime final : public BackendRuntime {
+    class ExternalExecutorRuntime final : public BackendRuntime {
     public:
-        explicit ExternalRealtimeRuntime(ExternalRealtimeRuntimeConfiguration configuration);
-        ~ExternalRealtimeRuntime() override;
-        ExternalRealtimeRuntime(const ExternalRealtimeRuntime &) = delete;
-        ExternalRealtimeRuntime &operator=(const ExternalRealtimeRuntime &) = delete;
+        explicit ExternalExecutorRuntime(ExternalExecutorRuntimeConfiguration configuration);
+        ~ExternalExecutorRuntime() override;
+        ExternalExecutorRuntime(const ExternalExecutorRuntime &) = delete;
+        ExternalExecutorRuntime &operator=(const ExternalExecutorRuntime &) = delete;
 
         MotionBackend &endpoint() noexcept override;
         void start() override;

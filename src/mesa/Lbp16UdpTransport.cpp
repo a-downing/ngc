@@ -5,22 +5,13 @@
 #include <cerrno>
 #include <cstring>
 #include <format>
-#include <limits>
 #include <utility>
 
-#ifdef _WIN32
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#include <WinSock2.h>
-#include <WS2tcpip.h>
-#else
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <unistd.h>
-#endif
 
 namespace ngc::mesa {
     namespace {
@@ -48,18 +39,6 @@ namespace ngc::mesa {
             };
         }
 
-#ifdef _WIN32
-        std::string socketError(
-            const std::string_view operation) {
-            return std::format(
-                "{} failed with Windows socket error {}",
-                operation, WSAGetLastError());
-        }
-
-        int lastSocketError() noexcept {
-            return WSAGetLastError();
-        }
-#else
         std::string socketError(
             const std::string_view operation) {
             return std::format(
@@ -69,25 +48,15 @@ namespace ngc::mesa {
         int lastSocketError() noexcept {
             return errno;
         }
-#endif
     }
 
     class Lbp16UdpTransport::Impl {
     public:
-#ifdef _WIN32
-        using Socket = SOCKET;
-        static constexpr Socket INVALID_SOCKET_VALUE = INVALID_SOCKET;
-#else
         using Socket = int;
         static constexpr Socket INVALID_SOCKET_VALUE = -1;
-#endif
 
         Socket socket = INVALID_SOCKET_VALUE;
         std::string address;
-
-#ifdef _WIN32
-        bool winsockStarted = false;
-#endif
 
         ~Impl() {
             close();
@@ -95,19 +64,9 @@ namespace ngc::mesa {
 
         void close() noexcept {
             if (socket != INVALID_SOCKET_VALUE) {
-#ifdef _WIN32
-                closesocket(socket);
-#else
                 ::close(socket);
-#endif
                 socket = INVALID_SOCKET_VALUE;
             }
-#ifdef _WIN32
-            if (winsockStarted) {
-                WSACleanup();
-                winsockStarted = false;
-            }
-#endif
         }
 
         std::expected<void, std::string> readExchange(
@@ -116,14 +75,8 @@ namespace ngc::mesa {
             const auto words = static_cast<std::uint8_t>(
                 destination.size() / HOSTMOT2_WORD_SIZE);
             const auto request = readRequest(addressValue, words);
-#ifdef _WIN32
-            const auto sent = ::send(
-                socket, reinterpret_cast<const char *>(request.data()),
-                static_cast<int>(request.size()), 0);
-#else
             const auto sent = ::send(
                 socket, request.data(), request.size(), 0);
-#endif
             if (sent < 0) {
                 return std::unexpected(socketError("LBP16 UDP send"));
             }
@@ -133,14 +86,8 @@ namespace ngc::mesa {
                     sent, request.size()));
             }
 
-#ifdef _WIN32
-            const auto received = ::recv(
-                socket, reinterpret_cast<char *>(destination.data()),
-                static_cast<int>(destination.size()), 0);
-#else
             const auto received = ::recv(
                 socket, destination.data(), destination.size(), 0);
-#endif
             if (received < 0) {
                 return std::unexpected(socketError("LBP16 UDP receive"));
             }
@@ -163,14 +110,8 @@ namespace ngc::mesa {
                 return result;
             }
 
-#ifdef _WIN32
-            const auto sent = ::send(
-                socket, reinterpret_cast<const char *>(request.data()),
-                static_cast<int>(request.size()), 0);
-#else
             const auto sent = ::send(
                 socket, request.data(), request.size(), 0);
-#endif
             if (sent < 0) {
                 result.status = Lbp16DatagramStatus::SendFailed;
                 result.systemError = lastSocketError();
@@ -187,14 +128,8 @@ namespace ngc::mesa {
             std::array<
                 std::byte,
                 LBP16_MAX_DATAGRAM_SIZE + 1> datagram{};
-#ifdef _WIN32
-            const auto received = ::recv(
-                socket, reinterpret_cast<char *>(datagram.data()),
-                static_cast<int>(response.size() + 1), 0);
-#else
             const auto received = ::recv(
                 socket, datagram.data(), response.size() + 1, 0);
-#endif
             if (received < 0) {
                 result.status = Lbp16DatagramStatus::ReceiveFailed;
                 result.systemError = lastSocketError();
@@ -232,13 +167,6 @@ namespace ngc::mesa {
 
         auto impl = std::make_unique<Impl>();
         impl->address = configuration.address;
-#ifdef _WIN32
-        WSADATA data{};
-        if (WSAStartup(MAKEWORD(2, 2), &data) != 0) {
-            return std::unexpected(socketError("WSAStartup"));
-        }
-        impl->winsockStarted = true;
-#endif
         impl->socket = ::socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
         if (impl->socket == Impl::INVALID_SOCKET_VALUE) {
             return std::unexpected(socketError("LBP16 UDP socket"));
@@ -261,26 +189,6 @@ namespace ngc::mesa {
             return std::unexpected(socketError("LBP16 UDP connect"));
         }
 
-#ifdef _WIN32
-        const auto timeoutMilliseconds =
-            std::chrono::ceil<std::chrono::milliseconds>(
-                configuration.timeout);
-        const auto timeout = static_cast<DWORD>(
-            std::min<std::int64_t>(
-                timeoutMilliseconds.count(),
-                std::numeric_limits<DWORD>::max()));
-        if (setsockopt(
-                impl->socket, SOL_SOCKET, SO_RCVTIMEO,
-                reinterpret_cast<const char *>(&timeout),
-                sizeof(timeout)) != 0
-            || setsockopt(
-                impl->socket, SOL_SOCKET, SO_SNDTIMEO,
-                reinterpret_cast<const char *>(&timeout),
-                sizeof(timeout)) != 0) {
-            return std::unexpected(
-                socketError("LBP16 UDP timeout configuration"));
-        }
-#else
         const auto seconds =
             std::chrono::duration_cast<std::chrono::seconds>(
                 configuration.timeout);
@@ -300,7 +208,6 @@ namespace ngc::mesa {
             return std::unexpected(
                 socketError("LBP16 UDP timeout configuration"));
         }
-#endif
 
         return std::unique_ptr<Lbp16UdpTransport>(
             new Lbp16UdpTransport(std::move(impl)));

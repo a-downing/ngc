@@ -11,7 +11,7 @@
 
 #include "machine/DigitalIoProgram.h"
 #include "machine/MachineConfiguration.h"
-#include "machine/ProductionExecutorRuntime.h"
+#include "machine/HostedExecutorRuntime.h"
 #include "mesa/HostMot2CyclicIo.h"
 #include "mesa/MesaBackendConfiguration.h"
 

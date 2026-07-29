@@ -256,7 +256,7 @@ int main(const int argc, char **argv) {
             + fieldOutputs.count();
 
         const auto servoPeriodNanoseconds =
-            machine->realBackend->servoPeriod
+            machine->machineExecutor->servoPeriod
             * 1'000'000'000.0;
         std::println(
             "Mesa digital I/O program: instructions={} "

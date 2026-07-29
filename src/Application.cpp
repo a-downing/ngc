@@ -232,8 +232,8 @@ class ApplicationImpl final {
     ngc::ToolTableStorePaths m_toolTableStores;
     bool m_simulationParameterStoreReady = false;
     bool m_simulationToolTableStoreReady = false;
-    bool m_realParameterStoreReady = false;
-    bool m_realToolTableStoreReady = false;
+    bool m_machineParameterStoreReady = false;
+    bool m_machineToolTableStoreReady = false;
     std::uint64_t m_simulationToolTableRevision = 0;
     ngc::MachineControlTarget m_toolTableRevisionTarget =
         ngc::MachineControlTarget::Simulation;
@@ -573,59 +573,59 @@ public:
             }
         }
 
-        if (m_simulation.state().realAvailable) {
-            const auto realAuthority =
+        if (m_simulation.state().machineAvailable) {
+            const auto machineAuthority =
                 m_simulation.selectControlTarget(
-                    ngc::MachineControlTarget::Real);
-            if (!realAuthority) {
-                m_errorMessage = realAuthority.error();
+                    ngc::MachineControlTarget::Machine);
+            if (!machineAuthority) {
+                m_errorMessage = machineAuthority.error();
             } else {
-                m_controlAuthority = *realAuthority;
-                ngc::ToolTable realTools;
-                if (auto loaded = realTools.load(m_toolTableStores.real);
+                m_controlAuthority = *machineAuthority;
+                ngc::ToolTable machineTools;
+                if (auto loaded = machineTools.load(m_toolTableStores.machine);
                     !loaded) {
                     m_errorMessage = loaded.error();
                 } else if (!m_simulation.setToolTable(
-                               m_controlAuthority, realTools)) {
+                               m_controlAuthority, machineTools)) {
                     m_errorMessage =
-                        "Real tool table was loaded, but could not be applied";
+                        "Machine tool table was loaded, but could not be applied";
                 } else if (auto configured =
                                m_simulation.setToolTableStorePath(
                                    m_controlAuthority,
-                                   m_toolTableStores.real);
+                                   m_toolTableStores.machine);
                            !configured) {
                     m_errorMessage = configured.error();
                 } else {
-                    m_realToolTableStoreReady = true;
+                    m_machineToolTableStoreReady = true;
                 }
 
-                std::error_code realParameterError;
-                const auto realParametersExist = std::filesystem::exists(
-                    m_parameterStores.real, realParameterError);
-                if (realParameterError) {
+                std::error_code machineParameterError;
+                const auto machineParametersExist = std::filesystem::exists(
+                    m_parameterStores.machine, machineParameterError);
+                if (machineParameterError) {
                     m_errorMessage = std::format(
-                        "failed to inspect Real parameter store '{}': {}",
-                        m_parameterStores.real.string(),
-                        realParameterError.message());
-                } else if (realParametersExist) {
+                        "failed to inspect Machine parameter store '{}': {}",
+                        m_parameterStores.machine.string(),
+                        machineParameterError.message());
+                } else if (machineParametersExist) {
                     const auto loaded =
                         m_simulation.loadPersistentParameters(
                             m_controlAuthority,
-                            m_parameterStores.real);
+                            m_parameterStores.machine);
                     if (!loaded) {
                         m_errorMessage = loaded.error();
                     } else {
-                        m_realParameterStoreReady = true;
+                        m_machineParameterStoreReady = true;
                     }
                 } else {
                     const auto configured =
                         m_simulation.setPersistentParameterStorePath(
                             m_controlAuthority,
-                            m_parameterStores.real);
+                            m_parameterStores.machine);
                     if (!configured) {
                         m_errorMessage = configured.error();
                     } else {
-                        m_realParameterStoreReady = true;
+                        m_machineParameterStoreReady = true;
                     }
                 }
 
@@ -678,28 +678,28 @@ public:
     }
 
     [[nodiscard]] std::filesystem::path activeParameterStore() const {
-        return m_controlAuthority.target == ngc::MachineControlTarget::Real
-            ? m_parameterStores.real : m_parameterStores.simulation;
+        return m_controlAuthority.target == ngc::MachineControlTarget::Machine
+            ? m_parameterStores.machine : m_parameterStores.simulation;
     }
 
     [[nodiscard]] std::filesystem::path activeToolTableStore() const {
-        return m_controlAuthority.target == ngc::MachineControlTarget::Real
-            ? m_toolTableStores.real : m_toolTableStores.simulation;
+        return m_controlAuthority.target == ngc::MachineControlTarget::Machine
+            ? m_toolTableStores.machine : m_toolTableStores.simulation;
     }
 
     [[nodiscard]] bool activeParameterStoreReady() const noexcept {
-        return m_controlAuthority.target == ngc::MachineControlTarget::Real
-            ? m_realParameterStoreReady : m_simulationParameterStoreReady;
+        return m_controlAuthority.target == ngc::MachineControlTarget::Machine
+            ? m_machineParameterStoreReady : m_simulationParameterStoreReady;
     }
 
     [[nodiscard]] bool activeToolTableStoreReady() const noexcept {
-        return m_controlAuthority.target == ngc::MachineControlTarget::Real
-            ? m_realToolTableStoreReady : m_simulationToolTableStoreReady;
+        return m_controlAuthority.target == ngc::MachineControlTarget::Machine
+            ? m_machineToolTableStoreReady : m_simulationToolTableStoreReady;
     }
 
     [[nodiscard]] std::string_view activeTargetName() const noexcept {
-        return m_controlAuthority.target == ngc::MachineControlTarget::Real
-            ? std::string_view("Real") : std::string_view("Simulation");
+        return m_controlAuthority.target == ngc::MachineControlTarget::Machine
+            ? std::string_view("Machine") : std::string_view("Simulation");
     }
 
     void terminate() {
@@ -753,13 +753,13 @@ public:
             m_simulationToolTableStoreReady,
             m_parameterStores.simulation,
             m_toolTableStores.simulation);
-        if (m_simulation.state().realAvailable) {
+        if (m_simulation.state().machineAvailable) {
             saveStores(
-                ngc::MachineControlTarget::Real,
-                m_realParameterStoreReady,
-                m_realToolTableStoreReady,
-                m_parameterStores.real,
-                m_toolTableStores.real);
+                ngc::MachineControlTarget::Machine,
+                m_machineParameterStoreReady,
+                m_machineToolTableStoreReady,
+                m_parameterStores.machine,
+                m_toolTableStores.machine);
         }
         m_worker.join();
         if(m_glDeleteBuffers) {
@@ -2050,7 +2050,7 @@ public:
         if (ImGui::BeginCombo("##control_target", target.data())) {
             constexpr std::array targets {
                 ngc::MachineControlTarget::Simulation,
-                ngc::MachineControlTarget::Real,
+                ngc::MachineControlTarget::Machine,
             };
             for (const auto candidate : targets) {
                 const auto name = ngc::gui::controlTargetName(candidate);
@@ -2083,15 +2083,15 @@ public:
         for (const auto &joint : m_joints) {
             configuredJoints |= ngc::JointMask { 1 } << joint.id;
         }
-        const auto simulateFromReal = ngc::gui::simulateFromRealControl(
-            managerState, sessions.simulation, sessions.real, configuredJoints);
-        ImGui::BeginDisabled(!simulateFromReal.available);
-        if (ImGui::Button("Simulate from Real")) {
+        const auto simulateFromMachine = ngc::gui::simulateFromMachineControl(
+            managerState, sessions.simulation, sessions.machine, configuredJoints);
+        ImGui::BeginDisabled(!simulateFromMachine.available);
+        if (ImGui::Button("Simulate from Machine")) {
             const auto result =
-                m_simulation.simulateFromReal(m_controlAuthority);
+                m_simulation.simulateFromMachine(m_controlAuthority);
             if (!result) {
                 m_errorMessage = std::format(
-                    "Simulate from Real was rejected because {}.",
+                    "Simulate from Machine was rejected because {}.",
                     result.error());
             } else {
                 m_controlAuthority = *result;
@@ -2100,8 +2100,8 @@ public:
         }
         ImGui::EndDisabled();
         unavailableTooltip(
-            !simulateFromReal.available,
-            simulateFromReal.unavailableReason);
+            !simulateFromMachine.available,
+            simulateFromMachine.unavailableReason);
 
         const auto simulationControlled =
             managerState.authority.target == ngc::MachineControlTarget::Simulation;
@@ -2129,19 +2129,19 @@ public:
             ? static_cast<const ngc::MachineSessionSnapshot *>(
                   &*sessions.simulation)
             : nullptr;
-        const auto *realSession = sessions.real
-            ? &*sessions.real : nullptr;
+        const auto *machineSession = sessions.machine
+            ? &*sessions.machine : nullptr;
         sessionRow("SIMULATION", simulationSession, simulationControlled);
         ImGui::SameLine();
         ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
         ImGui::SameLine();
         sessionRow(
-            "REAL", realSession,
-            managerState.authority.target == ngc::MachineControlTarget::Real);
-        if (!managerState.realAvailable) {
+            "MACHINE", machineSession,
+            managerState.authority.target == ngc::MachineControlTarget::Machine);
+        if (!managerState.machineAvailable) {
             unavailableTooltip(true,
                 ngc::gui::unavailableControlTargetReason(
-                    managerState, ngc::MachineControlTarget::Real));
+                    managerState, ngc::MachineControlTarget::Machine));
         }
 
         if(ImGui::Button("Open G-code")) m_enableOpenDialog = true;

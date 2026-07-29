@@ -92,7 +92,7 @@ triggered moves, feed hold generates a constrained stop while retaining the
 target and input condition, continues sampling during braking, and regenerates
 the remaining approach on Resume. A sampled trigger during braking supersedes
 the feed hold and completes through the ordinary triggered-stop result.
-`ProductionExecutorRuntime` is the production-shaped `BackendRuntime` host for
+`HostedExecutorRuntime` is the production-shaped `BackendRuntime` host for
 the core. It derives fixed-capacity executor mappings and limits from typed
 machine configuration, owns fixed-period ticking and stopped-state synchronous
 service stepping, samples a fixed-size digital-input image before each tick,
@@ -133,25 +133,20 @@ deliberate stationary coordinate assignments, and otherwise applies bounded
 proportional position correction on top of commanded joint velocity. It holds
 motion until DPLL-backed feedback is aligned and faults on moving alignment or
 following-error violations. Disabled and faulted executor
-states suppress the watchdog, StepGen motion, and digital outputs. On
-configured Linux hosts, the runtime's existing servo thread removes the
-calling NRT host from the selected CPU, locks process memory, pins itself,
+states suppress the watchdog, StepGen motion, and digital outputs.
+`HostedExecutorRuntime`, the external IPC backend, the Mesa stack, and all
+physical-backend programs are Linux-only. The runtime's existing servo thread
+removes the calling NRT host from the selected CPU, locks process memory, pins itself,
 enters `SCHED_FIFO`, prefaults its stack, and sleeps to absolute monotonic
 deadlines. Host setup failure is fatal rather than falling back to ordinary
 scheduling. A missed hosted deadline faults the executor and reapplies safe
-outputs instead of issuing catch-up ticks. On Windows, the same configured
-host policy is best effort: the host and servo threads request CPU affinity,
-the servo thread requests time-critical priority with priority boosting
-disabled and HighQoS power policy, and absolute pacing uses a high-resolution
-waitable timer followed by a short deadline spin. Unsupported or rejected
-Windows host requests fall back without failing startup, and deadline misses
-remain diagnostic rather than faulting the executor. The servo thread aggregates
+outputs instead of issuing catch-up ticks. The servo thread aggregates
 fixed-size timing summaries and publishes them through a bounded SPSC
 diagnostic channel; the NRT peer bridges those summaries through a separate
-versioned IPC ring into Real session snapshots. Diagnostic backpressure never
+versioned IPC ring into Machine session snapshots. Diagnostic backpressure never
 blocks motion. Hardware acquisition and synthetic-input policy remain outside
 the runtime. The runtime is the second backend-conformance target and is paired
-end-to-end with `HomingController`. It is hosted by the physical Real process
+end-to-end with `HomingController`. It is hosted by the physical Machine process
 and by a hardware-free external test peer. There is no HAL component.
 `ngc_mesa_backend` is the initial physical executor process: its NRT bootstrap
 loads and cross-validates the typed machine and physical-backend
@@ -159,7 +154,7 @@ configurations. The physical-backend configuration owns the executor host
 policy and composes independent Mesa motion and optional spindle roles;
 `MesaBackendConfiguration` remains limited to Mesa motion hardware. The
 current Huanyang spindle role is typed and
-validated but disabled. `PhysicalProductionExecutorIo` composes motion I/O with
+validated but disabled. `PhysicalExecutorIo` composes motion I/O with
 an optional `SpindleHardware` behind a bounded RT-to-NRT `SpindleWorker`;
 serial communication never runs in the servo cycle, and worker shutdown or a
 latched spindle communication fault establishes the spindle safe stop. The
@@ -178,7 +173,7 @@ and Stop-to-zero phases. Signal interruption, normal destruction, and failures
 attempt the safe spindle stop.
 The process discovers and validates the 7I96, compiles the bounded digital-I/O
 program, constructs `MesaProductionExecutorIo`, then starts
-`ProductionExecutorRuntime` and bridges it over the existing production IPC
+`HostedExecutorRuntime` and bridges it over the existing production IPC
 rings without synthetic triggered inputs.
 When `motion.safety` identifies a verified external-enable logical input and
 its explicit `high` or `low` active polarity, loss of that level latches a
@@ -191,18 +186,18 @@ supply with INPUT COMMON grounded; removing that voltage must latch
 `MESA_EXTERNAL_ENABLE_FAULT` and safe outputs. This commissioning wire proves
 input polarity and executor response only and must be replaced with verified
 E-stop/enable feedback before any drive, motor, spindle, or other output is
-powered. The process is the application's configured Real target but has not
+powered. The process is the application's configured Machine target but has not
 completed staged physical commissioning. The typed Mesa backend
 configuration loader shares only generic,
 source-aware TOML field validation with the frontend machine loader and keeps
 its hardware schema separate. The `ngc_mesa_stepgen_diagnostic` executable
-combines that backend configuration with the authoritative Real servo period,
+combines that backend configuration with the authoritative Machine servo period,
 discovers and validates a physical 7I96, configures DPLL, watchdog, pin routing,
 and selected StepGens, actively commands bounded positive and negative rates,
-and checks DPLL-latched accumulator travel. By default it applies the Real
+and checks DPLL-latched accumulator travel. By default it applies the Machine
 backend's configured memory-lock, CPU-affinity, FIFO-priority, stack-prefault,
 and absolute-deadline host policy through the same reusable Linux facilities as
-`ProductionExecutorRuntime`; `--ordinary-scheduler` explicitly selects an
+`HostedExecutorRuntime`; `--ordinary-scheduler` explicitly selects an
 adverse-condition run. Fixed-size diagnostic accumulators report host wake
 lateness, period jitter, UDP exchange duration, missed deadlines, and signed
 DPLL phase error after convergence, including the faulting phase and lead-up to
@@ -216,15 +211,13 @@ through the same production helper and measures batched input, output, and
 combined passes entirely outside the servo cycle; timing instrumentation must
 not be added to `DigitalIoProgram::executeInputs()` or
 `executeOutputs()`.
-`ExternalRealtimeRuntime`
+`ExternalExecutorRuntime`
 implements the NRT side of the versioned shared-memory IPC boundary and owns a
-bounded `MotionBackend` proxy. `ngc_ipc_test_peer` is test-only infrastructure,
-not a selectable product backend. It validates typed machine configuration
-during startup, hosts `ProductionExecutorRuntime`, and bridges bounded
+bounded `MotionBackend` proxy. `ngc_ipc_test_peer` is Linux-only test
+infrastructure, not a selectable product backend. It validates typed machine
+configuration during startup, hosts `HostedExecutorRuntime`, and bridges bounded
 execution items, controls, events, and snapshots across the production IPC
-path. On Windows its best-effort priority, affinity, and high-resolution
-scheduler prove functional executor and process behavior without claiming
-real-time latency. On configured Linux RT hosts, its RT scheduler and
+path. On configured Linux RT hosts, its RT scheduler and
 hardware-free I/O boundary prove the production execution and diagnostic path,
 not physical I/O or hardware safety. The peer temporarily fakes axis-space
 probe and joint-space homing inputs. Probe input triggers 0.5 machine units
@@ -233,7 +226,7 @@ machine units from the move start. The peer lengthens its private copy of a
 shorter triggered joint approach to leave trigger and stopping room. This
 exists only so automated production-IPC tests can exercise probing and homing;
 it does not fake other physical inputs.
-`[real_backend]` configures this process as the application's selectable Real
+On Linux, `[machine_executor]` configures this process as the application's selectable Machine
 target for development without hardware; unavailable physical I/O operations
 must fail or use explicit peer-owned synthetic policy rather than falling back
 to `MockMotionBackend`. Preserve the separation
@@ -263,17 +256,18 @@ and Stop through the selected boundary. Every target-dependent manager operation
 requires the current generation-tagged `MachineControlAuthority`; stale or
 wrong-target commands and unsafe control transfers are rejected under the same
 manager lock used for admission. The production application constructs
-Simulation through `InProcessSimulationRuntime` and, when `[real_backend]` is
-present, constructs Real through `ExternalRealtimeRuntime`. `SessionBackendRuntime`
+Simulation through `InProcessSimulationRuntime` on Windows and Linux. On Linux
+only, when `[machine_executor]` is present, it constructs Machine through
+`ExternalExecutorRuntime`. `SessionBackendRuntime`
 keeps mock-only accelerated pacing, diagnostics, and synthetic inputs on the
-Simulation branch while forwarding the Real branch to the external process.
-An explicitly test-only in-process RealRun-mode host remains available for
+Simulation branch while forwarding the Machine branch to the external process.
+An explicitly test-only in-process MachineRun-mode host remains available for
 deterministic routing and checkpoint tests. Checkpoint import
-requires powered, stationary, idle, homed, fault-free Real state and a
+requires powered, stationary, idle, homed, fault-free Machine state and a
 powered-off idle Simulation session; it copies backend position/joints,
 homing, canonical modal and persistent parameter state, presentation, and the
 complete live tool table, then powers Simulation and advances generation-tagged
-control authority. Simulation changes are never copied back to Real.
+control authority. Simulation changes are never copied back to Machine.
 `MachineSession`
 owns homing and jogging runtime-service callback
 construction plus thread-safe live service observations. `BackendRuntime`
@@ -293,9 +287,9 @@ observation independently of geometry and trajectory-planning work. GUI
 snapshots overlay that observation so presentation position cannot stall while
 the selected runtime continues executing.
 
-The intended evolution toward persistent Simulation and Real machine sessions, isolated parameter persistence, Real-to-Simulation branching, and a separate composed physical-backend executable is documented in [Machine sessions, persistent Simulation, and the physical backend](docs/machine_session_backend_architecture.md). Treat its remaining session and backend phases as a design and implementation roadmap, not as a description of functionality that already exists.
+The intended evolution toward persistent Simulation and Machine sessions, isolated parameter persistence, Machine-to-Simulation branching, and a separate composed physical-backend executable is documented in [Machine sessions, persistent Simulation, and the physical backend](docs/machine_session_backend_architecture.md). Treat its remaining session and backend phases as a design and implementation roadmap, not as a description of functionality that already exists.
 
-`Memory` explicitly exports and imports only predefined nonvolatile canonical cells. The strict version-1 parameter store is parsed and written by NRT application code with complete validation and atomic replacement. Simulation loads `simulation_parameters.var` at application startup and saves it at orderly shutdown; `real_parameters.var` is a separate typed configuration path reserved for the future Real session. A failed Simulation load remains visible and inhibits overwriting that invalid store during shutdown. Tool tables use the same isolation model: startup migrates the legacy `tool_table.txt` into complete `real_tool_table.txt` and `simulation_tool_table.txt` stores only when neither isolated store exists, and rejects a partial migration. Simulation owns its live tool table across program and MDI epochs, persists changes only to the Simulation store, and synchronizes `G10 L11` after prior motion before calibrating a complete tool record against G59.3.
+`Memory` explicitly exports and imports only predefined nonvolatile canonical cells. The strict version-1 parameter store is parsed and written by NRT application code with complete validation and atomic replacement. Simulation loads `simulation_parameters.var` at application startup and saves it at orderly shutdown; `machine_parameters.var` is a separate typed configuration path reserved for the future Machine session. A failed Simulation load remains visible and inhibits overwriting that invalid store during shutdown. Tool tables use the same isolation model: startup migrates the legacy `tool_table.txt` into complete `machine_tool_table.txt` and `simulation_tool_table.txt` stores only when neither isolated store exists, and rejects a partial migration. Simulation owns its live tool table across program and MDI epochs, persists changes only to the Simulation store, and synchronizes `G10 L11` after prior motion before calibrating a complete tool record against G59.3.
 
 Pendant device access is NRT and separate from `MotionBackend`. `HidTransport` owns platform HID discovery and report I/O, while model drivers such as `vista_cnc_p2s::Driver` own device report framing, decoding, and display payloads. A model device-session manager owns its reader thread, cumulative wheel counts, ordered control-change events, latest snapshot, display serialization, and cancellation; heartbeat-only reports update its snapshot without filling the control-event queue. VistaCNC P2-S reads have a two-second report deadline, after which the outstanding platform read is cancelled and the session disconnects. Keep Windows handles and Linux HIDAPI handles behind the transport boundary; pendant drivers and managers must not call `Machine` or the backend directly.
 
@@ -311,7 +305,7 @@ The VistaCNC P2-S LCD is two eight-character rows and requires periodic output r
 
 ## Build and test
 
-The supported development environments are Windows and Linux with Clang, Ninja, and CMake. Windows uses vcpkg for GLM. Linux uses system GLM, OpenGL/GLU, window-system development packages, and HIDAPI's hidraw backend as documented in `docs/linux_build.md`. GLFW, ImGui, toml++, and PathTempo are submodules. PathTempo privately provides the pinned unmodified upstream Ruckig dependency used by trajectory timing, and NGC's other NRT motion generation shares PathTempo's Ruckig target.
+The supported development environments are Windows and Linux with Clang, Ninja, and CMake. Windows builds only the application, in-process Simulation, platform-independent libraries, and applicable tests; it does not build the external Machine runtime, IPC peer, Mesa stack, or physical-backend programs. Windows uses vcpkg for GLM. Linux uses system GLM, OpenGL/GLU, window-system development packages, and HIDAPI's hidraw backend as documented in `docs/linux_build.md`. GLFW, ImGui, toml++, and PathTempo are submodules. PathTempo privately provides the pinned unmodified upstream Ruckig dependency used by trajectory timing, and NGC's other NRT motion generation shares PathTempo's Ruckig target.
 
 Configure a fresh Release build with:
 
@@ -331,13 +325,13 @@ Tests are framework-free executables, with the core suite in `src/test.cpp`. The
 
 ## Configuration and interpreter semantics
 
-`machine.toml` is loaded and validated during NRT startup through `MachineConfiguration`. The application passes its resolved path to the selected external Real peer, which independently loads it before starting its RT thread. Keep toml++ and disk access inside configuration loaders. Planners, workers, and RT-facing backends receive typed configuration; configuration parsing must never enter the RT cycle.
+`machine.toml` is loaded and validated during NRT startup through `MachineConfiguration`. On Linux, the application passes its resolved path to the selected external Machine peer, which independently loads it before starting its RT thread. Keep toml++ and disk access inside configuration loaders. Planners, workers, and RT-facing backends receive typed configuration; configuration parsing must never enter the RT cycle.
 
 - `machine.units` selects the fixed internal `Machine::Unit`.
 - Trajectory, axis, joint, jogging, probing, simulation, and homing values use the configured machine unit and seconds as documented in `machine.toml` and `MachineConfiguration`.
 - `rapid_velocity` is converted at the loader boundary to the per-minute representation expected by canonical motion.
 - `simulation.scheduler_period` must be an integer multiple of `servo_period`.
-- `[real_backend]` owns the external executor path, optional resolved
+- `[machine_executor]` owns the external executor path, optional resolved
   backend-configuration path, and independent authoritative `servo_period`.
   The selected backend configuration's `[runtime]` table owns the optional
   Linux-only `realtime_cpu`, `realtime_priority`, and `lock_memory` host
@@ -354,7 +348,7 @@ Preserve these interpreter decisions:
 - Numeric parsing must consume the entire input. Tool-table parsing is line-oriented, accepts a final unterminated line, rejects duplicate tools with row context, and must not accept partial file I/O.
 - G43 applies the full XYZABC tool offset; G49 clears it. G53 bypasses work-coordinate offsets but retains the tool offset. Preserve explicit-G53 metadata through every consumer.
 - M6 validates that the selected tool exists and emits an ordered spindle stop before invoking `_tool_change`; a zero routine return or any nested interpreter failure is fatal to the active run. A typed tool-change modal checkpoint restores the caller's ordinary modal groups, feed and spindle-speed settings, selected tool, active WCS/#5220, and exact applied G43/G49 offset after the routine, including on failure. It deliberately retains the stopped spindle mode, newly loaded physical tool, position, probe results, persistent parameter changes, and tool-table mutations. Publish the restored presentation at the ordered post-routine boundary.
-- `InterpretationMode` maps `_task` to Preview = 0, Simulation = 1, and RealRun = 2. Parameter 6000 is read-only.
+- `InterpretationMode` maps `_task` to Preview = 0, Simulation = 1, and MachineRun = 2. Parameter 6000 is read-only.
 - IJK arcs allow one in-plane center word to be omitted as zero, but require at least one applicable center word. G91.1 makes IJK incremental; G90.1 makes it absolute in the active work coordinate system without changing endpoint mode. Reject zero radius and radius mismatch beyond `Machine::arcTolerance()`.
 - G64 is executable. Its optional non-negative P value is a blend/control-spacing scale in machine units, not a strict maximum-deviation tolerance. G61 and G61.1 clear it.
 - Rapid `MoveLine` speed `-1` is a sentinel, not a physical feedrate. G1/G2/G3 require an established positive modal feedrate and must report a recoverable `InterpreterError` when it is absent.

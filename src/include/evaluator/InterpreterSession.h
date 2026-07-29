@@ -25,14 +25,14 @@ namespace ngc {
     enum class InterpretationMode {
         Preview,
         Simulation,
-        RealRun,
+        MachineRun,
     };
 
     constexpr double taskValue(const InterpretationMode mode) {
         switch(mode) {
             case InterpretationMode::Preview: return 0.0;
             case InterpretationMode::Simulation: return 1.0;
-            case InterpretationMode::RealRun: return 2.0;
+            case InterpretationMode::MachineRun: return 2.0;
         }
         return 0.0;
     }

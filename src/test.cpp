@@ -34,7 +34,9 @@
 #include "machine/OwningSpscChannel.h"
 #include "machine/PreparedGeometry.h"
 #include "machine/PresentationTracker.h"
-#include "machine/ProductionExecutorRuntime.h"
+#ifdef __linux__
+#include "machine/HostedExecutorRuntime.h"
+#endif
 #include "machine/SpscChannel.h"
 #include "machine/SplineHandleOptimization.h"
 #include "machine/ToolTable.h"
@@ -100,6 +102,7 @@ namespace {
         bool m_failStart;
     };
 
+#ifdef __linux__
     class ScheduledTriggerProductionExecutorIo final
         : public ngc::ProductionExecutorIo {
     public:
@@ -162,6 +165,7 @@ namespace {
         static constexpr std::uint32_t fault = 0x1234'5678;
         ngc::ProductionExecutorOutputState lastOutputs;
     };
+#endif
 
     constexpr std::string_view HELLO_FIXTURE=R"NGC(
 %
@@ -558,36 +562,36 @@ final_move_together = true
     void testPersistentParameterFilesAreAtomicAndIsolated() {
         const auto root = std::filesystem::temp_directory_path();
         const auto simulationPath = root / "ngc-simulation-parameters-test.var";
-        const auto realPath = root / "ngc-real-parameters-test.var";
+        const auto machinePath = root / "ngc-machine-parameters-test.var";
         std::filesystem::remove(simulationPath);
-        std::filesystem::remove(realPath);
+        std::filesystem::remove(machinePath);
 
         ngc::Memory simulation;
-        ngc::Memory real;
+        ngc::Memory machine;
         simulation.init(ngc::gVars);
-        real.init(ngc::gVars);
+        machine.init(ngc::gVars);
         const auto address = simulation.deref(ngc::Var::G54_X);
         require(simulation.write(address, 12.5, true).has_value()
-                && real.write(address, -3.25, true).has_value(),
+                && machine.write(address, -3.25, true).has_value(),
                 "isolated parameter fixtures should be writable internally");
         require(ngc::savePersistentParameters(simulationPath, UNIT, simulation).has_value(),
                 "Simulation parameter store should save");
-        require(ngc::savePersistentParameters(realPath, UNIT, real).has_value(),
-                "Real parameter store should save");
+        require(ngc::savePersistentParameters(machinePath, UNIT, machine).has_value(),
+                "Machine parameter store should save");
 
         ngc::Memory loadedSimulation;
-        ngc::Memory loadedReal;
+        ngc::Memory loadedMachine;
         loadedSimulation.init(ngc::gVars);
-        loadedReal.init(ngc::gVars);
+        loadedMachine.init(ngc::gVars);
         require(ngc::loadPersistentParameters(
                     simulationPath, UNIT, loadedSimulation).has_value(),
                 "Simulation parameter store should load");
-        require(ngc::loadPersistentParameters(realPath, UNIT, loadedReal).has_value(),
-                "Real parameter store should load");
+        require(ngc::loadPersistentParameters(machinePath, UNIT, loadedMachine).has_value(),
+                "Machine parameter store should load");
         requireNear(*loadedSimulation.read(address), 12.5,
                     "Simulation parameters should remain isolated");
-        requireNear(*loadedReal.read(address), -3.25,
-                    "Real parameters should remain isolated");
+        requireNear(*loadedMachine.read(address), -3.25,
+                    "Machine parameters should remain isolated");
 
         {
             std::ofstream corrupt(simulationPath, std::ios::binary | std::ios::trunc);
@@ -601,7 +605,7 @@ final_move_together = true
                     "a failed load should not apply a valid prefix");
 
         std::filesystem::remove(simulationPath);
-        std::filesystem::remove(realPath);
+        std::filesystem::remove(machinePath);
     }
 
     void testSimulationPersistsCoordinateSystemAtCompletion() {
@@ -930,20 +934,30 @@ final_move_together = true
     void testMachineSessionManagerOwnsStandaloneSimulation() {
         ngc::MachineSessionManager manager;
         const auto state = manager.state();
-        require(state.simulationAvailable && !state.realAvailable,
+        require(state.simulationAvailable && !state.machineAvailable,
                 "the manager should expose a standalone Simulation session");
         require(state.authority.target == ngc::MachineControlTarget::Simulation
                     && state.authority.generation != 0,
                 "standalone Simulation should begin with generation-tagged control authority");
         require(manager.hasControlAuthority(state.authority),
                 "the current manager authority should be accepted");
-        const auto unavailableReal =
-            manager.selectControlTarget(ngc::MachineControlTarget::Real);
-        require(!unavailableReal
-                    && unavailableReal.error() == "the Real machine session is not configured",
-                "standalone Simulation should reject selecting an unavailable Real session");
+        const auto unavailableMachine =
+            manager.selectControlTarget(ngc::MachineControlTarget::Machine);
+        require(!unavailableMachine
+                    && unavailableMachine.error() == "the Machine session is not configured",
+                "standalone Simulation should reject selecting an unavailable Machine session");
         require(manager.state().authority == state.authority,
                 "a rejected control-target change must not advance control authority");
+
+#ifndef __linux__
+        const auto configuration = fixtureMachineConfiguration();
+        require(configuration.has_value(),
+                configuration ? "" : configuration.error());
+        ngc::MachineSessionManager configuredManager(*configuration);
+        const auto configuredState = configuredManager.state();
+        require(configuredState.simulationAvailable && !configuredState.machineAvailable,
+                "non-Linux builds should ignore configured external Machine sessions");
+#endif
 
         const auto authority = state.authority;
         auto staleAuthority = authority;
@@ -996,7 +1010,7 @@ final_move_together = true
                         staleAuthority, std::filesystem::path("unused-stale.var")),
                 "stale authority must reject controller-data mutations");
         auto wrongTargetAuthority = authority;
-        wrongTargetAuthority.target = ngc::MachineControlTarget::Real;
+        wrongTargetAuthority.target = ngc::MachineControlTarget::Machine;
         const auto wrongTargetStart =
             manager.start(wrongTargetAuthority, {{"G0 X1\n", "wrong-target.ngc"}}, {});
         require(!wrongTargetStart
@@ -1097,7 +1111,7 @@ final_move_together = true
         ngc::MachineSessionManager manager(
             ngc::MachineSessionManager::inProcessDualSessionForTesting);
         const auto initialState = manager.state();
-        require(initialState.simulationAvailable && initialState.realAvailable,
+        require(initialState.simulationAvailable && initialState.machineAvailable,
                 "a dual-session manager should expose both independently owned sessions");
         require(initialState.authority.target == ngc::MachineControlTarget::Simulation,
                 "a dual-session manager should initially control Simulation");
@@ -1109,14 +1123,14 @@ final_move_together = true
         require(manager.powerOn(initialState.authority),
                 "Simulation should power on under its initial authority");
 
-        const auto realAuthority =
-            manager.selectControlTarget(ngc::MachineControlTarget::Real);
-        require(realAuthority.has_value(),
-                realAuthority ? "" : realAuthority.error());
-        require(realAuthority->target == ngc::MachineControlTarget::Real
-                    && realAuthority->generation
+        const auto machineAuthority =
+            manager.selectControlTarget(ngc::MachineControlTarget::Machine);
+        require(machineAuthority.has_value(),
+                machineAuthority ? "" : machineAuthority.error());
+        require(machineAuthority->target == ngc::MachineControlTarget::Machine
+                    && machineAuthority->generation
                         == initialState.authority.generation + 1,
-                "control transfer should select Real and advance the generation");
+                "control transfer should select Machine and advance the generation");
         const auto staleSimulationPowerOff =
             manager.powerOff(initialState.authority);
         require(!staleSimulationPowerOff
@@ -1124,40 +1138,40 @@ final_move_together = true
                         == ngc::SessionCommandRejection::StaleControlAuthority,
                 "Simulation authority should become stale immediately after transfer");
 
-        const auto afterRealTransfer = manager.snapshots();
-        require(afterRealTransfer.simulation && afterRealTransfer.real
-                    && afterRealTransfer.simulation->powerState
+        const auto afterMachineTransfer = manager.snapshots();
+        require(afterMachineTransfer.simulation && afterMachineTransfer.machine
+                    && afterMachineTransfer.simulation->powerState
                         == ngc::MachinePowerState::On
-                    && afterRealTransfer.real->powerState
+                    && afterMachineTransfer.machine->powerState
                         == ngc::MachinePowerState::Off,
                 "target transfer should retain independent session power state");
-        require(manager.powerOn(*realAuthority),
-                "Real should accept a command routed through current Real authority");
-        ngc::ToolTable realTools;
-        realTools.set(1, { 1, 0, 0, 2, 0, 0, 0, 0.5, "Real tool" });
-        require(manager.setToolTable(*realAuthority, realTools)
-                    && manager.toolTable() == realTools,
-                "controller-data access should route to the selected Real session");
+        require(manager.powerOn(*machineAuthority),
+                "Machine should accept a command routed through current Machine authority");
+        ngc::ToolTable machineTools;
+        machineTools.set(1, { 1, 0, 0, 2, 0, 0, 0, 0.5, "Machine tool" });
+        require(manager.setToolTable(*machineAuthority, machineTools)
+                    && manager.toolTable() == machineTools,
+                "controller-data access should route to the selected Machine session");
 
         const auto simulationAuthority =
             manager.selectControlTarget(ngc::MachineControlTarget::Simulation);
         require(simulationAuthority.has_value(),
                 simulationAuthority ? "" : simulationAuthority.error());
-        require(simulationAuthority->generation == realAuthority->generation + 1
+        require(simulationAuthority->generation == machineAuthority->generation + 1
                     && manager.toolTable() == simulationTools,
                 "returning to Simulation should expose its unchanged isolated tool table");
-        const auto staleRealStart =
-            manager.start(*realAuthority, {{"G0 X1\n", "stale-real.ngc"}}, realTools);
-        require(!staleRealStart
-                    && staleRealStart.rejection
+        const auto staleMachineStart =
+            manager.start(*machineAuthority, {{"G0 X1\n", "stale-machine.ngc"}}, machineTools);
+        require(!staleMachineStart
+                    && staleMachineStart.rejection
                         == ngc::SessionCommandRejection::StaleControlAuthority,
-                "commands carrying prior Real authority must not reach Simulation");
+                "commands carrying prior Machine authority must not reach Simulation");
 
         require(manager.start(
                     *simulationAuthority, {{"G0 X0.01\n", "routed-simulation.ngc"}}, simulationTools),
                 "current Simulation authority should route a program to Simulation");
         const auto transferDuringMotion =
-            manager.selectControlTarget(ngc::MachineControlTarget::Real);
+            manager.selectControlTarget(ngc::MachineControlTarget::Machine);
         require(!transferDuringMotion
                     && transferDuringMotion.error()
                         == "control transfer requires both machine sessions to be stationary and idle",
@@ -1176,17 +1190,17 @@ final_move_together = true
                 completed.error.empty() ? "routed Simulation program should complete"
                                         : completed.error);
         const auto separated = manager.snapshots();
-        require(separated.simulation && separated.real
+        require(separated.simulation && separated.machine
                     && separated.simulation->machinePosition.x > 0.009
-                    && std::abs(separated.real->machinePosition.x) <= 1e-12,
-                "Simulation motion must not alter the concurrently owned Real session");
+                    && std::abs(separated.machine->machinePosition.x) <= 1e-12,
+                "Simulation motion must not alter the concurrently owned Machine session");
 
-        const auto finalRealAuthority =
-            manager.selectControlTarget(ngc::MachineControlTarget::Real);
-        require(finalRealAuthority.has_value(),
-                finalRealAuthority ? "" : finalRealAuthority.error());
-        require(manager.powerOff(*finalRealAuthority),
-                "Real should power off through final Real authority");
+        const auto finalMachineAuthority =
+            manager.selectControlTarget(ngc::MachineControlTarget::Machine);
+        require(finalMachineAuthority.has_value(),
+                finalMachineAuthority ? "" : finalMachineAuthority.error());
+        require(manager.powerOff(*finalMachineAuthority),
+                "Machine should power off through final Machine authority");
         const auto finalSimulationAuthority =
             manager.selectControlTarget(ngc::MachineControlTarget::Simulation);
         require(finalSimulationAuthority.has_value(),
@@ -1196,15 +1210,15 @@ final_move_together = true
         manager.join();
     }
 
-    void testMachineSessionManagerBranchesRealIntoIsolatedSimulation() {
+    void testMachineSessionManagerBranchesMachineIntoIsolatedSimulation() {
         ngc::MachineSessionManager manager(
             ngc::MachineSessionManager::inProcessDualSessionForTesting);
         const auto simulationParameterPath =
             std::filesystem::temp_directory_path()
-            / "ngc-real-branch-simulation-parameters.var";
+            / "ngc-machine-branch-simulation-parameters.var";
         const auto simulationToolPath =
             std::filesystem::temp_directory_path()
-            / "ngc-real-branch-simulation-tools.txt";
+            / "ngc-machine-branch-simulation-tools.txt";
         std::filesystem::remove(simulationParameterPath);
         std::filesystem::remove(simulationToolPath);
         const auto initialSimulation = manager.state().authority;
@@ -1213,68 +1227,68 @@ final_move_together = true
                     && manager.setToolTableStorePath(
                         initialSimulation, simulationToolPath).has_value(),
                 "checkpoint target should configure isolated Simulation stores");
-        const auto realAuthority =
-            manager.selectControlTarget(ngc::MachineControlTarget::Real);
-        require(realAuthority.has_value(),
-                realAuthority ? "" : realAuthority.error());
-        require(manager.powerOn(*realAuthority),
-                "checkpoint source Real session should power on");
+        const auto machineAuthority =
+            manager.selectControlTarget(ngc::MachineControlTarget::Machine);
+        require(machineAuthority.has_value(),
+                machineAuthority ? "" : machineAuthority.error());
+        require(manager.powerOn(*machineAuthority),
+                "checkpoint source Machine session should power on");
         manager.setTickMultiplier(1000);
 
-        ngc::ToolTable realTools;
-        realTools.set(1, {1, 0, 0, 2, 0, 0, 0, 0.5, "Real checkpoint tool"});
-        require(manager.setToolTable(*realAuthority, realTools),
-                "checkpoint source Real tool table should be initialized");
+        ngc::ToolTable machineTools;
+        machineTools.set(1, {1, 0, 0, 2, 0, 0, 0, 0.5, "Machine checkpoint tool"});
+        require(manager.setToolTable(*machineAuthority, machineTools),
+                "checkpoint source Machine tool table should be initialized");
         require(manager.start(
-                    *realAuthority,
-                    {{"G10 L2 P1 X7\nG54\nG0 X0.02\n", "real-checkpoint.ngc"}},
-                    realTools),
-                "checkpoint source Real program should start");
+                    *machineAuthority,
+                    {{"G10 L2 P1 X7\nG54\nG0 X0.02\n", "machine-checkpoint.ngc"}},
+                    machineTools),
+                "checkpoint source Machine program should start");
 
-        const auto activeBranch = manager.simulateFromReal(*realAuthority);
+        const auto activeBranch = manager.simulateFromMachine(*machineAuthority);
         require(!activeBranch
                     && activeBranch.error()
-                        == "Real-to-Simulation branching requires Real to be stationary and idle",
-                "checkpoint export must reject while Real owns motion");
-        require(manager.state().authority == *realAuthority,
+                        == "Machine-to-Simulation branching requires Machine to be stationary and idle",
+                "checkpoint export must reject while Machine owns motion");
+        require(manager.state().authority == *machineAuthority,
                 "rejected checkpoint export must not transfer control");
 
-        auto realCompleted = manager.snapshot();
+        auto machineCompleted = manager.snapshot();
         for (auto attempt = 0; attempt < 2000
-             && realCompleted.status != ngc::SimulationStatus::Completed
-             && realCompleted.status != ngc::SimulationStatus::Error; ++attempt) {
+             && machineCompleted.status != ngc::SimulationStatus::Completed
+             && machineCompleted.status != ngc::SimulationStatus::Error; ++attempt) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            realCompleted = manager.snapshot();
+            machineCompleted = manager.snapshot();
         }
-        require(realCompleted.status == ngc::SimulationStatus::Completed,
-                realCompleted.error.empty() ? "checkpoint source program should complete"
-                                            : realCompleted.error);
-        const auto realPosition = realCompleted.machinePosition;
-        const auto realParameters = manager.parameterSnapshot();
-        requireNear(realParameters.at(ngc::Var::G54_X), 7.0,
+        require(machineCompleted.status == ngc::SimulationStatus::Completed,
+                machineCompleted.error.empty() ? "checkpoint source program should complete"
+                                            : machineCompleted.error);
+        const auto machinePosition = machineCompleted.machinePosition;
+        const auto machineParameters = manager.parameterSnapshot();
+        requireNear(machineParameters.at(ngc::Var::G54_X), 7.0,
                     "checkpoint source should publish its persistent WCS value");
 
-        const auto simulationAuthority = manager.simulateFromReal(*realAuthority);
+        const auto simulationAuthority = manager.simulateFromMachine(*machineAuthority);
         require(simulationAuthority.has_value(),
                 simulationAuthority ? "" : simulationAuthority.error());
         require(simulationAuthority->target == ngc::MachineControlTarget::Simulation
-                    && simulationAuthority->generation == realAuthority->generation + 1,
+                    && simulationAuthority->generation == machineAuthority->generation + 1,
                 "successful checkpoint import should power Simulation and advance authority");
         const auto imported = manager.snapshots();
-        require(imported.real && imported.simulation
-                    && imported.real->powerState == ngc::MachinePowerState::On
+        require(imported.machine && imported.simulation
+                    && imported.machine->powerState == ngc::MachinePowerState::On
                     && imported.simulation->powerState == ngc::MachinePowerState::On,
-                "checkpoint import should leave Real powered and power Simulation on");
-        requireNear(imported.simulation->machinePosition.x, realPosition.x,
-                    "Simulation should begin at the stationary Real position");
-        require(manager.toolTable() == realTools,
-                "Simulation should receive a complete copy of the live Real tool table");
+                "checkpoint import should leave Machine powered and power Simulation on");
+        requireNear(imported.simulation->machinePosition.x, machinePosition.x,
+                    "Simulation should begin at the stationary Machine position");
+        require(manager.toolTable() == machineTools,
+                "Simulation should receive a complete copy of the live Machine tool table");
         requireNear(manager.parameterSnapshot().at(ngc::Var::G54_X),
-                    realParameters.at(ngc::Var::G54_X),
-                    "Simulation should receive the complete persistent Real parameter bank");
+                    machineParameters.at(ngc::Var::G54_X),
+                    "Simulation should receive the complete persistent Machine parameter bank");
         ngc::ToolTable storedSimulationTools;
         require(storedSimulationTools.load(simulationToolPath).has_value()
-                    && storedSimulationTools == realTools,
+                    && storedSimulationTools == machineTools,
                 "checkpoint import should persist the complete copied Simulation tool table");
         const auto storedSimulationParameters =
             ngc::readFile(simulationParameterPath);
@@ -1283,7 +1297,7 @@ final_move_together = true
                         != std::string::npos,
                 "checkpoint import should persist the copied Simulation parameter bank");
 
-        auto simulationTools = realTools;
+        auto simulationTools = machineTools;
         simulationTools.set(
             1, {1, 0, 0, 3, 0, 0, 0, 0.75, "Simulation-only checkpoint tool"});
         require(manager.setToolTable(*simulationAuthority, simulationTools),
@@ -1309,45 +1323,45 @@ final_move_together = true
                 simulationCompleted.error.empty()
                     ? "checkpoint-derived Simulation MDI should complete"
                     : simulationCompleted.error);
-        require(simulationCompleted.machinePosition.x > realPosition.x + 0.009,
+        require(simulationCompleted.machinePosition.x > machinePosition.x + 0.009,
                 "checkpoint-derived Simulation motion should evolve independently");
         require(manager.parameterSnapshot().at(ngc::Var::G54_X)
-                    != realParameters.at(ngc::Var::G54_X),
+                    != machineParameters.at(ngc::Var::G54_X),
                 "Simulation WCS mutation should change only its copied parameter bank");
 
         require(manager.powerOff(*simulationAuthority),
-                "checkpoint-derived Simulation should power off before returning to Real");
-        const auto returnedReal =
-            manager.selectControlTarget(ngc::MachineControlTarget::Real);
-        require(returnedReal.has_value(),
-                returnedReal ? "" : returnedReal.error());
-        require(manager.toolTable() == realTools,
-                "returning to Real must discard Simulation tool-table mutations");
+                "checkpoint-derived Simulation should power off before returning to Machine");
+        const auto returnedMachine =
+            manager.selectControlTarget(ngc::MachineControlTarget::Machine);
+        require(returnedMachine.has_value(),
+                returnedMachine ? "" : returnedMachine.error());
+        require(manager.toolTable() == machineTools,
+                "returning to Machine must discard Simulation tool-table mutations");
         requireNear(manager.parameterSnapshot().at(ngc::Var::G54_X),
-                    realParameters.at(ngc::Var::G54_X),
-                    "returning to Real must expose its unchanged parameter bank");
-        const auto unchangedReal = manager.snapshot();
-        requireNear(unchangedReal.machinePosition.x, realPosition.x,
-                    "Simulation motion must not alter the stationary Real endpoint");
+                    machineParameters.at(ngc::Var::G54_X),
+                    "returning to Machine must expose its unchanged parameter bank");
+        const auto unchangedMachine = manager.snapshot();
+        requireNear(unchangedMachine.machinePosition.x, machinePosition.x,
+                    "Simulation motion must not alter the stationary Machine endpoint");
 
-        const auto refreshedSimulation = manager.simulateFromReal(*returnedReal);
+        const auto refreshedSimulation = manager.simulateFromMachine(*returnedMachine);
         require(refreshedSimulation.has_value(),
                 refreshedSimulation ? "" : refreshedSimulation.error());
-        require(manager.toolTable() == realTools,
-                "a new Real checkpoint should replace discarded Simulation tool changes");
+        require(manager.toolTable() == machineTools,
+                "a new Machine checkpoint should replace discarded Simulation tool changes");
         requireNear(manager.parameterSnapshot().at(ngc::Var::G54_X),
-                    realParameters.at(ngc::Var::G54_X),
-                    "a new Real checkpoint should replace discarded Simulation parameter changes");
-        requireNear(manager.snapshot().machinePosition.x, realPosition.x,
-                    "a new Real checkpoint should refresh the Simulation endpoint");
+                    machineParameters.at(ngc::Var::G54_X),
+                    "a new Machine checkpoint should replace discarded Simulation parameter changes");
+        requireNear(manager.snapshot().machinePosition.x, machinePosition.x,
+                    "a new Machine checkpoint should refresh the Simulation endpoint");
 
         require(manager.powerOff(*refreshedSimulation),
                 "refreshed Simulation should power off cleanly");
-        const auto finalReal =
-            manager.selectControlTarget(ngc::MachineControlTarget::Real);
-        require(finalReal.has_value(), finalReal ? "" : finalReal.error());
-        require(manager.powerOff(*finalReal),
-                "checkpoint source Real session should power off cleanly");
+        const auto finalMachine =
+            manager.selectControlTarget(ngc::MachineControlTarget::Machine);
+        require(finalMachine.has_value(), finalMachine ? "" : finalMachine.error());
+        require(manager.powerOff(*finalMachine),
+                "checkpoint source Machine session should power off cleanly");
         manager.join();
         std::filesystem::remove(simulationParameterPath);
         std::filesystem::remove(simulationToolPath);
@@ -1359,50 +1373,50 @@ final_move_together = true
         ngc::MachineSessionManager manager(
             ngc::MachineSessionManager::inProcessDualSessionForTesting,
             *configuration);
-        const auto realAuthority =
-            manager.selectControlTarget(ngc::MachineControlTarget::Real);
-        require(realAuthority.has_value(), realAuthority ? "" : realAuthority.error());
-        require(manager.powerOn(*realAuthority),
-                "configured checkpoint source Real session should power on");
+        const auto machineAuthority =
+            manager.selectControlTarget(ngc::MachineControlTarget::Machine);
+        require(machineAuthority.has_value(), machineAuthority ? "" : machineAuthority.error());
+        require(manager.powerOn(*machineAuthority),
+                "configured checkpoint source Machine session should power on");
         manager.setTickMultiplier(1000);
 
-        const auto unhomedBranch = manager.simulateFromReal(*realAuthority);
+        const auto unhomedBranch = manager.simulateFromMachine(*machineAuthority);
         require(!unhomedBranch
                     && unhomedBranch.error()
-                        == "Real-to-Simulation branching requires every configured Real joint to be homed",
-                "configured Real checkpoint should reject an unhomed source");
-        require(manager.home(*realAuthority),
-                "configured checkpoint source Real session should begin homing");
-        auto homedReal = manager.snapshot();
+                        == "Machine-to-Simulation branching requires every configured Machine joint to be homed",
+                "configured Machine checkpoint should reject an unhomed source");
+        require(manager.home(*machineAuthority),
+                "configured checkpoint source Machine session should begin homing");
+        auto homedMachine = manager.snapshot();
         for (auto attempt = 0; attempt < 5000
-             && homedReal.status != ngc::SimulationStatus::Completed
-             && homedReal.status != ngc::SimulationStatus::Error; ++attempt) {
+             && homedMachine.status != ngc::SimulationStatus::Completed
+             && homedMachine.status != ngc::SimulationStatus::Error; ++attempt) {
             std::this_thread::sleep_for(std::chrono::milliseconds(1));
-            homedReal = manager.snapshot();
+            homedMachine = manager.snapshot();
         }
-        require(homedReal.status == ngc::SimulationStatus::Completed,
-                homedReal.error.empty() ? "configured checkpoint homing should complete"
-                                        : homedReal.error);
+        require(homedMachine.status == ngc::SimulationStatus::Completed,
+                homedMachine.error.empty() ? "configured checkpoint homing should complete"
+                                        : homedMachine.error);
 
-        const auto simulationAuthority = manager.simulateFromReal(*realAuthority);
+        const auto simulationAuthority = manager.simulateFromMachine(*machineAuthority);
         require(simulationAuthority.has_value(),
                 simulationAuthority ? "" : simulationAuthority.error());
         const auto homedSimulation = manager.snapshot();
-        require(homedSimulation.homedJoints == homedReal.homedJoints,
-                "checkpoint import should copy Real homed-joint confidence");
+        require(homedSimulation.homedJoints == homedMachine.homedJoints,
+                "checkpoint import should copy Machine homed-joint confidence");
         for (const auto &joint : configuration->joints) {
             requireNear(homedSimulation.joints.position[joint.id],
-                        homedReal.joints.position[joint.id],
-                        "checkpoint import should copy each stationary Real joint position");
+                        homedMachine.joints.position[joint.id],
+                        "checkpoint import should copy each stationary Machine joint position");
         }
 
         require(manager.powerOff(*simulationAuthority),
                 "homing-derived Simulation should power off cleanly");
-        const auto finalReal =
-            manager.selectControlTarget(ngc::MachineControlTarget::Real);
-        require(finalReal.has_value(), finalReal ? "" : finalReal.error());
-        require(manager.powerOff(*finalReal),
-                "configured checkpoint source Real should power off cleanly");
+        const auto finalMachine =
+            manager.selectControlTarget(ngc::MachineControlTarget::Machine);
+        require(finalMachine.has_value(), finalMachine ? "" : finalMachine.error());
+        require(manager.powerOff(*finalMachine),
+                "configured checkpoint source Machine should power off cleanly");
         manager.join();
     }
 
@@ -1558,65 +1572,65 @@ final_move_together = true
                         managerState, ngc::MachineControlTarget::Simulation),
                 "the session view should identify the available Simulation control target");
         require(!ngc::gui::controlTargetAvailable(
-                    managerState, ngc::MachineControlTarget::Real)
+                    managerState, ngc::MachineControlTarget::Machine)
                     && ngc::gui::unavailableControlTargetReason(
-                        managerState, ngc::MachineControlTarget::Real)
-                        == "The Real machine session is not configured.",
-                "the session view should explain an unavailable Real control target");
+                        managerState, ngc::MachineControlTarget::Machine)
+                        == "The Machine session is not configured.",
+                "the session view should explain an unavailable Machine control target");
         require(ngc::gui::sessionCommandRejectionReason(
                     ngc::SessionCommandRejection::StaleControlAuthority)
                     == "control has transferred or the command targets another session",
                 "the session view should explain stale control authority");
-        managerState.realAvailable = true;
+        managerState.machineAvailable = true;
         require(ngc::gui::controlTargetAvailable(
-                    managerState, ngc::MachineControlTarget::Real)
+                    managerState, ngc::MachineControlTarget::Machine)
                     && ngc::gui::unavailableControlTargetReason(
-                        managerState, ngc::MachineControlTarget::Real).empty(),
-                "the session view should permit a configured Real control target");
+                        managerState, ngc::MachineControlTarget::Machine).empty(),
+                "the session view should permit a configured Machine control target");
 
         ngc::MachineSessionManagerSnapshots sessions;
-        auto simulateFromReal = ngc::gui::simulateFromRealControl(
-            managerState, sessions.simulation, sessions.real,
+        auto simulateFromMachine = ngc::gui::simulateFromMachineControl(
+            managerState, sessions.simulation, sessions.machine,
             ngc::JointMask { 1 });
-        require(!simulateFromReal.available
-                    && simulateFromReal.unavailableReason
-                        == "The Real machine session is not configured.",
-                "the session view should require a Real snapshot for checkpoint control");
+        require(!simulateFromMachine.available
+                    && simulateFromMachine.unavailableReason
+                        == "The Machine session is not configured.",
+                "the session view should require a Machine snapshot for checkpoint control");
 
         sessions.simulation.emplace();
-        sessions.real.emplace();
-        simulateFromReal = ngc::gui::simulateFromRealControl(
-            managerState, sessions.simulation, sessions.real,
+        sessions.machine.emplace();
+        simulateFromMachine = ngc::gui::simulateFromMachineControl(
+            managerState, sessions.simulation, sessions.machine,
             ngc::JointMask { 1 });
-        require(!simulateFromReal.available
-                    && simulateFromReal.unavailableReason
-                        == "Select the Real control target before creating a Simulation checkpoint.",
-                "the session view should require Real control before checkpointing");
+        require(!simulateFromMachine.available
+                    && simulateFromMachine.unavailableReason
+                        == "Select the Machine control target before creating a Simulation checkpoint.",
+                "the session view should require Machine control before checkpointing");
 
-        managerState.authority.target = ngc::MachineControlTarget::Real;
-        sessions.real->powerState = ngc::MachinePowerState::On;
-        simulateFromReal = ngc::gui::simulateFromRealControl(
-            managerState, sessions.simulation, sessions.real,
+        managerState.authority.target = ngc::MachineControlTarget::Machine;
+        sessions.machine->powerState = ngc::MachinePowerState::On;
+        simulateFromMachine = ngc::gui::simulateFromMachineControl(
+            managerState, sessions.simulation, sessions.machine,
             ngc::JointMask { 1 });
-        require(!simulateFromReal.available
-                    && simulateFromReal.unavailableReason
-                        == "Every configured Real joint must be homed.",
-                "the session view should explain the Real homing requirement");
+        require(!simulateFromMachine.available
+                    && simulateFromMachine.unavailableReason
+                        == "Every configured Machine joint must be homed.",
+                "the session view should explain the Machine homing requirement");
 
-        sessions.real->homedJoints = ngc::JointMask { 1 };
-        simulateFromReal = ngc::gui::simulateFromRealControl(
-            managerState, sessions.simulation, sessions.real,
+        sessions.machine->homedJoints = ngc::JointMask { 1 };
+        simulateFromMachine = ngc::gui::simulateFromMachineControl(
+            managerState, sessions.simulation, sessions.machine,
             ngc::JointMask { 1 });
-        require(simulateFromReal.available
-                    && simulateFromReal.unavailableReason.empty(),
-                "stationary homed Real state and powered-off Simulation should enable checkpointing");
+        require(simulateFromMachine.available
+                    && simulateFromMachine.unavailableReason.empty(),
+                "stationary homed Machine state and powered-off Simulation should enable checkpointing");
 
         sessions.simulation->powerState = ngc::MachinePowerState::On;
-        simulateFromReal = ngc::gui::simulateFromRealControl(
-            managerState, sessions.simulation, sessions.real,
+        simulateFromMachine = ngc::gui::simulateFromMachineControl(
+            managerState, sessions.simulation, sessions.machine,
             ngc::JointMask { 1 });
-        require(!simulateFromReal.available
-                    && simulateFromReal.unavailableReason
+        require(!simulateFromMachine.available
+                    && simulateFromMachine.unavailableReason
                         == "Simulation must be powered off and idle.",
                 "the session view should require Simulation to be powered off");
 
@@ -1784,10 +1798,11 @@ final_move_together = true
         runtime.stop();
     }
 
-    void testProductionExecutorRuntimeOwnsFixedPeriodLifecycle() {
+#ifdef __linux__
+    void testHostedExecutorRuntimeOwnsFixedPeriodLifecycle() {
         const auto configuration = fixtureMachineConfiguration();
         require(configuration.has_value(), configuration ? "" : configuration.error());
-        ngc::ProductionExecutorRuntime runtime(*configuration);
+        ngc::HostedExecutorRuntime runtime(*configuration);
 
         runtime.start();
         for (auto attempt = 0;
@@ -1822,36 +1837,11 @@ final_move_together = true
                     "production runtime should restore commanded joint position");
     }
 
-#ifdef _WIN32
-    void testProductionExecutorRuntimeUsesBestEffortWindowsHostPolicy() {
-        auto configuration = ngc::ProductionExecutorRuntimeConfiguration{};
-        configuration.timingPublicationTicks = 1;
-        configuration.realtime = {
-            .realtimeEnabled = true,
-            .realtimeCpu = std::numeric_limits<std::uint32_t>::max(),
-            .realtimePriority = 98,
-            .lockMemory = true,
-        };
-        ngc::ProductionExecutorRuntime runtime(std::move(configuration));
-
-        runtime.start();
-        for (auto attempt = 0;
-             attempt < 1000 && runtime.servoTicks() < 2; ++attempt) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-        require(runtime.started() && runtime.servoTicks() >= 2,
-                "Windows best-effort host policy should tolerate unavailable "
-                "affinity and memory-lock requests");
-
-        runtime.stop();
-    }
-#endif
-
-    void testProductionExecutorRuntimePublishesBoundedTiming() {
-        ngc::ProductionExecutorRuntimeConfiguration configuration;
+    void testHostedExecutorRuntimePublishesBoundedTiming() {
+        ngc::HostedExecutorRuntimeConfiguration configuration;
         configuration.servoPeriod = 0.0001;
         configuration.timingPublicationTicks = 4;
-        ngc::ProductionExecutorRuntime runtime(configuration);
+        ngc::HostedExecutorRuntime runtime(configuration);
 
         runtime.start();
         for (auto attempt = 0;
@@ -1882,11 +1872,11 @@ final_move_together = true
         runtime.stop();
     }
 
-    void testProductionExecutorRuntimeReportsIoFault() {
-        ngc::ProductionExecutorRuntimeConfiguration configuration;
+    void testHostedExecutorRuntimeReportsIoFault() {
+        ngc::HostedExecutorRuntimeConfiguration configuration;
         auto io = std::make_unique<FaultingProductionExecutorIo>();
         const auto *observation = io.get();
-        ngc::ProductionExecutorRuntime runtime(
+        ngc::HostedExecutorRuntime runtime(
             configuration, std::move(io));
 
         require(runtime.advanceServiceMotionPeriod() == 1,
@@ -1902,10 +1892,10 @@ final_move_together = true
     }
 
     void testProductionExecutorTimingBackpressureDoesNotBlockServo() {
-        ngc::ProductionExecutorRuntimeConfiguration configuration;
+        ngc::HostedExecutorRuntimeConfiguration configuration;
         configuration.servoPeriod = 0.0001;
         configuration.timingPublicationTicks = 1;
-        ngc::ProductionExecutorRuntime runtime(configuration);
+        ngc::HostedExecutorRuntime runtime(configuration);
 
         runtime.start();
         for (auto attempt = 0;
@@ -1935,6 +1925,7 @@ final_move_together = true
 
         runtime.stop();
     }
+#endif
 
     void testHomingControllerOwnsBackendNeutralSequence() {
         const auto configuration = fixtureMachineConfiguration();
@@ -2016,10 +2007,11 @@ final_move_together = true
         }
     }
 
-    void testProductionExecutorRuntimeRunsHomingController() {
+#ifdef __linux__
+    void testHostedExecutorRuntimeRunsHomingController() {
         const auto configuration = fixtureMachineConfiguration();
         require(configuration.has_value(), configuration ? "" : configuration.error());
-        ngc::ProductionExecutorRuntime runtime(
+        ngc::HostedExecutorRuntime runtime(
             *configuration,
             std::make_unique<ScheduledTriggerProductionExecutorIo>());
         ngc::HomingController controller(
@@ -2067,6 +2059,7 @@ final_move_together = true
         require(homing->homedJoints == configuredJoints,
                 "production executor runtime should report every configured joint homed");
     }
+#endif
 
     void testMachineSessionOwnsBackendNeutralServiceOperations() {
         const auto configuration = fixtureMachineConfiguration();
@@ -2198,11 +2191,11 @@ final_move_together = true
         const auto root = std::filesystem::temp_directory_path();
         const ngc::ToolTableStorePaths paths {
             .legacy = root / "ngc-legacy-tool-table-test.txt",
-            .real = root / "ngc-real-tool-table-test.txt",
+            .machine = root / "ngc-machine-tool-table-test.txt",
             .simulation = root / "ngc-simulation-tool-table-test.txt",
         };
         std::filesystem::remove(paths.legacy);
-        std::filesystem::remove(paths.real);
+        std::filesystem::remove(paths.machine);
         std::filesystem::remove(paths.simulation);
 
         auto legacy = fixtureToolTable();
@@ -2211,12 +2204,12 @@ final_move_together = true
         require(ngc::migrateLegacyToolTables(paths).has_value(),
                 "legacy tool table should seed both isolated stores");
 
-        ngc::ToolTable real;
+        ngc::ToolTable machine;
         ngc::ToolTable simulation;
-        require(real.load(paths.real).has_value()
+        require(machine.load(paths.machine).has_value()
                 && simulation.load(paths.simulation).has_value(),
                 "both isolated tool tables should load after migration");
-        require(real == legacy && simulation == legacy,
+        require(machine == legacy && simulation == legacy,
                 "legacy migration should preserve complete tool records");
 
         std::filesystem::remove(paths.simulation);
@@ -2224,18 +2217,18 @@ final_move_together = true
                 "a partial isolated-tool-table migration should be rejected");
 
         std::filesystem::remove(paths.legacy);
-        std::filesystem::remove(paths.real);
+        std::filesystem::remove(paths.machine);
     }
 
     void testSimulationG10L11PersistsOnlySimulationToolTable() {
         const auto root = std::filesystem::temp_directory_path();
         const ngc::ToolTableStorePaths paths {
             .legacy = root / "ngc-l11-legacy-tool-table-test.txt",
-            .real = root / "ngc-l11-real-tool-table-test.txt",
+            .machine = root / "ngc-l11-machine-tool-table-test.txt",
             .simulation = root / "ngc-l11-simulation-tool-table-test.txt",
         };
         std::filesystem::remove(paths.legacy);
-        std::filesystem::remove(paths.real);
+        std::filesystem::remove(paths.machine);
         std::filesystem::remove(paths.simulation);
 
         auto initial = fixtureToolTable();
@@ -2270,13 +2263,13 @@ final_move_together = true
                                        : snapshot.error);
         worker.join();
 
-        ngc::ToolTable real;
+        ngc::ToolTable machine;
         ngc::ToolTable simulation;
-        require(real.load(paths.real).has_value()
+        require(machine.load(paths.machine).has_value()
                 && simulation.load(paths.simulation).has_value(),
                 "isolated G10 L11 result tables should load");
-        requireNear(real.get(1)->z, initial.get(1)->z,
-                    "Simulation G10 L11 must not mutate the Real tool table");
+        requireNear(machine.get(1)->z, initial.get(1)->z,
+                    "Simulation G10 L11 must not mutate the Machine tool table");
         requireNear(simulation.get(1)->x, 0.09,
                     "Simulation G10 L11 X calibration should persist");
         requireNear(simulation.get(1)->y, 0.18,
@@ -2287,7 +2280,7 @@ final_move_together = true
                 "Simulation should retain its calibrated table across operation epochs");
 
         std::filesystem::remove(paths.legacy);
-        std::filesystem::remove(paths.real);
+        std::filesystem::remove(paths.machine);
         std::filesystem::remove(paths.simulation);
     }
 
@@ -2326,7 +2319,7 @@ final_move_together = true
     }
 
     void testFeedMotionRequiresFeedrate() {
-        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::RealRun);
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::MachineRun);
         session.setPrograms({ { "G1 X1\n", "missing-feed.ngc" } });
         session.compile([](const auto &callback) { callback(); });
         require(session.compiled(), "missing-feed regression program should compile");
@@ -2338,7 +2331,7 @@ final_move_together = true
     }
 
     void requireInterpreterError(const std::string_view source, const std::string_view expectedText) {
-        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::RealRun);
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::MachineRun);
         session.setPrograms({ { std::string(source), "invalid-code.ngc" } });
         session.compile([](const auto &callback) { callback(); });
         require(session.compiled(), "invalid-code regression program should parse before interpretation");
@@ -3602,7 +3595,7 @@ G1 F60 X2
     }
 
     void testInterpreterStatusMessagesPreserveOrder() {
-        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::RealRun);
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::MachineRun);
         session.setPrograms({ { "print[\"before error\"]\nG1 X1\n", "status-order.ngc" } });
         session.compile([](const auto &callback) { callback(); });
 
@@ -4244,7 +4237,7 @@ G1 F60 X2
 
     void testInterpreterSessionOwnsCompilationAndExecution() {
         const auto synchronize = [](const auto &callback) { callback(); };
-        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::RealRun);
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::MachineRun);
 
         session.setPrograms({ { "G0 X10\nG1 F20 X15\n", "session.ngc" } });
         session.compile(synchronize);
@@ -4320,10 +4313,10 @@ G1 F60 X2
 
         testMode(ngc::InterpretationMode::Preview, 0.0);
         testMode(ngc::InterpretationMode::Simulation, 1.0);
-        testMode(ngc::InterpretationMode::RealRun, 2.0);
+        testMode(ngc::InterpretationMode::MachineRun, 2.0);
 
         const auto requireWriteRejected = [](const std::string_view source) {
-            ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::RealRun);
+            ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::MachineRun);
             compileSession(session, source);
             const auto event = session.next();
             const auto error = std::get_if<ngc::InterpreterError>(&event);
@@ -4340,7 +4333,7 @@ G1 F60 X2
     }
 
     void testIncrementalSessionControlFlow() {
-        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::RealRun);
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::MachineRun);
 
         compileSession(session,
             "if 0 {\n"
@@ -4463,7 +4456,7 @@ G1 F60 X2
         require(probe->stopOnContact(), "G38.3 should stop on contact");
         require(!probe->errorIfNotFound(), "G38.3 should not error when contact is not found");
 
-        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::RealRun);
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::MachineRun);
         compileSession(session, "G38.3 F5 Z-1\nG1 X1\n");
         const auto command = session.next();
         const auto emitted = std::get_if<ngc::MachineCommand>(&command);
@@ -4482,7 +4475,7 @@ G1 F60 X2
     }
 
     void testAutomaticToolChangeReachesProbeBarrier() {
-        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::RealRun);
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::MachineRun);
         session.machine().toolTable()=fixtureToolTable();
         session.setPrograms({
             { std::string(TOOL_CHANGE_FIXTURE), "fixture/tool_change.ngc" },
@@ -6340,14 +6333,15 @@ G1 F60 X2
         });
     }
 
+#ifdef __linux__
     void testProductionExecutorBackendConformance() {
         const auto configuration = fixtureMachineConfiguration();
         require(configuration.has_value(), configuration ? "" : configuration.error());
 
         ngc::test::runBackendConformanceSuite({
-            .name = "ProductionExecutorRuntime",
+            .name = "HostedExecutorRuntime",
             .createRuntime = [configuration = *configuration] {
-                return std::make_unique<ngc::ProductionExecutorRuntime>(
+                return std::make_unique<ngc::HostedExecutorRuntime>(
                     configuration,
                     std::make_unique<ScheduledTriggerProductionExecutorIo>());
             },
@@ -6371,6 +6365,7 @@ G1 F60 X2
             },
         });
     }
+#endif
 
     void testPreparedLineJunctionRetainsExactEndpointCurvature() {
         const ngc::position_t first{-1.0644,13.9651,-0.4068730132094953,0,0,0};
@@ -7542,18 +7537,18 @@ G1 F60 X2
                     && configuration->pendant.velocity.leaseDuration
                         >= configuration->simulation.servoPeriod,
                 "machine configuration should load validated VistaCNC P2-S jog settings");
-        require(configuration->parameterStores.real.filename() == "real_parameters.var"
+        require(configuration->parameterStores.machine.filename() == "machine_parameters.var"
                     && configuration->parameterStores.simulation.filename()
                         == "simulation_parameters.var"
-                    && configuration->parameterStores.real
+                    && configuration->parameterStores.machine
                         != configuration->parameterStores.simulation,
                 "machine configuration should provide isolated typed parameter-store paths");
         require(configuration->toolTableStores.legacy.filename() == "tool_table.txt"
-                    && configuration->toolTableStores.real.filename()
-                        == "real_tool_table.txt"
+                    && configuration->toolTableStores.machine.filename()
+                        == "machine_tool_table.txt"
                     && configuration->toolTableStores.simulation.filename()
                         == "simulation_tool_table.txt"
-                    && configuration->toolTableStores.real
+                    && configuration->toolTableStores.machine
                         != configuration->toolTableStores.simulation,
                 "machine configuration should provide isolated typed tool-table paths");
         const auto repositoryConfiguration =
@@ -7561,23 +7556,23 @@ G1 F60 X2
         require(repositoryConfiguration.has_value(),
                 repositoryConfiguration
                     ? "" : repositoryConfiguration.error());
-        require(repositoryConfiguration->realBackend.has_value()
-                    && repositoryConfiguration->realBackend
+        require(repositoryConfiguration->machineExecutor.has_value()
+                    && repositoryConfiguration->machineExecutor
                            ->executable.is_absolute()
-                    && !repositoryConfiguration->realBackend
+                    && !repositoryConfiguration->machineExecutor
                             ->executable.filename().empty()
-                    && repositoryConfiguration->realBackend
+                    && repositoryConfiguration->machineExecutor
                            ->machineConfiguration.filename()
                         == "machine.toml"
-                    && repositoryConfiguration->realBackend
+                    && repositoryConfiguration->machineExecutor
                            ->backendConfiguration.has_value()
-                    && repositoryConfiguration->realBackend
+                    && repositoryConfiguration->machineExecutor
                            ->backendConfiguration->is_absolute()
-                    && !repositoryConfiguration->realBackend
+                    && !repositoryConfiguration->machineExecutor
                             ->backendConfiguration->filename().empty()
-                    && repositoryConfiguration->realBackend->servoPeriod
+                    && repositoryConfiguration->machineExecutor->servoPeriod
                         == 0.001,
-                "machine configuration should enable a resolved external Real backend");
+                "machine configuration should enable a resolved external Machine executor");
 
         require(!configuration->coordinates.empty(),
                 "machine configuration should load at least one logical coordinate");
@@ -8087,21 +8082,22 @@ int main() {
         testMachineSessionOwnsControllerDataPersistence();
         testMachineSessionManagerOwnsStandaloneSimulation();
         testMachineSessionManagerRoutesDualSessionControl();
-        testMachineSessionManagerBranchesRealIntoIsolatedSimulation();
+        testMachineSessionManagerBranchesMachineIntoIsolatedSimulation();
         testMachineSessionCheckpointRequiresAndCopiesHoming();
         testMachineSessionManagerPublishesOwnedParameterSnapshot();
         testPreviewImportsSelectedPersistentWorkOffsets();
         testMachineSessionViewDerivesOperatorControls();
         testInProcessSimulationRuntimePersistsAcrossTimedEpochs();
-        testProductionExecutorRuntimeOwnsFixedPeriodLifecycle();
-#ifdef _WIN32
-        testProductionExecutorRuntimeUsesBestEffortWindowsHostPolicy();
-#endif
-        testProductionExecutorRuntimePublishesBoundedTiming();
-        testProductionExecutorRuntimeReportsIoFault();
+#ifdef __linux__
+        testHostedExecutorRuntimeOwnsFixedPeriodLifecycle();
+        testHostedExecutorRuntimePublishesBoundedTiming();
+        testHostedExecutorRuntimeReportsIoFault();
         testProductionExecutorTimingBackpressureDoesNotBlockServo();
+#endif
         testHomingControllerOwnsBackendNeutralSequence();
-        testProductionExecutorRuntimeRunsHomingController();
+#ifdef __linux__
+        testHostedExecutorRuntimeRunsHomingController();
+#endif
         testMachineSessionOwnsBackendNeutralServiceOperations();
         testSimulationPersistsCoordinateSystemAtCompletion();
         testToolTableLoadsFinalLineWithoutNewline();
@@ -8191,7 +8187,9 @@ int main() {
         testJogControlUsesBoundedBackendTransport();
         testMockBackendAdvancesOneFixedServoTick();
         testInProcessBackendConformance();
+#ifdef __linux__
         testProductionExecutorBackendConformance();
+#endif
         testExactStopPlannerCompilesLinesAndArcs();
         testInfiniteJerkTrajectoryTimeMatchesAnalyticLine();
         testExactStopPlannerEnforcesIndependentAxisLimits();

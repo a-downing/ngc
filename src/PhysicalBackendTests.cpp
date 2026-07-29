@@ -21,7 +21,7 @@
 #include <unistd.h>
 #endif
 
-#include "machine/PhysicalProductionExecutorIo.h"
+#include "machine/PhysicalExecutorIo.h"
 #include "physical/HuanyangSpindleHardware.h"
 #include "physical/PhysicalBackendConfiguration.h"
 
@@ -297,7 +297,7 @@ namespace {
         auto observation =
             std::make_shared<SpindleObservation>();
         {
-            auto io = ngc::PhysicalProductionExecutorIo(
+            auto io = ngc::PhysicalExecutorIo(
                 std::make_unique<NullMotionIo>(),
                 std::make_unique<ObservedSpindle>(
                     observation));
@@ -342,7 +342,7 @@ namespace {
     void testSpindleCommunicationFailureEstablishesSafeStop() {
         auto observation =
             std::make_shared<SpindleObservation>();
-        auto io = ngc::PhysicalProductionExecutorIo(
+        auto io = ngc::PhysicalExecutorIo(
             std::make_unique<NullMotionIo>(),
             std::make_unique<ObservedSpindle>(
                 observation, true));

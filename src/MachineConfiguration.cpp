@@ -127,9 +127,9 @@ namespace ngc {
             const auto *probing = document["probing"].as_table();
             const auto *joints = document["joints"].as_array();
             const auto *homing = document["homing"].as_table();
-            const auto *realBackendNode = document.get("real_backend");
-            const auto *realBackend =
-                realBackendNode ? realBackendNode->as_table() : nullptr;
+            const auto *machineExecutorNode = document.get("machine_executor");
+            const auto *machineExecutor =
+                machineExecutorNode ? machineExecutorNode->as_table() : nullptr;
             const auto *parameterStoreNode = document.get("parameter_store");
             const auto *parameterStores = parameterStoreNode ? parameterStoreNode->as_table() : nullptr;
             const auto *toolTableStoreNode = document.get("tool_table_store");
@@ -146,9 +146,9 @@ namespace ngc {
             if(!joints || joints->empty())
                 return std::unexpected(configurationError(path, "joints", "must be a non-empty array of tables"));
             if(!homing) return std::unexpected(configurationError(path, "homing", "missing table"));
-            if (realBackendNode && !realBackend) {
+            if (machineExecutorNode && !machineExecutor) {
                 return std::unexpected(configurationError(
-                    path, "real_backend", "must be a table", realBackendNode));
+                    path, "machine_executor", "must be a table", machineExecutorNode));
             }
             if (parameterStoreNode && !parameterStores) {
                 return std::unexpected(configurationError(
@@ -176,12 +176,12 @@ namespace ngc {
                     return std::filesystem::absolute(
                         path.parent_path() / configured).lexically_normal();
                 };
-            result.parameterStores.real = resolveStorePath(result.parameterStores.real);
+            result.parameterStores.machine = resolveStorePath(result.parameterStores.machine);
             result.parameterStores.simulation = resolveStorePath(result.parameterStores.simulation);
             result.toolTableStores.legacy = resolveStorePath(result.toolTableStores.legacy);
-            result.toolTableStores.real = resolveStorePath(result.toolTableStores.real);
+            result.toolTableStores.machine = resolveStorePath(result.toolTableStores.machine);
             result.toolTableStores.simulation = resolveStorePath(result.toolTableStores.simulation);
-            if (realBackend) {
+            if (machineExecutor) {
                 constexpr std::array<std::string_view, 3>
                     backendOwnedFields{
                         "realtime_cpu",
@@ -190,11 +190,11 @@ namespace ngc {
                     };
                 for (const auto field : backendOwnedFields) {
                     if (const auto *misplaced =
-                            realBackend->get(field)) {
+                            machineExecutor->get(field)) {
                         return std::unexpected(
                             configurationError(
                                 path,
-                                "real_backend." + std::string(field),
+                                "machine_executor." + std::string(field),
                                 "belongs in the backend "
                                 "configuration's runtime table",
                                 misplaced));
@@ -202,47 +202,47 @@ namespace ngc {
                 }
 
                 const auto executable = requiredString(
-                    *realBackend, "executable", path);
+                    *machineExecutor, "executable", path);
                 if (!executable) {
                     return std::unexpected(executable.error());
                 }
                 auto backendConfiguration =
                     std::optional<std::filesystem::path>{};
-                if (realBackend->contains("configuration")) {
+                if (machineExecutor->contains("configuration")) {
                     const auto configured = requiredString(
-                        *realBackend, "configuration", path);
+                        *machineExecutor, "configuration", path);
                     if (!configured) {
                         return std::unexpected(configured.error());
                     }
                     backendConfiguration =
                         resolveConfigurationPath(*configured);
                 }
-                auto realServoPeriod = result.simulation.servoPeriod;
-                if (realBackend->contains("servo_period")) {
+                auto machineServoPeriod = result.simulation.servoPeriod;
+                if (machineExecutor->contains("servo_period")) {
                     const auto configured = positiveNumber(
-                        *realBackend, "servo_period", path);
+                        *machineExecutor, "servo_period", path);
                     if (!configured) {
                         return std::unexpected(configured.error());
                     }
-                    realServoPeriod = *configured;
+                    machineServoPeriod = *configured;
                 }
-                result.realBackend = RealBackendConfiguration{
+                result.machineExecutor = MachineExecutorConfiguration{
                     .executable = resolveConfigurationPath(*executable),
                     .machineConfiguration =
                         std::filesystem::absolute(path).lexically_normal(),
                     .backendConfiguration =
                         std::move(backendConfiguration),
-                    .servoPeriod = realServoPeriod,
+                    .servoPeriod = machineServoPeriod,
                 };
             }
             if (parameterStores) {
-                if (const auto configured = parameterStores->get("real")) {
+                if (const auto configured = parameterStores->get("machine")) {
                     const auto value = configured->value<std::string>();
                     if (!value || value->empty()) {
                         return std::unexpected(configurationError(
-                            path, "parameter_store.real", "must be a non-empty path", configured));
+                            path, "parameter_store.machine", "must be a non-empty path", configured));
                     }
-                    result.parameterStores.real = resolveStorePath(*value);
+                    result.parameterStores.machine = resolveStorePath(*value);
                 }
                 if (const auto configured = parameterStores->get("simulation")) {
                     const auto value = configured->value<std::string>();
@@ -262,13 +262,13 @@ namespace ngc {
                     }
                     result.toolTableStores.legacy = resolveStorePath(*value);
                 }
-                if (const auto configured = toolTableStores->get("real")) {
+                if (const auto configured = toolTableStores->get("machine")) {
                     const auto value = configured->value<std::string>();
                     if (!value || value->empty()) {
                         return std::unexpected(configurationError(
-                            path, "tool_table_store.real", "must be a non-empty path", configured));
+                            path, "tool_table_store.machine", "must be a non-empty path", configured));
                     }
-                    result.toolTableStores.real = resolveStorePath(*value);
+                    result.toolTableStores.machine = resolveStorePath(*value);
                 }
                 if (const auto configured = toolTableStores->get("simulation")) {
                     const auto value = configured->value<std::string>();

@@ -20,8 +20,8 @@
 #include "machine/IpcExecutorBridge.h"
 #include "machine/IpcProtocol.h"
 #include "machine/MachineConfiguration.h"
-#include "machine/PhysicalProductionExecutorIo.h"
-#include "machine/ProductionExecutorRuntime.h"
+#include "machine/PhysicalExecutorIo.h"
+#include "machine/HostedExecutorRuntime.h"
 #include "mesa/HostMot2CyclicIo.h"
 #include "mesa/HostMot2Discovery.h"
 #include "mesa/Lbp16UdpTransport.h"
@@ -107,17 +107,17 @@ namespace {
 
     std::uint32_t servoPeriodNanoseconds(
         const ngc::MachineConfiguration &configuration) {
-        if (!configuration.realBackend.has_value()) {
+        if (!configuration.machineExecutor.has_value()) {
             throw std::runtime_error(
-                "machine configuration has no real_backend");
+                "machine configuration has no machine_executor");
         }
         const auto scaled =
-            configuration.realBackend->servoPeriod
+            configuration.machineExecutor->servoPeriod
             * 1'000'000'000.0;
         if (!std::isfinite(scaled) || scaled < 1.0
             || scaled > std::numeric_limits<std::uint32_t>::max()) {
             throw std::runtime_error(
-                "real_backend servo period is outside "
+                "machine_executor servo period is outside "
                 "the supported nanosecond range");
         }
 
@@ -230,7 +230,7 @@ namespace {
         return result;
     }
 
-    std::unique_ptr<ngc::ProductionExecutorRuntime> makeRuntime(
+    std::unique_ptr<ngc::HostedExecutorRuntime> makeRuntime(
         const ngc::MachineConfiguration &machine,
         const ngc::physical::PhysicalBackendConfiguration
             &physical,
@@ -302,14 +302,14 @@ namespace {
             spindle = std::move(*hardware);
         }
         auto io =
-            std::make_unique<ngc::PhysicalProductionExecutorIo>(
+            std::make_unique<ngc::PhysicalExecutorIo>(
                 std::move(*motion), std::move(spindle));
 
         auto runtimeConfiguration =
-            ngc::productionExecutorRuntimeConfiguration(machine);
+            ngc::hostedExecutorRuntimeConfiguration(machine);
         runtimeConfiguration.realtime = physical.runtime;
 
-        return std::make_unique<ngc::ProductionExecutorRuntime>(
+        return std::make_unique<ngc::HostedExecutorRuntime>(
             std::move(runtimeConfiguration), std::move(io));
     }
 
@@ -346,16 +346,11 @@ namespace {
                 "Mesa physical backend requires a configured "
                 "motion.safety enable input");
         }
-#if !defined(__linux__) && !defined(_WIN32)
-        throw std::runtime_error(
-            "the Mesa physical backend requires Linux or Windows");
-#else
         if (!physical->runtime.realtimeEnabled) {
             throw std::runtime_error(
                 "the Mesa physical backend requires configured "
                 "real-time CPU and priority");
         }
-#endif
 
         auto memory = ngc::ipc_detail::SharedMemory::open(
             options.mapping, sizeof(ngc::IpcSharedRegion));

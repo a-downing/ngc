@@ -3,19 +3,19 @@
 ## Purpose
 
 This document records the intended architecture for persistent machine sessions,
-standalone and Real-derived Simulation, and the future physical motion backend.
+standalone and Machine-derived Simulation, and the future physical motion backend.
 It also defines the incremental path from the current standalone
 `MachineSessionManager` design to that architecture.
 
 The design preserves the existing interpretation, prepared-geometry, trajectory
 planning, and bounded `MotionBackend` contracts. It changes how those components
 are owned and how their lifetimes relate to operator power, program execution,
-MDI, Simulation, and Real operation.
+MDI, Simulation, and Machine operation.
 
 ## Core decisions
 
 1. Machine power and program execution are separate lifecycles.
-   - The operator selects Simulation or Real before pressing **On**.
+   - The operator selects Simulation or Machine before pressing **On**.
    - **On** creates or connects the selected machine session and enables it.
    - **Start** begins a program run on the already-powered session.
    - Homing, jogging, MDI, and repeated program runs reuse that session.
@@ -23,11 +23,11 @@ MDI, Simulation, and Real operation.
      lifetime.
 
 2. Simulation is always available.
-   - It does not require a configured, connected, or running Real backend.
+   - It does not require a configured, connected, or running Machine executor.
    - Standalone Simulation begins from typed Simulation startup configuration.
    - Simulation uses an in-process backend and in-process bounded rings.
 
-3. Real operation uses a separate physical-backend executable.
+3. Machine operation uses a separate physical-backend executable.
    - The NGC front end remains NRT.
    - A local shared-memory proxy implements the front end's `MotionBackend`
      endpoint.
@@ -35,34 +35,34 @@ MDI, Simulation, and Real operation.
      Mesa motion and optional spindle hardware roles.
    - The Mesa 7I96 is reached through a dedicated Ethernet interface.
 
-4. A powered, homed, stationary Real session may be used to initialize
+4. A powered, homed, stationary Machine session may be used to initialize
    Simulation.
-   - Real remains online, stationary, and monitored.
-   - Simulation receives a consistent NRT checkpoint of Real state.
+   - Machine remains online, stationary, and monitored.
+   - Simulation receives a consistent NRT checkpoint of Machine state.
    - Simulation subsequently evolves independently.
-   - No simulated command or state change is applied back to Real.
+   - No simulated command or state change is applied back to Machine.
 
-5. Simulation has the same durable state model as the intended Real machine.
+5. Simulation has the same durable state model as the intended physical machine.
    - Persistent parameter cells survive application shutdown and simulated
      power cycles.
    - A complete Simulation tool table survives application shutdown and
-     simulated power cycles independently of the Real tool table.
+     simulated power cycles independently of the Machine tool table.
    - Position, homing, modal state, tool selection, active tool offset, active
      execution, and other controller-runtime state are not durably serialized.
    - A live Simulation session may retain volatile state while it remains
      powered in the current application lifetime.
 
-6. Real and Simulation parameter and tool-table stores are isolated.
-   - Real parameter changes never implicitly mutate Simulation.
-   - Simulation parameter changes never implicitly mutate Real.
-   - Real tool-table changes never implicitly mutate Simulation.
-   - Simulation tool-table changes never implicitly mutate Real.
-   - An explicit **Simulate from Real** operation copies Real's parameter values
+6. Machine and Simulation parameter and tool-table stores are isolated.
+   - Machine parameter changes never implicitly mutate Simulation.
+   - Simulation parameter changes never implicitly mutate Machine.
+   - Machine tool-table changes never implicitly mutate Simulation.
+   - Simulation tool-table changes never implicitly mutate Machine.
+   - An explicit **Simulate from Machine** operation copies Machine's parameter values
      and complete live tool table into Simulation as part of the new checkpoint.
 
 7. Failure is explicit.
-   - RealRun never silently falls back to Simulation.
-   - An unavailable or incompatible physical backend prevents Real power-on.
+   - MachineRun never silently falls back to Simulation.
+   - An unavailable or incompatible physical backend prevents Machine power-on.
    - Bounded-channel exhaustion, invalid state transitions, configuration
      mismatch, lost physical communication, and unproved motion remain fatal to
      the affected operation.
@@ -72,9 +72,9 @@ MDI, Simulation, and Real operation.
 Power, control target, and activity are separate state dimensions.
 
 ```text
-Selected power mode:  Simulation | Real
+Selected power mode:  Simulation | Machine
 Power state:          Off | Starting | On | Stopping | Faulted
-Control target:       Simulation | Real
+Control target:       Simulation | Machine
 Activity:             Idle | Program | MDI | Homing | Jogging |
                       Holding | Stopping | Faulted
 ```
@@ -82,7 +82,7 @@ Activity:             Idle | Program | MDI | Homing | Jogging |
 The ordinary startup flow is:
 
 ```text
-select Simulation or Real
+select Simulation or Machine
     -> On
         -> validate and start/connect the selected session
         -> enable it
@@ -93,31 +93,31 @@ select Simulation or Real
 ```
 
 Changing the selected power mode ordinarily requires going Off. The exception
-is entering Simulation from an already-powered Real session. In that case Real
+is entering Simulation from an already-powered Machine session. In that case Machine
 remains powered and the control target moves to a separately owned Simulation
 session.
 
 The UI must make this state unambiguous, for example:
 
 ```text
-REAL: ON / HOMED / IDLE
+MACHINE: ON / HOMED / IDLE
 CONTROL TARGET: SIMULATION
 ```
 
-When Simulation owns operator control, Real motion-producing requests are
-inhibited. Real continues to report communication, input, E-stop, and fault
+When Simulation owns operator control, Machine motion-producing requests are
+inhibited. Machine continues to report communication, input, E-stop, and fault
 state.
 
 ## Session architecture
 
 ```text
 MachineSessionManager
-|-- optional Real MachineSession
-|   |-- InterpreterSession in RealRun mode
+|-- optional Machine session (`MachineSession`)
+|   |-- InterpreterSession in MachineRun mode
 |   |-- ExecutionCoordinator
 |   |-- HomingController
 |   |-- PresentationTracker
-|   `-- ExternalRealtimeRuntime
+|   `-- ExternalExecutorRuntime
 |       `-- shared-memory MotionBackend proxy
 |
 `-- optional Simulation MachineSession
@@ -136,15 +136,15 @@ The manager owns the available sessions and the current control target. It:
 
 - powers sessions on and off;
 - creates standalone Simulation sessions;
-- creates or rebases Simulation from a stationary Real checkpoint;
-- keeps Real event and snapshot channels serviced while Simulation is active;
+- creates or rebases Simulation from a stationary Machine checkpoint;
+- keeps Machine event and snapshot channels serviced while Simulation is active;
 - routes program, MDI, homing, jogging, hold, resume, and stop requests only to
   the current control target;
-- continuously exposes Real safety and fault state even when Simulation owns
+- continuously exposes Machine safety and fault state even when Simulation owns
   operator control;
-- discards simulated volatile state rather than merging it into Real; and
-- refreshes the UI from a new Real snapshot before returning operator control
-  to Real.
+- discards simulated volatile state rather than merging it into Machine; and
+- refreshes the UI from a new Machine snapshot before returning operator control
+  to Machine.
 
 ### `MachineSession`
 
@@ -168,7 +168,7 @@ checkpoint();
 ```
 
 It owns canonical NRT machine state and accepts an `InterpretationMode` during
-construction. Simulation continues to expose `_task = 1`; RealRun exposes
+construction. Simulation continues to expose `_task = 1`; MachineRun exposes
 `_task = 2`.
 
 A session owns its live parameter bank and complete mutable tool table. Startup
@@ -213,7 +213,7 @@ stateful interpreter operations. `alert[...]` appends a typed persistent
 operator message but does not itself suspend interpretation. M0 publishes a
 program-pause boundary after prior motion and ordered effects; Resume is the
 authoritative continuation action. Geometry-only Preview acknowledges that
-boundary automatically, while Simulation and Real wait for an operator Resume.
+boundary automatically, while Simulation and Machine wait for an operator Resume.
 
 ### `PresentationTracker`
 
@@ -266,18 +266,18 @@ broaden the RT-facing `MotionBackend` contract.
 scheduler, accelerated playback coordination, synthetic input policy, and
 mock-only diagnostics.
 
-`ExternalRealtimeRuntime` owns the local IPC connection and a
+`ExternalExecutorRuntime` owns the local IPC connection and a
 `MotionBackend` proxy. It does not run a local servo loop.
 
-## Real-to-Simulation checkpoint
+## Machine-to-Simulation checkpoint
 
-Entering Simulation from Real is allowed only at a proved quiescent boundary:
+Entering Simulation from Machine is allowed only at a proved quiescent boundary:
 
 - commanded and feedback velocity and acceleration are zero;
 - no program, MDI, probe, homing, or jog owns motion;
 - no feed-hold or stop transition is in progress;
 - no queued execution item or synchronization operation remains; and
-- Real has not faulted or lost position confidence.
+- Machine has not faulted or lost position confidence.
 
 The NRT session manager assembles a consistent in-memory checkpoint from the
 stationary backend snapshot and canonical interpreter state. The checkpoint
@@ -288,7 +288,7 @@ physical point, including:
 - homed-joint state and gantry squaring offsets;
 - canonical parameter values and WCS memory;
 - active tool, tool offset, and modal state where required for MDI continuity;
-- the complete live Real tool table; and
+- the complete live Machine tool table; and
 - current presentation state.
 
 The checkpoint does not contain active RT execution state, queued
@@ -297,15 +297,15 @@ blocks.
 
 After import, Simulation changes only its own state, parameter store, and
 tool-table store. Leaving Simulation never copies its endpoint, homing, tools,
-offsets, parameters, tool-table changes, outputs, or presentation back to Real.
+offsets, parameters, tool-table changes, outputs, or presentation back to Machine.
 
-Real must continue servicing the 7I96 and its watchdog while Simulation is
-active. The front end must also continue draining Real events and snapshots so
-bounded reverse channels cannot fill. A Real fault remains visible and blocks
+Machine must continue servicing the 7I96 and its watchdog while Simulation is
+active. The front end must also continue draining Machine events and snapshots so
+bounded reverse channels cannot fill. A Machine fault remains visible and blocks
 returning operator control until the fault is handled.
 
-A generation-tagged control-authority mechanism should make stale Real commands
-incapable of taking effect after control has moved to Simulation. Real must
+A generation-tagged control-authority mechanism should make stale Machine commands
+incapable of taking effect after control has moved to Simulation. Machine must
 reject new program, MDI, jog, and homing requests while inhibited, while still
 accepting safety, abort, disable, and required supervisory traffic.
 
@@ -324,7 +324,7 @@ in the memory model rather than inferred by persisting every allocated cell.
 
 ### Tool-table scope
 
-Real and Simulation each persist one complete tool table. A tool record keeps
+Machine and Simulation each persist one complete tool table. A tool record keeps
 its identity, XYZABC offsets, diameter, comment, and future tool-geometry fields
 together. Do not split measured offsets into a partial overlay file: doing so
 would require ambiguous merge rules when tools are added, removed, renumbered,
@@ -343,9 +343,9 @@ G52/G92 offset. Unspecified tool fields remain unchanged. Updating a table entry
 does not silently replace an already-applied `G43` offset; the new offset takes
 effect when tool compensation is reapplied.
 
-Real tool calibration saves only the Real table. Simulation tool calibration
+Machine tool calibration saves only the Machine table. Simulation tool calibration
 saves only the Simulation table, including when Simulation was initialized from
-Real. Returning control to Real never applies simulated tool-table changes.
+Machine. Returning control to Machine never applies simulated tool-table changes.
 
 ### Tool-change execution scope
 
@@ -375,12 +375,12 @@ post-routine boundary, after the final spindle stop.
 
 ### Files
 
-Real and Simulation use separate parameter and complete tool-table files:
+Machine and Simulation use separate parameter and complete tool-table files:
 
 ```text
-real_parameters.var
+machine_parameters.var
 simulation_parameters.var
-real_tool_table.txt
+machine_tool_table.txt
 simulation_tool_table.txt
 ```
 
@@ -452,20 +452,20 @@ persistent parameters     <- simulation_parameters.var
 tool table                <- simulation_tool_table.txt
 ```
 
-Real startup:
+Machine startup:
 
 ```text
-volatile controller state <- typed Real startup configuration/backend snapshot
-persistent parameters     <- real_parameters.var
-tool table                <- real_tool_table.txt
+volatile controller state <- typed Machine startup configuration/backend snapshot
+persistent parameters     <- machine_parameters.var
+tool table                <- machine_tool_table.txt
 ```
 
-Real-to-Simulation branching:
+Machine-to-Simulation branching:
 
 ```text
-volatile controller state <- current stationary Real checkpoint
-persistent parameters     <- copy of current Real parameters
-tool table                <- copy of current live Real tool table
+volatile controller state <- current stationary Machine checkpoint
+persistent parameters     <- copy of current Machine parameters
+tool table                <- copy of current live Machine tool table
 future Simulation writes  -> simulation_parameters.var only
 future Simulation edits   -> simulation_tool_table.txt only
 ```
@@ -479,26 +479,26 @@ table.
 `machine.toml` continues to define logical machine behavior:
 
 - units;
-- isolated Real and Simulation parameter-store and complete tool-table paths;
+- isolated Machine and Simulation parameter-store and complete tool-table paths;
 - axes, joints, and topology;
 - motion and trajectory limits;
 - homing behavior;
 - logical digital-input identities;
 - probing input identity;
 - Simulation timing and typed Simulation startup state; and
-- the optional Real backend executable, backend-configuration path, and
-  authoritative Real servo period.
+- the optional Machine executor executable, backend-configuration path, and
+  authoritative Machine servo period.
 
 Illustrative selection:
 
 ```toml
-[real_backend]
+[machine_executor]
 executable = "build/ngc_mesa_backend"
 configuration = "physical_backend.toml"
 servo_period = 0.001
 ```
 
-The entire `[real_backend]` section may be absent. Simulation remains
+The entire `[machine_executor]` section may be absent. Simulation remains
 available. The front end always passes the resolved machine-configuration
 path and, when configured, the resolved backend-configuration path to the
 backend executable. The servo period is part of the shared planning and
@@ -835,13 +835,13 @@ control-target routing without duplicating its proved execution loop.
 ### Phase 2: Implement persistent controller data
 
 Status: implemented in the current application/`MachineSessionManager`.
-The Real parameter and tool-table paths are reserved for
-the future Real session; Simulation does not write them.
+The Machine parameter and tool-table paths are reserved for
+the future Machine session; Simulation does not write them.
 
 - Add explicit iteration/export of eligible persistent `Memory` cells.
 - Implement the strict version-1 parameter parser and serializer.
 - Implement complete validation and atomic replacement.
-- Add separate typed Real and Simulation parameter-store and complete
+- Add separate typed Machine and Simulation parameter-store and complete
   tool-table paths.
 - Load parameters and the session's isolated tool table at startup and save
   mutations at ordered NRT boundaries.
@@ -862,7 +862,7 @@ the future Real session; Simulation does not write them.
 - Test exact floating-point round trips, duplicates, partial input, unit
   mismatch, corruption, failed replacement, volatile-cell exclusion,
   tool-record preservation, `G10 L11`, tool-change modal restoration,
-  operator pause ordering, one-time migration, and Real/Simulation isolation.
+  operator pause ordering, one-time migration, and Machine/Simulation isolation.
 
 ### Phase 3: Extract presentation tracking
 
@@ -941,9 +941,9 @@ and synthetic homing-switch preparation.
 
 ### Phase 6: Introduce `MachineSessionManager`
 
-Status: implemented. Simulation and Real are application-owned through
+Status: implemented. Simulation and Machine are application-owned through
 `MachineSessionManager`; the former `SimulationWorker` facade is removed.
-Hardware-free Real-path coverage uses the test-only IPC peer.
+Hardware-free Machine-path coverage uses the test-only IPC peer.
 The Simulation execution loop and its state now live in a per-session host
 owned behind the manager's target router. The manager exposes available
 targets, generation-tagged control authority, target-routed controller data,
@@ -953,63 +953,63 @@ Stale or wrong-target operations are rejected before changing either session,
 and transfer is rejected unless both the current and destination sessions are
 stationary and idle.
 
-Tests exercise concurrent Simulation and RealRun-mode session ownership through
-both an explicitly test-only in-process Real host and the configured
-`ExternalRealtimeRuntime` process path. They prove authority advancement,
+Tests exercise concurrent Simulation and MachineRun-mode session ownership through
+both an explicitly test-only in-process Machine host and the configured
+`ExternalExecutorRuntime` process path. They prove authority advancement,
 stale-command rejection across actual transfers, independent power and tool
-tables, one-way motion isolation, and a complete Real program epoch through
-shared memory and `ProductionExecutorCore`. `[real_backend]` makes the Windows
-hardware-free peer act as Real only inside the IPC tests; it is not selectable
+tables, one-way motion isolation, and a complete Machine program epoch through
+shared memory and `ProductionExecutorCore`. `[machine_executor]` makes the Linux
+hardware-free peer act as Machine only inside the IPC tests; it is not selectable
 as a product backend. The application configures the Mesa physical process for
-Real, and Real must never fall back to the in-process test host or
+Machine, and Machine must never fall back to the in-process test host or
 `MockMotionBackend`.
 
-- Support standalone Simulation with no `[real_run]` configuration.
-- Support optional Real and Simulation sessions concurrently. Complete across
+- Support standalone Simulation with no `[machine_executor]` configuration.
+- Support optional Machine and Simulation sessions concurrently. Complete across
   the production IPC boundary.
 - Add active-control-target routing and visible dual-session state. Complete
-  for the configured Windows IPC executor.
+  for the configured Linux IPC executor.
 - Add generation-tagged control authority.
-- Keep inactive physical Real events and snapshots drained and faults visible.
+- Keep inactive physical Machine events and snapshots drained and faults visible.
 
-### Phase 7: Add in-memory Real-to-Simulation branching
+### Phase 7: Add in-memory Machine-to-Simulation branching
 
 Status: implemented at the backend-neutral manager and explicitly test-only
 dual-session boundary. `MachineSessionCheckpoint` captures validated stationary
 axis/joint state, homing, canonical position and modal state, persistent
 parameters, presentation, the physical tool and applied offset, and the
-complete live tool table. `MachineSessionManager::simulateFromReal()` requires
-powered, stationary, idle, homed, fault-free Real state and powered-off idle
+complete live tool table. `MachineSessionManager::simulateFromMachine()` requires
+powered, stationary, idle, homed, fault-free Machine state and powered-off idle
 Simulation, persists the copied Simulation parameter and tool-table stores,
 restores the stopped Simulation runtime, powers Simulation, and advances
 generation-tagged control authority. Tests prove one-way state and motion
-isolation and prove that a later Real checkpoint discards prior Simulation
+isolation and prove that a later Machine checkpoint discards prior Simulation
 changes. Application exposure is available through the configured external
-Real session. The explicit Simulate-from-Real GUI action and physical
+Machine session. The explicit Simulate-from-Machine GUI action and physical
 commissioning remain future work; the application must not expose the
 in-process test host.
 
 - Define and validate `MachineSessionCheckpoint`. Complete.
-- Require a stationary, idle Real boundary. Complete at the manager/test-host
+- Require a stationary, idle Machine boundary. Complete at the manager/test-host
   boundary.
-- Import live Real state into a Simulation session. Complete at the
+- Import live Machine state into a Simulation session. Complete at the
   manager/test-host boundary.
-- Copy Real parameters into Simulation's isolated parameter bank. Complete.
-- Copy the complete live Real tool table into Simulation's isolated tool-table
+- Copy Machine parameters into Simulation's isolated parameter bank. Complete.
+- Copy the complete live Machine tool table into Simulation's isolated tool-table
   store. Complete.
 - Prove through tests that simulated programs, MDI, jogging, homing, WCS/tool
-  changes, parameter writes, and tool calibration cannot reach or mutate Real.
+  changes, parameter writes, and tool calibration cannot reach or mutate Machine.
   Program/MDI motion, WCS/parameter, complete tool-table isolation, and
   configured homing-state transfer are covered; post-branch homing, jogging,
   and tool-calibration isolation scenarios remain.
-- Discard Simulation changes when returning to Real and refresh from a new Real
+- Discard Simulation changes when returning to Machine and refresh from a new Machine
   snapshot. Complete at the manager/test-host boundary.
 
 ### Phase 8: Add backend conformance tests
 
 Status: implemented for the current runtime targets. A reusable target-driven
 backend conformance suite runs against both `InProcessSimulationRuntime` and
-`ProductionExecutorRuntime` through only `BackendRuntime` and `MotionBackend`.
+`HostedExecutorRuntime` through only `BackendRuntime` and `MotionBackend`.
 It covers idempotent runtime lifecycle, stationary-state restore gating,
 enable/disable, repeated epochs, dependent publication and retirement, marker
 ordering, triggered joint motion, jogging lease expiry, controlled Stop, abort,
@@ -1023,18 +1023,18 @@ expectations.
   jogging leases, stop/abort, channel capacity, and faults. Complete for the
   current backend-neutral primitive coverage.
 - Run it against the in-process backend and later against the reusable
-  production executor core. Complete through `ProductionExecutorRuntime`.
+  production executor core. Complete through `HostedExecutorRuntime`.
 
 ### Phase 9: Add the IPC skeleton
 
 Status: implemented through a hardware-free executor-in-the-loop test
 checkpoint.
-`ExternalRealtimeRuntime` owns a platform shared-memory mapping, child-process
+`ExternalExecutorRuntime` owns a platform shared-memory mapping, child-process
 lifecycle, and a bounded `MotionBackend` proxy. The test-only
 `ngc_ipc_test_peer` opens the same fixed layout as a separate process, validates
 optional typed machine configuration before advertising readiness, hosts
-`ProductionExecutorRuntime`, and bridges bounded execution items, controls,
-events, and snapshots to the real production executor core without importing
+`HostedExecutorRuntime`, and bridges bounded execution items, controls,
+events, and snapshots to the production executor core without importing
 `MockMotionBackend`. The
 connection validates ABI and payload layout,
 configuration and topology fingerprints, and session, epoch, and control
@@ -1042,12 +1042,9 @@ authority generations before entering Running. Peer loss becomes a bounded
 backend fault after already-published peer events are drained, and an epoch
 interrupted by peer loss cannot be resumed after a fresh connection.
 
-The shared-memory storage and process layer has Windows and POSIX
-implementations and the executor-in-the-loop path is exercised on both
-supported development platforms. The Windows peer uses an ordinary scheduler
-by default and the configured host policy enables best-effort Windows timing.
-On Linux, typed Real-backend configuration can require locked memory, a
-selected CPU, `SCHED_FIFO` priority, and absolute monotonic servo deadlines.
+The shared-memory storage and process layer is Linux-only. Typed Machine
+executor configuration can require locked memory, a selected CPU, `SCHED_FIFO`
+priority, and absolute monotonic servo deadlines.
 The NRT peer host is excluded from the servo CPU before the RT thread starts.
 Any host setup failure rejects startup rather than falling back to ordinary
 scheduling. The test peer uses a hardware-free I/O boundary. A temporary
@@ -1059,65 +1056,17 @@ copy so the fixed transition can be sampled and stopped. These results prove
 functional executor and process behavior rather than hardware safety. The
 production IPC path and configured RT hosting have been validated on the Linux
 RT development host; the Mesa physical transport is implemented separately
-and remains under staged hardware commissioning.
-
-#### Windows timing follow-up
-
-The Windows IPC test peer proves executor and process behavior but is not a
-hard real-time host. With configured host policy,
-`ProductionExecutorRuntime` requests CPU affinity, prefaults its stack,
-requests `THREAD_PRIORITY_TIME_CRITICAL` with priority boosting disabled,
-disables execution-speed throttling, and sleeps toward each absolute deadline
-with a high-resolution waitable timer followed by a short spin. Windows host
-requests are best effort, process-wide memory locking is unavailable, and a
-missed deadline remains diagnostic rather than faulting the executor.
-`WindowsServoPacer` remains a separate Simulation-only implementation.
-
-The Linux RT commissioning work established several distinctions that should
-guide a future Windows timing experiment:
-
-- Measure wake lateness, servo-period jitter, executor duration, and UDP
-  exchange duration separately. Do not infer scheduler behavior from a total
-  cyclic duration.
-- Use one dedicated physical core for the servo thread, leave its SMT sibling
-  idle, and keep NIC interrupts, DPCs, and ordinary work off that core.
-- Validate the production host's high-resolution waitable timer, absolute
-  deadlines, affinity, time-critical priority, and final spin as independent
-  changes. Measure the spin threshold rather than assuming that more busy
-  waiting improves the tail, and evaluate MMCSS separately. Windows still
-  provides no equivalent guarantee to Linux `SCHED_FIFO`.
-- Configure a dedicated Mesa NIC for latency rather than throughput. Measure
-  RSS/interrupt affinity, interrupt moderation, offloads, Energy Efficient
-  Ethernet, and device power saving one change at a time because the available
-  controls are driver-specific.
-- Use a high-performance power policy, avoid core parking on the selected
-  core, prefault fixed cyclic storage and stack, and evaluate `VirtualLock`
-  where its privilege and working-set limits are acceptable.
-- Avoid heavy memory pressure during real-time operation. Trace unexplained
-  tails with ETW/WPR so ISR, DPC, scheduler preemption, hard faults, memory
-  activity, and NIC processing can be distinguished.
-
-Linux `kernel.timer_migration`, PREEMPT_RT hrtimer behavior, IRQ affinity
-files, and `mlockall` are not Windows tuning controls and must not be copied
-literally. Their transferable lesson is to identify where the timer expires
-and which CPU performs every wakeup and network-completion stage.
-
-The corrected Mesa StepGen diagnostic is platform-independent evidence for a
-future Windows run: align accumulator measurements to DPLL latch boundaries,
-report requested-rate error separately from signed DDS quantization, retain
-per-interval deltas, and preserve activation and stop transition travel.
-Without those measurements, an endpoint accounting artifact can be mistaken
-for generated-step following error even when scheduler and UDP timing are
-sound.
+and remains under staged hardware commissioning. `WindowsServoPacer` remains
+a separate Simulation-only implementation.
 
 - Implement fixed shared-memory rings and the physical `MotionBackend` proxy.
   Complete for the transport skeleton.
 - Add ABI, topology, configuration, session, epoch, and authority handshakes.
   Complete.
 - Run a hardware-free test peer using the production IPC path. Complete with
-  the Windows executor-in-the-loop peer.
+  the Linux executor-in-the-loop peer.
 - Test peer death, stale generations, full channels, restart, and refusal to
-  resume interrupted epochs. Complete on Windows.
+  resume interrupted epochs. Complete on Linux.
 
 ### Phase 10: Extract and prove the production executor core
 
@@ -1179,7 +1128,7 @@ Abort, and faults establish the safe spindle output. Focused tests cover
 activation across spans and dependent chunks, hold/Resume, controlled Stop,
 Abort, Disable, and feed-retiming faults.
 
-`ProductionExecutorRuntime` now hosts the core behind `BackendRuntime`. It
+`HostedExecutorRuntime` now hosts the core behind `BackendRuntime`. It
 derives fixed-capacity executor mappings and physical limits from typed machine
 configuration, owns fixed-period ticking and stopped-state synchronous service
 stepping, restores complete stationary axis and joint state only while stopped,
@@ -1200,13 +1149,13 @@ back-to-back catch-up ticks. Each tick measures wake lateness, executor
 duration, deadline slack, missed deadlines, and skipped periods. Fixed-size
 histogram summaries cross a bounded SPSC diagnostic channel every 100 ticks.
 The NRT bridge forwards them through a separate versioned
-shared-memory ring, and the frontend aggregates them into the Real session
+shared-memory ring, and the frontend aggregates them into the Machine session
 snapshot. A full diagnostic channel retains the active aggregate and records
 failed publications without delaying execution; safety faults continue to use
 the executor event path.
 
 The runtime/core combination is hosted by `ngc_ipc_test_peer` for the
-hardware-free Windows and Linux test checkpoints. A fixed pending slot per
+hardware-free Linux test checkpoint. A fixed pending slot per
 channel preserves backpressure between each shared-memory ring and the core's
 bounded channels.
 IPC tests execute a timed `PlanChunk`, an axis-space probe, and joint-space
@@ -1217,7 +1166,7 @@ peer-loss behavior. The executable remains test-only and hardware-free, uses
 a temporary probe-and-homing input shim with otherwise null I/O, and runs
 either an ordinary scheduler thread or the configured Linux RT host. It is not
 exposed as a selectable product backend. The session runtime sends explicit
-Enable and Disable controls at Real power boundaries, and executor epoch Reset
+Enable and Disable controls at Machine power boundaries, and executor epoch Reset
 retains an already-enabled held state.
 
 - Factor reusable allocation-free execution mechanics without importing
@@ -1289,7 +1238,7 @@ retains an already-enabled held state.
   StepGen diagnostic are complete. The initial `ngc_mesa_backend` process
   performs NRT-only machine/physical-backend configuration loading and
   cross-validation, constructs the composed physical I/O adapter, hosts
-  `ProductionExecutorRuntime`
+  `HostedExecutorRuntime`
   behind the production IPC bridge without synthetic inputs, and faults to
   safe outputs when its configured external-enable logical input is outside
   its explicitly configured `high` or `low` active polarity.
@@ -1318,7 +1267,7 @@ retains an already-enabled held state.
 - Verify all independent joints, then coupled gantry motion and squaring.
 - Verify triggered stops, jogging leases, queue-starvation stop, feed hold,
   abort, frontend loss, communication loss, and backend-process loss.
-- Enable complete Real program execution only after every bounded safety and
+- Enable complete Machine program execution only after every bounded safety and
   dynamic proof is exercised.
 
 ### Phase 13: Update durable repository guidance
@@ -1333,20 +1282,20 @@ retains an already-enabled held state.
 ## Required invariants
 
 - Preview remains geometry-only and never constructs a motion backend.
-- Geometry preparation remains identical for Simulation and Real.
-- Simulation works without Real configuration or hardware.
-- RealRun never silently becomes Simulation.
+- Geometry preparation remains identical for Simulation and Machine.
+- Simulation works without Machine configuration or hardware.
+- MachineRun never silently becomes Simulation.
 - Backend selection and power are separate from program Start.
 - A backend persists across program, MDI, homing, and jogging operations while
   its machine session remains powered.
-- Simulated actions cannot publish motion or control mutations to Real.
-- Real remains monitored while Simulation owns operator control.
-- Simulation-to-Real state merge is forbidden.
+- Simulated actions cannot publish motion or control mutations to Machine.
+- Machine remains monitored while Simulation owns operator control.
+- Simulation-to-Machine state merge is forbidden.
 - Only eligible parameters, not volatile controller state, survive shutdown.
-- Real and Simulation parameter files are isolated.
-- Real and Simulation persist isolated complete tool tables.
+- Machine and Simulation parameter files are isolated.
+- Machine and Simulation persist isolated complete tool tables.
 - Tool-table offsets are not split from their owning tool records.
-- Real-to-Simulation tool-table inheritance is explicit and one-way.
+- Machine-to-Simulation tool-table inheritance is explicit and one-way.
 - M6 stops the spindle before `_tool_change`, restores only its typed caller
   modal checkpoint, retains physical/calibration effects, and leaves the
   spindle stopped.

@@ -10,7 +10,7 @@
 #include <thread>
 #include <variant>
 
-#include "machine/ExternalRealtimeRuntime.h"
+#include "machine/ExternalExecutorRuntime.h"
 #include "mesa/MesaProductionExecutorIo.h"
 
 namespace {
@@ -56,7 +56,7 @@ namespace {
     }
 
     ngc::RequestCompleted waitForRequest(
-        ngc::ExternalRealtimeRuntime &runtime,
+        ngc::ExternalExecutorRuntime &runtime,
         const ngc::RequestId request) {
         const auto deadline =
             std::chrono::steady_clock::now() + 5s;
@@ -85,7 +85,7 @@ namespace {
     }
 
     ngc::ExecutionSnapshot waitForState(
-        ngc::ExternalRealtimeRuntime &runtime,
+        ngc::ExternalExecutorRuntime &runtime,
         const ngc::BackendState state) {
         const auto deadline =
             std::chrono::steady_clock::now() + 5s;
@@ -110,7 +110,7 @@ namespace {
     }
 
     ngc::RealtimeTimingSummary waitForTiming(
-        ngc::ExternalRealtimeRuntime &runtime) {
+        ngc::ExternalExecutorRuntime &runtime) {
         const auto deadline =
             std::chrono::steady_clock::now() + 5s;
         while (std::chrono::steady_clock::now() < deadline) {
@@ -128,7 +128,7 @@ namespace {
     }
 
     ngc::ExecutionSnapshot waitForExternalEnableLoss(
-        ngc::ExternalRealtimeRuntime &runtime) {
+        ngc::ExternalExecutorRuntime &runtime) {
         const auto deadline =
             std::chrono::steady_clock::now()
             + std::chrono::minutes(2);
@@ -179,7 +179,7 @@ namespace {
     }
 
     void requireRequest(
-        ngc::ExternalRealtimeRuntime &runtime,
+        ngc::ExternalExecutorRuntime &runtime,
         const ngc::ControlRequest &request,
         const ngc::RequestId id) {
         if (runtime.endpoint().trySubmit(request)
@@ -201,7 +201,7 @@ namespace {
             .epochGeneration = 1,
             .authorityGeneration = 1,
         };
-        auto runtime = ngc::ExternalRealtimeRuntime({
+        auto runtime = ngc::ExternalExecutorRuntime({
             .peerExecutable = std::filesystem::absolute(
                 options.peer),
             .identity = identity,

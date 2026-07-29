@@ -104,22 +104,22 @@ namespace ngc {
     }
 
     std::expected<void, std::string> migrateLegacyToolTables(const ToolTableStorePaths &paths) {
-        std::error_code realError;
+        std::error_code machineError;
         std::error_code simulationError;
         std::error_code legacyError;
-        const auto realExists = std::filesystem::exists(paths.real, realError);
+        const auto machineExists = std::filesystem::exists(paths.machine, machineError);
         const auto simulationExists = std::filesystem::exists(paths.simulation, simulationError);
         const auto legacyExists = std::filesystem::exists(paths.legacy, legacyError);
-        if (realError || simulationError || legacyError) {
-            const auto message = realError ? realError.message()
+        if (machineError || simulationError || legacyError) {
+            const auto message = machineError ? machineError.message()
                 : simulationError ? simulationError.message() : legacyError.message();
             return std::unexpected("failed to inspect tool-table stores: " + message);
         }
-        if (realExists != simulationExists) {
+        if (machineExists != simulationExists) {
             return std::unexpected(
                 "only one isolated tool-table store exists; refusing ambiguous legacy migration");
         }
-        if (realExists) {
+        if (machineExists) {
             return {};
         }
         if (!legacyExists) {
@@ -132,13 +132,13 @@ namespace ngc {
         if (auto loaded = legacy.load(paths.legacy); !loaded) {
             return std::unexpected(loaded.error());
         }
-        if (auto saved = legacy.save(paths.real); !saved) {
+        if (auto saved = legacy.save(paths.machine); !saved) {
             return std::unexpected(std::format(
-                "failed to seed Real tool table: {}", saved.error()));
+                "failed to seed Machine tool table: {}", saved.error()));
         }
         if (auto saved = legacy.save(paths.simulation); !saved) {
             return std::unexpected(std::format(
-                "failed to seed Simulation tool table after Real was seeded: {}", saved.error()));
+                "failed to seed Simulation tool table after Machine was seeded: {}", saved.error()));
         }
 
         return {};

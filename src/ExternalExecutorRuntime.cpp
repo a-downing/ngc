@@ -1,4 +1,4 @@
-#include "machine/ExternalRealtimeRuntime.h"
+#include "machine/ExternalExecutorRuntime.h"
 
 #include <atomic>
 #include <chrono>
@@ -48,7 +48,7 @@ namespace ngc {
         }
     }
 
-    class ExternalRealtimeRuntime::Impl {
+    class ExternalExecutorRuntime::Impl {
         class Endpoint final : public MotionBackend {
         public:
             explicit Endpoint(Impl &owner) : m_owner(owner) { }
@@ -141,7 +141,7 @@ namespace ngc {
         };
 
     public:
-        explicit Impl(ExternalRealtimeRuntimeConfiguration configuration)
+        explicit Impl(ExternalExecutorRuntimeConfiguration configuration)
             : m_configuration(std::move(configuration)), m_endpoint(*this) {
             if (emptyIdentity(m_configuration.peerExpectedIdentity)) {
                 m_configuration.peerExpectedIdentity = m_configuration.identity;
@@ -328,7 +328,7 @@ namespace ngc {
             m_peerLossEventPending = false;
         }
 
-        ExternalRealtimeRuntimeConfiguration m_configuration;
+        ExternalExecutorRuntimeConfiguration m_configuration;
         ipc_detail::SharedMemory m_sharedMemory;
         ipc_detail::ChildProcess m_process;
         IpcSharedRegion *m_region = nullptr;
@@ -341,61 +341,61 @@ namespace ngc {
         bool m_peerLossEventPending = false;
     };
 
-    ExternalRealtimeRuntime::ExternalRealtimeRuntime(
-        ExternalRealtimeRuntimeConfiguration configuration)
+    ExternalExecutorRuntime::ExternalExecutorRuntime(
+        ExternalExecutorRuntimeConfiguration configuration)
         : m_impl(std::make_unique<Impl>(std::move(configuration))) { }
 
-    ExternalRealtimeRuntime::~ExternalRealtimeRuntime() = default;
+    ExternalExecutorRuntime::~ExternalExecutorRuntime() = default;
 
-    MotionBackend &ExternalRealtimeRuntime::endpoint() noexcept {
+    MotionBackend &ExternalExecutorRuntime::endpoint() noexcept {
         return m_impl->endpoint();
     }
 
-    void ExternalRealtimeRuntime::start() {
+    void ExternalExecutorRuntime::start() {
         m_impl->start();
     }
 
-    void ExternalRealtimeRuntime::stop() {
+    void ExternalExecutorRuntime::stop() {
         m_impl->stop();
     }
 
-    BackendCapabilities ExternalRealtimeRuntime::capabilities() const noexcept {
+    BackendCapabilities ExternalExecutorRuntime::capabilities() const noexcept {
         return {};
     }
 
-    bool ExternalRealtimeRuntime::restoreStationaryState(
+    bool ExternalExecutorRuntime::restoreStationaryState(
         const StationaryBackendState &) noexcept {
         return false;
     }
 
-    bool ExternalRealtimeRuntime::prepareTriggeredJointMove(
+    bool ExternalExecutorRuntime::prepareTriggeredJointMove(
         const TriggeredJointMove &) noexcept {
         return m_impl->connected();
     }
 
-    void ExternalRealtimeRuntime::serviceImmediate() {
+    void ExternalExecutorRuntime::serviceImmediate() {
         m_impl->serviceImmediate();
     }
 
-    std::uint64_t ExternalRealtimeRuntime::advanceServiceMotionPeriod() {
+    std::uint64_t ExternalExecutorRuntime::advanceServiceMotionPeriod() {
         m_impl->serviceImmediate();
 
         return 0;
     }
 
-    void ExternalRealtimeRuntime::waitForServiceMotion() {
+    void ExternalExecutorRuntime::waitForServiceMotion() {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
     }
 
-    bool ExternalRealtimeRuntime::connected() const noexcept {
+    bool ExternalExecutorRuntime::connected() const noexcept {
         return m_impl->connected();
     }
 
-    IpcRejection ExternalRealtimeRuntime::lastRejection() const noexcept {
+    IpcRejection ExternalExecutorRuntime::lastRejection() const noexcept {
         return m_impl->lastRejection();
     }
 
-    bool ExternalRealtimeRuntime::tryTakeRealtimeTiming(
+    bool ExternalExecutorRuntime::tryTakeRealtimeTiming(
         RealtimeTimingSummary &summary) noexcept {
         return m_impl->tryTakeRealtimeTiming(summary);
     }

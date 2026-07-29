@@ -5,7 +5,7 @@
 namespace ngc {
     enum class MachineControlTarget {
         Simulation,
-        Real,
+        Machine,
     };
 
     struct MachineControlAuthority {
@@ -18,6 +18,6 @@ namespace ngc {
     struct MachineSessionManagerState {
         MachineControlAuthority authority;
         bool simulationAvailable = true;
-        bool realAvailable = false;
+        bool machineAvailable = false;
     };
 }

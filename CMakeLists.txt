@@ -45,19 +45,14 @@ add_library(ngc_core STATIC
         src/ArcInterpolation.cpp
         src/DigitalIoProgram.cpp
         src/ExecutionItemOperations.cpp
-        src/ExternalRealtimeRuntime.cpp
         src/HomingController.cpp
         src/InfiniteJerkTrajectoryTime.cpp
         src/InProcessSimulationRuntime.cpp
-        src/IpcExecutorBridge.cpp
-        src/IpcPlatform.cpp
         src/JoggingController.cpp
         src/MachineSession.cpp
         src/MachineConfiguration.cpp
         src/ProgramExecutionController.cpp
         src/ProductionExecutorCore.cpp
-        src/ProductionExecutorRuntime.cpp
-        src/RealtimeHost.cpp
         src/PreparedGeometry.cpp
         src/SplineReconstruction.cpp
         src/TrajectoryCompiler.cpp
@@ -65,63 +60,70 @@ add_library(ngc_core STATIC
         src/Machine.cpp
         src/MockMotionBackend.cpp
         src/ParameterStore.cpp
-        src/PhysicalProductionExecutorIo.cpp
         src/PresentationTracker.cpp
-        src/SpindleHardware.cpp
         src/ToolTable.cpp)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    target_sources(ngc_core PRIVATE
+        src/ExternalExecutorRuntime.cpp
+        src/IpcExecutorBridge.cpp
+        src/IpcPlatform.cpp
+        src/PhysicalExecutorIo.cpp
+        src/HostedExecutorRuntime.cpp
+        src/RealtimeHost.cpp
+        src/SpindleHardware.cpp)
+endif()
 target_include_directories(ngc_core PUBLIC src/include)
 target_link_libraries(ngc_core
     PUBLIC ruckig::ruckig
     PRIVATE PathTempo::PathTempo ngc_configuration)
 ngc_target_defaults(ngc_core)
 
-add_library(ngc_mesa STATIC
-        src/mesa/HostMot2CyclicIo.cpp
-        src/mesa/HostMot2Discovery.cpp
-        src/mesa/HostMot2Latency.cpp
-        src/mesa/Lbp16CyclicTransaction.cpp
-        src/mesa/Lbp16UdpTransport.cpp
-        src/mesa/SevenI96Capabilities.cpp
-        src/mesa/SevenI96CyclicLayout.cpp)
-target_include_directories(ngc_mesa PUBLIC src/include)
-if(WIN32)
-    target_link_libraries(ngc_mesa PRIVATE ws2_32)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_library(ngc_mesa STATIC
+            src/mesa/HostMot2CyclicIo.cpp
+            src/mesa/HostMot2Discovery.cpp
+            src/mesa/HostMot2Latency.cpp
+            src/mesa/Lbp16CyclicTransaction.cpp
+            src/mesa/Lbp16UdpTransport.cpp
+            src/mesa/SevenI96Capabilities.cpp
+            src/mesa/SevenI96CyclicLayout.cpp)
+    target_include_directories(ngc_mesa PUBLIC src/include)
+    ngc_target_defaults(ngc_mesa)
+
+    add_library(ngc_mesa_executor STATIC
+            src/mesa/MesaProductionExecutorIo.cpp)
+    target_include_directories(ngc_mesa_executor PUBLIC src/include)
+    target_link_libraries(ngc_mesa_executor PUBLIC ngc_core ngc_mesa)
+    ngc_target_defaults(ngc_mesa_executor)
+
+    add_library(ngc_mesa_configuration STATIC
+            src/mesa/MesaBackendConfiguration.cpp)
+    target_include_directories(
+            ngc_mesa_configuration PUBLIC src/include)
+    target_link_libraries(
+            ngc_mesa_configuration
+            PUBLIC ngc_mesa ngc_configuration)
+    ngc_target_defaults(ngc_mesa_configuration)
+
+    add_library(ngc_physical_configuration STATIC
+            src/physical/PhysicalBackendConfiguration.cpp)
+    target_include_directories(
+            ngc_physical_configuration PUBLIC src/include)
+    target_link_libraries(
+            ngc_physical_configuration
+            PUBLIC ngc_mesa_configuration ngc_configuration)
+    ngc_target_defaults(ngc_physical_configuration)
+
+    add_library(ngc_spindle_huanyang STATIC
+            src/physical/HuanyangSpindleHardware.cpp
+            src/physical/SerialTransport.cpp)
+    target_include_directories(
+            ngc_spindle_huanyang PUBLIC src/include)
+    target_link_libraries(
+            ngc_spindle_huanyang
+            PUBLIC ngc_core ngc_physical_configuration)
+    ngc_target_defaults(ngc_spindle_huanyang)
 endif()
-ngc_target_defaults(ngc_mesa)
-
-add_library(ngc_mesa_executor STATIC
-        src/mesa/MesaProductionExecutorIo.cpp)
-target_include_directories(ngc_mesa_executor PUBLIC src/include)
-target_link_libraries(ngc_mesa_executor PUBLIC ngc_core ngc_mesa)
-ngc_target_defaults(ngc_mesa_executor)
-
-add_library(ngc_mesa_configuration STATIC
-        src/mesa/MesaBackendConfiguration.cpp)
-target_include_directories(
-        ngc_mesa_configuration PUBLIC src/include)
-target_link_libraries(
-        ngc_mesa_configuration
-        PUBLIC ngc_mesa ngc_configuration)
-ngc_target_defaults(ngc_mesa_configuration)
-
-add_library(ngc_physical_configuration STATIC
-        src/physical/PhysicalBackendConfiguration.cpp)
-target_include_directories(
-        ngc_physical_configuration PUBLIC src/include)
-target_link_libraries(
-        ngc_physical_configuration
-        PUBLIC ngc_mesa_configuration ngc_configuration)
-ngc_target_defaults(ngc_physical_configuration)
-
-add_library(ngc_spindle_huanyang STATIC
-        src/physical/HuanyangSpindleHardware.cpp
-        src/physical/SerialTransport.cpp)
-target_include_directories(
-        ngc_spindle_huanyang PUBLIC src/include)
-target_link_libraries(
-        ngc_spindle_huanyang
-        PUBLIC ngc_core ngc_physical_configuration)
-ngc_target_defaults(ngc_spindle_huanyang)
 
 add_library(ngc_operator STATIC
         src/operator/OperatorJogController.cpp
@@ -181,121 +183,123 @@ target_link_libraries(ngc_tests PRIVATE ngc_core glm::glm-header-only PathTempo:
 ngc_target_defaults(ngc_tests)
 add_test(NAME ngc_tests COMMAND ngc_tests)
 
-add_executable(ngc_production_executor_tests
-    src/ProductionExecutorCoreTests.cpp
-)
-target_link_libraries(ngc_production_executor_tests PRIVATE ngc_core)
-ngc_target_defaults(ngc_production_executor_tests)
-add_test(NAME ngc_production_executor_tests COMMAND ngc_production_executor_tests)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(ngc_production_executor_tests
+        src/ProductionExecutorCoreTests.cpp
+    )
+    target_link_libraries(ngc_production_executor_tests PRIVATE ngc_core)
+    ngc_target_defaults(ngc_production_executor_tests)
+    add_test(NAME ngc_production_executor_tests COMMAND ngc_production_executor_tests)
 
-add_executable(ngc_mesa_tests src/MesaHostMot2Tests.cpp)
-target_compile_definitions(
-    ngc_mesa_tests PRIVATE NGC_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-target_link_libraries(
-    ngc_mesa_tests PRIVATE
-    ngc_mesa_executor ngc_mesa_configuration)
-ngc_target_defaults(ngc_mesa_tests)
-add_test(NAME ngc_mesa_tests COMMAND ngc_mesa_tests)
+    add_executable(ngc_mesa_tests src/MesaHostMot2Tests.cpp)
+    target_compile_definitions(
+        ngc_mesa_tests PRIVATE NGC_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    target_link_libraries(
+        ngc_mesa_tests PRIVATE
+        ngc_mesa_executor ngc_mesa_configuration)
+    ngc_target_defaults(ngc_mesa_tests)
+    add_test(NAME ngc_mesa_tests COMMAND ngc_mesa_tests)
 
-add_executable(
-    ngc_physical_backend_tests
-    src/PhysicalBackendTests.cpp)
-target_compile_definitions(
-    ngc_physical_backend_tests
-    PRIVATE NGC_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
-target_link_libraries(
-    ngc_physical_backend_tests
-    PRIVATE ngc_spindle_huanyang)
-ngc_target_defaults(ngc_physical_backend_tests)
-add_test(
-    NAME ngc_physical_backend_tests
-    COMMAND ngc_physical_backend_tests)
+    add_executable(
+        ngc_physical_backend_tests
+        src/PhysicalBackendTests.cpp)
+    target_compile_definitions(
+        ngc_physical_backend_tests
+        PRIVATE NGC_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+    target_link_libraries(
+        ngc_physical_backend_tests
+        PRIVATE ngc_spindle_huanyang)
+    ngc_target_defaults(ngc_physical_backend_tests)
+    add_test(
+        NAME ngc_physical_backend_tests
+        COMMAND ngc_physical_backend_tests)
 
-add_executable(ngc_ipc_test_peer tools/ngc_ipc_test_peer.cpp)
-target_include_directories(ngc_ipc_test_peer PRIVATE src)
-target_link_libraries(ngc_ipc_test_peer PRIVATE ngc_core)
-ngc_target_defaults(ngc_ipc_test_peer)
-if(NOT WIN32)
+    add_executable(ngc_ipc_test_peer tools/ngc_ipc_test_peer.cpp)
+    target_include_directories(ngc_ipc_test_peer PRIVATE src)
+    target_link_libraries(ngc_ipc_test_peer PRIVATE ngc_core)
+    ngc_target_defaults(ngc_ipc_test_peer)
     set_target_properties(ngc_ipc_test_peer PROPERTIES SUFFIX ".exe")
-endif()
-add_test(
-    NAME ngc_ipc_test_peer_configuration
-    COMMAND ngc_ipc_test_peer
-        --machine-configuration ${CMAKE_SOURCE_DIR}/machine.toml
-        --backend-configuration
-            ${CMAKE_SOURCE_DIR}/ipc_test_peer.toml
-        --validate-config-only)
+    add_test(
+        NAME ngc_ipc_test_peer_configuration
+        COMMAND ngc_ipc_test_peer
+            --machine-configuration ${CMAKE_SOURCE_DIR}/machine.toml
+            --backend-configuration
+                ${CMAKE_SOURCE_DIR}/ipc_test_peer.toml
+            --validate-config-only)
 
-add_executable(ngc_ipc_tests src/IpcTests.cpp)
-target_include_directories(ngc_ipc_tests PRIVATE src)
-target_link_libraries(ngc_ipc_tests PRIVATE ngc_core)
-ngc_target_defaults(ngc_ipc_tests)
-add_test(NAME ngc_ipc_tests COMMAND ngc_ipc_tests $<TARGET_FILE:ngc_ipc_test_peer>)
-set_tests_properties(ngc_ipc_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+    add_executable(ngc_ipc_tests src/IpcTests.cpp)
+    target_include_directories(ngc_ipc_tests PRIVATE src)
+    target_link_libraries(ngc_ipc_tests PRIVATE ngc_core)
+    ngc_target_defaults(ngc_ipc_tests)
+    add_test(NAME ngc_ipc_tests COMMAND ngc_ipc_tests $<TARGET_FILE:ngc_ipc_test_peer>)
+    set_tests_properties(ngc_ipc_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+endif()
 
 add_executable(ngc_simulation_diagnostic tools/ngc_simulation_diagnostic.cpp)
 target_include_directories(ngc_simulation_diagnostic PRIVATE src)
 target_link_libraries(ngc_simulation_diagnostic PRIVATE ngc_core)
 ngc_target_defaults(ngc_simulation_diagnostic)
 
-add_executable(ngc_mesa_discover tools/ngc_mesa_discover.cpp)
-target_link_libraries(ngc_mesa_discover PRIVATE ngc_mesa)
-ngc_target_defaults(ngc_mesa_discover)
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(ngc_mesa_discover tools/ngc_mesa_discover.cpp)
+    target_link_libraries(ngc_mesa_discover PRIVATE ngc_mesa)
+    ngc_target_defaults(ngc_mesa_discover)
 
-add_executable(ngc_mesa_latency tools/ngc_mesa_latency.cpp)
-target_link_libraries(ngc_mesa_latency PRIVATE ngc_mesa)
-ngc_target_defaults(ngc_mesa_latency)
+    add_executable(ngc_mesa_latency tools/ngc_mesa_latency.cpp)
+    target_link_libraries(ngc_mesa_latency PRIVATE ngc_mesa)
+    ngc_target_defaults(ngc_mesa_latency)
 
-add_executable(
-    ngc_mesa_stepgen_diagnostic
-    tools/ngc_mesa_stepgen_diagnostic.cpp)
-target_link_libraries(
-    ngc_mesa_stepgen_diagnostic
-    PRIVATE ngc_core ngc_mesa_configuration)
-ngc_target_defaults(ngc_mesa_stepgen_diagnostic)
+    add_executable(
+        ngc_mesa_stepgen_diagnostic
+        tools/ngc_mesa_stepgen_diagnostic.cpp)
+    target_link_libraries(
+        ngc_mesa_stepgen_diagnostic
+        PRIVATE ngc_core ngc_mesa_configuration)
+    ngc_target_defaults(ngc_mesa_stepgen_diagnostic)
 
-add_executable(
-    ngc_mesa_io_program_benchmark
-    tools/ngc_mesa_io_program_benchmark.cpp)
-target_link_libraries(
-    ngc_mesa_io_program_benchmark
-    PRIVATE ngc_mesa_executor ngc_physical_configuration)
-ngc_target_defaults(ngc_mesa_io_program_benchmark)
+    add_executable(
+        ngc_mesa_io_program_benchmark
+        tools/ngc_mesa_io_program_benchmark.cpp)
+    target_link_libraries(
+        ngc_mesa_io_program_benchmark
+        PRIVATE ngc_mesa_executor ngc_physical_configuration)
+    ngc_target_defaults(ngc_mesa_io_program_benchmark)
 
-add_executable(
-    ngc_huanyang_spindle_diagnostic
-    tools/ngc_huanyang_spindle_diagnostic.cpp)
-target_link_libraries(
-    ngc_huanyang_spindle_diagnostic
-    PRIVATE ngc_spindle_huanyang)
-ngc_target_defaults(ngc_huanyang_spindle_diagnostic)
-add_test(
-    NAME ngc_huanyang_spindle_configuration
-    COMMAND ngc_huanyang_spindle_diagnostic
-        --backend-configuration
-            ${CMAKE_SOURCE_DIR}/physical_backend.toml
-        --validate-config-only)
+    add_executable(
+        ngc_huanyang_spindle_diagnostic
+        tools/ngc_huanyang_spindle_diagnostic.cpp)
+    target_link_libraries(
+        ngc_huanyang_spindle_diagnostic
+        PRIVATE ngc_spindle_huanyang)
+    ngc_target_defaults(ngc_huanyang_spindle_diagnostic)
+    add_test(
+        NAME ngc_huanyang_spindle_configuration
+        COMMAND ngc_huanyang_spindle_diagnostic
+            --backend-configuration
+                ${CMAKE_SOURCE_DIR}/physical_backend.toml
+            --validate-config-only)
 
-add_executable(ngc_mesa_backend tools/ngc_mesa_backend.cpp)
-target_include_directories(ngc_mesa_backend PRIVATE src)
-target_link_libraries(
-    ngc_mesa_backend
-    PRIVATE ngc_mesa_executor ngc_spindle_huanyang)
-ngc_target_defaults(ngc_mesa_backend)
-add_test(
-    NAME ngc_mesa_backend_configuration
-    COMMAND ngc_mesa_backend
-        --machine-configuration ${CMAKE_SOURCE_DIR}/machine.toml
-        --backend-configuration
-            ${CMAKE_SOURCE_DIR}/physical_backend.toml
-        --validate-config-only)
+    add_executable(ngc_mesa_backend tools/ngc_mesa_backend.cpp)
+    target_include_directories(ngc_mesa_backend PRIVATE src)
+    target_link_libraries(
+        ngc_mesa_backend
+        PRIVATE ngc_mesa_executor ngc_spindle_huanyang)
+    ngc_target_defaults(ngc_mesa_backend)
+    add_test(
+        NAME ngc_mesa_backend_configuration
+        COMMAND ngc_mesa_backend
+            --machine-configuration ${CMAKE_SOURCE_DIR}/machine.toml
+            --backend-configuration
+                ${CMAKE_SOURCE_DIR}/physical_backend.toml
+            --validate-config-only)
 
-add_executable(
-    ngc_mesa_backend_smoke
-    tools/ngc_mesa_backend_smoke.cpp)
-target_link_libraries(
-    ngc_mesa_backend_smoke PRIVATE ngc_core)
-ngc_target_defaults(ngc_mesa_backend_smoke)
+    add_executable(
+        ngc_mesa_backend_smoke
+        tools/ngc_mesa_backend_smoke.cpp)
+    target_link_libraries(
+        ngc_mesa_backend_smoke PRIVATE ngc_core)
+    ngc_target_defaults(ngc_mesa_backend_smoke)
+endif()
 
 add_executable(ngc_g64_geometry_export tools/ngc_g64_geometry_export.cpp)
 target_include_directories(ngc_g64_geometry_export PRIVATE src)

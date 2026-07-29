@@ -34,7 +34,7 @@ namespace ngc::gui {
         bool canStop = false;
     };
 
-    struct SimulateFromRealControl {
+    struct SimulateFromMachineControl {
         bool available = false;
         std::string_view unavailableReason;
     };
@@ -42,7 +42,7 @@ namespace ngc::gui {
     constexpr std::string_view controlTargetName(const MachineControlTarget target) noexcept {
         switch (target) {
             case MachineControlTarget::Simulation: return "Simulation";
-            case MachineControlTarget::Real: return "Real";
+            case MachineControlTarget::Machine: return "Machine";
         }
 
         return "Unknown";
@@ -52,7 +52,7 @@ namespace ngc::gui {
             const MachineSessionManagerState &state, const MachineControlTarget target) noexcept {
         switch (target) {
             case MachineControlTarget::Simulation: return state.simulationAvailable;
-            case MachineControlTarget::Real: return state.realAvailable;
+            case MachineControlTarget::Machine: return state.machineAvailable;
         }
 
         return false;
@@ -66,35 +66,35 @@ namespace ngc::gui {
 
         switch (target) {
             case MachineControlTarget::Simulation:
-                return "The Simulation machine session is not configured.";
-            case MachineControlTarget::Real:
-                return "The Real machine session is not configured.";
+                return "The Simulation session is not configured.";
+            case MachineControlTarget::Machine:
+                return "The Machine session is not configured.";
         }
 
         return "The machine session is not available.";
     }
 
-    inline SimulateFromRealControl simulateFromRealControl(
+    inline SimulateFromMachineControl simulateFromMachineControl(
             const MachineSessionManagerState &state,
             const std::optional<SimulationSnapshot> &simulationSession,
-            const std::optional<MachineSessionSnapshot> &realSession,
+            const std::optional<MachineSessionSnapshot> &machineSession,
             const JointMask configuredJoints) noexcept {
-        if (!state.realAvailable || !realSession) {
+        if (!state.machineAvailable || !machineSession) {
             return {
                 false,
-                "The Real machine session is not configured.",
+                "The Machine session is not configured.",
             };
         }
         if (!state.simulationAvailable || !simulationSession) {
             return {
                 false,
-                "The Simulation machine session is not configured.",
+                "The Simulation session is not configured.",
             };
         }
-        if (state.authority.target != MachineControlTarget::Real) {
+        if (state.authority.target != MachineControlTarget::Machine) {
             return {
                 false,
-                "Select the Real control target before creating a Simulation checkpoint.",
+                "Select the Machine control target before creating a Simulation checkpoint.",
             };
         }
 
@@ -107,39 +107,39 @@ namespace ngc::gui {
             };
         }
 
-        const auto &real = *realSession;
-        if (real.powerState != MachinePowerState::On) {
+        const auto &machine = *machineSession;
+        if (machine.powerState != MachinePowerState::On) {
             return {
                 false,
-                "Real must be powered on.",
+                "Machine must be powered on.",
             };
         }
-        if (real.machineActivity != MachineActivity::Idle) {
+        if (machine.machineActivity != MachineActivity::Idle) {
             return {
                 false,
-                "Real must be idle.",
+                "Machine must be idle.",
             };
         }
-        if (real.trajectoryBackendState == BackendState::Faulted
-            || real.trajectoryBackendFaultCode != 0) {
+        if (machine.trajectoryBackendState == BackendState::Faulted
+            || machine.trajectoryBackendFaultCode != 0) {
             return {
                 false,
-                "Real must be fault-free.",
+                "Machine must be fault-free.",
             };
         }
-        if (real.hasActiveMotion
-            || real.trajectoryBackendQueuedExecutionItems != 0
-            || real.trajectoryBackendVelocity > 1e-9
-            || real.trajectoryBackendAcceleration > 1e-9) {
+        if (machine.hasActiveMotion
+            || machine.trajectoryBackendQueuedExecutionItems != 0
+            || machine.trajectoryBackendVelocity > 1e-9
+            || machine.trajectoryBackendAcceleration > 1e-9) {
             return {
                 false,
-                "Real must be stationary with no queued execution items.",
+                "Machine must be stationary with no queued execution items.",
             };
         }
-        if ((real.homedJoints & configuredJoints) != configuredJoints) {
+        if ((machine.homedJoints & configuredJoints) != configuredJoints) {
             return {
                 false,
-                "Every configured Real joint must be homed.",
+                "Every configured Machine joint must be homed.",
             };
         }
 

@@ -11,11 +11,11 @@ exists. Completed claims must be verified against the current code and tests.
 
 ## Current mismatch
 
-The application owns Simulation and the configured Mesa Real session through
+The application owns Simulation and the configured Mesa Machine session through
 `MachineSessionManager`, presents their backend-neutral power and activity
 state, and exposes the powered-session lifecycle explicitly. Phases 1 through
 6 are complete. The remaining mismatch is physical commissioning, not a
-second selectable backend. The GUI exposes the manager's Real-to-Simulation
+second selectable backend. The GUI exposes the manager's Machine-to-Simulation
 checkpoint operation with state-derived availability and precise rejection
 feedback.
 
@@ -40,7 +40,7 @@ Preview remains a geometry and source-inspection workflow. It must not be
 presented as the current state of the controlled machine.
 
 The initial implementation may expose only Simulation as an available control
-target. It should still show that target explicitly so adding Real does not
+target. It should still show that target explicitly so adding Machine does not
 require another conceptual redesign.
 
 ## Proposed layout
@@ -55,11 +55,11 @@ Keep a compact, always-visible header containing:
 - homing summary;
 - prominent fault or inhibited state.
 
-When Real support is added, the header must make concurrent state unambiguous.
+When Machine support is added, the header must make concurrent state unambiguous.
 For example:
 
 ```text
-REAL: ON / HOMED / IDLE
+MACHINE: ON / HOMED / IDLE
 CONTROL TARGET: SIMULATION
 SIMULATION: ON / PROGRAM
 ```
@@ -76,7 +76,7 @@ Disabled controls should provide a concise reason in a tooltip. Examples:
 - `Program currently owns motion.`
 - `Waiting for feed-hold acknowledgement.`
 - `Axis X must be homed before logical-axis jogging.`
-- `The Real machine session is not configured.`
+- `The Machine session is not configured.`
 
 ### DRO and motion pane
 
@@ -230,7 +230,7 @@ inhibition.
 - Label the active store, initially **Simulation Parameters**.
 - Label the tool-table editor with its owning session.
 - Disable edits while the owning session cannot accept them and explain why.
-- Preserve the independent Simulation and Real persistence paths.
+- Preserve the independent Simulation and Machine persistence paths.
 
 Acceptance criteria:
 
@@ -296,35 +296,36 @@ Acceptance criteria:
 - Power transitions expose Starting, Stopping, and Faulted states.
 - No GUI action bypasses `MachineSessionManager` control authority.
 
-### Phase 7: Prepare for Real and control transfer
+### Phase 7: Prepare for Machine and control transfer
 
 Status: in progress. The standalone application presents an explicit
-Simulation/Real selector and simultaneous live session rows. `[real_backend]`
-enables Real through `ExternalRealtimeRuntime` and `ngc_mesa_backend`; selecting
-and powering Real runs program motion through the production IPC and executor
+Simulation/Machine selector and simultaneous live session rows. On Linux,
+`[machine_executor]` enables Machine through `ExternalExecutorRuntime` and
+`ngc_mesa_backend`; selecting
+and powering Machine runs program motion through the production IPC and executor
 path. The GUI tags target-dependent motion and controller-data operations with
 current authority, switches live tool-table ownership and isolated stores with
 the target, and rejects stale generations or wrong targets before admission.
 Mock scheduler diagnostics and accelerated playback remain Simulation-only.
 The manager's target router and checkpoint boundary remain covered by the
-explicit in-process test host, while IPC tests cover a complete configured Real
+explicit in-process test host, while IPC tests cover a complete configured Machine
 program epoch through `ngc_ipc_test_peer`. The GUI exposes **Simulate from
-Real** only while Real control,
+Machine** only while Machine control,
 power, stationary idle state, fault-free state, and homing plus powered-off
 idle Simulation state satisfy the visible checkpoint prerequisites. Physical
 safety/I/O state remains unfinished.
 
-Implement this phase with the corresponding Real-session manager work.
+Implement this phase with the corresponding Machine-session manager work.
 
-- Add the Simulation/Real target selector.
+- Add the Simulation/Machine target selector.
 - Disable unavailable targets with a precise explanation.
-- Display both sessions when Real remains powered while Simulation owns
+- Display both sessions when Machine remains powered while Simulation owns
   control.
 - Tag GUI commands with current control authority where required so stale
   commands cannot reach a newly selected target. Complete for the standalone
   Simulation manager boundary and dual-session manager tests.
-- Keep inactive Real safety, communication, E-stop, and fault state visible.
-- Add the explicit **Simulate from Real** checkpoint operation. Complete; its
+- Keep inactive Machine safety, communication, E-stop, and fault state visible.
+- Add the explicit **Simulate from Machine** checkpoint operation. Complete; its
   quiescence and validation contract remains authoritative at the manager
   boundary.
 
@@ -332,8 +333,8 @@ Acceptance criteria:
 
 - The controlled target is unambiguous at all times.
 - A control transfer cannot route a stale motion command to the prior target.
-- Simulation changes never propagate back to Real.
-- Returning control to Real refreshes the GUI from a new Real snapshot.
+- Simulation changes never propagate back to Machine.
+- Returning control to Machine refreshes the GUI from a new Machine snapshot.
 
 ## Expected API work
 
@@ -365,10 +366,10 @@ Add focused tests for:
 - session parameter display after program and MDI mutation;
 - Preview/session state separation;
 - tool-table ownership and edit inhibition;
-- unavailable Real selection;
+- unavailable Machine selection;
 - stale control-authority rejection at the standalone manager boundary and
   across an actual target transfer. Complete at the in-process manager-test
-  boundary; repeat against the production Real session when available.
+  boundary; repeat against the production Machine session when available.
 
 Retain manual GUI checks for layout, legibility, tooltip clarity, resizing, and
 fault prominence.
@@ -377,11 +378,11 @@ fault prominence.
 
 This plan does not:
 
-- claim that the configured Mesa Real target has completed physical
+- claim that the configured Mesa Machine target has completed physical
   commissioning;
 - move geometry construction into the GUI;
 - give Preview a separate geometry implementation;
 - place diagnostics or presentation objects into the RT-facing backend;
-- merge Real and Simulation persistent state;
+- merge Machine and Simulation persistent state;
 - redesign pendant device handling, except where the common session status and
   command-availability presentation affects it.

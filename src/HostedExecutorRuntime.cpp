@@ -1,4 +1,4 @@
-#include "machine/ProductionExecutorRuntime.h"
+#include "machine/HostedExecutorRuntime.h"
 
 #include <algorithm>
 #include <bit>
@@ -14,11 +14,7 @@
 
 namespace ngc {
     namespace {
-#ifdef _WIN32
-        constexpr bool HOST_DEADLINE_MISS_IS_FATAL = false;
-#else
         constexpr bool HOST_DEADLINE_MISS_IS_FATAL = true;
-#endif
 
         class NullProductionExecutorIo final : public ProductionExecutorIo {
         public:
@@ -70,17 +66,17 @@ namespace ngc {
 
     }
 
-    struct ProductionExecutorRuntime::TimingAccumulator {
+    struct HostedExecutorRuntime::TimingAccumulator {
         RealtimeTimingSummary summary;
         std::uint64_t consecutiveMisses = 0;
         std::uint32_t ticksSincePublicationAttempt = 0;
     };
 
-    ProductionExecutorRuntimeConfiguration productionExecutorRuntimeConfiguration(
+    HostedExecutorRuntimeConfiguration hostedExecutorRuntimeConfiguration(
         const MachineConfiguration &configuration) {
-        ProductionExecutorRuntimeConfiguration result;
-        if (configuration.realBackend.has_value()) {
-            result.servoPeriod = configuration.realBackend->servoPeriod;
+        HostedExecutorRuntimeConfiguration result;
+        if (configuration.machineExecutor.has_value()) {
+            result.servoPeriod = configuration.machineExecutor->servoPeriod;
             result.serviceTicksPerPeriod = 1;
         } else {
             result.servoPeriod = configuration.simulation.servoPeriod;
@@ -140,8 +136,8 @@ namespace ngc {
         return result;
     }
 
-    ProductionExecutorRuntime::ProductionExecutorRuntime(
-        ProductionExecutorRuntimeConfiguration configuration,
+    HostedExecutorRuntime::HostedExecutorRuntime(
+        HostedExecutorRuntimeConfiguration configuration,
         std::unique_ptr<ProductionExecutorIo> io)
         : m_core(std::make_unique<ProductionExecutorCore>(
               configuration.servoPeriod, std::move(configuration.executor))),
@@ -168,22 +164,22 @@ namespace ngc {
         }
     }
 
-    ProductionExecutorRuntime::ProductionExecutorRuntime(
+    HostedExecutorRuntime::HostedExecutorRuntime(
         const MachineConfiguration &configuration,
         std::unique_ptr<ProductionExecutorIo> io)
-        : ProductionExecutorRuntime(
-              productionExecutorRuntimeConfiguration(configuration),
+        : HostedExecutorRuntime(
+              hostedExecutorRuntimeConfiguration(configuration),
               std::move(io)) { }
 
-    ProductionExecutorRuntime::~ProductionExecutorRuntime() {
+    HostedExecutorRuntime::~HostedExecutorRuntime() {
         stop();
     }
 
-    MotionBackend &ProductionExecutorRuntime::endpoint() noexcept {
+    MotionBackend &HostedExecutorRuntime::endpoint() noexcept {
         return *m_core;
     }
 
-    void ProductionExecutorRuntime::start() {
+    void HostedExecutorRuntime::start() {
         std::unique_lock lock(m_lifecycleMutex);
         if (m_started) {
             return;
@@ -206,7 +202,7 @@ namespace ngc {
         m_started = true;
         try {
             m_servoThread = std::thread(
-                &ProductionExecutorRuntime::runServoLoop, this);
+                &HostedExecutorRuntime::runServoLoop, this);
         } catch (...) {
             m_started = false;
             throw;
@@ -226,7 +222,7 @@ namespace ngc {
         }
     }
 
-    void ProductionExecutorRuntime::stop() {
+    void HostedExecutorRuntime::stop() {
         {
             std::scoped_lock lock(m_lifecycleMutex);
             if (!m_started) {
@@ -241,11 +237,11 @@ namespace ngc {
         m_stopping.store(false, std::memory_order_release);
     }
 
-    BackendCapabilities ProductionExecutorRuntime::capabilities() const noexcept {
+    BackendCapabilities HostedExecutorRuntime::capabilities() const noexcept {
         return {};
     }
 
-    bool ProductionExecutorRuntime::restoreStationaryState(
+    bool HostedExecutorRuntime::restoreStationaryState(
         const StationaryBackendState &state) noexcept {
         std::scoped_lock lock(m_lifecycleMutex);
         if (m_started) {
@@ -259,12 +255,12 @@ namespace ngc {
         return true;
     }
 
-    bool ProductionExecutorRuntime::prepareTriggeredJointMove(
+    bool HostedExecutorRuntime::prepareTriggeredJointMove(
         const TriggeredJointMove &move) noexcept {
         return m_io->prepareTriggeredJointMove(move);
     }
 
-    void ProductionExecutorRuntime::serviceImmediate() {
+    void HostedExecutorRuntime::serviceImmediate() {
         if (running()) {
             static_cast<void>(waitForNextTick(servoTicks()));
 
@@ -275,7 +271,7 @@ namespace ngc {
         m_io->applyOutputs(m_core->outputState());
     }
 
-    std::uint64_t ProductionExecutorRuntime::advanceServiceMotionPeriod() {
+    std::uint64_t HostedExecutorRuntime::advanceServiceMotionPeriod() {
         if (running()) {
             const auto before = servoTicks();
             auto advanced = std::uint64_t{0};
@@ -298,27 +294,27 @@ namespace ngc {
         return m_serviceTicksPerPeriod;
     }
 
-    void ProductionExecutorRuntime::waitForServiceMotion() {
+    void HostedExecutorRuntime::waitForServiceMotion() {
         // advanceServiceMotionPeriod() either performs or waits for the fixed
         // servo work. No additional host-side delay is required here.
     }
 
-    bool ProductionExecutorRuntime::started() const noexcept {
+    bool HostedExecutorRuntime::started() const noexcept {
         std::scoped_lock lock(m_lifecycleMutex);
 
         return m_started;
     }
 
-    std::uint64_t ProductionExecutorRuntime::servoTicks() const noexcept {
+    std::uint64_t HostedExecutorRuntime::servoTicks() const noexcept {
         return m_servoTicks.load(std::memory_order_relaxed);
     }
 
-    bool ProductionExecutorRuntime::tryTakeRealtimeTiming(
+    bool HostedExecutorRuntime::tryTakeRealtimeTiming(
         RealtimeTimingSummary &summary) noexcept {
         return m_timing.tryPop(summary);
     }
 
-    void ProductionExecutorRuntime::configureServoThread() {
+    void HostedExecutorRuntime::configureServoThread() {
         if (!m_realtime.realtimeEnabled) {
             return;
         }
@@ -328,7 +324,7 @@ namespace ngc {
             m_realtime.realtimePriority);
     }
 
-    void ProductionExecutorRuntime::runServoLoop() {
+    void HostedExecutorRuntime::runServoLoop() {
         using clock = std::chrono::steady_clock;
 
         try {
@@ -399,7 +395,7 @@ namespace ngc {
         }
     }
 
-    void ProductionExecutorRuntime::tick(
+    void HostedExecutorRuntime::tick(
         const bool publishSnapshot) noexcept {
         m_io->sampleDigitalInputs(
             m_core->motionContext(), m_inputs);
@@ -414,7 +410,7 @@ namespace ngc {
         m_servoTicks.fetch_add(1, std::memory_order_relaxed);
     }
 
-    void ProductionExecutorRuntime::observeTiming(
+    void HostedExecutorRuntime::observeTiming(
         const std::uint64_t tick,
         const std::int64_t wakeLatenessNanoseconds,
         const std::uint64_t executionNanoseconds,
@@ -479,14 +475,14 @@ namespace ngc {
         }
     }
 
-    bool ProductionExecutorRuntime::running() const noexcept {
+    bool HostedExecutorRuntime::running() const noexcept {
         std::scoped_lock lock(m_lifecycleMutex);
 
         return m_started
             && !m_stopping.load(std::memory_order_acquire);
     }
 
-    std::uint64_t ProductionExecutorRuntime::waitForNextTick(
+    std::uint64_t HostedExecutorRuntime::waitForNextTick(
         const std::uint64_t previousTicks) {
         auto current = m_servoTicks.load(std::memory_order_relaxed);
         while (current == previousTicks && running()) {

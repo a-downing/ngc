@@ -18,7 +18,7 @@
 #include "machine/IpcExecutorBridge.h"
 #include "machine/IpcProtocol.h"
 #include "machine/MachineConfiguration.h"
-#include "machine/ProductionExecutorRuntime.h"
+#include "machine/HostedExecutorRuntime.h"
 
 namespace {
     constexpr double TEMPORARY_TRIGGER_DISTANCE = 0.5;
@@ -259,10 +259,10 @@ namespace {
         bool m_preparedInputsArmed = false;
     };
 
-    std::unique_ptr<ngc::ProductionExecutorRuntime> makeRuntime(
+    std::unique_ptr<ngc::HostedExecutorRuntime> makeRuntime(
         const Options &options, std::unique_ptr<ngc::ProductionExecutorIo> io) {
         auto runtimeConfiguration =
-            ngc::ProductionExecutorRuntimeConfiguration{};
+            ngc::HostedExecutorRuntimeConfiguration{};
         if (options.machineConfiguration.has_value()) {
             const auto configuration =
                 ngc::loadMachineConfiguration(
@@ -273,7 +273,7 @@ namespace {
                     + configuration.error());
             }
             runtimeConfiguration =
-                ngc::productionExecutorRuntimeConfiguration(
+                ngc::hostedExecutorRuntimeConfiguration(
                     *configuration);
         }
 
@@ -288,14 +288,11 @@ namespace {
             }
             runtimeConfiguration.realtime = *host;
         }
-#if !defined(__linux__) && !defined(_WIN32)
-        runtimeConfiguration.realtime = {};
-#endif
         if (options.nonRealtime) {
             runtimeConfiguration.realtime = {};
         }
 
-        return std::make_unique<ngc::ProductionExecutorRuntime>(
+        return std::make_unique<ngc::HostedExecutorRuntime>(
             std::move(runtimeConfiguration), std::move(io));
     }
 

@@ -120,17 +120,17 @@ namespace {
 
     std::uint32_t servoPeriodNanoseconds(
         const ngc::MachineConfiguration &configuration) {
-        if (!configuration.realBackend) {
+        if (!configuration.machineExecutor) {
             throw std::runtime_error(
-                "machine configuration has no real_backend servo period");
+                "machine configuration has no machine_executor servo period");
         }
         const auto scaled =
-            configuration.realBackend->servoPeriod
+            configuration.machineExecutor->servoPeriod
             * 1'000'000'000.0;
         if (!std::isfinite(scaled) || scaled < 1.0
             || scaled > std::numeric_limits<std::uint32_t>::max()) {
             throw std::runtime_error(
-                "real_backend servo period is outside "
+                "machine_executor servo period is outside "
                 "the diagnostic's nanosecond range");
         }
 
@@ -536,15 +536,6 @@ int main(const int argc, char **argv) {
             ngc::configureCurrentRealtimeThread(
                 host->realtimeCpu,
                 host->realtimePriority);
-#ifdef _WIN32
-            std::println(
-                "Using CPU {} with best-effort Windows time-critical "
-                "priority{}",
-                host->realtimeCpu,
-                host->lockMemory
-                    ? "; process memory locking is unavailable"
-                    : "");
-#else
             std::println(
                 "Using CPU {} with SCHED_FIFO priority {}{}",
                 host->realtimeCpu,
@@ -552,7 +543,6 @@ int main(const int argc, char **argv) {
                 host->lockMemory
                     ? " and locked memory"
                     : "");
-#endif
         } else {
             std::println(
                 "Using the ordinary scheduler{}",

@@ -11,7 +11,7 @@
 #include <thread>
 #include <variant>
 
-#include "machine/ExternalRealtimeRuntime.h"
+#include "machine/ExternalExecutorRuntime.h"
 #include "machine/IpcProtocol.h"
 #include "machine/MachineConfiguration.h"
 #include "machine/MachineSessionManager.h"
@@ -35,7 +35,7 @@ namespace {
         };
     }
 
-    ngc::ExternalRealtimeRuntimeConfiguration configuration(
+    ngc::ExternalExecutorRuntimeConfiguration configuration(
         const std::filesystem::path &peer) {
         return {
             .peerExecutable = peer,
@@ -52,7 +52,7 @@ namespace {
     }
 
     ngc::ExecutionEvent waitForEvent(
-        ngc::ExternalRealtimeRuntime &runtime,
+        ngc::ExternalExecutorRuntime &runtime,
         const std::chrono::milliseconds timeout = 2s) {
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         ngc::ExecutionEvent event;
@@ -67,7 +67,7 @@ namespace {
     }
 
     ngc::RequestCompleted waitForRequest(
-        ngc::ExternalRealtimeRuntime &runtime,
+        ngc::ExternalExecutorRuntime &runtime,
         const ngc::RequestId request) {
         const auto deadline = std::chrono::steady_clock::now() + 2s;
         while (std::chrono::steady_clock::now() < deadline) {
@@ -83,7 +83,7 @@ namespace {
     }
 
     ngc::ExecutionSnapshot waitForSnapshot(
-        ngc::ExternalRealtimeRuntime &runtime,
+        ngc::ExternalExecutorRuntime &runtime,
         const ngc::BackendState expected,
         const std::optional<double> expectedX = std::nullopt) {
         const auto deadline = std::chrono::steady_clock::now() + 2s;
@@ -105,7 +105,7 @@ namespace {
     }
 
     ngc::RealtimeTimingSummary waitForRealtimeTiming(
-        ngc::ExternalRealtimeRuntime &runtime,
+        ngc::ExternalExecutorRuntime &runtime,
         const std::chrono::milliseconds timeout = 2s) {
         const auto deadline = std::chrono::steady_clock::now() + timeout;
         ngc::RealtimeTimingSummary timing;
@@ -121,7 +121,7 @@ namespace {
     }
 
     ngc::ExecutionSnapshot waitForMotionProgress(
-        ngc::ExternalRealtimeRuntime &runtime, const double minimumX) {
+        ngc::ExternalExecutorRuntime &runtime, const double minimumX) {
         const auto deadline = std::chrono::steady_clock::now() + 2s;
         ngc::ExecutionSnapshot snapshot;
         while (std::chrono::steady_clock::now() < deadline) {
@@ -138,7 +138,7 @@ namespace {
     }
 
     ngc::BackendHeld waitForHeld(
-        ngc::ExternalRealtimeRuntime &runtime,
+        ngc::ExternalExecutorRuntime &runtime,
         const ngc::BackendHoldReason reason) {
         const auto deadline = std::chrono::steady_clock::now() + 2s;
         while (std::chrono::steady_clock::now() < deadline) {
@@ -304,7 +304,7 @@ namespace {
 
     void testExternalRuntimeExecutesThroughProductionCore(
         const std::filesystem::path &peer) {
-        ngc::ExternalRealtimeRuntime runtime(configuration(peer));
+        ngc::ExternalExecutorRuntime runtime(configuration(peer));
         runtime.start();
         runtime.start();
         require(runtime.connected(), "external runtime should complete its handshake");
@@ -368,7 +368,7 @@ namespace {
 
     void testExternalRuntimeFeedHoldAndResume(
         const std::filesystem::path &peer) {
-        ngc::ExternalRealtimeRuntime runtime(configuration(peer));
+        ngc::ExternalExecutorRuntime runtime(configuration(peer));
         runtime.start();
 
         constexpr ngc::EpochId epoch = 18;
@@ -429,7 +429,7 @@ namespace {
 
     void testExternalRuntimeFakesTriggeredJointInput(
         const std::filesystem::path &peer) {
-        ngc::ExternalRealtimeRuntime runtime(configuration(peer));
+        ngc::ExternalExecutorRuntime runtime(configuration(peer));
         runtime.start();
 
         constexpr ngc::EpochId epoch = 19;
@@ -500,15 +500,15 @@ namespace {
         runtime.stop();
     }
 
-    void testConfiguredRealSessionRunsThroughIpcExecutor(
+    void testConfiguredMachineSessionRunsThroughIpcExecutor(
         const std::filesystem::path &peer,
         const bool realtime) {
         auto configuration = ngc::loadMachineConfiguration("machine.toml");
         require(configuration.has_value(),
                 configuration ? "" : configuration.error());
-        require(configuration->realBackend.has_value(),
-                "IPC test machine configuration should enable Real");
-        configuration->realBackend->executable =
+        require(configuration->machineExecutor.has_value(),
+                "IPC test machine configuration should enable Machine");
+        configuration->machineExecutor->executable =
             std::filesystem::absolute(peer).lexically_normal();
         auto ordinaryBackendConfiguration =
             std::optional<std::filesystem::path>{};
@@ -524,22 +524,22 @@ namespace {
                 static_cast<bool>(file),
                 "could not write the ordinary IPC test-peer "
                 "configuration");
-            configuration->realBackend->backendConfiguration =
+            configuration->machineExecutor->backendConfiguration =
                 *ordinaryBackendConfiguration;
         } else {
-            configuration->realBackend->backendConfiguration =
+            configuration->machineExecutor->backendConfiguration =
                 std::filesystem::absolute(
                     "ipc_test_peer.toml").lexically_normal();
         }
 
         ngc::MachineSessionManager manager(*configuration);
         const auto initial = manager.state();
-        require(initial.simulationAvailable && initial.realAvailable,
-                "configured IPC test peer should expose Simulation and Real");
-        auto realAuthority =
-            manager.selectControlTarget(ngc::MachineControlTarget::Real);
-        require(realAuthority.has_value(),
-                realAuthority ? "" : realAuthority.error());
+        require(initial.simulationAvailable && initial.machineAvailable,
+                "configured IPC test peer should expose Simulation and Machine");
+        auto machineAuthority =
+            manager.selectControlTarget(ngc::MachineControlTarget::Machine);
+        require(machineAuthority.has_value(),
+                machineAuthority ? "" : machineAuthority.error());
         const auto temporaryToolStore =
             std::filesystem::temp_directory_path()
             / "ngc_ipc_real_session_tools.txt";
@@ -551,20 +551,20 @@ namespace {
         cleanupError.clear();
         std::filesystem::remove(temporaryParameterStore, cleanupError);
         require(manager.setToolTableStorePath(
-                    *realAuthority, temporaryToolStore).has_value()
+                    *machineAuthority, temporaryToolStore).has_value()
                     && manager.setPersistentParameterStorePath(
-                        *realAuthority,
+                        *machineAuthority,
                         temporaryParameterStore).has_value(),
-                "configured IPC Real test should isolate persistent stores");
-        require(manager.powerOn(*realAuthority),
-                "configured IPC Real session should power on");
+                "configured IPC Machine test should isolate persistent stores");
+        require(manager.powerOn(*machineAuthority),
+                "configured IPC Machine session should power on");
         const auto powered = manager.snapshot();
         require(powered.powerState == ngc::MachinePowerState::On
                     && !powered.simulationDiagnostics.has_value(),
-                "IPC Real session should be powered without mock diagnostics");
+                "IPC Machine session should be powered without mock diagnostics");
 
-        require(manager.home(*realAuthority),
-                "configured IPC Real session should accept homing");
+        require(manager.home(*machineAuthority),
+                "configured IPC Machine session should accept homing");
         auto homed = manager.snapshot();
         for (auto attempt = 0; attempt < 30'000
              && homed.status != ngc::SimulationStatus::Completed
@@ -574,22 +574,22 @@ namespace {
         }
         require(homed.status == ngc::SimulationStatus::Completed,
                 homed.error.empty()
-                    ? "configured IPC Real homing should complete"
+                    ? "configured IPC Machine homing should complete"
                     : homed.error);
         require(static_cast<std::size_t>(std::popcount(homed.homedJoints))
                     == configuration->joints.size(),
-                "configured IPC Real homing should mark every joint homed");
+                "configured IPC Machine homing should mark every joint homed");
 
         const auto xAxis = std::ranges::find(
             configuration->axes, ngc::Machine::Axis::X,
             &ngc::AxisConfiguration::axis);
         require(xAxis != configuration->axes.end(),
-                "configured IPC Real jog should find X");
+                "configured IPC Machine jog should find X");
         const auto xJoint = std::ranges::find(
             configuration->joints, xAxis->joints.front(),
             &ngc::JointConfiguration::id);
         require(xJoint != configuration->joints.end(),
-                "configured IPC Real jog should find the X joint");
+                "configured IPC Machine jog should find the X joint");
         const auto jogLeaseTicks = static_cast<std::uint32_t>(std::ceil(
             configuration->pendant.velocity.leaseDuration
             / configuration->simulation.servoPeriod));
@@ -623,14 +623,14 @@ namespace {
             .leaseTicks = jogLeaseTicks,
         };
         require(manager.startJog(
-                    *realAuthority, ngc::ControlRequest {jogRequest}),
-                "configured IPC Real session should accept a post-home jog");
+                    *machineAuthority, ngc::ControlRequest {jogRequest}),
+                "configured IPC Machine session should accept a post-home jog");
         for (ngc::RequestId request = 702; request < 722; ++request) {
             std::this_thread::sleep_for(5ms);
-            if (!manager.renewJog(*realAuthority, request, jog)) {
+            if (!manager.renewJog(*machineAuthority, request, jog)) {
                 const auto failed = manager.snapshot();
                 require(false, std::format(
-                    "configured IPC Real session should queue post-home jog "
+                    "configured IPC Machine session should queue post-home jog "
                     "renewal {}, status={}, jogging={}, reason={}, error={}",
                     request, static_cast<int>(failed.status), failed.jogging,
                     failed.lastJogStopReason.has_value()
@@ -638,8 +638,8 @@ namespace {
                     failed.error));
             }
         }
-        require(manager.stopJog(*realAuthority, 722, jog),
-                "configured IPC Real session should accept the post-home jog stop");
+        require(manager.stopJog(*machineAuthority, 722, jog),
+                "configured IPC Machine session should accept the post-home jog stop");
         auto jogged = manager.snapshot();
         for (auto attempt = 0; attempt < 10'000
              && jogged.jogging
@@ -649,21 +649,21 @@ namespace {
         }
         require(jogged.status != ngc::SimulationStatus::Error,
                 jogged.error.empty()
-                    ? "configured IPC Real post-home jog should not fail"
+                    ? "configured IPC Machine post-home jog should not fail"
                     : jogged.error);
         require(jogged.lastJogStopReason
                     == ngc::JogStopReason::RequestedStop,
-                "configured IPC Real post-home jog should remain leased until stopped");
+                "configured IPC Machine post-home jog should remain leased until stopped");
         require(jogged.machinePosition.x < homed.machinePosition.x,
-                "configured IPC Real post-home jog should move X");
+                "configured IPC Machine post-home jog should move X");
 
         auto simulationAuthority =
-            manager.simulateFromReal(*realAuthority);
+            manager.simulateFromMachine(*machineAuthority);
         require(simulationAuthority.has_value(),
                 simulationAuthority
                     ? ""
                     : std::format(
-                        "configured IPC Real homing checkpoint failed: {}",
+                        "configured IPC Machine homing checkpoint failed: {}",
                         simulationAuthority.error()));
         require(manager.powerOff(*simulationAuthority),
                 "homing-derived Simulation should power off");
@@ -678,16 +678,16 @@ namespace {
                 simulationOff.error.empty()
                     ? "homing-derived Simulation should finish powering off"
                     : simulationOff.error);
-        realAuthority =
-            manager.selectControlTarget(ngc::MachineControlTarget::Real);
-        require(realAuthority.has_value(),
-                realAuthority ? "" : realAuthority.error());
+        machineAuthority =
+            manager.selectControlTarget(ngc::MachineControlTarget::Machine);
+        require(machineAuthority.has_value(),
+                machineAuthority ? "" : machineAuthority.error());
 
         require(manager.start(
-                    *realAuthority,
-                    {{"G1 F120 X10\n", "ipc-real-feed-hold.ngc"}},
+                    *machineAuthority,
+                    {{"G1 F120 X10\n", "ipc-machine-feed-hold.ngc"}},
                     {}),
-                "configured IPC Real session should accept feed-hold motion");
+                "configured IPC Machine session should accept feed-hold motion");
         auto moving = manager.snapshot();
         for (auto attempt = 0; attempt < 10'000
              && moving.trajectoryBackendVelocity <= 0.01
@@ -698,10 +698,10 @@ namespace {
         require(moving.status != ngc::SimulationStatus::Error
                     && moving.trajectoryBackendVelocity > 0.01,
                 moving.error.empty()
-                    ? "configured IPC Real motion should begin before Feed Hold"
+                    ? "configured IPC Machine motion should begin before Feed Hold"
                     : moving.error);
-        require(manager.feedHold(*realAuthority),
-                "configured IPC Real motion should accept Feed Hold");
+        require(manager.feedHold(*machineAuthority),
+                "configured IPC Machine motion should accept Feed Hold");
         auto feedHeld = manager.snapshot();
         for (auto attempt = 0; attempt < 10'000
              && feedHeld.status != ngc::SimulationStatus::Paused
@@ -711,10 +711,10 @@ namespace {
         }
         require(feedHeld.status == ngc::SimulationStatus::Paused,
                 feedHeld.error.empty()
-                    ? "configured IPC Real Feed Hold should reach Paused"
+                    ? "configured IPC Machine Feed Hold should reach Paused"
                     : feedHeld.error);
-        require(manager.stop(*realAuthority),
-                "configured IPC Real Feed Hold should accept Stop");
+        require(manager.stop(*machineAuthority),
+                "configured IPC Machine Feed Hold should accept Stop");
         auto stopped = manager.snapshot();
         for (auto attempt = 0; attempt < 10'000
              && stopped.status != ngc::SimulationStatus::Stopped
@@ -724,17 +724,17 @@ namespace {
         }
         require(stopped.status == ngc::SimulationStatus::Stopped,
                 stopped.error.empty()
-                    ? "configured IPC Real controlled Stop should complete"
+                    ? "configured IPC Machine controlled Stop should complete"
                     : stopped.error);
         require(stopped.realtimeTiming.has_value()
                     && stopped.realtimeTiming->sampleCount != 0,
-                "configured IPC Real snapshot should expose executor timing");
-        simulationAuthority = manager.simulateFromReal(*realAuthority);
+                "configured IPC Machine snapshot should expose executor timing");
+        simulationAuthority = manager.simulateFromMachine(*machineAuthority);
         require(simulationAuthority.has_value(),
                 simulationAuthority
                     ? ""
                     : std::format(
-                        "configured IPC Real stopped checkpoint failed: {}",
+                        "configured IPC Machine stopped checkpoint failed: {}",
                         simulationAuthority.error()));
         require(manager.powerOff(*simulationAuthority),
                 "stopped checkpoint Simulation should power off");
@@ -749,16 +749,16 @@ namespace {
                 simulationOff.error.empty()
                     ? "stopped checkpoint Simulation should finish powering off"
                     : simulationOff.error);
-        realAuthority =
-            manager.selectControlTarget(ngc::MachineControlTarget::Real);
-        require(realAuthority.has_value(),
-                realAuthority ? "" : realAuthority.error());
+        machineAuthority =
+            manager.selectControlTarget(ngc::MachineControlTarget::Machine);
+        require(machineAuthority.has_value(),
+                machineAuthority ? "" : machineAuthority.error());
 
         require(manager.start(
-                    *realAuthority,
-                    {{"G0 X0.01\n", "ipc-real-session.ngc"}},
+                    *machineAuthority,
+                    {{"G0 X0.01\n", "ipc-machine-session.ngc"}},
                     {}),
-                "configured IPC Real session should accept a program");
+                "configured IPC Machine session should accept a program");
         auto completed = manager.snapshot();
         for (auto attempt = 0; attempt < 10'000
              && completed.status != ngc::SimulationStatus::Completed
@@ -768,18 +768,18 @@ namespace {
         }
         require(completed.status == ngc::SimulationStatus::Completed,
                 completed.error.empty()
-                    ? "configured IPC Real program should complete"
+                    ? "configured IPC Machine program should complete"
                     : completed.error);
         require(std::abs(completed.machinePosition.x - 0.01) < 1e-9,
                 std::format(
-                    "configured IPC Real program should report its executed "
+                    "configured IPC Machine program should report its executed "
                     "position, got {}", completed.machinePosition.x));
 
         require(manager.start(
-                    *realAuthority,
-                    {{"G38.3 F60 X2\n", "ipc-real-probe.ngc"}},
+                    *machineAuthority,
+                    {{"G38.3 F60 X2\n", "ipc-machine-probe.ngc"}},
                     {}),
-                "configured IPC Real session should accept a probe");
+                "configured IPC Machine session should accept a probe");
         completed = manager.snapshot();
         for (auto attempt = 0; attempt < 10'000
              && completed.status != ngc::SimulationStatus::Completed
@@ -789,7 +789,7 @@ namespace {
         }
         require(completed.status == ngc::SimulationStatus::Completed,
                 completed.error.empty()
-                    ? "configured IPC Real probe should complete"
+                    ? "configured IPC Machine probe should complete"
                     : completed.error);
         require(completed.machinePosition.x >= 1.5
                     && completed.machinePosition.x < 2.0,
@@ -822,16 +822,16 @@ sub _tool_change[#tool_number] {
             .diameter = 0.25,
             .comment = "IPC tool-change fixture",
         });
-        require(manager.setToolTable(*realAuthority, tools),
-                "configured IPC Real session should accept its tool table");
+        require(manager.setToolTable(*machineAuthority, tools),
+                "configured IPC Machine session should accept its tool table");
         require(manager.start(
-                    *realAuthority,
+                    *machineAuthority,
                     {
                         {std::string(toolChange), "autoload/tool_change.ngc"},
-                        {"T2 M6\n", "ipc-real-tool-change.ngc"},
+                        {"T2 M6\n", "ipc-machine-tool-change.ngc"},
                     },
                     tools, true),
-                "configured IPC Real session should accept a tool change");
+                "configured IPC Machine session should accept a tool change");
         auto paused = manager.snapshot();
         for (auto attempt = 0; attempt < 10'000
              && paused.status != ngc::SimulationStatus::Paused
@@ -842,16 +842,16 @@ sub _tool_change[#tool_number] {
         require(paused.status == ngc::SimulationStatus::Paused,
                 paused.error.empty()
                     ? std::format(
-                        "configured IPC Real tool change should reach M0; "
+                        "configured IPC Machine tool change should reach M0; "
                         "operation {} driver '{}'",
                         static_cast<int>(paused.programOperation),
                         paused.trajectoryDriverActivity)
                     : paused.error);
         require(paused.operatorAlert
                     == "Install tool 2, then press Resume",
-                "configured IPC Real tool change should publish its operator alert");
-        require(manager.resume(*realAuthority),
-                "configured IPC Real tool change should accept Resume");
+                "configured IPC Machine tool change should publish its operator alert");
+        require(manager.resume(*machineAuthority),
+                "configured IPC Machine tool change should accept Resume");
         completed = manager.snapshot();
         for (auto attempt = 0; attempt < 10'000
              && completed.status != ngc::SimulationStatus::Completed
@@ -861,10 +861,10 @@ sub _tool_change[#tool_number] {
         }
         require(completed.status == ngc::SimulationStatus::Completed,
                 completed.error.empty()
-                    ? "resumed IPC Real tool change should complete"
+                    ? "resumed IPC Machine tool change should complete"
                     : completed.error);
-        require(manager.powerOff(*realAuthority),
-                "configured IPC Real session should power off");
+        require(manager.powerOff(*machineAuthority),
+                "configured IPC Machine session should power off");
         manager.join();
         cleanupError.clear();
         std::filesystem::remove(temporaryToolStore, cleanupError);
@@ -881,7 +881,7 @@ sub _tool_change[#tool_number] {
         const std::filesystem::path &peer) {
         auto options = configuration(peer);
         ++options.peerExpectedIdentity.authorityGeneration;
-        ngc::ExternalRealtimeRuntime runtime(std::move(options));
+        ngc::ExternalExecutorRuntime runtime(std::move(options));
 
         auto rejected = false;
         try {
@@ -903,7 +903,7 @@ sub _tool_change[#tool_number] {
             std::filesystem::absolute(
                 "missing_ipc_machine_configuration.toml").string(),
         };
-        ngc::ExternalRealtimeRuntime runtime(std::move(options));
+        ngc::ExternalExecutorRuntime runtime(std::move(options));
 
         auto rejected = false;
         try {
@@ -921,7 +921,7 @@ sub _tool_change[#tool_number] {
         const std::filesystem::path &peer) {
         auto options = configuration(peer);
         options.peerArguments = {"--no-consume"};
-        ngc::ExternalRealtimeRuntime runtime(std::move(options));
+        ngc::ExternalExecutorRuntime runtime(std::move(options));
         runtime.start();
 
         require(runtime.endpoint().tryPublish(ngc::PlanChunk{})
@@ -958,7 +958,7 @@ sub _tool_change[#tool_number] {
         const std::filesystem::path &peer) {
         auto options = configuration(peer);
         options.peerArguments = {"--exit-after-controls", "1"};
-        ngc::ExternalRealtimeRuntime runtime(std::move(options));
+        ngc::ExternalExecutorRuntime runtime(std::move(options));
         runtime.start();
         require(runtime.endpoint().trySubmit(ngc::StartRequest{41, 9})
                     == ngc::SubmitResult::Submitted,
@@ -1000,7 +1000,7 @@ int main(const int argc, char **argv) {
         testExternalRuntimeExecutesThroughProductionCore(peer);
         testExternalRuntimeFeedHoldAndResume(peer);
         testExternalRuntimeFakesTriggeredJointInput(peer);
-        testConfiguredRealSessionRunsThroughIpcExecutor(
+        testConfiguredMachineSessionRunsThroughIpcExecutor(
             peer, realtime);
         testExternalRuntimeRejectsStaleHandshake(peer);
         testExternalRuntimeRejectsInvalidExecutorConfiguration(peer);
