@@ -380,7 +380,8 @@ int main(const int argc, char **argv) {
     try {
         return run(parseOptions(argc, argv));
     } catch (const std::exception &error) {
-        std::cerr << "ngc_ipc_backend failed: " << error.what() << '\n';
+        std::cerr << "ngc_ipc_test_peer failed: "
+                  << error.what() << '\n';
 
         return 1;
     }

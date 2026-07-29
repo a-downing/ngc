@@ -211,26 +211,26 @@ add_test(
     NAME ngc_physical_backend_tests
     COMMAND ngc_physical_backend_tests)
 
-add_executable(ngc_ipc_backend tools/ngc_ipc_backend.cpp)
-target_include_directories(ngc_ipc_backend PRIVATE src)
-target_link_libraries(ngc_ipc_backend PRIVATE ngc_core)
-ngc_target_defaults(ngc_ipc_backend)
+add_executable(ngc_ipc_test_peer tools/ngc_ipc_test_peer.cpp)
+target_include_directories(ngc_ipc_test_peer PRIVATE src)
+target_link_libraries(ngc_ipc_test_peer PRIVATE ngc_core)
+ngc_target_defaults(ngc_ipc_test_peer)
 if(NOT WIN32)
-    set_target_properties(ngc_ipc_backend PROPERTIES SUFFIX ".exe")
+    set_target_properties(ngc_ipc_test_peer PROPERTIES SUFFIX ".exe")
 endif()
 add_test(
-    NAME ngc_ipc_backend_configuration
-    COMMAND ngc_ipc_backend
+    NAME ngc_ipc_test_peer_configuration
+    COMMAND ngc_ipc_test_peer
         --machine-configuration ${CMAKE_SOURCE_DIR}/machine.toml
         --backend-configuration
-            ${CMAKE_SOURCE_DIR}/ipc_backend.toml
+            ${CMAKE_SOURCE_DIR}/ipc_test_peer.toml
         --validate-config-only)
 
 add_executable(ngc_ipc_tests src/IpcTests.cpp)
 target_include_directories(ngc_ipc_tests PRIVATE src)
 target_link_libraries(ngc_ipc_tests PRIVATE ngc_core)
 ngc_target_defaults(ngc_ipc_tests)
-add_test(NAME ngc_ipc_tests COMMAND ngc_ipc_tests $<TARGET_FILE:ngc_ipc_backend>)
+add_test(NAME ngc_ipc_tests COMMAND ngc_ipc_tests $<TARGET_FILE:ngc_ipc_test_peer>)
 set_tests_properties(ngc_ipc_tests PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 add_executable(ngc_simulation_diagnostic tools/ngc_simulation_diagnostic.cpp)

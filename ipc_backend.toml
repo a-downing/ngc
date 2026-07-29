@@ -1,7 +1,0 @@
-# Host policy for the non-hardware production IPC executor used as the
-# application's development Real target.
-
-[runtime]
-realtime_cpu = 15
-realtime_priority = 98
-lock_memory = true

@@ -941,9 +941,9 @@ and synthetic homing-switch preparation.
 
 ### Phase 6: Introduce `MachineSessionManager`
 
-Status: implemented through the configured non-hardware Real checkpoint.
-Simulation and Real are application-owned through `MachineSessionManager`; the
-former `SimulationWorker` facade is removed.
+Status: implemented. Simulation and Real are application-owned through
+`MachineSessionManager`; the former `SimulationWorker` facade is removed.
+Hardware-free Real-path coverage uses the test-only IPC peer.
 The Simulation execution loop and its state now live in a per-session host
 owned behind the manager's target router. The manager exposes available
 targets, generation-tagged control authority, target-routed controller data,
@@ -959,14 +959,14 @@ both an explicitly test-only in-process Real host and the configured
 stale-command rejection across actual transfers, independent power and tool
 tables, one-way motion isolation, and a complete Real program epoch through
 shared memory and `ProductionExecutorCore`. `[real_backend]` makes the Windows
-non-hardware peer selectable as Real in the application. It is not a physical
-backend: inactive safety state, hardware I/O, watchdog behavior, and Linux
-real-time validation remain future work, and Real must never fall back to the
-in-process test host or `MockMotionBackend`.
+hardware-free peer act as Real only inside the IPC tests; it is not selectable
+as a product backend. The application configures the Mesa physical process for
+Real, and Real must never fall back to the in-process test host or
+`MockMotionBackend`.
 
 - Support standalone Simulation with no `[real_run]` configuration.
-- Support optional Real and Simulation sessions concurrently. Complete for the
-  configured Windows IPC executor.
+- Support optional Real and Simulation sessions concurrently. Complete across
+  the production IPC boundary.
 - Add active-control-target routing and visible dual-session state. Complete
   for the configured Windows IPC executor.
 - Add generation-tagged control authority.
@@ -1027,13 +1027,15 @@ expectations.
 
 ### Phase 9: Add the IPC skeleton
 
-Status: implemented through a non-hardware executor-in-the-loop checkpoint.
+Status: implemented through a hardware-free executor-in-the-loop test
+checkpoint.
 `ExternalRealtimeRuntime` owns a platform shared-memory mapping, child-process
-lifecycle, and a bounded `MotionBackend` proxy. `ngc_ipc_backend` opens the same
-fixed layout as a separate process, validates optional typed machine
-configuration before advertising readiness, hosts `ProductionExecutorRuntime`,
-and bridges bounded execution items, controls, events, and snapshots to the
-real production executor core without importing `MockMotionBackend`. The
+lifecycle, and a bounded `MotionBackend` proxy. The test-only
+`ngc_ipc_test_peer` opens the same fixed layout as a separate process, validates
+optional typed machine configuration before advertising readiness, hosts
+`ProductionExecutorRuntime`, and bridges bounded execution items, controls,
+events, and snapshots to the real production executor core without importing
+`MockMotionBackend`. The
 connection validates ABI and payload layout,
 configuration and topology fingerprints, and session, epoch, and control
 authority generations before entering Running. Peer loss becomes a bounded
@@ -1047,28 +1049,30 @@ thread. On Linux, typed Real-backend configuration can require locked memory,
 a selected CPU, `SCHED_FIFO` priority, and absolute monotonic servo deadlines.
 The NRT peer host is excluded from the servo CPU before the RT thread starts.
 Any host setup failure rejects startup rather than falling back to ordinary
-scheduling. Both platforms still use a non-hardware I/O boundary. A temporary peer-local shim
-fakes axis-space probe input 0.5 machine units before its move target and each
-joint-space homing input after 0.5 machine units of travel from its move start.
+scheduling. The test peer uses a hardware-free I/O boundary. A temporary
+peer-local shim fakes axis-space probe input 0.5 machine units before its move
+target and each joint-space homing input after 0.5 machine units of travel from
+its move start.
 For a shorter triggered joint approach, the peer lengthens its private item
 copy so the fixed transition can be sampled and stopped. These results prove
 functional executor and process behavior rather than hardware safety. The
 production IPC path and configured RT hosting have been validated on the Linux
-RT development host; physical transport and hardware commissioning remain
-separate later phases.
+RT development host; the Mesa physical transport is implemented separately
+and remains under staged hardware commissioning.
 
 - Implement fixed shared-memory rings and the physical `MotionBackend` proxy.
   Complete for the transport skeleton.
 - Add ABI, topology, configuration, session, epoch, and authority handshakes.
   Complete.
-- Run a non-hardware backend process using the production IPC path. Complete
-  with the Windows executor-in-the-loop peer.
+- Run a hardware-free test peer using the production IPC path. Complete with
+  the Windows executor-in-the-loop peer.
 - Test peer death, stale generations, full channels, restart, and refusal to
   resume interrupted epochs. Complete on Windows.
 
 ### Phase 10: Extract and prove the production executor core
 
-Status: implemented through the non-hardware Linux RT checkpoint.
+Status: implemented through the hardware-free Linux RT test checkpoint and
+the Mesa physical host.
 `ProductionExecutorCore` provides the first
 platform-independent, fixed-period execution slice. It owns only fixed-capacity
 execution-item, control, event, input-sample, and snapshot storage and executes
@@ -1151,20 +1155,20 @@ snapshot. A full diagnostic channel retains the active aggregate and records
 failed publications without delaying execution; safety faults continue to use
 the executor event path.
 
-The runtime/core combination is now hosted by `ngc_ipc_backend` for the
-non-hardware Windows and Linux checkpoints. A fixed pending slot per channel preserves
-backpressure between each shared-memory ring and the core's bounded channels.
+The runtime/core combination is hosted by `ngc_ipc_test_peer` for the
+hardware-free Windows and Linux test checkpoints. A fixed pending slot per
+channel preserves backpressure between each shared-memory ring and the core's
+bounded channels.
 IPC tests execute a timed `PlanChunk`, an axis-space probe, and joint-space
 triggered motion through the child process and verify executor-generated
 acceptance, marker crossing, terminal stop selection, retirement, snapshots,
 feed hold, Resume, and Abort in addition to handshake, capacity, restart, and
-peer-loss behavior. The executable remains non-hardware, uses a temporary
-probe-and-homing input shim with otherwise null I/O, and runs either an
-ordinary scheduler thread or the configured Linux RT host. It is exposed as
-the configured Real development target without claiming physical hardware
-availability. The session runtime sends explicit Enable and Disable controls
-at Real power boundaries, and executor epoch Reset retains an already-enabled
-held state.
+peer-loss behavior. The executable remains test-only and hardware-free, uses
+a temporary probe-and-homing input shim with otherwise null I/O, and runs
+either an ordinary scheduler thread or the configured Linux RT host. It is not
+exposed as a selectable product backend. The session runtime sends explicit
+Enable and Disable controls at Real power boundaries, and executor epoch Reset
+retains an already-enabled held state.
 
 - Factor reusable allocation-free execution mechanics without importing
   synthetic-input or mock-diagnostic policy. Complete.

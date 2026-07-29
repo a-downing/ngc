@@ -26,15 +26,15 @@ ctest --test-dir build -E '^ngc_tests$' --output-on-failure
 
 ## Real-time executor host
 
-The configured Linux IPC executor uses the existing
+The configured Mesa Real backend uses the existing
 `ProductionExecutorRuntime` servo thread as its RT thread. The Real backend
 selection names the executable and its backend-owned configuration, while
 `machine.toml` remains authoritative for the shared servo period:
 
 ```toml
 [real_backend]
-executable = "build/ngc_ipc_backend.exe"
-configuration = "ipc_backend.toml"
+executable = "build/ngc_mesa_backend"
+configuration = "physical_backend.toml"
 servo_period = 0.001
 ```
 
@@ -61,17 +61,18 @@ from the selected CPU, pin the servo thread, or enter the configured
 selected CPU's SMT sibling free of ordinary work and route routine IRQs to
 housekeeping CPUs.
 
-Run the ordinary portable IPC suite with:
+`ngc_ipc_test_peer` is a hardware-free test fixture, not a selectable Real
+backend. Run the ordinary portable IPC suite with:
 
 ```bash
-./build/ngc_ipc_tests ./build/ngc_ipc_backend.exe
+./build/ngc_ipc_tests ./build/ngc_ipc_test_peer.exe
 ```
 
 On a configured RT development host, exercise the same Real-session path with
 RT hosting enabled:
 
 ```bash
-./build/ngc_ipc_tests ./build/ngc_ipc_backend.exe --realtime
+./build/ngc_ipc_tests ./build/ngc_ipc_test_peer.exe --realtime
 ```
 
 ## Mesa 7I96 development network

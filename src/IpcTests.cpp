@@ -515,27 +515,27 @@ namespace {
         if (!realtime) {
             ordinaryBackendConfiguration =
                 std::filesystem::temp_directory_path()
-                / "ngc-ipc-backend-ordinary.toml";
+                / "ngc-ipc-test-peer-ordinary.toml";
             std::ofstream file(
                 *ordinaryBackendConfiguration,
                 std::ios::binary | std::ios::trunc);
             file << "[runtime]\nlock_memory = false\n";
             require(
                 static_cast<bool>(file),
-                "could not write the ordinary IPC backend "
+                "could not write the ordinary IPC test-peer "
                 "configuration");
             configuration->realBackend->backendConfiguration =
                 *ordinaryBackendConfiguration;
         } else {
             configuration->realBackend->backendConfiguration =
                 std::filesystem::absolute(
-                    "ipc_backend.toml").lexically_normal();
+                    "ipc_test_peer.toml").lexically_normal();
         }
 
         ngc::MachineSessionManager manager(*configuration);
         const auto initial = manager.state();
         require(initial.simulationAvailable && initial.realAvailable,
-                "configured IPC backend should expose Simulation and Real");
+                "configured IPC test peer should expose Simulation and Real");
         auto realAuthority =
             manager.selectControlTarget(ngc::MachineControlTarget::Real);
         require(realAuthority.has_value(),

@@ -146,8 +146,8 @@ diagnostic channel; the NRT peer bridges those summaries through a separate
 versioned IPC ring into Real session snapshots. Diagnostic backpressure never
 blocks motion. Hardware acquisition and synthetic-input policy remain outside
 the runtime. The runtime is the second backend-conformance target and is paired
-end-to-end with `HomingController`. It is hosted by the external process for
-the configured non-hardware Real target. There is no HAL component.
+end-to-end with `HomingController`. It is hosted by the physical Real process
+and by a hardware-free external test peer. There is no HAL component.
 `ngc_mesa_backend` is the initial physical executor process: its NRT bootstrap
 loads and cross-validates the typed machine and physical-backend
 configurations. The physical-backend configuration owns the executor host
@@ -186,9 +186,8 @@ supply with INPUT COMMON grounded; removing that voltage must latch
 `MESA_EXTERNAL_ENABLE_FAULT` and safe outputs. This commissioning wire proves
 input polarity and executor response only and must be replaced with verified
 E-stop/enable feedback before any drive, motor, spindle, or other output is
-powered. The process is not yet the
-application's default Real target and has not completed staged physical
-commissioning. The typed Mesa backend
+powered. The process is the application's configured Real target but has not
+completed staged physical commissioning. The typed Mesa backend
 configuration loader shares only generic,
 source-aware TOML field validation with the frontend machine loader and keeps
 its hardware schema separate. The `ngc_mesa_stepgen_diagnostic` executable
@@ -214,20 +213,20 @@ not be added to `DigitalIoProgram::executeInputs()` or
 `executeOutputs()`.
 `ExternalRealtimeRuntime`
 implements the NRT side of the versioned shared-memory IPC boundary and owns a
-bounded `MotionBackend` proxy. The `ngc_ipc_backend` executable is a
-non-hardware executor-in-the-loop peer: it validates typed machine
-configuration during startup, hosts `ProductionExecutorRuntime`, and bridges
-bounded execution items, controls, events, and snapshots across the production
-IPC path. On Windows its ordinary scheduler thread proves functional executor
-and process behavior. On configured Linux RT hosts, its RT scheduler and
-non-hardware I/O boundary prove the production execution and diagnostic path,
-not physical I/O or hardware safety. The peer temporarily fakes axis-space probe and
-joint-space homing inputs. Probe input triggers 0.5 machine units before its
-move target; each homing input triggers after its joint travels 0.5 machine
-units from the move start. The peer lengthens its private copy of a shorter
-triggered joint approach to leave trigger and stopping room. This exists only
-so the production IPC path can exercise probing and homing; it does not fake
-other physical inputs.
+bounded `MotionBackend` proxy. `ngc_ipc_test_peer` is test-only infrastructure,
+not a selectable product backend. It validates typed machine configuration
+during startup, hosts `ProductionExecutorRuntime`, and bridges bounded
+execution items, controls, events, and snapshots across the production IPC
+path. On Windows its ordinary scheduler thread proves functional executor and
+process behavior. On configured Linux RT hosts, its RT scheduler and
+hardware-free I/O boundary prove the production execution and diagnostic path,
+not physical I/O or hardware safety. The peer temporarily fakes axis-space
+probe and joint-space homing inputs. Probe input triggers 0.5 machine units
+before its move target; each homing input triggers after its joint travels 0.5
+machine units from the move start. The peer lengthens its private copy of a
+shorter triggered joint approach to leave trigger and stopping room. This
+exists only so automated production-IPC tests can exercise probing and homing;
+it does not fake other physical inputs.
 `[real_backend]` configures this process as the application's selectable Real
 target for development without hardware; unavailable physical I/O operations
 must fail or use explicit peer-owned synthetic policy rather than falling back

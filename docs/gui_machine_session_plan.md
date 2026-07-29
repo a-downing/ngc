@@ -11,11 +11,11 @@ exists. Completed claims must be verified against the current code and tests.
 
 ## Current mismatch
 
-The application owns Simulation and the configured non-hardware Real session
-through `MachineSessionManager`, presents their backend-neutral power and
-activity state, and exposes the powered-session lifecycle explicitly. Phases 1
-through 6 are complete. The remaining mismatch is physical status: the Windows
-Real target has null I/O. The GUI exposes the manager's Real-to-Simulation
+The application owns Simulation and the configured Mesa Real session through
+`MachineSessionManager`, presents their backend-neutral power and activity
+state, and exposes the powered-session lifecycle explicitly. Phases 1 through
+6 are complete. The remaining mismatch is physical commissioning, not a
+second selectable backend. The GUI exposes the manager's Real-to-Simulation
 checkpoint operation with state-derived availability and precise rejection
 feedback.
 
@@ -300,7 +300,7 @@ Acceptance criteria:
 
 Status: in progress. The standalone application presents an explicit
 Simulation/Real selector and simultaneous live session rows. `[real_backend]`
-enables Real through `ExternalRealtimeRuntime` and `ngc_ipc_backend`; selecting
+enables Real through `ExternalRealtimeRuntime` and `ngc_mesa_backend`; selecting
 and powering Real runs program motion through the production IPC and executor
 path. The GUI tags target-dependent motion and controller-data operations with
 current authority, switches live tool-table ownership and isolated stores with
@@ -308,7 +308,8 @@ the target, and rejects stale generations or wrong targets before admission.
 Mock scheduler diagnostics and accelerated playback remain Simulation-only.
 The manager's target router and checkpoint boundary remain covered by the
 explicit in-process test host, while IPC tests cover a complete configured Real
-program epoch. The GUI exposes **Simulate from Real** only while Real control,
+program epoch through `ngc_ipc_test_peer`. The GUI exposes **Simulate from
+Real** only while Real control,
 power, stationary idle state, fault-free state, and homing plus powered-off
 idle Simulation state satisfy the visible checkpoint prerequisites. Physical
 safety/I/O state remains unfinished.
@@ -376,8 +377,8 @@ fault prominence.
 
 This plan does not:
 
-- claim that the selectable non-hardware Real target is a commissioned physical
-  backend;
+- claim that the configured Mesa Real target has completed physical
+  commissioning;
 - move geometry construction into the GUI;
 - give Preview a separate geometry implementation;
 - place diagnostics or presentation objects into the RT-facing backend;

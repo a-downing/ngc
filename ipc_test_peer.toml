@@ -1,0 +1,6 @@
+# Host policy for the hardware-free production IPC test peer.
+
+[runtime]
+realtime_cpu = 15
+realtime_priority = 98
+lock_memory = true
