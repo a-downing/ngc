@@ -1045,8 +1045,9 @@ interrupted by peer loss cannot be resumed after a fresh connection.
 The shared-memory storage and process layer has Windows and POSIX
 implementations and the executor-in-the-loop path is exercised on both
 supported development platforms. The Windows peer uses an ordinary scheduler
-thread. On Linux, typed Real-backend configuration can require locked memory,
-a selected CPU, `SCHED_FIFO` priority, and absolute monotonic servo deadlines.
+by default and the configured host policy enables best-effort Windows timing.
+On Linux, typed Real-backend configuration can require locked memory, a
+selected CPU, `SCHED_FIFO` priority, and absolute monotonic servo deadlines.
 The NRT peer host is excluded from the servo CPU before the RT thread starts.
 Any host setup failure rejects startup rather than falling back to ordinary
 scheduling. The test peer uses a hardware-free I/O boundary. A temporary
@@ -1059,6 +1060,55 @@ functional executor and process behavior rather than hardware safety. The
 production IPC path and configured RT hosting have been validated on the Linux
 RT development host; the Mesa physical transport is implemented separately
 and remains under staged hardware commissioning.
+
+#### Windows timing follow-up
+
+The Windows IPC test peer proves executor and process behavior but is not a
+hard real-time host. With configured host policy,
+`ProductionExecutorRuntime` requests CPU affinity, prefaults its stack,
+requests `THREAD_PRIORITY_TIME_CRITICAL` with priority boosting disabled,
+disables execution-speed throttling, and sleeps toward each absolute deadline
+with a high-resolution waitable timer followed by a short spin. Windows host
+requests are best effort, process-wide memory locking is unavailable, and a
+missed deadline remains diagnostic rather than faulting the executor.
+`WindowsServoPacer` remains a separate Simulation-only implementation.
+
+The Linux RT commissioning work established several distinctions that should
+guide a future Windows timing experiment:
+
+- Measure wake lateness, servo-period jitter, executor duration, and UDP
+  exchange duration separately. Do not infer scheduler behavior from a total
+  cyclic duration.
+- Use one dedicated physical core for the servo thread, leave its SMT sibling
+  idle, and keep NIC interrupts, DPCs, and ordinary work off that core.
+- Validate the production host's high-resolution waitable timer, absolute
+  deadlines, affinity, time-critical priority, and final spin as independent
+  changes. Measure the spin threshold rather than assuming that more busy
+  waiting improves the tail, and evaluate MMCSS separately. Windows still
+  provides no equivalent guarantee to Linux `SCHED_FIFO`.
+- Configure a dedicated Mesa NIC for latency rather than throughput. Measure
+  RSS/interrupt affinity, interrupt moderation, offloads, Energy Efficient
+  Ethernet, and device power saving one change at a time because the available
+  controls are driver-specific.
+- Use a high-performance power policy, avoid core parking on the selected
+  core, prefault fixed cyclic storage and stack, and evaluate `VirtualLock`
+  where its privilege and working-set limits are acceptable.
+- Avoid heavy memory pressure during real-time operation. Trace unexplained
+  tails with ETW/WPR so ISR, DPC, scheduler preemption, hard faults, memory
+  activity, and NIC processing can be distinguished.
+
+Linux `kernel.timer_migration`, PREEMPT_RT hrtimer behavior, IRQ affinity
+files, and `mlockall` are not Windows tuning controls and must not be copied
+literally. Their transferable lesson is to identify where the timer expires
+and which CPU performs every wakeup and network-completion stage.
+
+The corrected Mesa StepGen diagnostic is platform-independent evidence for a
+future Windows run: align accumulator measurements to DPLL latch boundaries,
+report requested-rate error separately from signed DDS quantization, retain
+per-interval deltas, and preserve activation and stop transition travel.
+Without those measurements, an endpoint accounting artifact can be mistaken
+for generated-step following error even when scheduler and UDP timing are
+sound.
 
 - Implement fixed shared-memory rings and the physical `MotionBackend` proxy.
   Complete for the transport skeleton.
