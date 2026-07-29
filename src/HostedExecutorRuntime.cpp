@@ -14,8 +14,6 @@
 
 namespace ngc {
     namespace {
-        constexpr bool HOST_DEADLINE_MISS_IS_FATAL = true;
-
         class NullProductionExecutorIo final : public ProductionExecutorIo {
         public:
             void sampleDigitalInputs(
@@ -140,7 +138,7 @@ namespace ngc {
         HostedExecutorRuntimeConfiguration configuration,
         std::unique_ptr<ProductionExecutorIo> io)
         : m_core(std::make_unique<ProductionExecutorCore>(
-              configuration.servoPeriod, std::move(configuration.executor))),
+              configuration.servoPeriod, configuration.executor)),
           m_io(io ? std::move(io)
                   : std::make_unique<NullProductionExecutorIo>()),
           m_timingAccumulator(std::make_unique<TimingAccumulator>()),
@@ -381,8 +379,7 @@ namespace ngc {
                 m_servoTicks.load(std::memory_order_relaxed),
                 wakeLateness, static_cast<std::uint64_t>(execution),
                 slack, skippedPeriods);
-            if (m_realtime.realtimeEnabled
-                && HOST_DEADLINE_MISS_IS_FATAL && slack < 0) {
+            if (m_realtime.realtimeEnabled && slack < 0) {
                 m_core->reportHostFault(
                     PRODUCTION_EXECUTOR_DEADLINE_MISS_FAULT);
                 m_io->applyOutputs(m_core->outputState());

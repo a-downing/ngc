@@ -106,7 +106,6 @@ public:
           m_simulation(external ? nullptr
                                 : static_cast<ngc::InProcessSimulationRuntime *>(
                                       m_runtime.get())),
-          m_external(external),
           m_servoPeriod(external
               ? configuration.machineExecutor->servoPeriod
               : configuration.simulation.servoPeriod) { }
@@ -117,7 +116,7 @@ public:
 
     void start() override {
         m_runtime->start();
-        if (m_external && !submitControlAndWait(ngc::EnableRequest{
+        if (!m_simulation && !submitControlAndWait(ngc::EnableRequest{
                 std::numeric_limits<ngc::RequestId>::max()})) {
             m_runtime->stop();
             throw std::runtime_error(
@@ -126,7 +125,7 @@ public:
     }
 
     void stop() override {
-        if (m_external) {
+        if (!m_simulation) {
             static_cast<void>(submitControlAndWait(ngc::DisableRequest{
                 std::numeric_limits<ngc::RequestId>::max() - 1}));
         }
@@ -271,7 +270,6 @@ private:
 
     std::unique_ptr<ngc::BackendRuntime> m_runtime;
     ngc::InProcessSimulationRuntime *m_simulation = nullptr;
-    bool m_external = false;
     double m_servoPeriod = 0.001;
 };
 
