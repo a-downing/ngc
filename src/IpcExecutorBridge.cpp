@@ -139,4 +139,86 @@ namespace ngc {
 
         return progressed;
     }
+
+    ExecutionSnapshot stopExecutorAfterFrontendLoss(BackendRuntime &runtime) {
+        constexpr RequestId internalRequest = 0;
+        auto &backend = runtime.endpoint();
+        auto snapshot = ExecutionSnapshot{};
+        auto stopPending = false;
+        auto snapshotSeen = false;
+        auto stopResult = std::optional<bool>{};
+        const auto service = [&] {
+            runtime.serviceImmediate();
+            runtime.waitForServiceMotion();
+        };
+
+        ExecutionEvent staleEvent;
+        while (backend.tryTakeEvent(staleEvent)) { }
+        while (backend.tryTakeSnapshot(snapshot)) { }
+
+        for (;;) {
+            auto completedThisIteration = false;
+            ExecutionEvent event;
+            while (backend.tryTakeEvent(event)) {
+                const auto *completed =
+                    std::get_if<RequestCompleted>(&event);
+                if (completed != nullptr
+                    && completed->request == internalRequest) {
+                    stopPending = false;
+                    stopResult = completed->succeeded;
+                    completedThisIteration = true;
+                }
+            }
+            while (backend.tryTakeSnapshot(snapshot)) {
+                snapshotSeen = true;
+            }
+
+            if (completedThisIteration) {
+                snapshotSeen = false;
+                service();
+                continue;
+            }
+            if (stopResult.has_value() && snapshotSeen
+                && (snapshot.state == BackendState::Held
+                    || snapshot.state == BackendState::Faulted
+                    || snapshot.state == BackendState::Disabled)) {
+                break;
+            }
+            if (stopResult.has_value() && !*stopResult) {
+                stopResult.reset();
+            }
+            if (!stopPending
+                && !stopResult.has_value()
+                && backend.trySubmit(
+                    ControlledStopRequest{internalRequest})
+                    == SubmitResult::Submitted) {
+                stopPending = true;
+            }
+
+            service();
+        }
+
+        auto disablePending = false;
+        while (snapshot.state != BackendState::Disabled) {
+            ExecutionEvent event;
+            while (backend.tryTakeEvent(event)) { }
+            while (backend.tryTakeSnapshot(snapshot)) { }
+            if (snapshot.state == BackendState::Disabled) {
+                break;
+            }
+            if (!disablePending
+                && backend.trySubmit(DisableRequest{internalRequest})
+                    == SubmitResult::Submitted) {
+                disablePending = true;
+            }
+
+            service();
+        }
+
+        // Disable is staged by applyOutputs() after its servo tick. One more
+        // tick transmits that safe image to cyclic hardware before shutdown.
+        service();
+
+        return snapshot;
+    }
 }

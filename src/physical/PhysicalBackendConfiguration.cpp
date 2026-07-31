@@ -55,24 +55,32 @@ namespace ngc::physical {
     std::expected<PhysicalBackendConfiguration, std::string>
     loadPhysicalBackendConfiguration(
         const std::filesystem::path &path) {
+        const auto document =
+            toml_configuration::loadDocument(path);
+        if (!document) {
+            return std::unexpected(document.error());
+        }
         auto runtime =
-            loadBackendRuntimeHostConfiguration(path);
+            loadBackendRuntimeHostConfiguration(
+                document->table, path);
         if (!runtime) {
             return std::unexpected(runtime.error());
         }
-        auto motion = mesa::loadMesaBackendConfiguration(path);
+        auto motion = mesa::loadMesaBackendConfiguration(
+            document->table, path);
         if (!motion) {
             return std::unexpected(motion.error());
         }
 
         try {
-            const auto document = toml::parse_file(path.string());
             auto result = PhysicalBackendConfiguration{
+                .sourceFingerprint = document->fingerprint,
                 .runtime = *runtime,
                 .motion = std::move(*motion),
                 .spindle = std::nullopt,
             };
-            const auto *spindleNode = document.get("spindle");
+            const auto *spindleNode =
+                document->table.get("spindle");
             if (spindleNode == nullptr) {
                 return result;
             }

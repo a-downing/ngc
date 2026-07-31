@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <deque>
 #include <functional>
+#include <limits>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -162,15 +163,23 @@ namespace ngc {
         }
 
         void begin() {
-            beginImpl(true);
+            beginImpl(true, std::nullopt);
+        }
+
+        void begin(const position_t &position) {
+            beginImpl(true, position);
         }
 
         void beginContinuation() {
-            beginImpl(false);
+            beginImpl(false, std::nullopt);
+        }
+
+        void beginContinuation(const position_t &position) {
+            beginImpl(false, position);
         }
 
     private:
-        void beginImpl(const bool resetMachine) {
+        void beginImpl(const bool resetMachine, const std::optional<position_t> &position) {
             stop();
             m_statusMessages.clear();
             m_blockMessages.clear();
@@ -193,7 +202,12 @@ namespace ngc {
             m_executionStarted = true;
 
             try {
-                if(resetMachine) m_machine.beginProgramRun();
+                if (resetMachine) {
+                    m_machine.beginProgramRun();
+                }
+                if (position.has_value()) {
+                    m_machine.synchronizePosition(*position);
+                }
                 m_machine.memory().write(Var::TASK, taskValue(m_mode), true);
             } catch(const std::exception &error) {
                 m_executionError = error.what();
@@ -447,14 +461,28 @@ namespace ngc {
 
                         if(state.modeToolChange) {
                             evaluator.synchronize();
-                            m_machine.prepareToolChange(static_cast<int>(*state.T));
+                            const auto selectedTool = state.T ? state.T : m_machine.state().T;
+                            if (!selectedTool) {
+                                throw std::runtime_error(std::format(
+                                    "{}: M6 requires a selected tool", token.location()));
+                            }
+                            const auto convertedTool = convertExactInteger(
+                                *selectedTool, std::numeric_limits<int>::lowest(),
+                                std::numeric_limits<int>::max());
+                            if (!convertedTool) {
+                                throw std::runtime_error(std::format(
+                                    "{}: M6 selected tool must be a finite integer: T{}",
+                                    token.location(), *selectedTool));
+                            }
+                            const auto toolNumber = *convertedTool;
+                            m_machine.prepareToolChange(toolNumber);
                             publishMessage(std::move(message), execution);
                             evaluator.synchronize();
                             const auto checkpoint =
                                 m_machine.captureToolChangeModalCheckpoint();
                             double changed = 0.0;
                             try {
-                                changed = evaluator.call("_tool_change", *state.T);
+                                changed = evaluator.call("_tool_change", static_cast<double>(toolNumber));
                                 evaluator.synchronize();
                                 m_toolChangeModalCheckpoint = checkpoint;
                                 evaluator.toolChangeModalStateRestored();
@@ -466,7 +494,7 @@ namespace ngc {
                             if (changed == 0.0) {
                                 throw std::runtime_error(std::format(
                                     "tool-change routine returned failure for tool {}",
-                                    static_cast<int>(*state.T)));
+                                    toolNumber));
                             }
                             publishBlockLifecycle({ execution, BlockLifecyclePhase::Completed });
                             return;

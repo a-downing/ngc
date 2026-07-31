@@ -114,8 +114,13 @@ namespace ngc {
 
     std::expected<MachineConfiguration, std::string>
     loadMachineConfiguration(const std::filesystem::path &path) {
+        const auto loaded =
+            toml_configuration::loadDocument(path);
+        if (!loaded) {
+            return std::unexpected(loaded.error());
+        }
         try {
-            const auto document = toml::parse_file(path.string());
+            const auto &document = loaded->table;
             const auto *machine = document["machine"].as_table();
             const auto *trajectory = document["trajectory"].as_table();
             const auto *simulation = document["simulation"].as_table();
@@ -160,6 +165,8 @@ namespace ngc {
             }
 
             MachineConfiguration result;
+            result.sourceFingerprint =
+                loaded->fingerprint;
             const auto resolveStorePath = [&](const std::filesystem::path &configured) {
                 if (configured.is_absolute()) {
                     return configured;
@@ -515,7 +522,6 @@ namespace ngc {
                 auto latchVelocity = number(*home, "latch_velocity", path);
                 auto backoffDistance = positiveNumber(*home, "backoff_distance", path);
                 auto finalVelocity = number(*home, "final_velocity", path);
-                auto useIndex = requiredBool(*home, "use_index", path);
                 if(!inputName) return std::unexpected(inputName.error());
                 if(!conditionName) return std::unexpected(conditionName.error());
                 if(!homePosition) return std::unexpected(homePosition.error());
@@ -524,7 +530,12 @@ namespace ngc {
                 if(!latchVelocity) return std::unexpected(latchVelocity.error());
                 if(!backoffDistance) return std::unexpected(backoffDistance.error());
                 if(!finalVelocity) return std::unexpected(finalVelocity.error());
-                if(!useIndex) return std::unexpected(useIndex.error());
+                if (const auto *useIndex = home->get("use_index")) {
+                    return std::unexpected(configurationError(
+                        path, "joints.homing.use_index",
+                        "is unsupported because encoder-index homing is not supported",
+                        useIndex));
+                }
                 if(*searchVelocity == 0.0 || *latchVelocity == 0.0)
                     return std::unexpected(configurationError(
                         path, "joints.homing", "search_velocity and latch_velocity must be nonzero", home));
@@ -539,7 +550,7 @@ namespace ngc {
                 result.joints.push_back({ id, *name, *axis, *coordinateScale, *minimum, *maximum,
                     *maxVelocity, *maxAcceleration, *maxJerk,
                     { input->id, *condition, *homePosition, *switchPosition, *searchVelocity,
-                      *latchVelocity, *backoffDistance, *finalVelocity, *useIndex } });
+                      *latchVelocity, *backoffDistance, *finalVelocity } });
             }
 
             if(configuredJointIds != axisJointIds)
@@ -594,18 +605,36 @@ namespace ngc {
                                                                   "a joint may belong to only one homing group",
                                                                   table->get("joints")));
                 }
-                const auto optionalBool = [&](const std::string_view key) -> std::expected<bool, std::string> {
-                    if(!table->contains(key)) return false;
-                    return requiredBool(*table, key, path);
+                constexpr std::array groupOptions {
+                    "start_together",
+                    "stop_each_joint_on_trigger",
+                    "final_move_together",
                 };
-                auto startTogether = optionalBool("start_together");
-                auto stopSeparately = optionalBool("stop_each_joint_on_trigger");
-                auto finalTogether = optionalBool("final_move_together");
-                if(!startTogether) return std::unexpected(startTogether.error());
-                if(!stopSeparately) return std::unexpected(stopSeparately.error());
-                if(!finalTogether) return std::unexpected(finalTogether.error());
-                result.homing.groups.push_back({ *name, convertedSequence, std::move(*ids),
-                    *startTogether, *stopSeparately, *finalTogether });
+                if (ids->size() == 1) {
+                    for (const auto *option : groupOptions) {
+                        if (const auto *node = table->get(option)) {
+                            return std::unexpected(configurationError(
+                                path, std::format("homing.groups.{}", option),
+                                "must not be specified for a single-joint group", node));
+                        }
+                    }
+                } else {
+                    for (const auto *option : groupOptions) {
+                        const auto enabled = requiredBool(*table, option, path);
+                        if (!enabled) {
+                            return std::unexpected(enabled.error());
+                        }
+                        if (!*enabled) {
+                            return std::unexpected(configurationError(
+                                path, std::format("homing.groups.{}", option),
+                                "must be true; alternative multi-joint homing modes are not supported",
+                                table->get(option)));
+                        }
+                    }
+                }
+                result.homing.groups.push_back({
+                    *name, convertedSequence, std::move(*ids),
+                });
             }
             if(groupedJoints != configuredJointIds)
                 return std::unexpected(configurationError(

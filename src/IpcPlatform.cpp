@@ -222,6 +222,10 @@ namespace ngc::ipc_detail {
         return static_cast<std::uint32_t>(getpid());
     }
 
+    std::uint32_t parentProcessId() noexcept {
+        return static_cast<std::uint32_t>(getppid());
+    }
+
     std::string uniqueSharedMemoryName() {
         const auto id = nextSharedMemoryId.fetch_add(1, std::memory_order_relaxed);
 

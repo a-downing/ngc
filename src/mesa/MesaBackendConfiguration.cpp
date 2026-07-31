@@ -89,8 +89,21 @@ namespace ngc::mesa {
     std::expected<MesaBackendConfiguration, std::string>
     loadMesaBackendConfiguration(
         const std::filesystem::path &path) {
+        const auto document =
+            toml_configuration::loadDocument(path);
+        if (!document) {
+            return std::unexpected(document.error());
+        }
+
+        return loadMesaBackendConfiguration(
+            document->table, path);
+    }
+
+    std::expected<MesaBackendConfiguration, std::string>
+    loadMesaBackendConfiguration(
+        const toml::table &document,
+        const std::filesystem::path &path) {
         try {
-            const auto document = toml::parse_file(path.string());
             const auto *motion = document["motion"].as_table();
             if (motion == nullptr) {
                 return std::unexpected(toml_configuration::error(

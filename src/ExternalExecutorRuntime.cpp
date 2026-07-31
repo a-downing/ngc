@@ -20,7 +20,6 @@ namespace ngc {
 
         bool emptyIdentity(const IpcIdentity &identity) noexcept {
             return identity.configurationFingerprint == 0
-                && identity.topologyFingerprint == 0
                 && identity.sessionGeneration == 0
                 && identity.epochGeneration == 0
                 && identity.authorityGeneration == 0;
@@ -34,8 +33,6 @@ namespace ngc {
                 case IpcRejection::RegionLayout: return "shared-region layout mismatch";
                 case IpcRejection::ConfigurationFingerprint:
                     return "configuration fingerprint mismatch";
-                case IpcRejection::TopologyFingerprint:
-                    return "topology fingerprint mismatch";
                 case IpcRejection::SessionGeneration:
                     return "session generation mismatch";
                 case IpcRejection::EpochGeneration:
@@ -168,10 +165,6 @@ namespace ngc {
 
             std::vector<std::string> arguments{
                 "--mapping", m_sharedMemory.name(),
-                "--configuration", std::to_string(
-                    m_configuration.peerExpectedIdentity.configurationFingerprint),
-                "--topology", std::to_string(
-                    m_configuration.peerExpectedIdentity.topologyFingerprint),
                 "--session", std::to_string(
                     m_configuration.peerExpectedIdentity.sessionGeneration),
                 "--epoch", std::to_string(

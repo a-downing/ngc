@@ -17,6 +17,7 @@ namespace ngc {
         constexpr std::uint32_t JOG_GENERATION_FAULT = 3;
         constexpr std::uint32_t FEED_RETIMING_FAULT = 4;
         constexpr std::uint32_t FEED_RETIMING_STOP_BRANCH_FAULT = 5;
+        constexpr std::uint32_t PLAN_START_DISCONTINUITY_FAULT = 6;
         constexpr double DYNAMIC_LIMIT_TOLERANCE = 1.01;
 
         double magnitude(const position_t &value) noexcept {
@@ -65,6 +66,10 @@ namespace ngc {
                 value.x, value.y, value.z,
                 value.a, value.b, value.c,
             };
+        }
+
+        bool samePosition(const position_t &left, const position_t &right) noexcept {
+            return (left - right).length() <= 1e-9;
         }
 
         position_t axisPosition(
@@ -653,6 +658,17 @@ namespace ngc {
             emit(ChunkRejected{
                 execution_item::epoch(item), execution_item::id(item)});
             release(index);
+
+            return;
+        }
+        if (const auto *chunk = std::get_if<PlanChunk>(&item);
+            chunk != nullptr
+            && !samePosition(
+                executionSpanStart(chunk->normalMotion[0]).position,
+                m_snapshot.commanded.position)) {
+            emit(ChunkRejected{chunk->epoch, chunk->id});
+            release(index);
+            fault(PLAN_START_DISCONTINUITY_FAULT);
 
             return;
         }

@@ -218,7 +218,8 @@ namespace ngc {
     bool MachineSession::queueProgram(StartProgram start) {
         if (start.programs.empty()
             || (start.activity != MachineActivity::Program
-                && start.activity != MachineActivity::Mdi)) {
+                && start.activity != MachineActivity::Mdi)
+            || programMotionRequiresHoming()) {
             return false;
         }
         if (!m_coordinator.beginActivity(start.activity)) {
@@ -242,6 +243,7 @@ namespace ngc {
 
             return false;
         }
+        m_homedJoints = 0;
 
         return true;
     }
@@ -332,10 +334,6 @@ namespace ngc {
                 "machine-session program execution failed");
         } else if (controlState == ProgramExecutionState::StopComplete) {
             result.state = ProgramOperationState::StopComplete;
-        } else if (driverState == PreparedDriverState::Error) {
-            result.state = ProgramOperationState::Error;
-            result.error = m_driver.error().value_or(
-                "prepared trajectory execution failed");
         } else if (driverState == PreparedDriverState::Completed) {
             result.state = ProgramOperationState::Completed;
         } else if (controlState == ProgramExecutionState::Paused
@@ -367,9 +365,9 @@ namespace ngc {
         m_interpreter.setPrograms(start.programs);
         m_interpreter.compile([](const auto &callback) { callback(); });
         if (start.preserveState) {
-            m_interpreter.beginContinuation();
+            m_interpreter.beginContinuation(startingPosition);
         } else {
-            m_interpreter.begin();
+            m_interpreter.begin(startingPosition);
         }
 
         m_geometryCancelled.store(false, std::memory_order_release);
@@ -672,6 +670,11 @@ namespace ngc {
     void MachineSession::configureHoming(std::vector<AxisConfiguration> axes,
                                          std::vector<JointConfiguration> joints,
                                          HomingConfiguration homing) {
+        m_configuredJoints = 0;
+        for (const auto &joint : joints) {
+            m_configuredJoints |= JointMask {1} << joint.id;
+        }
+        m_requireHomingBeforeMotion = homing.requireBeforeMotion;
         m_homingController = std::make_unique<HomingController>(
             std::move(axes), std::move(joints), std::move(homing), m_backend);
     }
@@ -750,6 +753,11 @@ namespace ngc {
 
     JointMask MachineSession::homedJoints() const noexcept {
         return m_homedJoints;
+    }
+
+    bool MachineSession::programMotionRequiresHoming() const noexcept {
+        return m_requireHomingBeforeMotion
+            && (m_homedJoints & m_configuredJoints) != m_configuredJoints;
     }
 
     std::expected<JoggingResult, std::string> MachineSession::runJogging(

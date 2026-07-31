@@ -246,6 +246,7 @@ namespace ngc {
             const position_t &startingPosition);
         [[nodiscard]] std::optional<HomingObservation> homingObservation() const;
         [[nodiscard]] JointMask homedJoints() const noexcept;
+        [[nodiscard]] bool programMotionRequiresHoming() const noexcept;
         [[nodiscard]] std::expected<JoggingResult, std::string> runJogging(
             const position_t &startingPosition, const ControlRequest &firstRequest);
         [[nodiscard]] std::optional<JoggingObservation> joggingObservation() const;
@@ -398,6 +399,8 @@ namespace ngc {
         std::optional<HomingObservation> m_homingObservation;
         std::optional<JoggingObservation> m_joggingObservation;
         JointMask m_homedJoints = 0;
+        JointMask m_configuredJoints = 0;
+        bool m_requireHomingBeforeMotion = false;
         TrajectoryLimits m_limits;
         GeometryEpoch m_nextEpoch = 1;
         std::optional<std::filesystem::path> m_parameterStorePath;

@@ -10,7 +10,9 @@
 #include <thread>
 #include <variant>
 
+#include "config/ConfigurationFingerprint.h"
 #include "machine/ExternalExecutorRuntime.h"
+#include "machine/MachineConfiguration.h"
 #include "mesa/MesaProductionExecutorIo.h"
 
 namespace {
@@ -194,9 +196,27 @@ namespace {
     }
 
     int run(const Options &options) {
+        const auto machine =
+            ngc::loadMachineConfiguration(options.machine);
+        if (!machine) {
+            throw std::runtime_error(machine.error());
+        }
+        if (!machine->machineExecutor.has_value()) {
+            throw std::runtime_error(
+                "machine configuration has no machine_executor");
+        }
+        const auto backend =
+            ngc::toml_configuration::fileFingerprint(
+                options.backend);
+        if (!backend) {
+            throw std::runtime_error(backend.error());
+        }
         const auto identity = ngc::IpcIdentity{
-            .configurationFingerprint = 0x4D455341,
-            .topologyFingerprint = 0x37493936,
+            .configurationFingerprint =
+                ngc::toml_configuration::combinedFingerprint(
+                    machine->sourceFingerprint,
+                    *backend,
+                    machine->machineExecutor->servoPeriod),
             .sessionGeneration = 1,
             .epochGeneration = 1,
             .authorityGeneration = 1,

@@ -183,6 +183,16 @@ target_link_libraries(ngc_tests PRIVATE ngc_core glm::glm-header-only PathTempo:
 ngc_target_defaults(ngc_tests)
 add_test(NAME ngc_tests COMMAND ngc_tests)
 
+add_executable(ngc_machine_configuration_tests
+    src/MachineConfigurationTests.cpp
+)
+target_compile_definitions(ngc_machine_configuration_tests
+    PRIVATE NGC_SOURCE_DIR="${CMAKE_SOURCE_DIR}")
+target_link_libraries(ngc_machine_configuration_tests PRIVATE ngc_core)
+ngc_target_defaults(ngc_machine_configuration_tests)
+add_test(NAME ngc_machine_configuration_tests
+    COMMAND ngc_machine_configuration_tests)
+
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(ngc_production_executor_tests
         src/ProductionExecutorCoreTests.cpp
@@ -216,7 +226,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 
     add_executable(ngc_ipc_test_peer tools/ngc_ipc_test_peer.cpp)
     target_include_directories(ngc_ipc_test_peer PRIVATE src)
-    target_link_libraries(ngc_ipc_test_peer PRIVATE ngc_core)
+    target_link_libraries(
+        ngc_ipc_test_peer PRIVATE ngc_core ngc_configuration)
     ngc_target_defaults(ngc_ipc_test_peer)
     set_target_properties(ngc_ipc_test_peer PROPERTIES SUFFIX ".exe")
     add_test(

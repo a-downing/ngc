@@ -19,6 +19,7 @@
 #include <string>
 #include <vector>
 
+#include "config/ConfigurationFingerprint.h"
 #include "machine/GeometryStreamProducer.h"
 #ifdef __linux__
 #include "machine/ExternalExecutorRuntime.h"
@@ -42,9 +43,25 @@ class SessionBackendRuntime final : public ngc::BackendRuntime {
     static ngc::ExternalExecutorRuntimeConfiguration externalConfiguration(
             const ngc::MachineConfiguration &configuration) {
         const auto &backend = *configuration.machineExecutor;
+        auto backendFingerprint =
+            std::optional<std::uint64_t>{};
+        if (backend.backendConfiguration.has_value()) {
+            const auto fingerprint =
+                ngc::toml_configuration::fileFingerprint(
+                    *backend.backendConfiguration);
+            if (!fingerprint) {
+                throw std::runtime_error(
+                    "failed to fingerprint backend "
+                    "configuration: " + fingerprint.error());
+            }
+            backendFingerprint = *fingerprint;
+        }
         const ngc::IpcIdentity identity{
-            .configurationFingerprint = 1,
-            .topologyFingerprint = 1,
+            .configurationFingerprint =
+                ngc::toml_configuration::combinedFingerprint(
+                    configuration.sourceFingerprint,
+                    backendFingerprint,
+                    backend.servoPeriod),
             .sessionGeneration = 1,
             .epochGeneration = 1,
             .authorityGeneration = 1,
@@ -493,6 +510,9 @@ public:
         if (programs.empty()) {
             return { SessionCommandRejection::EmptyProgram };
         }
+        if (m_machineSession.programMotionRequiresHoming()) {
+            return { SessionCommandRejection::HomingRequired };
+        }
         const auto activity = std::get<1>(programs.back()) == "<MDI>"
             ? ngc::MachineActivity::Mdi : ngc::MachineActivity::Program;
         if (!m_machineSession.toolTableInitialized()
@@ -533,6 +553,7 @@ public:
         if (!m_machineSession.queueHoming()) {
             return { SessionCommandRejection::CommandUnavailable };
         }
+        m_snapshot.homedJoints = m_machineSession.homedJoints();
         m_stop = false;
         m_snapshot.status = ngc::SimulationStatus::Running;
         m_snapshot.activity = ngc::SimulationActivity::Homing;
@@ -1544,11 +1565,15 @@ private:
             auto start = std::get<ngc::StartProgram>(std::move(operation));
             auto programs = std::move(start.programs);
             const auto preserve = start.preserveState;
-            const auto startingPosition = preserve ? m_snapshot.machinePosition : ngc::position_t{};
+            const auto startingPosition = m_snapshot.machinePosition;
+            const auto startingJoints = m_snapshot.joints;
             m_running = true; m_programRunning = true; m_stop = false;
-            if(!preserve) {
+            if (!preserve) {
                 m_snapshot = {};
                 m_snapshot.powerState = m_machineSession.coordinator().powerState();
+                m_snapshot.machinePosition = startingPosition;
+                m_snapshot.joints = startingJoints;
+                m_snapshot.homedJoints = m_machineSession.homedJoints();
                 m_machineSession.presentationTracker().reset();
             }
             m_runtime.setTickMultiplier(static_cast<int>(m_tickMultiplier));

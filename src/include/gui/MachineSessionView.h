@@ -235,6 +235,8 @@ namespace ngc::gui {
                 return "the session tool table could not be initialized";
             case SessionCommandRejection::HomingUnavailable:
                 return "homing is not configured for the controlled session";
+            case SessionCommandRejection::HomingRequired:
+                return "every configured joint must be homed before program or MDI motion";
             case SessionCommandRejection::InvalidJogRequest:
                 return "the jog request is invalid";
             case SessionCommandRejection::ProgramNotRunning:

@@ -242,7 +242,11 @@ tracker, execution-epoch counter, backend-neutral `HomingController`, homed-join
 state, backend-neutral `JoggingController`, `ExecutionCoordinator`, and
 backend-neutral `ProgramExecutionController`. It also controls the powered
 lifecycle of its `BackendRuntime`; On starts the runtime and an idle Off stops
-it, while execution epochs reuse the same backend endpoint. The program
+it, while execution epochs reuse the same backend endpoint. Each program or
+MDI epoch copies the latest stationary backend commanded position into the
+interpreter's canonical pose and the trajectory planner origin before
+evaluation begins; epoch reset never overwrites backend position from frontend
+state. The program
 controller owns queued Feed Hold, Resume, and Stop translation plus backend
 acknowledgement and held-state transitions; `MachineSession` routes timed
 backend events and presentation-aware bounded driver pumping through one
@@ -337,6 +341,8 @@ Tests are framework-free executables, with the core suite in `src/test.cpp`. The
   Linux-only `realtime_cpu`, `realtime_priority`, and `lock_memory` host
   policy. Configuring one of the CPU/priority pair requires both.
 - The loader owns and validates logical axes, axis-to-joint topology, digital-input IDs, probing input, per-joint motion/homing values, and ordered homing groups. Logical coordinates without configured axes, duplicate or out-of-range IDs, and incomplete joint/group mappings are startup errors.
+- Encoder-index homing is not supported, and `joints.homing.use_index` is rejected. Single-joint homing groups do not accept group-policy options. Multi-joint groups require the fixed supported policy declared by `start_together = true`, `stop_each_joint_on_trigger = true`, and `final_move_together = true`: grouped phase starts, independent constrained joint stops on their own switches, and a grouped final move.
+- When `homing.require_before_motion` is true, Program and MDI admission requires every configured joint to be homed. Accepting any new homing operation immediately invalidates prior homing confidence; only complete successful homing restores it. Homing and pre-homing joint service motion remain available.
 - A positive homing `backoff_distance` means clearance behind the fast-trigger position. `switch_position` is assigned at the slow latch and `home_position` is the final post-latch destination.
 - Jog start limits come from `[jogging]`; jog stop and lease-expiry authority comes from the physical axis/joint limits carried in `stopLimits`.
 

@@ -7,6 +7,8 @@
 #include <string>
 #include <vector>
 
+#include <toml++/toml.hpp>
+
 #include "mesa/HostMot2CyclicIo.h"
 
 namespace ngc::mesa {
@@ -57,5 +59,11 @@ namespace ngc::mesa {
     [[nodiscard]] std::expected<
         MesaBackendConfiguration, std::string>
     loadMesaBackendConfiguration(
+        const std::filesystem::path &path);
+
+    [[nodiscard]] std::expected<
+        MesaBackendConfiguration, std::string>
+    loadMesaBackendConfiguration(
+        const toml::table &document,
         const std::filesystem::path &path);
 }

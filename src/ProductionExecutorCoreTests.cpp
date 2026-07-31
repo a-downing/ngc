@@ -370,6 +370,33 @@ namespace {
                 "epoch reset should retain the executor's enabled held state");
     }
 
+    void testFirstPlanMustStartAtRetainedPosition() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        ngc::MotionState stationary;
+        stationary.position.x = 4.0;
+        core->restoreStationaryState(stationary, stationary, {}, {});
+        initialize(*core, 12);
+
+        const auto chunk =
+            linearChunk(12, 101, 0, 201, 301, 0.0, 1.0, 1.0);
+        require(core->tryPublish(chunk) == ngc::PublishResult::Published,
+                "discontinuous first plan should reach executor activation");
+        require(core->trySubmit(ngc::StartRequest{3, 12})
+                    == ngc::SubmitResult::Submitted,
+                "discontinuous first plan start should fit");
+
+        core->servoTick();
+        const auto events = takeEvents(*core);
+        const auto snapshot = latestSnapshot(*core);
+        const auto rejected = selectEvents<ngc::ChunkRejected>(events);
+        require(rejected.size() == 1 && rejected[0].chunk == chunk.id,
+                "executor should reject a first plan with a stale origin");
+        require(snapshot.state == ngc::BackendState::Faulted,
+                "a discontinuous first plan should fault the executor");
+        requireNear(snapshot.commanded.position.x, 4.0,
+                    "first-plan rejection must retain commanded position");
+    }
+
     void testContinuationMarkersAndTerminalStop() {
         auto core = std::make_unique<ngc::ProductionExecutorCore>(0.25);
         initialize(*core, 20);
@@ -2511,6 +2538,7 @@ int main() {
         testPublishesFixedExecutorIoState();
         testFixedTickExecutionAndAccounting();
         testEnabledResetRetainsPoweredHeldState();
+        testFirstPlanMustStartAtRetainedPosition();
         testContinuationMarkersAndTerminalStop();
         testScheduledSpindleEventsFollowExecutionCursor();
         testAbortSuppressesFutureScheduledEvents();

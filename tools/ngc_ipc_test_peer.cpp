@@ -15,6 +15,8 @@
 #include "ExecutionItemOperations.h"
 #include "IpcPlatform.h"
 #include "config/BackendRuntimeConfiguration.h"
+#include "config/ConfigurationFingerprint.h"
+#include "config/TomlConfiguration.h"
 #include "machine/IpcExecutorBridge.h"
 #include "machine/IpcProtocol.h"
 #include "machine/MachineConfiguration.h"
@@ -59,10 +61,6 @@ namespace {
 
             if (option == "--mapping") {
                 options.mapping = value();
-            } else if (option == "--configuration") {
-                options.expected.configurationFingerprint = parseUnsigned(value());
-            } else if (option == "--topology") {
-                options.expected.topologyFingerprint = parseUnsigned(value());
             } else if (option == "--session") {
                 options.expected.sessionGeneration = parseUnsigned(value());
             } else if (option == "--epoch") {
@@ -259,10 +257,16 @@ namespace {
         bool m_preparedInputsArmed = false;
     };
 
-    std::unique_ptr<ngc::HostedExecutorRuntime> makeRuntime(
-        const Options &options, std::unique_ptr<ngc::ProductionExecutorIo> io) {
+    struct LoadedExecutorConfiguration {
+        ngc::HostedExecutorRuntimeConfiguration runtime;
+        std::uint64_t fingerprint = 0;
+    };
+
+    LoadedExecutorConfiguration loadExecutorConfiguration(
+        const Options &options) {
         auto runtimeConfiguration =
             ngc::HostedExecutorRuntimeConfiguration{};
+        auto machineFingerprint = std::uint64_t{0};
         if (options.machineConfiguration.has_value()) {
             const auto configuration =
                 ngc::loadMachineConfiguration(
@@ -275,11 +279,24 @@ namespace {
             runtimeConfiguration =
                 ngc::hostedExecutorRuntimeConfiguration(
                     *configuration);
+            machineFingerprint =
+                configuration->sourceFingerprint;
         }
 
+        auto backendFingerprint =
+            std::optional<std::uint64_t>{};
         if (options.backendConfiguration.has_value()) {
+            const auto document =
+                ngc::toml_configuration::loadDocument(
+                    *options.backendConfiguration);
+            if (!document) {
+                throw std::runtime_error(
+                    "failed to load backend configuration: "
+                    + document.error());
+            }
             const auto host =
                 ngc::loadBackendRuntimeHostConfiguration(
+                    document->table,
                     *options.backendConfiguration);
             if (!host) {
                 throw std::runtime_error(
@@ -287,19 +304,35 @@ namespace {
                     + host.error());
             }
             runtimeConfiguration.realtime = *host;
+            backendFingerprint = document->fingerprint;
         }
         if (options.nonRealtime) {
             runtimeConfiguration.realtime = {};
         }
+        const auto fingerprint =
+            ngc::toml_configuration::combinedFingerprint(
+                machineFingerprint,
+                backendFingerprint,
+                runtimeConfiguration.servoPeriod);
 
+        return {
+            .runtime = std::move(runtimeConfiguration),
+            .fingerprint = fingerprint,
+        };
+    }
+
+    std::unique_ptr<ngc::HostedExecutorRuntime> makeRuntime(
+        ngc::HostedExecutorRuntimeConfiguration configuration,
+        std::unique_ptr<ngc::ProductionExecutorIo> io) {
         return std::make_unique<ngc::HostedExecutorRuntime>(
-            std::move(runtimeConfiguration), std::move(io));
+            std::move(configuration), std::move(io));
     }
 
     int run(const Options &options) {
+        auto loaded = loadExecutorConfiguration(options);
         if (options.validateConfigurationOnly) {
             static_cast<void>(makeRuntime(
-                options,
+                std::move(loaded.runtime),
                 std::make_unique<TemporaryTriggeredInputs>()));
 
             return 0;
@@ -308,8 +341,11 @@ namespace {
         auto memory = ngc::ipc_detail::SharedMemory::open(
             options.mapping, sizeof(ngc::IpcSharedRegion));
         auto &region = *static_cast<ngc::IpcSharedRegion *>(memory.data());
+        auto expected = options.expected;
+        expected.configurationFingerprint =
+            loaded.fingerprint;
         const auto rejection = ngc::validateIpcSharedRegion(
-            region, options.expected);
+            region, expected);
         if (rejection != ngc::IpcRejection::None) {
             ngc::setIpcRejection(region, rejection);
             ngc::setIpcConnectionState(
@@ -317,15 +353,48 @@ namespace {
 
             return 2;
         }
+        if (ngc::ipc_detail::parentProcessId()
+            != region.frontendProcessId) {
+            ngc::setIpcConnectionState(
+                region, ngc::IpcConnectionState::PeerLost);
+
+            return 3;
+        }
 
         auto triggeredInputs = std::make_unique<TemporaryTriggeredInputs>();
         auto *triggeredInputsPointer = triggeredInputs.get();
-        auto runtime = makeRuntime(options, std::move(triggeredInputs));
+        auto runtime = makeRuntime(
+            std::move(loaded.runtime),
+            std::move(triggeredInputs));
+        if (ngc::ipc_detail::parentProcessId()
+            != region.frontendProcessId) {
+            ngc::setIpcConnectionState(
+                region, ngc::IpcConnectionState::PeerLost);
+
+            return 3;
+        }
         runtime->start();
+        const auto stopAfterFrontendLoss = [&] {
+            ngc::setIpcConnectionState(
+                region, ngc::IpcConnectionState::PeerLost);
+            static_cast<void>(
+                ngc::stopExecutorAfterFrontendLoss(*runtime));
+            runtime->stop();
+
+            return 3;
+        };
+        if (ngc::ipc_detail::parentProcessId()
+            != region.frontendProcessId) {
+            return stopAfterFrontendLoss();
+        }
         region.peerProcessId = ngc::ipc_detail::currentProcessId();
         ngc::setIpcConnectionState(region, ngc::IpcConnectionState::PeerReady);
         while (ngc::ipcConnectionState(region)
                == ngc::IpcConnectionState::PeerReady) {
+            if (ngc::ipc_detail::parentProcessId()
+                != region.frontendProcessId) {
+                return stopAfterFrontendLoss();
+            }
             std::this_thread::yield();
         }
         if (ngc::ipcConnectionState(region)
@@ -349,6 +418,10 @@ namespace {
                     region, ngc::IpcConnectionState::PeerStopped);
 
                 return 0;
+            }
+            if (ngc::ipc_detail::parentProcessId()
+                != region.frontendProcessId) {
+                return stopAfterFrontendLoss();
             }
             if (options.exitAfterHandshake.has_value()
                 && std::chrono::steady_clock::now() - started

@@ -9,6 +9,14 @@
 #include <toml++/toml.hpp>
 
 namespace ngc::toml_configuration {
+    struct Document {
+        toml::table table;
+        std::uint64_t fingerprint = 0;
+    };
+
+    [[nodiscard]] std::expected<Document, std::string> loadDocument(
+        const std::filesystem::path &path);
+
     [[nodiscard]] std::string error(
         const std::filesystem::path &path,
         std::string_view field,

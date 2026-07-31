@@ -181,7 +181,10 @@ A new program or MDI operation starts a new execution epoch without constructing
 or destroying the backend. Execution-epoch reset clears only execution-owned
 queues, markers, feed-hold state, block lifecycle, and prior-run bookkeeping.
 It does not reset physical position, homing, squaring offsets, backend
-connection, or other powered-session state.
+connection, or other powered-session state. Each epoch copies the latest
+stationary backend commanded position into the interpreter's canonical pose
+and the trajectory planner origin before evaluation begins; it never resets
+the backend position from frontend state.
 
 ### `ExecutionCoordinator`
 
@@ -505,8 +508,8 @@ backend executable. The servo period is part of the shared planning and
 execution contract, so `machine.toml` is its single source of truth. The
 backend reads and validates that period from the machine configuration but
 must not override it or define a duplicate value in its own file. The
-effective IPC configuration fingerprint includes both configuration inputs
-and the servo period.
+effective IPC configuration fingerprint covers the exact machine and backend
+configuration sources parsed by each process plus the effective servo period.
 
 The physical-backend file owns the executor host policy, composes independently
 configured hardware roles, and maps the logical machine to physical hardware:
@@ -656,7 +659,7 @@ The shared-memory protocol requires:
 
 - fixed-capacity SPSC rings;
 - an explicit ABI/version handshake;
-- configuration and machine-topology fingerprints;
+- an independently derived effective-configuration fingerprint;
 - session and control-authority generations;
 - clear producer/consumer ownership;
 - no unbounded data or UI/interpreter objects;
@@ -1037,7 +1040,7 @@ optional typed machine configuration before advertising readiness, hosts
 events, and snapshots to the production executor core without importing
 `MockMotionBackend`. The
 connection validates ABI and payload layout,
-configuration and topology fingerprints, and session, epoch, and control
+the effective configuration fingerprint, and session, epoch, and control
 authority generations before entering Running. Peer loss becomes a bounded
 backend fault after already-published peer events are drained, and an epoch
 interrupted by peer loss cannot be resumed after a fresh connection.
@@ -1061,7 +1064,7 @@ a separate Simulation-only implementation.
 
 - Implement fixed shared-memory rings and the physical `MotionBackend` proxy.
   Complete for the transport skeleton.
-- Add ABI, topology, configuration, session, epoch, and authority handshakes.
+- Add ABI, configuration, session, epoch, and authority handshakes.
   Complete.
 - Run a hardware-free test peer using the production IPC path. Complete with
   the Linux executor-in-the-loop peer.

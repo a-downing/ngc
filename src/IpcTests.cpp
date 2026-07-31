@@ -11,7 +11,9 @@
 #include <thread>
 #include <variant>
 
+#include "config/ConfigurationFingerprint.h"
 #include "machine/ExternalExecutorRuntime.h"
+#include "machine/IpcExecutorBridge.h"
 #include "machine/IpcProtocol.h"
 #include "machine/MachineConfiguration.h"
 #include "machine/MachineSessionManager.h"
@@ -28,7 +30,6 @@ namespace {
     ngc::IpcIdentity identity() {
         return {
             .configurationFingerprint = 0x10101010,
-            .topologyFingerprint = 0x20202020,
             .sessionGeneration = 7,
             .epochGeneration = 9,
             .authorityGeneration = 11,
@@ -37,10 +38,25 @@ namespace {
 
     ngc::ExternalExecutorRuntimeConfiguration configuration(
         const std::filesystem::path &peer) {
+        const auto machine =
+            ngc::loadMachineConfiguration("machine.toml");
+        require(machine.has_value(),
+                machine ? "" : machine.error());
+        const auto servoPeriod =
+            machine->machineExecutor.has_value()
+                ? machine->machineExecutor->servoPeriod
+                : machine->simulation.servoPeriod;
+        auto configuredIdentity = identity();
+        configuredIdentity.configurationFingerprint =
+            ngc::toml_configuration::combinedFingerprint(
+                machine->sourceFingerprint,
+                std::nullopt,
+                servoPeriod);
+
         return {
             .peerExecutable = peer,
-            .identity = identity(),
-            .peerExpectedIdentity = identity(),
+            .identity = configuredIdentity,
+            .peerExpectedIdentity = configuredIdentity,
             .handshakeTimeout = 2s,
             .shutdownTimeout = 2s,
             .peerArguments = {
@@ -218,11 +234,6 @@ namespace {
         require(ngc::validateIpcSharedRegion(*region, wrong)
                     == ngc::IpcRejection::ConfigurationFingerprint,
                 "configuration mismatch should be rejected");
-        wrong = identity();
-        ++wrong.topologyFingerprint;
-        require(ngc::validateIpcSharedRegion(*region, wrong)
-                    == ngc::IpcRejection::TopologyFingerprint,
-                "topology mismatch should be rejected");
         wrong = identity();
         ++wrong.sessionGeneration;
         require(ngc::validateIpcSharedRegion(*region, wrong)
@@ -423,6 +434,58 @@ namespace {
                 "resumed IPC motion should accept Abort");
         static_cast<void>(waitForSnapshot(
             runtime, ngc::BackendState::Held));
+
+        runtime.stop();
+    }
+
+    void testFrontendLossShutdownStopsAndDisables(
+        const std::filesystem::path &peer) {
+        ngc::ExternalExecutorRuntime runtime(configuration(peer));
+        runtime.start();
+
+        constexpr ngc::EpochId epoch = 20;
+        require(runtime.endpoint().trySubmit(
+                    ngc::ResetRequest{61, epoch})
+                    == ngc::SubmitResult::Submitted,
+                "frontend-loss reset should fit");
+        require(waitForRequest(runtime, 61).succeeded,
+                "frontend-loss reset should succeed");
+        require(runtime.endpoint().trySubmit(ngc::EnableRequest{62})
+                    == ngc::SubmitResult::Submitted,
+                "frontend-loss enable should fit");
+        require(waitForRequest(runtime, 62).succeeded,
+                "frontend-loss enable should succeed");
+
+        const auto chunk = linearChunk(
+            epoch, 63, 0.0, 10.0, 10.0);
+        require(runtime.endpoint().tryPublish(chunk)
+                    == ngc::PublishResult::Published,
+                "frontend-loss chunk should fit");
+        require(runtime.endpoint().trySubmit(
+                    ngc::StartRequest{64, epoch})
+                    == ngc::SubmitResult::Submitted,
+                "frontend-loss start should fit");
+        require(waitForRequest(runtime, 64).succeeded,
+                "frontend-loss start should succeed");
+        const auto accepted = waitForEvent(runtime);
+        require(std::get<ngc::ChunkAccepted>(accepted).chunk
+                    == chunk.id,
+                "frontend-loss chunk should activate");
+        const auto moving = waitForMotionProgress(runtime, 0.1);
+
+        const auto stopped =
+            ngc::stopExecutorAfterFrontendLoss(runtime);
+        require(stopped.state == ngc::BackendState::Disabled,
+                "frontend-loss shutdown should disable the executor");
+        require(stopped.commanded.position.x
+                    > moving.commanded.position.x
+                    && stopped.commanded.position.x < 10.0,
+                "frontend-loss shutdown should stop from the current "
+                "state before the published target");
+        require(std::abs(stopped.commanded.velocity.x) < 1e-12
+                    && std::abs(stopped.commanded.acceleration.x)
+                        < 1e-12,
+                "frontend-loss shutdown should finish at rest");
 
         runtime.stop();
     }
@@ -895,6 +958,51 @@ sub _tool_change[#tool_number] {
                 "stale authority handshake should retain its rejection reason");
     }
 
+    void testExternalRuntimeRejectsConfigurationMismatch(
+        const std::filesystem::path &peer) {
+        const auto alternateMachine =
+            std::filesystem::temp_directory_path()
+            / "ngc-ipc-alternate-machine.toml";
+        std::error_code error;
+        std::filesystem::copy_file(
+            "machine.toml", alternateMachine,
+            std::filesystem::copy_options::overwrite_existing,
+            error);
+        require(!error,
+                "could not create alternate IPC machine configuration");
+        {
+            std::ofstream file(
+                alternateMachine,
+                std::ios::binary | std::ios::app);
+            file << "\n# fingerprint mismatch\n";
+            require(static_cast<bool>(file),
+                    "could not modify alternate IPC machine configuration");
+        }
+
+        auto options = configuration(peer);
+        options.peerArguments = {
+            "--machine-configuration",
+            alternateMachine.string(),
+            "--non-realtime",
+        };
+        ngc::ExternalExecutorRuntime runtime(std::move(options));
+
+        auto rejected = false;
+        try {
+            runtime.start();
+        } catch (const std::runtime_error &) {
+            rejected = true;
+        }
+        require(rejected,
+                "different executor configuration should fail IPC startup");
+        require(runtime.lastRejection()
+                    == ngc::IpcRejection::ConfigurationFingerprint,
+                "configuration mismatch should retain its rejection reason");
+
+        error.clear();
+        std::filesystem::remove(alternateMachine, error);
+    }
+
     void testExternalRuntimeRejectsInvalidExecutorConfiguration(
         const std::filesystem::path &peer) {
         auto options = configuration(peer);
@@ -999,10 +1107,12 @@ int main(const int argc, char **argv) {
         testProtocolLayoutAndBoundedRings();
         testExternalRuntimeExecutesThroughProductionCore(peer);
         testExternalRuntimeFeedHoldAndResume(peer);
+        testFrontendLossShutdownStopsAndDisables(peer);
         testExternalRuntimeFakesTriggeredJointInput(peer);
         testConfiguredMachineSessionRunsThroughIpcExecutor(
             peer, realtime);
         testExternalRuntimeRejectsStaleHandshake(peer);
+        testExternalRuntimeRejectsConfigurationMismatch(peer);
         testExternalRuntimeRejectsInvalidExecutorConfiguration(peer);
         testExternalRuntimeReportsBackpressure(peer);
         testPeerLossAndInterruptedEpochRefusal(peer);

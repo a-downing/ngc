@@ -48,4 +48,6 @@ namespace ngc {
         std::uint64_t m_completedControls = 0;
         bool m_pendingItemPrepared = false;
     };
+
+    [[nodiscard]] ExecutionSnapshot stopExecutorAfterFrontendLoss(BackendRuntime &runtime);
 }

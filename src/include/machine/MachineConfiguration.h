@@ -80,7 +80,6 @@ namespace ngc {
         double latchVelocity = 0.0;
         double backoffDistance = 0.0;
         double finalVelocity = 0.0;
-        bool useIndex = false;
     };
 
     struct JointConfiguration {
@@ -100,9 +99,6 @@ namespace ngc {
         std::string name;
         std::uint32_t sequence = 0;
         std::vector<JointId> joints;
-        bool startTogether = false;
-        bool stopEachJointOnTrigger = false;
-        bool finalMoveTogether = false;
     };
 
     struct HomingConfiguration {
@@ -118,6 +114,7 @@ namespace ngc {
     };
 
     struct MachineConfiguration {
+        std::uint64_t sourceFingerprint = 0;
         Machine::Unit unit = Machine::Unit::Inch;
         std::vector<Machine::Axis> coordinates;
         TrajectoryLimits trajectory;

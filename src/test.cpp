@@ -302,7 +302,6 @@ search_velocity = 2
 latch_velocity = 0.2
 backoff_distance = 0.25
 final_velocity = 0.0
-use_index = false
 [[joints]]
 id = 1
 name = "y1"
@@ -322,7 +321,6 @@ search_velocity = -2
 latch_velocity = -0.2
 backoff_distance = 0.25
 final_velocity = 0.0
-use_index = false
 [[joints]]
 id = 2
 name = "y2"
@@ -342,7 +340,6 @@ search_velocity = -2
 latch_velocity = -0.2
 backoff_distance = 0.25
 final_velocity = 0.0
-use_index = false
 [[joints]]
 id = 3
 name = "z"
@@ -362,7 +359,6 @@ search_velocity = 2
 latch_velocity = 0.2
 backoff_distance = 0.25
 final_velocity = 0.0
-use_index = false
 [homing]
 require_before_motion = false
 [[homing.groups]]
@@ -2345,6 +2341,10 @@ final_move_together = true
     void testUnsupportedCodesProduceInterpreterErrors() {
         requireInterpreterError("G99\n", "unsupported G-code G99");
         requireInterpreterError("M99\n", "unsupported M-code M99");
+        requireInterpreterError("G59.31\n", "unsupported G-code G59.31");
+        requireInterpreterError("M3.5\n", "unsupported M-code M3.5");
+        requireInterpreterError("G[1 / 0]\n", "unsupported G-code");
+        requireInterpreterError("M[0 / 0]\n", "unsupported M-code");
         requireInterpreterError("G93\n", "unsupported feed mode G93");
         requireInterpreterError("G10 L20 P1 X1\n", "unsupported G10 L20");
         requireInterpreterError("G0 O1\n", "unsupported word O1");
@@ -3561,6 +3561,59 @@ G1 F60 X2
         worker.join();
     }
 
+    void testNormalProgramStartsAtRetainedBackendPosition() {
+        ngc::MachineSessionManager worker;
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority),
+                "retained-origin Simulation should power on");
+        worker.setTickMultiplier(1);
+
+        const auto waitForCompletion = [&](const std::string_view message) {
+            auto snapshot = worker.snapshot();
+            for (auto attempt = 0; attempt < 3'000
+                 && snapshot.status != ngc::SimulationStatus::Completed
+                 && snapshot.status != ngc::SimulationStatus::Error;
+                 ++attempt) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                snapshot = worker.snapshot();
+            }
+            require(snapshot.status == ngc::SimulationStatus::Completed,
+                    message);
+
+            return snapshot;
+        };
+
+        require(worker.start(
+                    authority,
+                    {{"G53 G1 F600 X1\n", "retained-origin-first.ngc"}},
+                    {}),
+                "first retained-origin program should start");
+        const auto first = waitForCompletion(
+            "first retained-origin program should complete");
+        requireNear(first.machinePosition.x, 1.0,
+                    "first retained-origin program should end at X1");
+
+        require(worker.start(
+                    authority,
+                    {{"G53 G1 F600 X2\n", "retained-origin-second.ngc"}},
+                    {}),
+                "second retained-origin program should start");
+        auto snapshot = worker.snapshot();
+        for (auto attempt = 0; attempt < 3'000
+             && snapshot.status != ngc::SimulationStatus::Completed
+             && snapshot.status != ngc::SimulationStatus::Error;
+             ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+
+        require(snapshot.status == ngc::SimulationStatus::Completed,
+                "second retained-origin program should complete");
+        requireNear(snapshot.machinePosition.x, 2.0,
+                    "second retained-origin program should end at X2");
+        worker.join();
+    }
+
     void testSimulationProgramElapsedTimeIsPlaybackSpeedIndependent() {
         const auto runAtMultiplier = [](const int multiplier) {
             ngc::MachineSessionManager worker;
@@ -3717,6 +3770,36 @@ G1 F60 X2
                         && status.text == "resumed";
                 }),
                 "interpretation after M0 should continue after Resume");
+    }
+
+    void testM6UsesModalToolSelectionAndRejectsInvalidSelection() {
+        ngc::InterpreterSession session(UNIT, ngc::InterpretationMode::Simulation);
+        session.machine().toolTable().set(
+            1, {1, 0, 0, 0, 0, 0, 0, 0.25, "modal tool"});
+        session.setPrograms({{
+            "sub _tool_change[#tool] {\n"
+            "    return 1\n"
+            "}\n"
+            "T1\n"
+            "M6\n",
+            "modal-m6-tool.ngc"
+        }});
+        session.compile([](const auto &callback) { callback(); });
+
+        auto event = session.next();
+        for (int guard = 0; guard < 50
+             && !std::holds_alternative<ngc::InterpreterError>(event)
+             && !std::holds_alternative<ngc::InterpreterCompleted>(event); ++guard) {
+            event = session.next();
+        }
+        require(std::holds_alternative<ngc::InterpreterCompleted>(event),
+                "standalone M6 should use the previously selected modal tool");
+        require(session.machine().toolGeometry().number == 1,
+                "standalone M6 should prepare the previously selected modal tool");
+
+        requireInterpreterError("M6\n", "M6 requires a selected tool");
+        requireInterpreterError(
+            "T1.5 M6\n", "M6 selected tool must be a finite integer");
     }
 
     void testM6RejectsMissingToolBeforeCallingRoutine() {
@@ -5344,6 +5427,118 @@ G1 F60 X2
         }
         require(resumeRejected,
                 "controlled stop should permanently reject resume for the abandoned epoch");
+    }
+
+    void testDriverFailureStopsAndAbortsBeforeBecomingTerminal() {
+        ngc::TrajectoryLimits limits;
+        limits.pathAcceleration = 4.0;
+        limits.axisAcceleration =
+            ngc::position_t { 4.0, 4.0, 4.0, 4.0, 4.0, 4.0 };
+        ngc::MockMotionBackend backend(
+            ngc::FeedHoldConfiguration { 2.0, 10.0 }, limits);
+        ngc::PreparedGeometryForwardChannel forward;
+        ngc::GeometryFeedbackChannel feedback;
+        std::atomic<bool> cancelled { false };
+        ngc::PreparedTrajectoryExecutionDriver driver(
+            backend, forward, feedback, cancelled, limits);
+        ngc::SessionCommandQueue commands;
+        ngc::ProgramExecutionController controller(
+            backend, driver, commands);
+        constexpr ngc::EpochId epoch = 28;
+
+        require(driver.begin(epoch),
+                "failure-stop fixture should initialize the trajectory driver");
+        controller.begin(epoch);
+        backend.advanceTick(0.0, true);
+        driver.serviceBackend([&](const ngc::ExecutionEvent &event) {
+            controller.observeBackendEvent(event);
+        });
+
+        ngc::PlanChunk chunk;
+        chunk.epoch = epoch;
+        chunk.id = 61;
+        chunk.branch = 71;
+        require(chunk.normalMotion.push(
+                    linearSpan(401, 0.0, 10.0, 10.0)),
+                "failure-stop normal span should fit");
+        require(chunk.stopTail.push(
+                    linearSpan(402, 10.0, 10.0, 1e-6)),
+                "failure-stop terminal span should fit");
+        chunk.branchState.position.x = 10.0;
+        chunk.stopState.position.x = 10.0;
+        require(backend.tryPublish(chunk)
+                    == ngc::PublishResult::Published,
+                "failure-stop motion should publish");
+        backend.advanceTick(0.25, true);
+
+        ngc::ExecutionSnapshot snapshot;
+        while (backend.tryTakeSnapshot(snapshot)) { }
+        require(snapshot.state == ngc::BackendState::Running
+                    && snapshot.commanded.velocity.x > 0.0,
+                "failure-stop fixture should establish active motion");
+        require(forward.tryPush(
+                    std::make_unique<ngc::PreparedStreamMessage>(
+                        ngc::PreparedFailure {
+                            epoch, 1, "late prepared geometry failure",
+                        })),
+                "failure-stop fixture should publish its late driver error");
+        require(!driver.pumpOne(
+                    [](const auto &, const auto &, const auto &,
+                       const auto &, const auto) { }),
+                "a prepared failure should stop trajectory-driver pumping");
+        controller.observeDriverState();
+        require(controller.state() == ngc::ProgramExecutionState::Holding
+                    && controller.error()
+                        == "late prepared geometry failure",
+                "a driver error should remain nonterminal while safety stopping");
+
+        controller.service(snapshot, false);
+        require(controller.state() == ngc::ProgramExecutionState::Holding,
+                "requesting the controlled stop should remain nonterminal");
+
+        auto sawControlledStop = false;
+        auto heldWasNonterminal = false;
+        auto successfulSafetyRequests = std::size_t { 0 };
+        for (auto tick = 0; tick < 5'000
+             && controller.state() != ngc::ProgramExecutionState::Error;
+             ++tick) {
+            backend.advanceTick(0.001, true);
+            while (backend.tryTakeSnapshot(snapshot)) { }
+            driver.serviceBackend([&](const ngc::ExecutionEvent &event) {
+                controller.observeBackendEvent(event);
+                if (const auto *held =
+                        std::get_if<ngc::BackendHeld>(&event)) {
+                    if (held->reason
+                        == ngc::BackendHoldReason::ControlledStop) {
+                        sawControlledStop = true;
+                        heldWasNonterminal =
+                            controller.state()
+                            == ngc::ProgramExecutionState::Holding;
+                    }
+                } else if (const auto *completed =
+                               std::get_if<ngc::RequestCompleted>(&event)) {
+                    if (completed->request >= (ngc::RequestId { 1 } << 63)
+                        && completed->succeeded) {
+                        ++successfulSafetyRequests;
+                    }
+                }
+            });
+            controller.service(snapshot, false);
+        }
+
+        require(sawControlledStop && heldWasNonterminal,
+                "driver failure should wait at rest before terminalizing");
+        require(successfulSafetyRequests == 2,
+                "driver failure should acknowledge controlled stop and Abort");
+        require(controller.state() == ngc::ProgramExecutionState::Error
+                    && controller.error()
+                        == "late prepared geometry failure",
+                "Abort completion should expose the preserved terminal error");
+        require(snapshot.state == ngc::BackendState::Held
+                    && snapshot.commanded.velocity.length() <= 1e-12
+                    && snapshot.commanded.acceleration.length() <= 1e-12
+                    && snapshot.queuedExecutionItems == 0,
+                "terminal driver failure should leave no active backend motion");
     }
 
     void testMockBackendFeedHoldStopBranchIsFatal() {
@@ -7691,6 +7886,99 @@ G1 F60 X2
         worker.join();
     }
 
+    void testMachineSessionRequiresHomingBeforeProgramAndMdi() {
+        auto configuration = fixtureMachineConfiguration();
+        require(configuration.has_value(), configuration ? "" : configuration.error());
+        configuration->homing.requireBeforeMotion = true;
+        configuration->simulation.schedulerPeriod =
+            configuration->simulation.servoPeriod;
+        ngc::MachineSessionManager worker(*configuration);
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority),
+                "homing-required Simulation should power on explicitly");
+        worker.setTickMultiplier(1000);
+
+        const auto unhomedProgram = worker.start(
+            authority, {{"G53 G1 F600 X0.01\n", "unhomed-program.ngc"}}, {});
+        require(!unhomedProgram
+                    && unhomedProgram.rejection
+                        == ngc::SessionCommandRejection::HomingRequired,
+                "configured homing policy should reject an unhomed program");
+        const auto unhomedMdi = worker.start(
+            authority, {{"G53 G1 F600 X0.01\n", "<MDI>"}}, {}, true);
+        require(!unhomedMdi
+                    && unhomedMdi.rejection
+                        == ngc::SessionCommandRejection::HomingRequired,
+                "configured homing policy should reject unhomed MDI");
+        require(worker.snapshot().machineActivity == ngc::MachineActivity::Idle,
+                "rejected unhomed execution must not acquire the machine session");
+
+        require(worker.home(authority),
+                "homing-required Simulation should begin homing");
+        auto snapshot = worker.snapshot();
+        for (auto attempt = 0; attempt < 5000
+             && snapshot.status != ngc::SimulationStatus::Completed
+             && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(snapshot.status == ngc::SimulationStatus::Completed,
+                std::format("required homing should complete: {}", snapshot.error));
+
+        const auto waitForProgram = [&](const std::string_view failure) {
+            auto programSnapshot = worker.snapshot();
+            for (auto attempt = 0; attempt < 5000
+                 && programSnapshot.status != ngc::SimulationStatus::Completed
+                 && programSnapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                programSnapshot = worker.snapshot();
+            }
+            require(programSnapshot.status == ngc::SimulationStatus::Completed,
+                    std::format("{}: {}", failure, programSnapshot.error));
+        };
+        require(worker.start(
+                    authority, {{"G53 G1 F600 X0.01\n", "homed-program.ngc"}}, {}),
+                "homed session should admit a program");
+        waitForProgram("homed program should complete");
+        require(worker.start(
+                    authority, {{"G53 G1 F600 X0.02\n", "<MDI>"}}, {}, true),
+                "homed session should admit MDI");
+        waitForProgram("homed MDI should complete");
+
+        worker.setTickMultiplier(1);
+        require(worker.home(authority),
+                "homed session should admit a new homing attempt");
+        require(worker.snapshot().homedJoints == 0,
+                "accepting re-homing should immediately invalidate prior homing confidence");
+        snapshot = worker.snapshot();
+        for (auto attempt = 0; attempt < 5000
+             && !snapshot.hasActiveMotion
+             && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(snapshot.hasActiveMotion,
+                std::format("re-homing should begin moving before Stop: {}", snapshot.error));
+        require(worker.stop(authority),
+                "re-homing should accept a controlled Stop");
+        for (auto attempt = 0; attempt < 5000
+             && snapshot.status != ngc::SimulationStatus::Stopped
+             && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(snapshot.status == ngc::SimulationStatus::Stopped
+                    && snapshot.homedJoints == 0,
+                std::format("stopped re-homing must remain unhomed: {}", snapshot.error));
+        const auto afterStoppedRehome = worker.start(
+            authority, {{"G53 G1 F600 X0.03\n", "stopped-rehome.ngc"}}, {});
+        require(!afterStoppedRehome
+                    && afterStoppedRehome.rejection
+                        == ngc::SessionCommandRejection::HomingRequired,
+                "stopped re-homing must restore the program admission gate");
+        worker.join();
+    }
+
     void testMachineSessionManagerStopBrakesHomingAtRest() {
         auto configuration = fixtureMachineConfiguration();
         require(configuration.has_value(), configuration ? "" : configuration.error());
@@ -8112,6 +8400,7 @@ int main() {
         testG64BlendScaleGeometryProgramIsValid();
         testFeedMotionRequiresFeedrate();
         testUnsupportedCodesProduceInterpreterErrors();
+        testM6UsesModalToolSelectionAndRejectsInvalidSelection();
         testFailedBlockRollsBackMachineState();
         testMachineCheckpointRestoresCanonicalState();
         testInterpreterCancellationInterruptsEvaluation();
@@ -8139,6 +8428,7 @@ int main() {
         testSimulationDriverFailureAppearsInGuiStatusStream();
         testMockBackendFeedHoldBrakesAlongActiveTrajectory();
         testMockBackendControlledStopBrakesAndCannotResume();
+        testDriverFailureStopsAndAbortsBeforeBecomingTerminal();
         testMockBackendFeedHoldStopBranchIsFatal();
         testMockBackendFeedHoldPausesAndResumesProbeApproach();
         testMockBackendProbeContactDuringFeedHoldStopIsDetected();
@@ -8151,6 +8441,7 @@ int main() {
         test1002PreparedSliceBoundaries();
         testMdiToolChangeUsesAutoloadPrograms();
         testMachineSessionManagerPersistsSimulationAcrossPowerCycle();
+        testNormalProgramStartsAtRetainedBackendPosition();
         testSimulationProgramElapsedTimeIsPlaybackSpeedIndependent();
         testInterpreterStatusMessagesPreserveOrder();
         testAlertAndM0RequireExplicitProgramResume();
@@ -8207,6 +8498,7 @@ int main() {
         testMockDiagnosticPositionsFollowServoPeriod();
         testMachineConfigurationLoadsTrajectoryLimits();
         testConfiguredSimulationStartsAtZeroAndHomes();
+        testMachineSessionRequiresHomingBeforeProgramAndMdi();
         testMachineSessionManagerStopBrakesHomingAtRest();
         testMachineSessionManagerJogsCoupledJointsBeforeHoming();
         testMachineSessionManagerStopBrakesJogAtRest();

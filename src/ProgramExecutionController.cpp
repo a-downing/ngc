@@ -25,9 +25,11 @@ namespace ngc {
         m_feedHoldHeld = false;
         m_feedResumeRequested = false;
         m_feedResumeInProgress = false;
+        m_failureStopComplete = false;
         m_pendingFeedHoldRequest.reset();
         m_pendingFeedResumeRequest.reset();
         m_pendingControlledStopRequest.reset();
+        m_pendingAbortRequest.reset();
         m_stoppedPosition.reset();
         m_error.reset();
     }
@@ -93,7 +95,7 @@ namespace ngc {
     void ProgramExecutionController::requestControlledStop(
         const ExecutionSnapshot &snapshot) {
         if (m_controlledStopInProgress || m_state == ProgramExecutionState::StopComplete
-            || m_feedHoldInProgress) {
+            || m_feedHoldInProgress || m_pendingAbortRequest) {
             return;
         }
 
@@ -101,7 +103,21 @@ namespace ngc {
             snapshot.state == BackendState::Held
             && snapshot.commanded.velocity.length() <= 1e-10
             && snapshot.commanded.acceleration.length() <= 1e-10;
-        if (m_programPaused || alreadyStationary) {
+        if (m_error) {
+            if (snapshot.state == BackendState::Faulted
+                || snapshot.state == BackendState::Disabled) {
+                m_state = ProgramExecutionState::Error;
+
+                return;
+            }
+            if (m_failureStopComplete || alreadyStationary) {
+                m_failureStopComplete = true;
+                m_stoppedPosition = snapshot.commanded.position;
+                requestFailureAbort();
+
+                return;
+            }
+        } else if (m_programPaused || alreadyStationary) {
             m_stoppedPosition = snapshot.commanded.position;
             m_state = ProgramExecutionState::StopComplete;
 
@@ -111,12 +127,27 @@ namespace ngc {
         const auto request = m_nextRequest++;
         if (m_backend.trySubmit(ControlledStopRequest { request })
             != SubmitResult::Submitted) {
-            fail("motion backend control channel is full while requesting stop");
+            if (!m_error) {
+                fail("motion backend control channel is full while requesting stop");
+            }
 
             return;
         }
         m_pendingControlledStopRequest = request;
         m_controlledStopInProgress = true;
+    }
+
+    void ProgramExecutionController::requestFailureAbort() {
+        if (m_pendingAbortRequest) {
+            return;
+        }
+
+        const auto request = m_nextRequest++;
+        if (m_backend.trySubmit(AbortRequest { request })
+            != SubmitResult::Submitted) {
+            return;
+        }
+        m_pendingAbortRequest = request;
     }
 
     void ProgramExecutionController::requestProgramResume() {
@@ -180,6 +211,21 @@ namespace ngc {
             if (held->epoch != m_epoch) {
                 return;
             }
+            if (m_error) {
+                m_pendingControlledStopRequest.reset();
+                m_controlledStopInProgress = false;
+                m_pendingFeedHoldRequest.reset();
+                m_feedHoldInProgress = false;
+                m_feedHoldHeld = false;
+                m_pendingFeedResumeRequest.reset();
+                m_feedResumeInProgress = false;
+                m_failureStopComplete = true;
+                m_stoppedPosition = held->state.position;
+                m_state = ProgramExecutionState::Holding;
+                requestFailureAbort();
+
+                return;
+            }
             if (held->reason == BackendHoldReason::FeedHold) {
                 m_pendingFeedHoldRequest.reset();
                 m_feedHoldInProgress = false;
@@ -198,7 +244,13 @@ namespace ngc {
         if (!completed) {
             return;
         }
-        if (m_pendingFeedHoldRequest && completed->request == *m_pendingFeedHoldRequest
+        if (m_pendingAbortRequest
+            && completed->request == *m_pendingAbortRequest) {
+            m_pendingAbortRequest.reset();
+            if (completed->succeeded) {
+                m_state = ProgramExecutionState::Error;
+            }
+        } else if (m_pendingFeedHoldRequest && completed->request == *m_pendingFeedHoldRequest
             && !completed->succeeded) {
             m_pendingFeedHoldRequest.reset();
             m_feedHoldInProgress = false;
@@ -217,7 +269,9 @@ namespace ngc {
                    && !completed->succeeded) {
             m_pendingControlledStopRequest.reset();
             m_controlledStopInProgress = false;
-            fail("motion backend rejected the controlled-stop request");
+            if (!m_error) {
+                fail("motion backend rejected the controlled-stop request");
+            }
         }
     }
 
@@ -236,7 +290,7 @@ namespace ngc {
             m_programPaused = true;
             m_state = ProgramExecutionState::Paused;
         } else if (m_driver.state() == PreparedDriverState::Error && m_driver.error()) {
-            fail(*m_driver.error());
+            beginFailureStop(*m_driver.error());
         }
     }
 
@@ -252,9 +306,11 @@ namespace ngc {
         m_feedHoldHeld = false;
         m_feedResumeRequested = false;
         m_feedResumeInProgress = false;
+        m_failureStopComplete = false;
         m_pendingFeedHoldRequest.reset();
         m_pendingFeedResumeRequest.reset();
         m_pendingControlledStopRequest.reset();
+        m_pendingAbortRequest.reset();
     }
 
     ProgramExecutionState ProgramExecutionController::state() const {
@@ -347,7 +403,24 @@ namespace ngc {
         return m_error;
     }
 
+    void ProgramExecutionController::beginFailureStop(std::string error) {
+        if (m_error) {
+            return;
+        }
+
+        m_error = std::move(error);
+        m_stopRequested = true;
+        m_programResumeRequested = false;
+        m_feedHoldRequested = false;
+        m_feedResumeRequested = false;
+        m_state = ProgramExecutionState::Holding;
+    }
+
     void ProgramExecutionController::fail(std::string error) {
+        if (m_error && m_state != ProgramExecutionState::Error) {
+            return;
+        }
+
         m_error = std::move(error);
         m_state = ProgramExecutionState::Error;
     }

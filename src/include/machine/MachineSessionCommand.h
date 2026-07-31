@@ -13,6 +13,7 @@ namespace ngc {
         EmptyProgram,
         ToolTableUnavailable,
         HomingUnavailable,
+        HomingRequired,
         InvalidJogRequest,
         ProgramNotRunning,
         ProgramAlreadyPaused,

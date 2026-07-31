@@ -12,7 +12,7 @@
 
 namespace ngc {
     inline constexpr std::uint64_t IPC_MAGIC = 0x4e47435f49504331ULL;
-    inline constexpr std::uint32_t IPC_ABI_VERSION = 3;
+    inline constexpr std::uint32_t IPC_ABI_VERSION = 4;
     inline constexpr std::size_t IPC_EXECUTION_CAPACITY = 8;
     inline constexpr std::size_t IPC_CONTROL_CAPACITY = 16;
     inline constexpr std::size_t IPC_EVENT_CAPACITY = 64;
@@ -36,7 +36,6 @@ namespace ngc {
         AbiVersion,
         RegionLayout,
         ConfigurationFingerprint,
-        TopologyFingerprint,
         SessionGeneration,
         EpochGeneration,
         AuthorityGeneration,
@@ -44,7 +43,6 @@ namespace ngc {
 
     struct IpcIdentity {
         std::uint64_t configurationFingerprint = 0;
-        std::uint64_t topologyFingerprint = 0;
         std::uint64_t sessionGeneration = 0;
         std::uint64_t epochGeneration = 0;
         std::uint64_t authorityGeneration = 0;
@@ -177,9 +175,6 @@ namespace ngc {
         }
         if (region.identity.configurationFingerprint != expected.configurationFingerprint) {
             return IpcRejection::ConfigurationFingerprint;
-        }
-        if (region.identity.topologyFingerprint != expected.topologyFingerprint) {
-            return IpcRejection::TopologyFingerprint;
         }
         if (region.identity.sessionGeneration != expected.sessionGeneration) {
             return IpcRejection::SessionGeneration;

@@ -29,6 +29,7 @@ namespace ngc::physical {
     };
 
     struct PhysicalBackendConfiguration {
+        std::uint64_t sourceFingerprint = 0;
         BackendRuntimeHostConfiguration runtime;
         mesa::MesaBackendConfiguration motion;
         std::optional<HuanyangSpindleConfiguration> spindle;

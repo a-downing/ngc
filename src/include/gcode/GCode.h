@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cmath>
 #include <utility>
 #include <vector>
 #include <optional>
@@ -17,6 +18,15 @@ namespace ngc {
 }
 
 namespace ngc {
+    inline std::optional<int> convertExactInteger(const double real, const int minimum, const int maximum) {
+        if (!std::isfinite(real) || real < static_cast<double>(minimum)
+            || real > static_cast<double>(maximum) || std::trunc(real) != real) {
+            return std::nullopt;
+        }
+
+        return static_cast<int>(real);
+    }
+
     inline GCode coordsys(const int i) {
         switch(i) {
             case 1: return GCode::G54;
@@ -106,8 +116,12 @@ namespace ngc {
     };
 
     inline GCode convertGCode(double real) {
-        const int whole = static_cast<int>(real);
-        const int fract = static_cast<int>((real - whole) * 10 + 0.5);
+        const auto encoded = convertExactInteger(real * 10.0, 0, 940);
+        if (!encoded) {
+            throw std::runtime_error(std::format("unsupported G-code G{}", real));
+        }
+        const int whole = *encoded / 10;
+        const int fract = *encoded % 10;
 
         switch(whole) {
             case 0:
@@ -278,7 +292,12 @@ namespace ngc {
     }
 
     inline MCode convertMCode(const double real) {
-        switch(static_cast<int>(real)) {
+        const auto encoded = convertExactInteger(real, 0, 30);
+        if (!encoded) {
+            throw std::runtime_error(std::format("unsupported M-code M{}", real));
+        }
+
+        switch(*encoded) {
             case 0: return MCode::M0;
             case 1: return MCode::M1;
             case 2: return MCode::M2;

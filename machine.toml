@@ -13,7 +13,7 @@ rapid_velocity = 3.33
 # machine-units
 arc_chord_tolerance = 0.0001
 # minimum seconds of provisional G64 motion before a proven rolling split
-lookahead_duration = 2
+lookahead_duration = 5
 
 [simulation]
 # seconds per mock executor servo tick
@@ -117,7 +117,6 @@ search_velocity = 2
 latch_velocity = 0.2
 backoff_distance = 0.25
 final_velocity = 0.0
-use_index = false
 
 [[joints]]
 id = 1
@@ -139,7 +138,6 @@ search_velocity = -2
 latch_velocity = -0.2
 backoff_distance = 0.25
 final_velocity = 0.0
-use_index = false
 
 [[joints]]
 id = 2
@@ -161,7 +159,6 @@ search_velocity = -2
 latch_velocity = -0.2
 backoff_distance = 0.25
 final_velocity = 0.0
-use_index = false
 
 [[joints]]
 id = 3
@@ -183,7 +180,6 @@ search_velocity = 2
 latch_velocity = 0.2
 backoff_distance = 0.25
 final_velocity = 0.0
-use_index = false
 
 [homing]
 require_before_motion = false
@@ -202,6 +198,8 @@ joints = [0]
 name = "y_gantry"
 sequence = 2
 joints = [1, 2]
+# Multi-joint groups use the only currently supported policy: grouped phase
+# starts, independent constrained stops at each switch, and a grouped final move.
 start_together = true
 stop_each_joint_on_trigger = true
 final_move_together = true

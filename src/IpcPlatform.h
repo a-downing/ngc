@@ -56,5 +56,6 @@ namespace ngc::ipc_detail {
     };
 
     [[nodiscard]] std::uint32_t currentProcessId() noexcept;
+    [[nodiscard]] std::uint32_t parentProcessId() noexcept;
     [[nodiscard]] std::string uniqueSharedMemoryName();
 }

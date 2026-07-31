@@ -45,10 +45,12 @@ namespace ngc {
     private:
         void consumeCommands();
         void requestControlledStop(const ExecutionSnapshot &snapshot);
+        void requestFailureAbort();
         void requestProgramResume();
         void requestFeedHold();
         void requestFeedResume();
         void observeDriverStateUnlocked();
+        void beginFailureStop(std::string error);
         [[nodiscard]] bool activeUnlocked() const noexcept;
         void fail(std::string error);
 
@@ -68,9 +70,11 @@ namespace ngc {
         bool m_feedHoldHeld = false;
         bool m_feedResumeRequested = false;
         bool m_feedResumeInProgress = false;
+        bool m_failureStopComplete = false;
         std::optional<RequestId> m_pendingFeedHoldRequest;
         std::optional<RequestId> m_pendingFeedResumeRequest;
         std::optional<RequestId> m_pendingControlledStopRequest;
+        std::optional<RequestId> m_pendingAbortRequest;
         std::optional<position_t> m_stoppedPosition;
         std::optional<std::string> m_error;
     };

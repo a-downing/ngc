@@ -5,6 +5,8 @@
 #include <filesystem>
 #include <string>
 
+#include <toml++/toml.hpp>
+
 namespace ngc {
     struct BackendRuntimeHostConfiguration {
         bool realtimeEnabled = false;
@@ -16,5 +18,11 @@ namespace ngc {
     [[nodiscard]] std::expected<
         BackendRuntimeHostConfiguration, std::string>
     loadBackendRuntimeHostConfiguration(
+        const std::filesystem::path &path);
+
+    [[nodiscard]] std::expected<
+        BackendRuntimeHostConfiguration, std::string>
+    loadBackendRuntimeHostConfiguration(
+        const toml::table &document,
         const std::filesystem::path &path);
 }

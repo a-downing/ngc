@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "IpcPlatform.h"
+#include "config/ConfigurationFingerprint.h"
 #include "machine/IpcExecutorBridge.h"
 #include "machine/IpcProtocol.h"
 #include "machine/MachineConfiguration.h"
@@ -68,12 +69,6 @@ namespace {
 
             if (option == "--mapping") {
                 result.mapping = value();
-            } else if (option == "--configuration") {
-                result.expected.configurationFingerprint =
-                    parseUnsigned(value());
-            } else if (option == "--topology") {
-                result.expected.topologyFingerprint =
-                    parseUnsigned(value());
             } else if (option == "--session") {
                 result.expected.sessionGeneration =
                     parseUnsigned(value());
@@ -356,14 +351,27 @@ namespace {
             options.mapping, sizeof(ngc::IpcSharedRegion));
         auto &region =
             *static_cast<ngc::IpcSharedRegion *>(memory.data());
+        auto expected = options.expected;
+        expected.configurationFingerprint =
+            ngc::toml_configuration::combinedFingerprint(
+                machine->sourceFingerprint,
+                physical->sourceFingerprint,
+                machine->machineExecutor->servoPeriod);
         const auto rejection = ngc::validateIpcSharedRegion(
-            region, options.expected);
+            region, expected);
         if (rejection != ngc::IpcRejection::None) {
             ngc::setIpcRejection(region, rejection);
             ngc::setIpcConnectionState(
                 region, ngc::IpcConnectionState::Rejected);
 
             return 2;
+        }
+        if (ngc::ipc_detail::parentProcessId()
+            != region.frontendProcessId) {
+            ngc::setIpcConnectionState(
+                region, ngc::IpcConnectionState::PeerLost);
+
+            return 3;
         }
 
         auto transport = ngc::mesa::Lbp16UdpTransport::open({
@@ -375,13 +383,37 @@ namespace {
         }
         auto runtime = makeRuntime(
             *machine, *physical, **transport);
+        if (ngc::ipc_detail::parentProcessId()
+            != region.frontendProcessId) {
+            ngc::setIpcConnectionState(
+                region, ngc::IpcConnectionState::PeerLost);
+
+            return 3;
+        }
         runtime->start();
+        const auto stopAfterFrontendLoss = [&] {
+            ngc::setIpcConnectionState(
+                region, ngc::IpcConnectionState::PeerLost);
+            static_cast<void>(
+                ngc::stopExecutorAfterFrontendLoss(*runtime));
+            runtime->stop();
+
+            return 3;
+        };
+        if (ngc::ipc_detail::parentProcessId()
+            != region.frontendProcessId) {
+            return stopAfterFrontendLoss();
+        }
         region.peerProcessId =
             ngc::ipc_detail::currentProcessId();
         ngc::setIpcConnectionState(
             region, ngc::IpcConnectionState::PeerReady);
         while (ngc::ipcConnectionState(region)
                == ngc::IpcConnectionState::PeerReady) {
+            if (ngc::ipc_detail::parentProcessId()
+                != region.frontendProcessId) {
+                return stopAfterFrontendLoss();
+            }
             std::this_thread::yield();
         }
         if (ngc::ipcConnectionState(region)
@@ -403,6 +435,10 @@ namespace {
                     region, ngc::IpcConnectionState::PeerStopped);
 
                 return 0;
+            }
+            if (ngc::ipc_detail::parentProcessId()
+                != region.frontendProcessId) {
+                return stopAfterFrontendLoss();
             }
 
             std::atomic_ref(region.peerHeartbeat).fetch_add(
