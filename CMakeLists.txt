@@ -74,8 +74,8 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
 endif()
 target_include_directories(ngc_core PUBLIC src/include)
 target_link_libraries(ngc_core
-    PUBLIC ruckig::ruckig
-    PRIVATE PathTempo::PathTempo ngc_configuration)
+    PUBLIC ruckig::ruckig ngc_configuration
+    PRIVATE PathTempo::PathTempo)
 ngc_target_defaults(ngc_core)
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")

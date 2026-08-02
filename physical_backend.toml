@@ -9,7 +9,7 @@
 # This backend file owns its executor host policy and physical hardware roles.
 
 [runtime]
-realtime_cpu = 15
+realtime_cpu = 3
 realtime_priority = 98
 lock_memory = true
 
