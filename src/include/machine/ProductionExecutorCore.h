@@ -200,6 +200,7 @@ namespace ngc {
         };
 
         void serviceControls() noexcept;
+        void applyAxisMotionState(const MotionState &state) noexcept;
         void activateNext() noexcept;
         void advanceActive(double seconds) noexcept;
         void advancePlan(double &seconds) noexcept;

@@ -374,6 +374,61 @@ namespace {
                 "activated chunk remained in the queued count");
     }
 
+    void testAxisSpacePlanUpdatesMappedJoints() {
+        ngc::ProductionExecutorConfiguration configuration;
+        auto &x = configuration.axes[
+            static_cast<std::size_t>(ngc::AxisId::X)];
+        x.joints = ngc::JointMask{1} | ngc::JointMask{1} << 1;
+        x.coordinateScale[0] = 1.0;
+        x.coordinateScale[1] = -2.0;
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(
+            0.25, configuration);
+        auto joints = ngc::JointMotionState{};
+        joints.position[0] = 1.0;
+        joints.position[1] = -1.0;
+        core->restoreStationaryState({}, {}, joints, joints);
+        initialize(*core, 11);
+
+        const auto chunk =
+            linearChunk(11, 111, 0, 211, 311, 0.0, 1.0, 1.0);
+        require(core->tryPublish(chunk) == ngc::PublishResult::Published,
+                "mapped axis-space plan was not published");
+        require(core->trySubmit(ngc::StartRequest{3, 11})
+                    == ngc::SubmitResult::Submitted,
+                "mapped axis-space plan did not start");
+
+        core->servoTick();
+        auto snapshot = latestSnapshot(*core);
+        requireNear(snapshot.commanded.position.x, 0.25,
+                    "mapped axis-space plan did not advance its axis");
+        requireNear(snapshot.commandedJoints.position[0], 1.25,
+                    "mapped axis-space plan lost the first joint offset");
+        requireNear(snapshot.commandedJoints.position[1], -1.5,
+                    "mapped axis-space plan lost the second joint offset");
+        requireNear(snapshot.commandedJoints.velocity[0], 1.0,
+                    "mapped axis-space plan omitted first joint velocity");
+        requireNear(snapshot.commandedJoints.velocity[1], -2.0,
+                    "mapped axis-space plan omitted second joint velocity");
+        requireNear(core->outputState().commandedJoints.position[0], 1.25,
+                    "executor output omitted mapped plan joint motion");
+
+        for (auto tick = 0; tick < 4; ++tick) {
+            core->servoTick();
+            takeEvents(*core);
+            snapshot = latestSnapshot(*core);
+        }
+        require(snapshot.state == ngc::BackendState::Held,
+                "mapped axis-space plan did not complete its stop tail");
+        requireNear(snapshot.commandedJoints.position[0], 2.0,
+                    "mapped plan stop lost the first joint offset");
+        requireNear(snapshot.commandedJoints.position[1], -3.0,
+                    "mapped plan stop lost the second joint offset");
+        requireNear(snapshot.commandedJoints.velocity[0], 0.0,
+                    "mapped plan stop retained joint velocity");
+        requireNear(snapshot.commandedJoints.acceleration[1], 0.0,
+                    "mapped plan stop retained joint acceleration");
+    }
+
     void testEnabledResetRetainsPoweredHeldState() {
         auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
         initialize(*core, 10);
@@ -712,7 +767,16 @@ namespace {
     }
 
     void testTriggeredMoveReachesTargetAtRest() {
-        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        ngc::ProductionExecutorConfiguration configuration;
+        auto &x = configuration.axes[
+            static_cast<std::size_t>(ngc::AxisId::X)];
+        x.joints = ngc::JointMask{1};
+        x.coordinateScale[0] = 1.0;
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(
+            0.01, configuration);
+        auto joints = ngc::JointMotionState{};
+        joints.position[0] = 3.0;
+        core->restoreStationaryState({}, {}, joints, joints);
         initialize(*core, 40);
 
         const auto move = triggeredMove(40, 401, 0, 501, 601, 0.2);
@@ -750,6 +814,10 @@ namespace {
         require(completed.state == ngc::BackendState::Held
                     && completed.lastBranch == move.branch,
                 "target completion did not establish the terminal hold");
+        requireNear(completed.commandedJoints.position[0], 3.2,
+                    "axis-space triggered move did not update its joint");
+        requireNear(completed.commandedJoints.velocity[0], 0.0,
+                    "axis-space triggered move retained joint velocity");
     }
 
     void testPublishesTriggeredMotionContext() {
@@ -2631,6 +2699,7 @@ int main() {
         testPublishesFixedExecutorIoState();
         testEmergencyStopFaultsSafelyAndResetsDisabled();
         testFixedTickExecutionAndAccounting();
+        testAxisSpacePlanUpdatesMappedJoints();
         testEnabledResetRetainsPoweredHeldState();
         testFirstPlanMustStartAtRetainedPosition();
         testContinuationMarkersAndTerminalStop();
