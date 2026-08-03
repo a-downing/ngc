@@ -337,6 +337,31 @@ namespace ngc {
         publishSnapshot();
     }
 
+    void ProductionExecutorCore::latchEmergencyStop(const std::uint32_t code) noexcept {
+        discardExecution();
+        if (m_jog.has_value()) {
+            abandonJog(JogStopReason::Aborted);
+        }
+        m_snapshot.commanded.velocity = {};
+        m_snapshot.commanded.acceleration = {};
+        m_snapshot.commandedJoints.velocity = {};
+        m_snapshot.commandedJoints.acceleration = {};
+        fault(code);
+        publishSnapshot();
+    }
+
+    void ProductionExecutorCore::resetEmergencyStop() noexcept {
+        if (m_snapshot.state != BackendState::Faulted) {
+            return;
+        }
+
+        m_snapshot.state = BackendState::Disabled;
+        m_snapshot.faultCode = 0;
+        m_outputState = {};
+        m_faultEventEmitted = false;
+        publishSnapshot();
+    }
+
     double ProductionExecutorCore::servoPeriod() const noexcept {
         return m_servoPeriod;
     }

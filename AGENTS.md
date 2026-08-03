@@ -257,8 +257,16 @@ tracker, execution-epoch counter, backend-neutral `HomingController`, homed-join
 state, backend-neutral `JoggingController`, `ExecutionCoordinator`, and
 backend-neutral `ProgramExecutionController`. It also controls the powered
 lifecycle of its `BackendRuntime`; On starts the runtime and an idle Off stops
-it, while execution epochs reuse the same backend endpoint. Each program or
-MDI epoch copies the latest stationary backend commanded position into the
+it, while execution epochs reuse the same backend endpoint. Emergency stop uses
+a dedicated fixed-size `EmergencyStopControlBlock`, not the ordinary SPSC
+command queues. The GUI request and executor-owned
+latched status use the same block for in-process Simulation and external
+Machine runtimes, while the physical external-enable circuit contributes a
+local executor source to the same latch. Any source faults an On session and
+establishes safe outputs. Releasing a source does not clear the latch: Reset is
+accepted only after every source is inactive, stops the backend runtime, and
+returns the session to Off; a separate On action starts it again. Each program
+or MDI epoch copies the latest stationary backend commanded position into the
 interpreter's canonical pose and the trajectory planner origin before
 evaluation begins; epoch reset never overwrites backend position from frontend
 state. The program

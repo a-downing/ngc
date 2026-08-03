@@ -12,6 +12,7 @@
 
 #include <ruckig/ruckig.hpp>
 
+#include "machine/EmergencyStop.h"
 #include "machine/MotionBackend.h"
 #include "machine/SpscChannel.h"
 
@@ -118,6 +119,8 @@ namespace ngc {
             const LogicalDigitalInputImage &inputs) noexcept;
         void servoTick(bool publishSnapshot = true) noexcept;
         void reportHostFault(std::uint32_t code) noexcept;
+        void latchEmergencyStop(std::uint32_t code = EMERGENCY_STOP_FAULT) noexcept;
+        void resetEmergencyStop() noexcept;
         [[nodiscard]] double servoPeriod() const noexcept;
         [[nodiscard]] ProductionExecutorMotionContext
         motionContext() const noexcept;

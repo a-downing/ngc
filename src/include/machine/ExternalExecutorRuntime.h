@@ -42,6 +42,10 @@ namespace ngc {
         [[nodiscard]] IpcRejection lastRejection() const noexcept;
         bool tryTakeRealtimeTiming(
             RealtimeTimingSummary &summary) noexcept override;
+        void requestEmergencyStop(EmergencyStopSource source) noexcept override;
+        void releaseEmergencyStop(EmergencyStopSource source) noexcept override;
+        [[nodiscard]] std::uint64_t requestEmergencyStopReset() noexcept override;
+        [[nodiscard]] EmergencyStopStatus emergencyStopStatus() const noexcept override;
 
     private:
         class Impl;

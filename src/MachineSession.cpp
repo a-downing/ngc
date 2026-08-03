@@ -143,6 +143,17 @@ namespace ngc {
         m_activity.store(MachineActivity::Faulted);
     }
 
+    bool ExecutionCoordinator::resetFaultToOff() noexcept {
+        auto expected = MachinePowerState::Faulted;
+        if (!m_powerState.compare_exchange_strong(
+                expected, MachinePowerState::Off)) {
+            return false;
+        }
+        m_activity.store(MachineActivity::Idle);
+
+        return true;
+    }
+
     MachinePowerState ExecutionCoordinator::powerState() const noexcept {
         return m_powerState.load();
     }

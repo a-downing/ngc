@@ -65,6 +65,8 @@ namespace ngc::mesa {
         [[nodiscard]] std::uint32_t faultCode() const noexcept override;
         [[nodiscard]] ProductionExecutorIoFaultDiagnostic
         faultDiagnostic() const noexcept override;
+        [[nodiscard]] std::uint32_t emergencyStopSources() const noexcept override;
+        [[nodiscard]] std::uint32_t emergencyStopFaultCode() const noexcept override;
 
         [[nodiscard]] const HostMot2CyclicOutputImage &
         pendingOutputs() const noexcept;
@@ -101,5 +103,6 @@ namespace ngc::mesa {
         bool m_lastExecutorEnabled = false;
         bool m_accumulatorFeedbackAvailable = false;
         bool m_accumulatorFeedbackAligned = false;
+        bool m_externalEnableActive = false;
     };
 }

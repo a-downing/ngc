@@ -1897,13 +1897,17 @@ namespace {
         (*adapter)->applyOutputs(outputs);
 
         require(
-            (*adapter)->faultCode()
+            (*adapter)->faultCode() == 0
+                && (*adapter)->emergencyStopSources()
+                    == ngc::emergencyStopSourceMask(
+                        ngc::EmergencyStopSource::PhysicalExternalEnable)
+                && (*adapter)->emergencyStopFaultCode()
                     == ngc::mesa::MESA_EXTERNAL_ENABLE_FAULT
                 && inputs.none()
                 && !(*adapter)->pendingOutputs().watchdogEnabled
                 && !(*adapter)->pendingOutputs().stepGeneratorsEnabled
                 && !(*adapter)->pendingOutputs().digitalOutputsEnabled,
-            "inactive external enable did not latch safe Mesa outputs");
+            "inactive external enable did not request an emergency stop and stage safe Mesa outputs");
     }
 
     void testRebasesStationaryMesaCoordinatesAndFaultsFollowingError() {

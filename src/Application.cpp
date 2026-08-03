@@ -2181,23 +2181,57 @@ public:
         ImGui::SameLine();
         ImGui::SeparatorEx(ImGuiSeparatorFlags_Vertical);
         ImGui::SameLine();
+        const auto emergencyStopLatched = managerState.guiEmergencyStopLatched
+            || (sessions.simulation
+                && sessions.simulation->emergencyStopLatchedSources != 0)
+            || (sessions.machine
+                && sessions.machine->emergencyStopLatchedSources != 0);
+        ImGui::PushStyleColor(
+            ImGuiCol_Button,
+            emergencyStopLatched
+                ? ImVec4{0.85f, 0.45f, 0.05f, 1.0f}
+                : ImVec4{0.75f, 0.05f, 0.05f, 1.0f});
+        ImGui::PushStyleColor(
+            ImGuiCol_ButtonHovered,
+            emergencyStopLatched
+                ? ImVec4{0.95f, 0.55f, 0.10f, 1.0f}
+                : ImVec4{0.90f, 0.10f, 0.10f, 1.0f});
+        if (ImGui::Button("E-STOP")) {
+            static_cast<void>(m_simulation.emergencyStop());
+            m_errorMessage.clear();
+        }
+        ImGui::PopStyleColor(2);
+        ImGui::SameLine();
         const auto powerOn = simulation.powerState == ngc::MachinePowerState::Off;
-        const auto powerAvailable = controls.canPowerOn || controls.canPowerOff;
-        const auto powerLabel = powerOn ? "On"
+        const auto powerAvailable = emergencyStopLatched
+            || controls.canPowerOn || controls.canPowerOff;
+        const auto powerLabel = emergencyStopLatched ? "Reset"
+            : powerOn ? "On"
             : simulation.powerState == ngc::MachinePowerState::Starting ? "Starting..."
             : simulation.powerState == ngc::MachinePowerState::Stopping ? "Stopping..."
             : simulation.powerState == ngc::MachinePowerState::Faulted ? "Faulted"
             : "Off";
         ImGui::BeginDisabled(!powerAvailable);
         if (ImGui::Button(powerLabel)) {
-            const auto result = powerOn
-                ? m_simulation.powerOn(m_controlAuthority)
-                : m_simulation.powerOff(m_controlAuthority);
-            if (!result) {
-                reportRejectedSessionAction(
-                    powerOn ? "Machine power on" : "Machine power off", result);
+            if (emergencyStopLatched) {
+                const auto reset = m_simulation.resetEmergencyStop();
+                if (!reset) {
+                    m_errorMessage = std::format(
+                        "Emergency-stop reset was rejected because {}.",
+                        reset.error());
+                } else {
+                    m_errorMessage.clear();
+                }
             } else {
-                m_errorMessage.clear();
+                const auto result = powerOn
+                    ? m_simulation.powerOn(m_controlAuthority)
+                    : m_simulation.powerOff(m_controlAuthority);
+                if (!result) {
+                    reportRejectedSessionAction(
+                        powerOn ? "Machine power on" : "Machine power off", result);
+                } else {
+                    m_errorMessage.clear();
+                }
             }
         }
         ImGui::EndDisabled();
@@ -2205,7 +2239,8 @@ public:
             || simulation.powerState == ngc::MachinePowerState::Stopping) {
             unavailableTooltip(true, "The controlled machine power transition is in progress.");
         } else if (simulation.powerState == ngc::MachinePowerState::Faulted) {
-            unavailableTooltip(true, "The controlled machine session is faulted.");
+            unavailableTooltip(
+                true, "Clear every E-stop source, then press Reset.");
         } else {
             unavailableTooltip(!powerAvailable,
                 "Stop the active operation before powering off the controlled machine.");

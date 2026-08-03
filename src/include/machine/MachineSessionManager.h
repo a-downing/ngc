@@ -180,6 +180,22 @@ public:
         return m_runtime->tryTakeRealtimeTiming(summary);
     }
 
+    void requestEmergencyStop(const ngc::EmergencyStopSource source) noexcept override {
+        m_runtime->requestEmergencyStop(source);
+    }
+
+    void releaseEmergencyStop(const ngc::EmergencyStopSource source) noexcept override {
+        m_runtime->releaseEmergencyStop(source);
+    }
+
+    [[nodiscard]] std::uint64_t requestEmergencyStopReset() noexcept override {
+        return m_runtime->requestEmergencyStopReset();
+    }
+
+    [[nodiscard]] ngc::EmergencyStopStatus emergencyStopStatus() const noexcept override {
+        return m_runtime->emergencyStopStatus();
+    }
+
     bool beginTimedExecution() {
         return m_simulation ? m_simulation->beginTimedExecution() : true;
     }
@@ -492,6 +508,109 @@ public:
         m_cv.notify_all();
 
         return result;
+    }
+
+    bool emergencyStop() {
+        std::scoped_lock lock(m_mutex);
+        const auto state = m_machineSession.coordinator().powerState();
+        if (state == ngc::MachinePowerState::Off) {
+            return false;
+        }
+
+        m_runtime.requestEmergencyStop(ngc::EmergencyStopSource::Gui);
+        m_machineSession.coordinator().commands().clear();
+        m_machineSession.coordinator().fault();
+        m_snapshot.powerState = ngc::MachinePowerState::Faulted;
+        m_snapshot.machineActivity = ngc::MachineActivity::Faulted;
+        m_snapshot.status = ngc::SimulationStatus::Error;
+        m_snapshot.error = "GUI emergency stop is latched";
+        m_snapshot.emergencyStopActiveSources |= emergencyStopSourceMask(
+            ngc::EmergencyStopSource::Gui);
+        m_snapshot.emergencyStopLatchedSources |= emergencyStopSourceMask(
+            ngc::EmergencyStopSource::Gui);
+        m_cv.notify_all();
+
+        return true;
+    }
+
+    std::expected<void, std::string> resetEmergencyStop() {
+        std::unique_lock lock(m_mutex);
+        if (m_machineSession.coordinator().powerState()
+                != ngc::MachinePowerState::Faulted) {
+            return std::unexpected("the session is not emergency-stop faulted");
+        }
+        if (m_running || m_machineSession.executionEpochActive()) {
+            return std::unexpected(
+                "the faulted operation has not finished shutting down");
+        }
+
+        const auto guiSource = emergencyStopSourceMask(
+            ngc::EmergencyStopSource::Gui);
+        const bool guiEmergencyStop =
+            (m_snapshot.emergencyStopLatchedSources & guiSource) != 0;
+
+        lock.unlock();
+
+        const auto deadline = std::chrono::steady_clock::now()
+            + std::chrono::seconds(2);
+        auto status = ngc::EmergencyStopStatus{};
+        if (guiEmergencyStop) {
+            while (std::chrono::steady_clock::now() < deadline) {
+                status = m_runtime.emergencyStopStatus();
+                if ((status.latchedSources & guiSource) != 0) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+            if ((status.latchedSources & guiSource) == 0) {
+                return std::unexpected(
+                    "the executor did not acknowledge the GUI emergency stop");
+            }
+            m_runtime.releaseEmergencyStop(ngc::EmergencyStopSource::Gui);
+        }
+
+        const auto resetGeneration = m_runtime.requestEmergencyStopReset();
+        while (std::chrono::steady_clock::now() < deadline) {
+            status = m_runtime.emergencyStopStatus();
+            if (status.acknowledgedResetGeneration == resetGeneration) {
+                break;
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+        }
+        if (resetGeneration == 0
+            || status.acknowledgedResetGeneration != resetGeneration) {
+            return std::unexpected(
+                "the executor did not acknowledge emergency-stop reset");
+        }
+        if (status.resetResult
+                == ngc::EmergencyStopResetResult::BlockedByActiveSource) {
+            return std::unexpected(
+                "an emergency-stop source is still active");
+        }
+        if (status.resetResult != ngc::EmergencyStopResetResult::Cleared) {
+            return std::unexpected(
+                "the executor did not clear its emergency-stop latch");
+        }
+
+        m_runtime.stop();
+
+        lock.lock();
+        if (!m_machineSession.coordinator().resetFaultToOff()) {
+            return std::unexpected(
+                "the session left its faulted state during reset");
+        }
+        m_snapshot.powerState = ngc::MachinePowerState::Off;
+        m_snapshot.machineActivity = ngc::MachineActivity::Idle;
+        m_snapshot.status = ngc::SimulationStatus::Stopped;
+        m_snapshot.activity = ngc::SimulationActivity::Idle;
+        m_snapshot.programOperation = ngc::ProgramOperationPresentation::Failed;
+        m_snapshot.trajectoryBackendState = ngc::BackendState::Disabled;
+        m_snapshot.trajectoryBackendFaultCode = 0;
+        m_snapshot.emergencyStopActiveSources = 0;
+        m_snapshot.emergencyStopLatchedSources = 0;
+        m_snapshot.error.clear();
+
+        return {};
     }
 
     SessionCommandResult start(const MachineControlAuthority authority,
@@ -836,6 +955,9 @@ public:
         if (const auto timing = latestRealtimeTiming()) {
             result.realtimeTiming = *timing;
         }
+        const auto emergencyStop = m_runtime.emergencyStopStatus();
+        result.emergencyStopActiveSources = emergencyStop.activeSources;
+        result.emergencyStopLatchedSources = emergencyStop.latchedSources;
         if (m_programRunning) {
             if (const auto backend = latestTimedBackendSnapshot()) {
                 applyBackendObservation(result, *backend);
@@ -1136,7 +1258,13 @@ public:
         {
             std::scoped_lock lock(m_mutex);
             m_machineSession.coordinator().finishActivity();
-            (void)m_machineSession.powerOff();
+            if (m_machineSession.coordinator().powerState()
+                    == ngc::MachinePowerState::Faulted) {
+                m_runtime.stop();
+                (void)m_machineSession.coordinator().resetFaultToOff();
+            } else {
+                (void)m_machineSession.powerOff();
+            }
             m_snapshot.powerState = m_machineSession.coordinator().powerState();
             m_snapshot.machineActivity = ngc::MachineActivity::Idle;
             m_cv.notify_all();
@@ -1511,12 +1639,31 @@ private:
         using clock = std::chrono::steady_clock;
         for(;;) {
             std::unique_lock lock(m_mutex);
-            m_cv.wait(lock, [&] {
+            static_cast<void>(m_cv.wait_for(lock, std::chrono::milliseconds(16), [&] {
                 return m_join || m_pendingPowerOperation
                     || !m_machineSession.coordinator().commands().empty();
-            });
+            }));
+            const auto emergencyStop = m_runtime.emergencyStopStatus();
+            if (emergencyStop.latchedSources != 0
+                && m_machineSession.coordinator().powerState()
+                    == ngc::MachinePowerState::On) {
+                m_machineSession.coordinator().commands().clear();
+                m_machineSession.coordinator().fault();
+                m_snapshot.powerState = ngc::MachinePowerState::Faulted;
+                m_snapshot.machineActivity = ngc::MachineActivity::Faulted;
+                m_snapshot.status = ngc::SimulationStatus::Error;
+                m_snapshot.error = "emergency stop is latched";
+                m_snapshot.emergencyStopActiveSources =
+                    emergencyStop.activeSources;
+                m_snapshot.emergencyStopLatchedSources =
+                    emergencyStop.latchedSources;
+            }
             if (m_join) {
                 return;
+            }
+            if (!m_pendingPowerOperation
+                && m_machineSession.coordinator().commands().empty()) {
+                continue;
             }
             if (m_pendingPowerOperation) {
                 const auto operation = *m_pendingPowerOperation;
@@ -1913,6 +2060,7 @@ private:
         .target = MachineControlTarget::Simulation,
         .generation = 1,
     };
+    bool m_guiEmergencyStopLatched = false;
 
     [[nodiscard]] detail::MachineSessionHost *sessionLocked(
             const MachineControlTarget target) {
@@ -2008,6 +2156,7 @@ public:
             .authority = m_controlAuthority,
             .simulationAvailable = m_simulation != nullptr,
             .machineAvailable = m_machine != nullptr,
+            .guiEmergencyStopLatched = m_guiEmergencyStopLatched,
         };
     }
 
@@ -2084,6 +2233,9 @@ public:
 
     SessionCommandResult powerOn(const MachineControlAuthority authority) {
         std::scoped_lock lock(m_mutex);
+        if (m_guiEmergencyStopLatched) {
+            return {SessionCommandRejection::CommandUnavailable};
+        }
         auto *session = controlledSessionLocked(authority);
 
         return session ? session->powerOn(localAuthority(*session))
@@ -2098,6 +2250,36 @@ public:
         return session ? session->powerOff(localAuthority(*session))
                        : SessionCommandResult {
                            SessionCommandRejection::StaleControlAuthority };
+    }
+
+    bool emergencyStop() {
+        std::scoped_lock lock(m_mutex);
+        m_guiEmergencyStopLatched = true;
+        if (m_simulation) {
+            static_cast<void>(m_simulation->emergencyStop());
+        }
+        if (m_machine) {
+            static_cast<void>(m_machine->emergencyStop());
+        }
+
+        return true;
+    }
+
+    std::expected<void, std::string> resetEmergencyStop() {
+        std::scoped_lock lock(m_mutex);
+        for (auto *session : {m_simulation.get(), m_machine.get()}) {
+            if (!session
+                || session->snapshot().powerState
+                    != ngc::MachinePowerState::Faulted) {
+                continue;
+            }
+            if (auto reset = session->resetEmergencyStop(); !reset) {
+                return reset;
+            }
+        }
+        m_guiEmergencyStopLatched = false;
+
+        return {};
     }
 
     SessionCommandResult start(const MachineControlAuthority authority,

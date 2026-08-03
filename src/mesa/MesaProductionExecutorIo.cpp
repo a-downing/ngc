@@ -293,14 +293,17 @@ namespace ngc::mesa {
             && inputs[m_safetyInput->input]
                 != m_safetyInput->requiredLevel) {
             inputs.reset();
-            m_faultCode = MESA_EXTERNAL_ENABLE_FAULT;
+            m_externalEnableActive = true;
+        } else {
+            m_externalEnableActive = false;
         }
     }
 
     void MesaProductionExecutorIo::applyOutputs(
         const ProductionExecutorOutputState &outputs) noexcept {
         auto next = HostMot2CyclicOutputImage{};
-        if (m_faultCode != 0 || !outputs.executorEnabled) {
+        if (m_faultCode != 0 || m_externalEnableActive
+            || !outputs.executorEnabled) {
             m_logicalOutputs.reset();
             m_lastCommandedJoints = outputs.commandedJoints;
             m_pendingCommandedJoints =
@@ -442,6 +445,17 @@ namespace ngc::mesa {
     ProductionExecutorIoFaultDiagnostic
     MesaProductionExecutorIo::faultDiagnostic() const noexcept {
         return m_faultDiagnostic;
+    }
+
+    std::uint32_t MesaProductionExecutorIo::emergencyStopSources() const noexcept {
+        return m_externalEnableActive
+            ? emergencyStopSourceMask(
+                EmergencyStopSource::PhysicalExternalEnable)
+            : 0;
+    }
+
+    std::uint32_t MesaProductionExecutorIo::emergencyStopFaultCode() const noexcept {
+        return MESA_EXTERNAL_ENABLE_FAULT;
     }
 
     const HostMot2CyclicOutputImage &

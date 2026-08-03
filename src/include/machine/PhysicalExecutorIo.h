@@ -24,6 +24,8 @@ namespace ngc {
         [[nodiscard]] std::uint32_t faultCode() const noexcept override;
         [[nodiscard]] ProductionExecutorIoFaultDiagnostic
         faultDiagnostic() const noexcept override;
+        [[nodiscard]] std::uint32_t emergencyStopSources() const noexcept override;
+        [[nodiscard]] std::uint32_t emergencyStopFaultCode() const noexcept override;
         [[nodiscard]] bool prepareTriggeredJointMove(
             const TriggeredJointMove &move) noexcept override;
 

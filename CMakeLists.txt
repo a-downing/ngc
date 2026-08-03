@@ -44,6 +44,7 @@ ngc_target_defaults(ngc_configuration)
 add_library(ngc_core STATIC
         src/ArcInterpolation.cpp
         src/DigitalIoProgram.cpp
+        src/EmergencyStop.cpp
         src/ExecutionItemOperations.cpp
         src/HomingController.cpp
         src/InfiniteJerkTrajectoryTime.cpp
@@ -192,6 +193,15 @@ target_link_libraries(ngc_machine_configuration_tests PRIVATE ngc_core)
 ngc_target_defaults(ngc_machine_configuration_tests)
 add_test(NAME ngc_machine_configuration_tests
     COMMAND ngc_machine_configuration_tests)
+
+add_executable(ngc_emergency_stop_tests
+    src/EmergencyStopTests.cpp
+)
+target_link_libraries(ngc_emergency_stop_tests PRIVATE ngc_core)
+ngc_target_defaults(ngc_emergency_stop_tests)
+add_test(NAME ngc_emergency_stop_tests COMMAND ngc_emergency_stop_tests)
+set_tests_properties(ngc_emergency_stop_tests
+    PROPERTIES WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
 
 if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(ngc_production_executor_tests

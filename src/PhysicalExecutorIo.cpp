@@ -60,6 +60,14 @@ namespace ngc {
         return m_motion->faultDiagnostic();
     }
 
+    std::uint32_t PhysicalExecutorIo::emergencyStopSources() const noexcept {
+        return m_motion->emergencyStopSources();
+    }
+
+    std::uint32_t PhysicalExecutorIo::emergencyStopFaultCode() const noexcept {
+        return m_motion->emergencyStopFaultCode();
+    }
+
     bool PhysicalExecutorIo::prepareTriggeredJointMove(
         const TriggeredJointMove &move) noexcept {
         return m_motion->prepareTriggeredJointMove(move);

@@ -255,6 +255,30 @@ namespace ngc {
                 && ipcTryPop(m_region->realtimeTiming, summary);
         }
 
+        void requestEmergencyStop(const EmergencyStopSource source) noexcept {
+            if (m_region != nullptr) {
+                EmergencyStopInterface(m_region->emergencyStop).request(source);
+            }
+        }
+
+        void releaseEmergencyStop(const EmergencyStopSource source) noexcept {
+            if (m_region != nullptr) {
+                EmergencyStopInterface(m_region->emergencyStop).release(source);
+            }
+        }
+
+        std::uint64_t requestEmergencyStopReset() noexcept {
+            return m_region != nullptr
+                ? EmergencyStopInterface(m_region->emergencyStop).requestReset()
+                : 0;
+        }
+
+        EmergencyStopStatus emergencyStopStatus() const noexcept {
+            return m_region != nullptr
+                ? EmergencyStopInterface(m_region->emergencyStop).status()
+                : EmergencyStopStatus{};
+        }
+
         MotionBackend &endpoint() noexcept {
             return m_endpoint;
         }
@@ -391,5 +415,23 @@ namespace ngc {
     bool ExternalExecutorRuntime::tryTakeRealtimeTiming(
         RealtimeTimingSummary &summary) noexcept {
         return m_impl->tryTakeRealtimeTiming(summary);
+    }
+
+    void ExternalExecutorRuntime::requestEmergencyStop(
+        const EmergencyStopSource source) noexcept {
+        m_impl->requestEmergencyStop(source);
+    }
+
+    void ExternalExecutorRuntime::releaseEmergencyStop(
+        const EmergencyStopSource source) noexcept {
+        m_impl->releaseEmergencyStop(source);
+    }
+
+    std::uint64_t ExternalExecutorRuntime::requestEmergencyStopReset() noexcept {
+        return m_impl->requestEmergencyStopReset();
+    }
+
+    EmergencyStopStatus ExternalExecutorRuntime::emergencyStopStatus() const noexcept {
+        return m_impl->emergencyStopStatus();
     }
 }

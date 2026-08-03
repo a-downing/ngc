@@ -142,6 +142,8 @@ namespace ngc {
           m_io(io ? std::move(io)
                   : std::make_unique<NullProductionExecutorIo>()),
           m_timingAccumulator(std::make_unique<TimingAccumulator>()),
+          m_emergencyStopState(std::make_unique<EmergencyStopState>(
+              m_ownedEmergencyStopControl)),
           m_servoPeriod(configuration.servoPeriod),
           m_serviceTicksPerPeriod(configuration.serviceTicksPerPeriod),
           m_timingPublicationTicks(configuration.timingPublicationTicks),
@@ -175,6 +177,35 @@ namespace ngc {
 
     MotionBackend &HostedExecutorRuntime::endpoint() noexcept {
         return *m_core;
+    }
+
+    void HostedExecutorRuntime::attachEmergencyStopControl(
+        EmergencyStopControlBlock &control) {
+        std::scoped_lock lock(m_lifecycleMutex);
+        if (m_started) {
+            throw std::logic_error(
+                "cannot replace emergency-stop control while the executor is running");
+        }
+        m_emergencyStopControl = &control;
+        m_emergencyStopState = std::make_unique<EmergencyStopState>(control);
+    }
+
+    void HostedExecutorRuntime::requestEmergencyStop(
+        const EmergencyStopSource source) noexcept {
+        EmergencyStopInterface(*m_emergencyStopControl).request(source);
+    }
+
+    void HostedExecutorRuntime::releaseEmergencyStop(
+        const EmergencyStopSource source) noexcept {
+        EmergencyStopInterface(*m_emergencyStopControl).release(source);
+    }
+
+    std::uint64_t HostedExecutorRuntime::requestEmergencyStopReset() noexcept {
+        return EmergencyStopInterface(*m_emergencyStopControl).requestReset();
+    }
+
+    EmergencyStopStatus HostedExecutorRuntime::emergencyStopStatus() const noexcept {
+        return EmergencyStopInterface(*m_emergencyStopControl).status();
     }
 
     void HostedExecutorRuntime::start() {
@@ -397,7 +428,20 @@ namespace ngc {
         const bool publishSnapshot) noexcept {
         m_io->sampleDigitalInputs(
             m_core->motionContext(), m_inputs);
-        if (const auto fault = m_io->faultCode(); fault != 0) {
+        const auto wasEmergencyStopped = m_emergencyStopState->latched();
+        const auto localEmergencyStopSources = m_io->emergencyStopSources();
+        const auto isEmergencyStopped = m_emergencyStopState->update(
+            localEmergencyStopSources);
+        if (isEmergencyStopped) {
+            if (!wasEmergencyStopped) {
+                m_core->latchEmergencyStop(
+                    localEmergencyStopSources != 0
+                        ? m_io->emergencyStopFaultCode()
+                        : EMERGENCY_STOP_FAULT);
+            }
+        } else if (wasEmergencyStopped) {
+            m_core->resetEmergencyStop();
+        } else if (const auto fault = m_io->faultCode(); fault != 0) {
             if (!m_ioFaultTimingPublished) {
                 const auto diagnostic = m_io->faultDiagnostic();
                 auto &accumulator = *m_timingAccumulator;

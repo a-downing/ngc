@@ -212,6 +212,44 @@ namespace ngc {
             m_snapshot.feedbackJoints = state.feedbackJoints;
         }
 
+        void latchEmergencyStop() noexcept {
+            if (m_active) {
+                release(*m_active);
+                m_active.reset();
+            }
+            std::uint8_t discarded = 0;
+            while (m_plans.tryPop(discarded)) {
+                accountForDequeued(discarded);
+                release(discarded);
+            }
+            m_jog.reset();
+            m_stopping = false;
+            m_feedHolding = false;
+            m_feedHeld = false;
+            m_feedResuming = false;
+            m_controlledStopping = false;
+            m_controlledStopped = false;
+            m_snapshot.state = BackendState::Faulted;
+            m_snapshot.faultCode = EMERGENCY_STOP_FAULT;
+            m_snapshot.commanded.velocity = {};
+            m_snapshot.commanded.acceleration = {};
+            m_snapshot.commandedJoints.velocity = {};
+            m_snapshot.commandedJoints.acceleration = {};
+            emit(BackendFault{EMERGENCY_STOP_FAULT});
+            publishSnapshot();
+        }
+
+        void resetEmergencyStop() noexcept {
+            if (m_snapshot.state != BackendState::Faulted
+                || m_snapshot.faultCode != EMERGENCY_STOP_FAULT) {
+                return;
+            }
+
+            m_snapshot.state = BackendState::Disabled;
+            m_snapshot.faultCode = 0;
+            publishSnapshot();
+        }
+
     private:
 
         JointMask axisJoints(const AxisId axis) const {
@@ -1738,6 +1776,12 @@ namespace ngc {
     void MockMotionBackend::restoreStationaryState(
         const StationaryBackendState &state) noexcept {
         m_impl->restoreStationaryState(state);
+    }
+    void MockMotionBackend::latchEmergencyStop() noexcept {
+        m_impl->latchEmergencyStop();
+    }
+    void MockMotionBackend::resetEmergencyStop() noexcept {
+        m_impl->resetEmergencyStop();
     }
     void MockMotionBackend::advance(const double seconds) { m_impl->advance(seconds); }
     bool MockMotionBackend::advanceTick(const double seconds, const bool publishSnapshot) {

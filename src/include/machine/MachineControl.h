@@ -19,5 +19,6 @@ namespace ngc {
         MachineControlAuthority authority;
         bool simulationAvailable = true;
         bool machineAvailable = false;
+        bool guiEmergencyStopLatched = false;
     };
 }

@@ -30,6 +30,8 @@ namespace ngc {
         bool tryTakeEvent(ExecutionEvent &event) noexcept override;
         bool tryTakeSnapshot(ExecutionSnapshot &snapshot) noexcept override;
         void restoreStationaryState(const StationaryBackendState &state) noexcept;
+        void latchEmergencyStop() noexcept;
+        void resetEmergencyStop() noexcept;
 
         void advance(double seconds) override;
         // Fixed-tick simulation may decimate presentation snapshots while still

@@ -662,6 +662,7 @@ namespace {
         auto runtime = makeRuntime(
             std::move(loaded.runtime),
             std::move(triggeredInputs));
+        runtime->attachEmergencyStopControl(region.emergencyStop);
         if (ngc::ipc_detail::parentProcessId()
             != region.frontendProcessId) {
             ngc::setIpcConnectionState(

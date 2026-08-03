@@ -51,6 +51,12 @@ namespace ngc {
         faultDiagnostic() const noexcept {
             return {};
         }
+        [[nodiscard]] virtual std::uint32_t emergencyStopSources() const noexcept {
+            return 0;
+        }
+        [[nodiscard]] virtual std::uint32_t emergencyStopFaultCode() const noexcept {
+            return EMERGENCY_STOP_FAULT;
+        }
         [[nodiscard]] virtual bool prepareTriggeredJointMove(
             const TriggeredJointMove &) noexcept {
             return true;
@@ -98,6 +104,11 @@ namespace ngc {
         [[nodiscard]] std::uint64_t servoTicks() const noexcept;
         bool tryTakeRealtimeTiming(
             RealtimeTimingSummary &summary) noexcept override;
+        void attachEmergencyStopControl(EmergencyStopControlBlock &control);
+        void requestEmergencyStop(EmergencyStopSource source) noexcept override;
+        void releaseEmergencyStop(EmergencyStopSource source) noexcept override;
+        [[nodiscard]] std::uint64_t requestEmergencyStopReset() noexcept override;
+        [[nodiscard]] EmergencyStopStatus emergencyStopStatus() const noexcept override;
 
     private:
         struct TimingAccumulator;
@@ -119,6 +130,10 @@ namespace ngc {
         std::unique_ptr<ProductionExecutorCore> m_core;
         std::unique_ptr<ProductionExecutorIo> m_io;
         std::unique_ptr<TimingAccumulator> m_timingAccumulator;
+        EmergencyStopControlBlock m_ownedEmergencyStopControl;
+        EmergencyStopControlBlock *m_emergencyStopControl =
+            &m_ownedEmergencyStopControl;
+        std::unique_ptr<EmergencyStopState> m_emergencyStopState;
         ProductionExecutorDigitalInputs m_inputs;
         double m_servoPeriod;
         std::uint32_t m_serviceTicksPerPeriod;

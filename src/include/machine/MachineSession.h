@@ -184,6 +184,7 @@ namespace ngc {
         [[nodiscard]] bool beginActivity(MachineActivity activity) noexcept;
         void finishActivity() noexcept;
         void fault() noexcept;
+        [[nodiscard]] bool resetFaultToOff() noexcept;
 
         [[nodiscard]] MachinePowerState powerState() const noexcept;
         [[nodiscard]] MachineActivity activity() const noexcept;

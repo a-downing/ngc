@@ -255,6 +255,29 @@ namespace {
                 "faulted executor output retained hardware enable");
     }
 
+    void testEmergencyStopFaultsSafelyAndResetsDisabled() {
+        ngc::ProductionExecutorCore core(0.001);
+        require(core.trySubmit(ngc::EnableRequest{1})
+                    == ngc::SubmitResult::Submitted,
+                "emergency-stop fixture did not accept enable");
+        core.serviceImmediate();
+        static_cast<void>(takeEvents(core));
+
+        core.latchEmergencyStop();
+        const auto faulted = latestSnapshot(core);
+        require(faulted.state == ngc::BackendState::Faulted
+                    && faulted.faultCode == ngc::EMERGENCY_STOP_FAULT
+                    && !core.outputState().executorEnabled,
+                "emergency stop did not fault the executor with safe outputs");
+
+        core.resetEmergencyStop();
+        const auto reset = latestSnapshot(core);
+        require(reset.state == ngc::BackendState::Disabled
+                    && reset.faultCode == 0
+                    && !core.outputState().executorEnabled,
+                "emergency-stop reset did not leave the executor disabled");
+    }
+
     JogRun runJogUntilHeld(ngc::ProductionExecutorCore &core,
                            const std::size_t maximumTicks = 4'000) {
         JogRun result;
@@ -2536,6 +2559,7 @@ int main() {
 
     try {
         testPublishesFixedExecutorIoState();
+        testEmergencyStopFaultsSafelyAndResetsDisabled();
         testFixedTickExecutionAndAccounting();
         testEnabledResetRetainsPoweredHeldState();
         testFirstPlanMustStartAtRetainedPosition();

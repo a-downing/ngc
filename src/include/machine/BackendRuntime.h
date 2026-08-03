@@ -2,6 +2,7 @@
 
 #include <cstdint>
 
+#include "machine/EmergencyStop.h"
 #include "machine/MotionBackend.h"
 #include "machine/RealtimeTiming.h"
 
@@ -36,6 +37,14 @@ namespace ngc {
         virtual bool tryTakeRealtimeTiming(
             RealtimeTimingSummary &) noexcept {
             return false;
+        }
+        virtual void requestEmergencyStop(EmergencyStopSource) noexcept { }
+        virtual void releaseEmergencyStop(EmergencyStopSource) noexcept { }
+        [[nodiscard]] virtual std::uint64_t requestEmergencyStopReset() noexcept {
+            return 0;
+        }
+        [[nodiscard]] virtual EmergencyStopStatus emergencyStopStatus() const noexcept {
+            return {};
         }
     };
 }

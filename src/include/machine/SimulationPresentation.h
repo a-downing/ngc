@@ -60,6 +60,8 @@ namespace ngc {
         std::uint32_t trajectoryBackendQueuedExecutionItems = 0;
         BranchSequence trajectoryBackendLastBranch = 0;
         std::uint32_t trajectoryBackendFaultCode = 0;
+        std::uint32_t emergencyStopActiveSources = 0;
+        std::uint32_t emergencyStopLatchedSources = 0;
         double trajectoryBackendVelocity = 0.0;
         double trajectoryBackendAcceleration = 0.0;
         double trajectoryBackendExecutionRate = 1.0;

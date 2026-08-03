@@ -383,6 +383,7 @@ namespace {
         }
         auto runtime = makeRuntime(
             *machine, *physical, **transport);
+        runtime->attachEmergencyStopControl(region.emergencyStop);
         if (ngc::ipc_detail::parentProcessId()
             != region.frontendProcessId) {
             ngc::setIpcConnectionState(

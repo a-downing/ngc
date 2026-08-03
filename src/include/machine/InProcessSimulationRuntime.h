@@ -67,15 +67,24 @@ namespace ngc {
         bool configureSyntheticInput(TriggeredMoveId move, const position_t &transitionPosition) noexcept;
         bool configureSyntheticJointInput(TriggeredMoveId move, JointId joint,
                                           double transitionPosition) noexcept;
+        void requestEmergencyStop(EmergencyStopSource source) noexcept override;
+        void releaseEmergencyStop(EmergencyStopSource source) noexcept override;
+        [[nodiscard]] std::uint64_t requestEmergencyStopReset() noexcept override;
+        [[nodiscard]] EmergencyStopStatus emergencyStopStatus() const noexcept override;
         void clearTrajectoryDiagnostics();
         std::vector<ExecutedJerkSample> takeExecutedJerkSamples();
 
     private:
         void runScheduler();
+        void serviceEmergencyStop() noexcept;
+        [[nodiscard]] bool emergencyStopWorkPending() const noexcept;
         void resetTimedDiagnostics() noexcept;
         static void updateMaximum(std::atomic<double> &target, double value) noexcept;
 
         MockMotionBackend m_backend;
+        EmergencyStopControlBlock m_emergencyStopControl;
+        EmergencyStopInterface m_emergencyStopInterface{m_emergencyStopControl};
+        EmergencyStopState m_emergencyStopState{m_emergencyStopControl};
         std::vector<JointConfiguration> m_joints;
         double m_servoPeriod;
         double m_schedulerPeriod;

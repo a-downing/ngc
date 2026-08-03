@@ -194,6 +194,7 @@ namespace ngc {
     }
 
     void InProcessSimulationRuntime::advanceImmediate(const double seconds) {
+        serviceEmergencyStop();
         m_backend.advance(seconds);
     }
 
@@ -201,6 +202,7 @@ namespace ngc {
         const auto ticks = static_cast<std::uint64_t>(m_servoTicksPerSchedulerPeriod)
             * m_tickMultiplier.load(std::memory_order_relaxed);
         for (std::uint64_t tick = 0; tick < ticks; ++tick) {
+            serviceEmergencyStop();
             m_backend.advanceTick(m_servoPeriod, tick + 1 == ticks);
         }
 
@@ -216,6 +218,47 @@ namespace ngc {
         const TriggeredMoveId move, const JointId joint,
         const double transitionPosition) noexcept {
         return m_backend.configureSyntheticJointInput(move, joint, transitionPosition);
+    }
+
+    void InProcessSimulationRuntime::requestEmergencyStop(
+        const EmergencyStopSource source) noexcept {
+        m_emergencyStopInterface.request(source);
+        m_schedulerCv.notify_all();
+    }
+
+    void InProcessSimulationRuntime::releaseEmergencyStop(
+        const EmergencyStopSource source) noexcept {
+        m_emergencyStopInterface.release(source);
+    }
+
+    std::uint64_t InProcessSimulationRuntime::requestEmergencyStopReset() noexcept {
+        const auto generation = m_emergencyStopInterface.requestReset();
+        m_schedulerCv.notify_all();
+
+        return generation;
+    }
+
+    EmergencyStopStatus InProcessSimulationRuntime::emergencyStopStatus() const noexcept {
+        return m_emergencyStopInterface.status();
+    }
+
+    void InProcessSimulationRuntime::serviceEmergencyStop() noexcept {
+        const auto wasLatched = m_emergencyStopState.latched();
+        const auto isLatched = m_emergencyStopState.update();
+        if (isLatched && !wasLatched) {
+            m_backend.latchEmergencyStop();
+        } else if (!isLatched && wasLatched) {
+            m_backend.resetEmergencyStop();
+        }
+    }
+
+    bool InProcessSimulationRuntime::emergencyStopWorkPending() const noexcept {
+        const auto status = m_emergencyStopInterface.status();
+        const auto requested = m_emergencyStopInterface.requestedSources();
+
+        return (requested & ~status.latchedSources) != 0
+            || m_emergencyStopInterface.resetGeneration()
+                != status.acknowledgedResetGeneration;
     }
 
     void InProcessSimulationRuntime::clearTrajectoryDiagnostics() {
@@ -240,10 +283,15 @@ namespace ngc {
                 std::unique_lock lock(m_schedulerMutex);
                 m_schedulerCv.wait(lock, [&] {
                     return m_stopping.load(std::memory_order_acquire)
-                        || m_timedExecutionActive.load(std::memory_order_acquire);
+                        || m_timedExecutionActive.load(std::memory_order_acquire)
+                        || emergencyStopWorkPending();
                 });
                 if (m_stopping.load(std::memory_order_acquire)) {
                     return;
+                }
+                if (!m_timedExecutionActive.load(std::memory_order_acquire)) {
+                    serviceEmergencyStop();
+                    continue;
                 }
                 pacer.reset();
             }
@@ -297,6 +345,7 @@ namespace ngc {
                      && m_timedExecutionActive.load(std::memory_order_relaxed);
                      ++tick) {
                     const auto started = clock::now();
+                    serviceEmergencyStop();
                     const auto crossedChunk =
                         m_backend.advanceTick(m_servoPeriod, tick + 1 == ticksThisPeriod);
                     m_programElapsedSeconds.fetch_add(

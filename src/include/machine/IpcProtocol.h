@@ -7,12 +7,13 @@
 #include <cstring>
 #include <type_traits>
 
+#include "machine/EmergencyStop.h"
 #include "machine/MotionBackend.h"
 #include "machine/RealtimeTiming.h"
 
 namespace ngc {
     inline constexpr std::uint64_t IPC_MAGIC = 0x4e47435f49504331ULL;
-    inline constexpr std::uint32_t IPC_ABI_VERSION = 4;
+    inline constexpr std::uint32_t IPC_ABI_VERSION = 5;
     inline constexpr std::size_t IPC_EXECUTION_CAPACITY = 8;
     inline constexpr std::size_t IPC_CONTROL_CAPACITY = 16;
     inline constexpr std::size_t IPC_EVENT_CAPACITY = 64;
@@ -74,6 +75,7 @@ namespace ngc {
         std::uint32_t peerProcessId = 0;
         alignas(64) std::uint64_t frontendHeartbeat = 0;
         alignas(64) std::uint64_t peerHeartbeat = 0;
+        EmergencyStopControlBlock emergencyStop;
         IpcRingStorage<ExecutionItem, IPC_EXECUTION_CAPACITY> executionItems;
         IpcRingStorage<ControlRequest, IPC_CONTROL_CAPACITY> controls;
         IpcRingStorage<ExecutionEvent, IPC_EVENT_CAPACITY> events;
