@@ -70,8 +70,14 @@ NRT communication endpoint. Ordinary-plan controlled stop generates a fixed-size
 axis-space velocity-stop trajectory from the current commanded PVA under
 configuration-carried physical velocity, acceleration, and jerk limits,
 retires the abandoned horizon, suppresses its future markers, and permanently
-rejects resume for that epoch. Continuous and
-incremental jogs use a fixed-capacity logical-axis-to-joint mapping,
+rejects resume for that epoch. Terminal and exact-stop plan chunks explicitly
+allow their stop tails to complete as ordinary held states. Every intermediate
+or rolling-horizon chunk requires a valid queued continuation; a missing
+continuation executes the complete proved stop tail and then latches
+`PLAN_UNDERRUN_FAULT`, while a discontinuous continuation similarly stops and
+latches `PLAN_CONTINUATION_DISCONTINUITY_FAULT`. Both faults establish safe
+outputs and reject Resume. Continuous and incremental jogs use a fixed-capacity
+logical-axis-to-joint mapping,
 jerk-limited scalar trajectories, token-matched velocity updates and stops,
 bounded dead-man leases, travel limits, and physical stop limits. Its hosting
 servo thread supplies sampled digital-input levels before each tick; the core

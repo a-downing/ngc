@@ -52,6 +52,7 @@ namespace {
                                const ngc::SpanId span, const double from,
                                const double to, const double duration) {
         ngc::PlanChunk chunk;
+        chunk.stopTailPolicy = ngc::StopTailPolicy::StopAllowed;
         chunk.epoch = epoch;
         chunk.id = id;
         chunk.predecessorBranch = predecessor;
@@ -485,6 +486,68 @@ namespace {
                     "terminal stop did not reach its declared state");
     }
 
+    void testRequiredContinuationUnderrunFaultsAfterStopTail() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.25);
+        initialize(*core, 20);
+
+        auto chunk =
+            linearChunk(20, 201, 0, 301, 401, 0.0, 1.0, 0.5);
+        chunk.stopTailPolicy = ngc::StopTailPolicy::ContinuationRequired;
+        require(chunk.events.push({
+                    0, ngc::SpindleEvent{
+                        true, ngc::Direction::CW, 1'200.0,
+                    },
+                }),
+                "underrun spindle event did not fit");
+        require(core->tryPublish(chunk) == ngc::PublishResult::Published,
+                "continuation-required chunk did not publish");
+        require(core->trySubmit(ngc::StartRequest{3, chunk.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "continuation-required chunk did not accept start");
+
+        core->servoTick();
+        takeEvents(*core);
+        latestSnapshot(*core);
+        core->servoTick();
+        auto events = takeEvents(*core);
+        const auto stopping = latestSnapshot(*core);
+        require(stopping.state == ngc::BackendState::Running
+                    && stopping.stopBranchRemainingSeconds > 0.0,
+                "underrun did not enter its proved stop tail before faulting");
+        require(core->outputState().spindle.enabled,
+                "underrun cleared spindle output before completing its stop tail");
+
+        core->servoTick();
+        auto completedEvents = takeEvents(*core);
+        events.insert(events.end(), completedEvents.begin(), completedEvents.end());
+        const auto faulted = latestSnapshot(*core);
+        const auto faults = selectEvents<ngc::BackendFault>(events);
+        require(faulted.state == ngc::BackendState::Faulted
+                    && faulted.faultCode == ngc::PLAN_UNDERRUN_FAULT,
+                "stop-tail underrun did not latch its dedicated fault");
+        require(faults.size() == 1
+                    && faults[0].code == ngc::PLAN_UNDERRUN_FAULT,
+                "stop-tail underrun did not emit its dedicated backend fault");
+        require(selectEvents<ngc::BackendHeld>(events).empty(),
+                "stop-tail underrun incorrectly emitted an ordinary held event");
+        require(!core->outputState().executorEnabled
+                    && !core->outputState().spindle.enabled,
+                "stop-tail underrun did not establish safe executor outputs");
+        requireNear(faulted.commanded.position.x, chunk.stopState.position.x,
+                    "stop-tail underrun did not finish at its proved stop state");
+
+        require(core->trySubmit(ngc::ResumeRequest{4, chunk.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "faulted underrun Resume request did not fit for rejection");
+        core->servoTick();
+        const auto resumeEvents = takeEvents(*core);
+        const auto resumes = selectEvents<ngc::RequestCompleted>(resumeEvents);
+        require(resumes.size() == 1 && resumes[0].request == 4
+                    && !resumes[0].succeeded,
+                "faulted underrun accepted Resume");
+        latestSnapshot(*core);
+    }
+
     void testScheduledSpindleEventsFollowExecutionCursor() {
         auto core = std::make_unique<ngc::ProductionExecutorCore>(0.25);
         initialize(*core, 21);
@@ -637,8 +700,15 @@ namespace {
         require(branches.size() == 1
                     && branches[0].choice == ngc::BranchChoice::Stop,
                 "mismatched continuation did not select the proved stop tail");
-        require(completed.state == ngc::BackendState::Held,
-                "proved stop tail did not finish held");
+        const auto faults = selectEvents<ngc::BackendFault>(events);
+        require(completed.state == ngc::BackendState::Faulted
+                    && completed.faultCode
+                        == ngc::PLAN_CONTINUATION_DISCONTINUITY_FAULT,
+                "discontinuous continuation did not fault after its stop tail");
+        require(faults.size() == 1
+                    && faults[0].code
+                        == ngc::PLAN_CONTINUATION_DISCONTINUITY_FAULT,
+                "discontinuous continuation did not emit its dedicated fault");
     }
 
     void testTriggeredMoveReachesTargetAtRest() {
@@ -2564,6 +2634,7 @@ int main() {
         testEnabledResetRetainsPoweredHeldState();
         testFirstPlanMustStartAtRetainedPosition();
         testContinuationMarkersAndTerminalStop();
+        testRequiredContinuationUnderrunFaultsAfterStopTail();
         testScheduledSpindleEventsFollowExecutionCursor();
         testAbortSuppressesFutureScheduledEvents();
         testMismatchedContinuationStopsSafely();

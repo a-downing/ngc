@@ -41,6 +41,7 @@ namespace ngc::test {
                               const BranchSequence branch, const SpanId span, const double from,
                               const double to, const double duration) {
             PlanChunk chunk;
+            chunk.stopTailPolicy = StopTailPolicy::StopAllowed;
             chunk.epoch = epoch;
             chunk.id = id;
             chunk.predecessorBranch = predecessor;
@@ -530,6 +531,35 @@ namespace ngc::test {
                     && !faults.empty(),
                     "an infeasible late hold did not produce a visible backend fault");
         }
+
+        void verifyRequiredContinuationUnderrun(const BackendConformanceTarget &target) {
+            RuntimeFixture fixture(target, target.createRuntime());
+            fixture.initialize(61);
+
+            auto chunk =
+                linearChunk(61, 902, 0, 1'002, 1'102, 0.0, 0.1, 0.1);
+            chunk.stopTailPolicy = StopTailPolicy::ContinuationRequired;
+            require(target,
+                    fixture.backend().tryPublish(chunk) == PublishResult::Published,
+                    "the continuation-required trajectory was not published");
+            require(target,
+                    fixture.backend().trySubmit(StartRequest{
+                        fixture.nextRequest(), chunk.epoch}) == SubmitResult::Submitted,
+                    "the continuation-required trajectory did not accept start");
+
+            const auto events = serviceUntilStationary(target, fixture);
+            const auto faults = selectEvents<BackendFault>(events);
+            const auto held = selectEvents<BackendHeld>(events);
+            const auto snapshot = fixture.latestSnapshot();
+            require(target, snapshot.state == BackendState::Faulted
+                    && snapshot.faultCode == PLAN_UNDERRUN_FAULT,
+                    "a missing required continuation did not fault after stopping");
+            require(target, faults.size() == 1
+                    && faults[0].code == PLAN_UNDERRUN_FAULT,
+                    "a missing required continuation did not report its underrun fault");
+            require(target, held.empty(),
+                    "a missing required continuation reported an ordinary hold");
+        }
     }
 
     void runBackendConformanceSuite(const BackendConformanceTarget &target) {
@@ -548,5 +578,6 @@ namespace ngc::test {
         verifyControlledStopAndAbort(target);
         verifyBoundedChannels(target);
         verifyFaultTransition(target);
+        verifyRequiredContinuationUnderrun(target);
     }
 }

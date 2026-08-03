@@ -86,6 +86,7 @@ namespace ngc {
         std::atomic<std::uint64_t> m_queuedNormalMotionNanoseconds{0};
         std::atomic<std::uint32_t> m_queuedExecutionItems{0};
         bool m_stopping = false;
+        std::uint32_t m_stopTailFaultCode = 0;
         std::uint32_t m_span = 0;
         std::uint32_t m_nextMarker = 0;
         double m_spanElapsed = 0.0;
@@ -189,6 +190,7 @@ namespace ngc {
             m_pendingSyntheticInputs.size = 0;
             m_jog.reset();
             m_stopping = false;
+            m_stopTailFaultCode = 0;
             m_span = 0;
             m_nextMarker = 0;
             m_spanElapsed = 0.0;
@@ -224,6 +226,7 @@ namespace ngc {
             }
             m_jog.reset();
             m_stopping = false;
+            m_stopTailFaultCode = 0;
             m_feedHolding = false;
             m_feedHeld = false;
             m_feedResuming = false;
@@ -464,9 +467,8 @@ namespace ngc {
             for(std::size_t guard = 0; guard < 100000000 && m_snapshot.state != BackendState::Faulted
                 && (m_active || m_jog || !m_plans.empty() || !m_controls.empty()); ++guard) {
                 advance(step, false);
-                // STOP is irrevocable. Queued descendants are now stale and may
-                // remain in the forward channel until NRT observes HELD and sends
-                // the recovery reset. Spinning on them cannot make progress.
+                // STOP is irrevocable. Once the backend is held, only a reset can
+                // make further progress.
                 if(m_snapshot.state == BackendState::Held && m_controls.empty()) break;
             }
         }
@@ -670,6 +672,7 @@ namespace ngc {
                 release(discarded);
             }
             m_stopping = false;
+            m_stopTailFaultCode = 0;
             m_span = 0;
             m_nextMarker = 0;
             m_spanElapsed = 0.0;
@@ -1415,6 +1418,7 @@ namespace ngc {
                         }
                         if(m_active) release(*m_active);
                         m_active.reset(); m_snapshot.state = BackendState::Disabled;
+                        m_stopTailFaultCode = 0;
                         m_feedHolding = false;
                         m_feedHeld = false;
                         m_feedResuming = false;
@@ -1538,6 +1542,7 @@ namespace ngc {
                         else {
                             if(m_active) release(*m_active);
                             m_active.reset(); m_snapshot.state = BackendState::Held;
+                            m_stopTailFaultCode = 0;
                             m_feedHolding = false;
                             m_feedHeld = false;
                             m_feedResuming = false;
@@ -1552,6 +1557,8 @@ namespace ngc {
                             applyJogState();
                             completeJog();
                         }
+                        const auto commanded = m_snapshot.commanded;
+                        const auto feedback = m_snapshot.feedback;
                         const auto commandedJoints = m_snapshot.commandedJoints;
                         const auto feedbackJoints = m_snapshot.feedbackJoints;
                         if(m_active) release(*m_active);
@@ -1561,7 +1568,11 @@ namespace ngc {
                             accountForDequeued(discarded);
                             release(discarded);
                         }
-                        m_stopping = false; m_span = 0; m_nextMarker = 0; m_spanElapsed = 0.0;
+                        m_stopping = false;
+                        m_stopTailFaultCode = 0;
+                        m_span = 0;
+                        m_nextMarker = 0;
+                        m_spanElapsed = 0.0;
                         m_feedHolding = false;
                         m_feedHeld = false;
                         m_feedResuming = false;
@@ -1573,6 +1584,8 @@ namespace ngc {
                         m_physicalElapsed = 0.0;
                         m_referenceElapsed = 0.0;
                         m_snapshot = {}; m_snapshot.epoch = value.nextEpoch;
+                        m_snapshot.commanded = commanded;
+                        m_snapshot.feedback = feedback;
                         m_snapshot.commandedJoints = commandedJoints;
                         m_snapshot.feedbackJoints = feedbackJoints;
                     } else if constexpr(std::same_as<T, SetJointPositionRequest>) {
@@ -1619,6 +1632,7 @@ namespace ngc {
             }
             m_active = index;
             m_stopping = false;
+            m_stopTailFaultCode = 0;
             m_span = 0;
             m_nextMarker = 0;
             m_spanElapsed = 0.0;
@@ -1643,8 +1657,20 @@ namespace ngc {
                 return;
             }
             if(m_stopping) {
-                auto &chunk = activeChunk();
+                const auto chunk = activeChunk();
                 emit(ChunkRetired { chunk.epoch, chunk.id });
+                if (m_stopTailFaultCode != 0) {
+                    const auto faultCode = m_stopTailFaultCode;
+                    m_snapshot.commanded = chunk.stopState;
+                    m_snapshot.feedback = m_snapshot.commanded;
+                    m_snapshot.lastBranch = chunk.branch;
+                    discardExecutionHorizon();
+                    m_snapshot.state = BackendState::Faulted;
+                    m_snapshot.faultCode = faultCode;
+                    emit(BackendFault { faultCode });
+
+                    return;
+                }
                 m_snapshot.state = BackendState::Held;
                 m_snapshot.lastBranch = chunk.branch;
                 const auto reason = m_feedHolding
@@ -1704,6 +1730,11 @@ namespace ngc {
                         execution_item::epoch(continuation),
                         execution_item::id(continuation) });
                     release(continuationIndex);
+                    m_stopTailFaultCode =
+                        PLAN_CONTINUATION_DISCONTINUITY_FAULT;
+                } else if (current.stopTailPolicy
+                           == StopTailPolicy::ContinuationRequired) {
+                    m_stopTailFaultCode = PLAN_UNDERRUN_FAULT;
                 }
                 emit(BranchSelected { current.epoch, current.branch, BranchChoice::Stop, 0 });
                 if(m_feedHolding || m_feedResuming) {

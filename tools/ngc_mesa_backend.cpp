@@ -1,5 +1,4 @@
 #include <algorithm>
-#include <atomic>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
@@ -442,8 +441,6 @@ namespace {
                 return stopAfterFrontendLoss();
             }
 
-            std::atomic_ref(region.peerHeartbeat).fetch_add(
-                1, std::memory_order_relaxed);
             if (!bridge.service(true)) {
                 std::this_thread::sleep_for(
                     std::chrono::microseconds(100));

@@ -219,6 +219,8 @@ namespace ngc::gui {
                 return "control has transferred or the command targets another session";
             case SessionCommandRejection::SessionNotPowered:
                 return "the controlled session is not powered on";
+            case SessionCommandRejection::BackendFaulted:
+                return "the motion backend is faulted; power the session off before restarting it";
             case SessionCommandRejection::SessionAlreadyPowered:
                 return "the controlled session is already powered on";
             case SessionCommandRejection::SessionAlreadyOff:

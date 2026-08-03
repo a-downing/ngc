@@ -194,6 +194,7 @@ namespace {
         const ngc::EpochId epoch, const ngc::ChunkId id,
         const double from, const double to, const double duration) {
         ngc::PlanChunk chunk;
+        chunk.stopTailPolicy = ngc::StopTailPolicy::StopAllowed;
         chunk.epoch = epoch;
         chunk.id = id;
         chunk.branch = id + 100;
@@ -368,6 +369,51 @@ namespace {
                 "IPC executor should report its terminal held state");
         static_cast<void>(waitForSnapshot(
             runtime, ngc::BackendState::Held, 0.125));
+
+        constexpr ngc::EpochId underrunEpoch = 18;
+        require(runtime.endpoint().trySubmit(
+                    ngc::ResetRequest{25, underrunEpoch})
+                    == ngc::SubmitResult::Submitted,
+                "IPC underrun reset should fit");
+        require(waitForRequest(runtime, 25).succeeded,
+                "IPC underrun reset should succeed");
+        require(runtime.endpoint().trySubmit(ngc::EnableRequest{26})
+                    == ngc::SubmitResult::Submitted,
+                "IPC underrun enable should fit");
+        require(waitForRequest(runtime, 26).succeeded,
+                "IPC underrun enable should succeed");
+
+        auto requiredChunk = linearChunk(
+            underrunEpoch, 27, 0.125, 0.25, 0.03);
+        requiredChunk.stopTailPolicy =
+            ngc::StopTailPolicy::ContinuationRequired;
+        require(runtime.endpoint().tryPublish(requiredChunk)
+                    == ngc::PublishResult::Published,
+                "IPC required-continuation chunk should fit");
+        require(runtime.endpoint().trySubmit(
+                    ngc::StartRequest{28, underrunEpoch})
+                    == ngc::SubmitResult::Submitted,
+                "IPC required-continuation epoch should start");
+        require(waitForRequest(runtime, 28).succeeded,
+                "IPC required-continuation start should succeed");
+        require(std::get<ngc::ChunkAccepted>(waitForEvent(runtime)).chunk
+                    == requiredChunk.id,
+                "IPC executor should accept the required-continuation chunk");
+        static_cast<void>(
+            std::get<ngc::ExecutionMarkerReached>(waitForEvent(runtime)));
+        require(std::get<ngc::BranchSelected>(waitForEvent(runtime)).choice
+                    == ngc::BranchChoice::Stop,
+                "IPC underrun should execute the proved stop tail");
+        require(std::get<ngc::ChunkRetired>(waitForEvent(runtime)).chunk
+                    == requiredChunk.id,
+                "IPC underrun should retire the stopped chunk");
+        require(std::get<ngc::BackendFault>(waitForEvent(runtime)).code
+                    == ngc::PLAN_UNDERRUN_FAULT,
+                "IPC underrun should report the dedicated backend fault");
+        const auto faulted = waitForSnapshot(
+            runtime, ngc::BackendState::Faulted, 0.25);
+        require(faulted.faultCode == ngc::PLAN_UNDERRUN_FAULT,
+                "IPC underrun should latch its fault in the backend snapshot");
 
         runtime.stop();
         runtime.stop();

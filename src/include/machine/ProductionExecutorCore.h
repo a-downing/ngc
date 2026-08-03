@@ -317,6 +317,7 @@ namespace ngc {
         TriggeredMoveStatus m_triggeredJointCompletionStatus =
             TriggeredMoveStatus::ReachedTarget;
         EpochId m_controlledStoppedEpoch = 0;
+        std::uint32_t m_stopTailFaultCode = 0;
         LogicalDigitalInputImage m_digitalInputs;
         LogicalDigitalInputImage m_previousDigitalInputs;
         bool m_stopping = false;

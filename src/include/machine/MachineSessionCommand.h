@@ -5,6 +5,7 @@ namespace ngc {
         None,
         StaleControlAuthority,
         SessionNotPowered,
+        BackendFaulted,
         SessionAlreadyPowered,
         SessionAlreadyOff,
         PowerTransitionInProgress,

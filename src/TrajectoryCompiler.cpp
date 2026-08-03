@@ -1697,6 +1697,7 @@ namespace ngc {
         if(!chunk.stopTail.push(stop))
             return std::unexpected("trajectory chunk stop-tail capacity exceeded");
         chunk.stopState = chunk.branchState;
+        chunk.stopTailPolicy = StopTailPolicy::StopAllowed;
         if (!chunk.markers.push({
                 .id = m_nextExecutionMarker++,
                 .span = 0,
@@ -3451,6 +3452,9 @@ namespace ngc {
                 chunk.stopState.acceleration={};
             }
             predecessor=chunk.branch;
+        }
+        if (!requestedEndState.has_value()) {
+            result->chunks.back().stopTailPolicy = StopTailPolicy::StopAllowed;
         }
 
         m_nextChunk=nextChunk;

@@ -2452,6 +2452,7 @@ final_move_together = true
         tracker.reset(initial);
 
         ngc::PlanChunk chunk;
+        chunk.stopTailPolicy = ngc::StopTailPolicy::StopAllowed;
         chunk.epoch = 7;
         chunk.id = 9;
         ngc::AxisPolynomialSpan span;
@@ -2544,6 +2545,7 @@ final_move_together = true
         tracker.observeLifecycle({outer, ngc::BlockLifecyclePhase::Completed});
 
         ngc::PlanChunk chunk;
+        chunk.stopTailPolicy = ngc::StopTailPolicy::StopAllowed;
         chunk.epoch = 3;
         chunk.id = 5;
         ngc::TrajectoryCommandPresentation presentation;
@@ -4816,6 +4818,7 @@ G1 F60 X2
                 "backend should reject an incomplete trajectory chunk");
 
         ngc::PlanChunk chunk;
+        chunk.stopTailPolicy = ngc::StopTailPolicy::StopAllowed;
         chunk.epoch = 7;
         chunk.id = 11;
         chunk.branch = 21;
@@ -4860,7 +4863,7 @@ G1 F60 X2
                 "mock diagnostics should distinguish the executed stop tail");
     }
 
-    void testImmediateDrainStopsAtHeldWithStaleDescendants() {
+    void testImmediateDrainFaultsWithStaleDescendants() {
         ngc::MockMotionBackend backend;
         require(backend.trySubmit(ngc::ResetRequest { 1, 6 }) == ngc::SubmitResult::Submitted,
                 "stale-descendant test reset should publish");
@@ -4871,6 +4874,7 @@ G1 F60 X2
         while (backend.tryTakeEvent(event)) { }
 
         ngc::PlanChunk first;
+        first.stopTailPolicy = ngc::StopTailPolicy::StopAllowed;
         first.epoch = 6;
         first.id = 1;
         first.branch = 1;
@@ -4916,7 +4920,7 @@ G1 F60 X2
                 "immediate draining must not spin while held with stale queued descendants");
         bool rejectedStale = false;
         bool selectedStop = false;
-        bool held = false;
+        bool faulted = false;
         bool acceptedStale = false;
         bool emittedStaleMarker = false;
         while (backend.tryTakeEvent(event)) {
@@ -4931,12 +4935,14 @@ G1 F60 X2
             } else if (const auto *marker = std::get_if<ngc::ExecutionMarkerReached>(&event)) {
                 emittedStaleMarker = emittedStaleMarker || marker->marker == 200
                     || marker->marker == 300;
-            } else if (const auto *heldEvent = std::get_if<ngc::BackendHeld>(&event)) {
-                held = held || heldEvent->reason == ngc::BackendHoldReason::StopBranch;
+            } else if (const auto *fault = std::get_if<ngc::BackendFault>(&event)) {
+                faulted = faulted
+                    || fault->code
+                        == ngc::PLAN_CONTINUATION_DISCONTINUITY_FAULT;
             }
         }
-        require(rejectedStale && selectedStop && held,
-                "a mismatched continuation should be rejected before its predecessor stops held");
+        require(rejectedStale && selectedStop && faulted,
+                "a mismatched continuation should fault after its predecessor stop tail");
         require(!acceptedStale && !emittedStaleMarker,
                 "stale descendants must not execute or emit presentation markers");
 
@@ -4945,10 +4951,12 @@ G1 F60 X2
         while (backend.tryTakeSnapshot(snapshot)) {
             latest = snapshot;
         }
-        require(latest.state == ngc::BackendState::Held
+        require(latest.state == ngc::BackendState::Faulted
+                    && latest.faultCode
+                        == ngc::PLAN_CONTINUATION_DISCONTINUITY_FAULT
                     && latest.activeChunk == first.id
-                    && latest.queuedExecutionItems == 1,
-                "held state should retain the unconsumed stale descendant for NRT recovery");
+                    && latest.queuedExecutionItems == 0,
+                "continuation fault should abandon every stale descendant");
         requireNear(latest.commanded.position.x, 1.0,
                     "immediate draining must stop at the lead chunk's proved stop state");
     }
@@ -4956,6 +4964,7 @@ G1 F60 X2
     void testMockBackendEmitsOrderedInSpanExecutionMarkers() {
         ngc::MockMotionBackend backend;
         ngc::PlanChunk chunk;
+        chunk.stopTailPolicy = ngc::StopTailPolicy::StopAllowed;
         chunk.epoch = 8;
         chunk.id = 12;
         chunk.branch = 22;
@@ -5190,6 +5199,7 @@ G1 F60 X2
             ngc::FeedHoldConfiguration { 2.0, 10.0 }, limits);
 
         ngc::PlanChunk chunk;
+        chunk.stopTailPolicy = ngc::StopTailPolicy::StopAllowed;
         chunk.epoch = 17;
         chunk.id = 31;
         chunk.branch = 41;
@@ -5338,6 +5348,7 @@ G1 F60 X2
             ngc::FeedHoldConfiguration { 2.0, 10.0 }, limits);
 
         ngc::PlanChunk chunk;
+        chunk.stopTailPolicy = ngc::StopTailPolicy::StopAllowed;
         chunk.epoch = 27;
         chunk.id = 51;
         chunk.branch = 61;
@@ -5455,6 +5466,7 @@ G1 F60 X2
         });
 
         ngc::PlanChunk chunk;
+        chunk.stopTailPolicy = ngc::StopTailPolicy::StopAllowed;
         chunk.epoch = epoch;
         chunk.id = 61;
         chunk.branch = 71;
@@ -5549,6 +5561,7 @@ G1 F60 X2
             ngc::FeedHoldConfiguration { 0.01, 0.1 }, limits);
 
         ngc::PlanChunk chunk;
+        chunk.stopTailPolicy = ngc::StopTailPolicy::StopAllowed;
         chunk.epoch = 18;
         chunk.id = 32;
         chunk.branch = 42;
@@ -6289,6 +6302,7 @@ G1 F60 X2
     void testMockBackendAdvancesOneFixedServoTick() {
         ngc::MockMotionBackend backend;
         ngc::PlanChunk chunk;
+        chunk.stopTailPolicy = ngc::StopTailPolicy::StopAllowed;
         chunk.epoch = 31;
         chunk.id = 1;
         chunk.branch = 1;
@@ -6943,6 +6957,18 @@ G1 F60 X2
         compiler.reset(94,points.front());
         const auto planned=compiler.compileContinuous(*prepared,0.05);
         require(planned&&*planned,planned?"":planned.error());
+        require(!(*planned)->chunks.empty()
+                    && (*planned)->chunks.back().stopTailPolicy
+                        == ngc::StopTailPolicy::StopAllowed
+                    && std::ranges::all_of(
+                        std::span((*planned)->chunks).first(
+                            (*planned)->chunks.size() - 1),
+                        [](const auto &chunk) {
+                            return chunk.stopTailPolicy
+                                == ngc::StopTailPolicy::ContinuationRequired;
+                        }),
+                "terminal continuous planning should allow only its final "
+                "packet to stop normally");
         require(std::ranges::all_of((*planned)->chunks, [](const auto &chunk) {
                     return std::ranges::all_of(
                                chunk.normalMotion, [](const auto &span) {
@@ -7664,6 +7690,7 @@ G1 F60 X2
         const auto positionsAtPeriod = [](const double period) {
             ngc::MockMotionBackend backend;
             ngc::PlanChunk chunk;
+            chunk.stopTailPolicy = ngc::StopTailPolicy::StopAllowed;
             chunk.epoch = 4;
             chunk.id = 8;
             chunk.branch = 12;
@@ -8472,7 +8499,7 @@ int main() {
         testSpscChannelIsBoundedAndOrdered();
         testOwningSpscChannelTransfersMoveOnlyValues();
         testMockMotionBackendUsesProductionTransportContract();
-        testImmediateDrainStopsAtHeldWithStaleDescendants();
+        testImmediateDrainFaultsWithStaleDescendants();
         testMockBackendEmitsOrderedInSpanExecutionMarkers();
         testContinuousMarkerBoundPacketsExecuteWithoutIntermediateStops();
         testJogControlUsesBoundedBackendTransport();

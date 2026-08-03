@@ -1,6 +1,5 @@
 #include "machine/ExternalExecutorRuntime.h"
 
-#include <atomic>
 #include <chrono>
 #include <format>
 #include <new>
@@ -232,10 +231,6 @@ namespace ngc {
 
         void serviceImmediate() noexcept {
             refreshPeerState();
-            if (m_region != nullptr) {
-                std::atomic_ref(m_region->frontendHeartbeat).fetch_add(
-                    1, std::memory_order_relaxed);
-            }
         }
 
         bool connected() const noexcept {

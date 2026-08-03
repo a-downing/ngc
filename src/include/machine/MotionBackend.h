@@ -122,6 +122,11 @@ namespace ngc {
         double parameter = 0.0;
     };
 
+    enum class StopTailPolicy : std::uint8_t {
+        ContinuationRequired,
+        StopAllowed,
+    };
+
     template<typename T, std::size_t Capacity>
     struct FixedArray {
         std::array<T, Capacity> values{};
@@ -152,6 +157,7 @@ namespace ngc {
         FixedArray<ExecutionMarker, MAX_EXECUTION_MARKERS_PER_CHUNK> markers;
         MotionState branchState{};
         MotionState stopState{};
+        StopTailPolicy stopTailPolicy = StopTailPolicy::ContinuationRequired;
     };
 
     static_assert(std::is_trivially_copyable_v<PlanChunk>);
@@ -243,6 +249,8 @@ namespace ngc {
     static_assert(std::is_trivially_copyable_v<ExecutionItem>);
 
     enum class BackendState : std::uint8_t { Disabled, Held, Running, Holding, Faulted };
+    inline constexpr std::uint32_t PLAN_UNDERRUN_FAULT = 0x504c0001;
+    inline constexpr std::uint32_t PLAN_CONTINUATION_DISCONTINUITY_FAULT = 0x504c0002;
     enum class BranchChoice : std::uint8_t { Continue, Stop };
     enum class PublishResult : std::uint8_t { Published, Full, Invalid };
     enum class SubmitResult : std::uint8_t { Submitted, Full };

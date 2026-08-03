@@ -286,6 +286,7 @@ namespace ngc {
         m_snapshot.feedbackJoints = feedbackJoints;
         m_planStop.reset();
         m_controlledStoppedEpoch = 0;
+        m_stopTailFaultCode = 0;
         m_outputState = {};
         m_faultEventEmitted = false;
     }
@@ -709,6 +710,7 @@ namespace ngc {
         m_triggeredJointMask = 0;
         m_triggeredJointCompletionStatus =
             TriggeredMoveStatus::ReachedTarget;
+        m_stopTailFaultCode = 0;
         m_snapshot.activeChunk = execution_item::id(item);
         m_snapshot.activeSpan = 0;
         emit(ChunkAccepted{
@@ -2047,6 +2049,14 @@ namespace ngc {
         m_snapshot.commanded = chunk.stopState;
         m_snapshot.feedback = m_snapshot.commanded;
         m_snapshot.lastBranch = chunk.branch;
+        if (m_stopTailFaultCode != 0) {
+            const auto faultCode = m_stopTailFaultCode;
+            emit(ChunkRetired{chunk.epoch, chunk.id});
+            discardExecution();
+            fault(faultCode);
+
+            return;
+        }
         m_snapshot.state = BackendState::Held;
         emit(ChunkRetired{chunk.epoch, chunk.id});
         emit(BackendHeld{
@@ -2111,6 +2121,11 @@ namespace ngc {
                 execution_item::id(continuation),
             });
             release(continuationIndex);
+            m_stopTailFaultCode =
+                PLAN_CONTINUATION_DISCONTINUITY_FAULT;
+        } else if (current.stopTailPolicy
+                   == StopTailPolicy::ContinuationRequired) {
+            m_stopTailFaultCode = PLAN_UNDERRUN_FAULT;
         }
 
         if (m_feedRetiming.holding || m_feedRetiming.resuming) {
@@ -2229,6 +2244,7 @@ namespace ngc {
         m_triggeredJointMask = 0;
         m_triggeredJointCompletionStatus =
             TriggeredMoveStatus::ReachedTarget;
+        m_stopTailFaultCode = 0;
         m_snapshot.activeJoints = 0;
     }
 

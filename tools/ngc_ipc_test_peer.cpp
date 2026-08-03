@@ -726,8 +726,6 @@ namespace {
                 return 3;
             }
 
-            std::atomic_ref(region.peerHeartbeat).fetch_add(
-                1, std::memory_order_relaxed);
             const auto progressed = bridge.service(options.consume);
             if (options.exitAfterControls.has_value()
                 && bridge.completedControls() >= *options.exitAfterControls) {

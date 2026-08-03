@@ -623,6 +623,10 @@ public:
         if (m_machineSession.coordinator().powerState() != ngc::MachinePowerState::On) {
             return { SessionCommandRejection::SessionNotPowered };
         }
+        if (m_snapshot.trajectoryBackendState == ngc::BackendState::Faulted
+            || m_snapshot.trajectoryBackendFaultCode != 0) {
+            return { SessionCommandRejection::BackendFaulted };
+        }
         if (motionOwnedOrQueued()) {
             return { SessionCommandRejection::MotionOwned };
         }
@@ -663,6 +667,10 @@ public:
         if (m_machineSession.coordinator().powerState() != ngc::MachinePowerState::On) {
             return { SessionCommandRejection::SessionNotPowered };
         }
+        if (m_snapshot.trajectoryBackendState == ngc::BackendState::Faulted
+            || m_snapshot.trajectoryBackendFaultCode != 0) {
+            return { SessionCommandRejection::BackendFaulted };
+        }
         if (motionOwnedOrQueued()) {
             return { SessionCommandRejection::MotionOwned };
         }
@@ -701,6 +709,10 @@ public:
         }
         if (m_machineSession.coordinator().powerState() != ngc::MachinePowerState::On) {
             return { SessionCommandRejection::SessionNotPowered };
+        }
+        if (m_snapshot.trajectoryBackendState == ngc::BackendState::Faulted
+            || m_snapshot.trajectoryBackendFaultCode != 0) {
+            return { SessionCommandRejection::BackendFaulted };
         }
         if (!jog || *jog == 0) {
             return { SessionCommandRejection::InvalidJogRequest };

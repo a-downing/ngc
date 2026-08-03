@@ -82,6 +82,8 @@ namespace ngc::execution_item {
             if (chunk.epoch == 0 || chunk.id == 0 || chunk.branch == 0
                 || chunk.normalMotion.size == 0
                 || chunk.stopTail.size == 0
+                || (chunk.stopTailPolicy != StopTailPolicy::ContinuationRequired
+                    && chunk.stopTailPolicy != StopTailPolicy::StopAllowed)
                 || !finiteMotionState(chunk.branchState)
                 || !finiteMotionState(chunk.stopState)
                 || !std::ranges::all_of(chunk.normalMotion, validSpan)

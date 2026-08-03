@@ -11,7 +11,6 @@ namespace ngc {
         Gui = 1U << 0,
         Pendant = 1U << 1,
         PhysicalExternalEnable = 1U << 2,
-        FrontendLost = 1U << 3,
     };
 
     enum class EmergencyStopResetResult : std::uint32_t {
