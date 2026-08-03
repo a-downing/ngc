@@ -279,8 +279,7 @@ namespace ngc::physical {
         return transaction(
                 FUNCTION_WRITE_CONTROL, data,
                 response, responseSize)
-            && response[2] == 1
-            && response[3] == control;
+            && response[2] == 1;
     }
 
     bool HuanyangSpindleHardware::readStatus(

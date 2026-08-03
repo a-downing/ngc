@@ -2842,6 +2842,20 @@ public:
                 ImGui::TextColored(
                     ImVec4_Redish, "[Simulation] MOTION ERROR: %s", simulation.error.c_str());
             }
+            if (const auto &timing = simulation.realtimeTiming;
+                timing && timing->ioFaultCode != 0) {
+                ImGui::TextColored(
+                    ImVec4_Redish,
+                    "[Machine] I/O FAULT %u: joint %u | following error %+.6f "
+                    "steps | target %.9f | actual %.9f | DPLL phase %.3f us",
+                    timing->ioFaultCode,
+                    timing->ioFaultJoint,
+                    timing->ioFaultFollowingErrorSteps,
+                    timing->ioFaultTargetPosition,
+                    timing->ioFaultActualPosition,
+                    static_cast<double>(
+                        timing->ioFaultDpllPhaseErrorNanoseconds) * 1.0e-3);
+            }
             for (const auto &error : parserErrors) {
                 ImGui::TextColored(
                     ImVec4_Redish, "[Preview] ERROR: %s", error.text().c_str());
@@ -2854,6 +2868,8 @@ public:
             }
 
             if (m_errorMessage.empty() && simulation.error.empty()
+                && (!simulation.realtimeTiming
+                    || simulation.realtimeTiming->ioFaultCode == 0)
                 && parserErrors.empty() && previewMessages.empty()
                 && simulation.statusMessages.empty()) {
                 ImGui::TextDisabled("No messages.");
@@ -2919,6 +2935,21 @@ public:
                         "Diagnostic publication backpressure: %llu",
                         static_cast<unsigned long long>(
                             timing->failedPublications));
+                    if (timing->ioFaultCode != 0) {
+                        ImGui::TextColored(
+                            ImVec4_Redish,
+                            "I/O fault %u: joint %u | following error %+.6f "
+                            "steps | target %.9f | actual %.9f | "
+                            "DPLL phase %.3f us",
+                            timing->ioFaultCode,
+                            timing->ioFaultJoint,
+                            timing->ioFaultFollowingErrorSteps,
+                            timing->ioFaultTargetPosition,
+                            timing->ioFaultActualPosition,
+                            static_cast<double>(
+                                timing->ioFaultDpllPhaseErrorNanoseconds)
+                                * 1.0e-3);
+                    }
                     ImGui::Separator();
                 }
                 if (const auto &diagnostics = simulation.simulationDiagnostics) {

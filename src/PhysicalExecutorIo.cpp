@@ -55,6 +55,11 @@ namespace ngc {
         return m_spindle ? m_spindle->faultCode() : 0;
     }
 
+    ProductionExecutorIoFaultDiagnostic
+    PhysicalExecutorIo::faultDiagnostic() const noexcept {
+        return m_motion->faultDiagnostic();
+    }
+
     bool PhysicalExecutorIo::prepareTriggeredJointMove(
         const TriggeredJointMove &move) noexcept {
         return m_motion->prepareTriggeredJointMove(move);

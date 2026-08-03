@@ -24,6 +24,12 @@ namespace ngc {
         std::uint64_t maximumConsecutiveMisses = 0;
         std::uint64_t worstTick = 0;
         std::uint64_t failedPublications = 0;
+        std::uint32_t ioFaultCode = 0;
+        std::uint32_t ioFaultJoint = 0;
+        double ioFaultFollowingErrorSteps = 0.0;
+        double ioFaultTargetPosition = 0.0;
+        double ioFaultActualPosition = 0.0;
+        std::int32_t ioFaultDpllPhaseErrorNanoseconds = 0;
         std::array<
             std::uint64_t,
             REALTIME_TIMING_HISTOGRAM_BUCKETS> wakeLatenessHistogram{};
@@ -66,6 +72,18 @@ namespace ngc {
             aggregate.maximumConsecutiveMisses,
             summary.maximumConsecutiveMisses);
         aggregate.failedPublications += summary.failedPublications;
+        if (summary.ioFaultCode != 0) {
+            aggregate.ioFaultCode = summary.ioFaultCode;
+            aggregate.ioFaultJoint = summary.ioFaultJoint;
+            aggregate.ioFaultFollowingErrorSteps =
+                summary.ioFaultFollowingErrorSteps;
+            aggregate.ioFaultTargetPosition =
+                summary.ioFaultTargetPosition;
+            aggregate.ioFaultActualPosition =
+                summary.ioFaultActualPosition;
+            aggregate.ioFaultDpllPhaseErrorNanoseconds =
+                summary.ioFaultDpllPhaseErrorNanoseconds;
+        }
         for (auto bucket = std::size_t{0};
              bucket < REALTIME_TIMING_HISTOGRAM_BUCKETS;
              ++bucket) {

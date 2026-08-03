@@ -21,6 +21,7 @@
 #include "mesa/HostMot2Discovery.h"
 #include "mesa/Lbp16UdpTransport.h"
 #include "mesa/MesaBackendConfiguration.h"
+#include "mesa/MesaProductionExecutorIo.h"
 #include "mesa/SevenI96Capabilities.h"
 #include "mesa/SevenI96CyclicLayout.h"
 
@@ -38,6 +39,7 @@ namespace {
         std::uint32_t cyclesPerDirection = 1'000;
         double rateStepsPerSecond = 800.0;
         bool validateConfigurationOnly = false;
+        bool monitorInputs = false;
         bool ordinaryScheduler = false;
     };
 
@@ -107,6 +109,8 @@ namespace {
                     value(), "--rate-steps-per-second");
             } else if (option == "--validate-config-only") {
                 result.validateConfigurationOnly = true;
+            } else if (option == "--monitor-inputs") {
+                result.monitorInputs = true;
             } else if (option == "--ordinary-scheduler") {
                 result.ordinaryScheduler = true;
             } else {
@@ -420,6 +424,58 @@ namespace {
         return result;
     }
 
+    void printInputState(
+        const ngc::FieldDigitalInputImage &fieldInputs,
+        const ngc::LogicalDigitalInputImage &logicalInputs,
+        const ngc::MachineConfiguration &machine,
+        const ngc::mesa::MesaBackendConfiguration &mesa) {
+        std::print("raw:");
+        for (const auto &input : mesa.fieldInputs) {
+            std::print(
+                " {}={}", input.name,
+                fieldInputs[input.index] ? "HIGH" : "LOW");
+        }
+        std::print("; logical:");
+        for (const auto &input : machine.digitalInputs) {
+            std::print(
+                " {}={}", input.name,
+                logicalInputs[input.id] ? "ACTIVE" : "inactive");
+        }
+        std::println();
+    }
+
+    void monitorInputs(
+        ScheduledCyclicIo &scheduled,
+        ngc::DigitalIoProgram &program,
+        const ngc::MachineConfiguration &machine,
+        const ngc::mesa::MesaBackendConfiguration &mesa) {
+        auto previousFieldInputs = ngc::FieldDigitalInputImage{};
+        auto previousLogicalInputs = ngc::LogicalDigitalInputImage{};
+        auto havePrevious = false;
+        std::println(
+            "Input monitor ready; all watchdog, StepGen, and digital "
+            "outputs are disabled. Press Ctrl+C to stop.");
+        while (interrupted == 0) {
+            const auto &sample = scheduled.cycle({});
+            auto fieldInputs = ngc::FieldDigitalInputImage{};
+            for (std::size_t index = 0;
+                 index < program.fieldInputCount(); ++index) {
+                fieldInputs[index] = sample.fieldDigitalInputs[index];
+            }
+            auto logicalInputs = ngc::LogicalDigitalInputImage{};
+            program.executeInputs(fieldInputs, {}, logicalInputs);
+            if (!havePrevious
+                || fieldInputs != previousFieldInputs
+                || logicalInputs != previousLogicalInputs) {
+                printInputState(
+                    fieldInputs, logicalInputs, machine, mesa);
+                previousFieldInputs = fieldInputs;
+                previousLogicalInputs = logicalInputs;
+                havePrevious = true;
+            }
+        }
+    }
+
     std::string_view faultName(
         const ngc::mesa::HostMot2CyclicIoFault fault) noexcept {
         using Fault = ngc::mesa::HostMot2CyclicIoFault;
@@ -464,6 +520,11 @@ int main(const int argc, char **argv) {
                 options.mesaConfiguration);
         if (!host) {
             throw std::runtime_error(host.error());
+        }
+        auto ioProgram = ngc::mesa::compileMesaDigitalIoProgram(
+            *machine, *mesa);
+        if (!ioProgram) {
+            throw std::runtime_error(ioProgram.error());
         }
         const auto periodNanoseconds =
             servoPeriodNanoseconds(*machine);
@@ -521,8 +582,9 @@ int main(const int argc, char **argv) {
         SafeOutputGuard safeOutputs(*io);
         ScheduledCyclicIo scheduled(
             *io, std::chrono::nanoseconds(periodNanoseconds));
-        auto outputs = enabledZeroOutput(
-            mesa->stepGenerators.size());
+        auto outputs = options.monitorInputs
+            ? ngc::mesa::HostMot2CyclicOutputImage{}
+            : enabledZeroOutput(mesa->stepGenerators.size());
 
         std::println(
             "Connected to {} at {}; configured {} StepGens",
@@ -568,6 +630,17 @@ int main(const int argc, char **argv) {
             convergenceCycles,
             io->inputImage().dpll.phaseErrorNanoseconds);
         scheduled.resetDiagnostics();
+
+        if (options.monitorInputs) {
+            monitorInputs(
+                scheduled, *ioProgram, *machine, *mesa);
+            scheduled.reportDiagnostics();
+            disableOutputs(*io);
+            std::println(
+                "Mesa input monitor stopped; outputs remain disabled");
+
+            return 0;
+        }
 
         const auto periodSeconds =
             static_cast<double>(periodNanoseconds)

@@ -1,16 +1,27 @@
 #include <atomic>
 #include <array>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
+#include <cerrno>
+#include <cstring>
 #include <filesystem>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <variant>
+
+#include <arpa/inet.h>
+#include <pthread.h>
+#include <sched.h>
+#include <sys/socket.h>
+#include <unistd.h>
 
 #include "ExecutionItemOperations.h"
 #include "IpcPlatform.h"
@@ -24,6 +35,12 @@
 
 namespace {
     constexpr double TEMPORARY_TRIGGER_DISTANCE = 0.5;
+    constexpr std::size_t SIMULATED_UDP_PAYLOAD_SIZE = 256;
+
+    struct SimulatedUdpConfiguration {
+        std::chrono::microseconds responseDelay{0};
+        std::optional<std::uint32_t> responderCpu;
+    };
 
     struct Options {
         std::string mapping;
@@ -35,6 +52,7 @@ namespace {
         bool validateConfigurationOnly = false;
         std::optional<std::uint64_t> exitAfterControls;
         std::optional<std::chrono::milliseconds> exitAfterHandshake;
+        std::optional<SimulatedUdpConfiguration> simulatedUdp;
     };
 
     std::uint64_t parseUnsigned(const std::string_view value) {
@@ -82,6 +100,18 @@ namespace {
             } else if (option == "--exit-after-handshake-ms") {
                 options.exitAfterHandshake = std::chrono::milliseconds(
                     parseUnsigned(value()));
+            } else if (option == "--simulated-udp-response-us") {
+                if (!options.simulatedUdp.has_value()) {
+                    options.simulatedUdp.emplace();
+                }
+                options.simulatedUdp->responseDelay =
+                    std::chrono::microseconds(parseUnsigned(value()));
+            } else if (option == "--simulated-udp-responder-cpu") {
+                if (!options.simulatedUdp.has_value()) {
+                    options.simulatedUdp.emplace();
+                }
+                options.simulatedUdp->responderCpu =
+                    static_cast<std::uint32_t>(parseUnsigned(value()));
             } else {
                 throw std::runtime_error("unknown option: " + std::string(option));
             }
@@ -94,13 +124,263 @@ namespace {
         return options;
     }
 
+    class SimulatedUdpExchange {
+    public:
+        explicit SimulatedUdpExchange(SimulatedUdpConfiguration configuration)
+            : m_configuration(configuration) {
+            openSockets();
+            try {
+                m_responder = std::thread(
+                    &SimulatedUdpExchange::runResponder, this);
+            } catch (...) {
+                closeSockets();
+                throw;
+            }
+
+            std::unique_lock lock(m_startupMutex);
+            m_startupCv.wait(lock, [&] {
+                return m_startupComplete;
+            });
+            if (!m_startupError.empty()) {
+                lock.unlock();
+                stop();
+                throw std::runtime_error(m_startupError);
+            }
+        }
+
+        ~SimulatedUdpExchange() {
+            stop();
+        }
+
+        SimulatedUdpExchange(const SimulatedUdpExchange &) = delete;
+        SimulatedUdpExchange &operator=(const SimulatedUdpExchange &) = delete;
+
+        bool exchange() noexcept {
+            ++m_sequence;
+            std::memcpy(
+                m_request.data(), &m_sequence,
+                sizeof(m_sequence));
+            const auto sent = ::send(
+                m_clientSocket, m_request.data(),
+                m_request.size(), 0);
+            if (sent != static_cast<ssize_t>(m_request.size())) {
+                return false;
+            }
+
+            const auto received = ::recv(
+                m_clientSocket, m_response.data(),
+                m_response.size(), 0);
+            if (received != static_cast<ssize_t>(m_response.size())
+                || std::memcmp(
+                    m_request.data(), m_response.data(),
+                    m_request.size()) != 0) {
+                return false;
+            }
+
+            return true;
+        }
+
+    private:
+        void openSockets() {
+            m_serverSocket = ::socket(
+                AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+            if (m_serverSocket < 0) {
+                throw std::system_error(
+                    errno, std::generic_category(),
+                    "failed to create simulated UDP responder socket");
+            }
+
+            auto bindAddress = sockaddr_in{};
+            bindAddress.sin_family = AF_INET;
+            bindAddress.sin_port = 0;
+            bindAddress.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+            if (::bind(
+                    m_serverSocket,
+                    reinterpret_cast<const sockaddr *>(&bindAddress),
+                    sizeof(bindAddress)) != 0) {
+                const auto error = errno;
+                closeSockets();
+                throw std::system_error(
+                    error, std::generic_category(),
+                    "failed to bind simulated UDP responder socket");
+            }
+
+            auto serverAddress = sockaddr_in{};
+            auto addressSize = static_cast<socklen_t>(
+                sizeof(serverAddress));
+            if (::getsockname(
+                    m_serverSocket,
+                    reinterpret_cast<sockaddr *>(&serverAddress),
+                    &addressSize) != 0) {
+                const auto error = errno;
+                closeSockets();
+                throw std::system_error(
+                    error, std::generic_category(),
+                    "failed to inspect simulated UDP responder socket");
+            }
+
+            m_clientSocket = ::socket(
+                AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+            if (m_clientSocket < 0) {
+                const auto error = errno;
+                closeSockets();
+                throw std::system_error(
+                    error, std::generic_category(),
+                    "failed to create simulated UDP client socket");
+            }
+            if (::connect(
+                    m_clientSocket,
+                    reinterpret_cast<const sockaddr *>(&serverAddress),
+                    sizeof(serverAddress)) != 0) {
+                const auto error = errno;
+                closeSockets();
+                throw std::system_error(
+                    error, std::generic_category(),
+                    "failed to connect simulated UDP client socket");
+            }
+
+            const timeval timeout{
+                .tv_sec = 0,
+                .tv_usec = 100'000,
+            };
+            if (::setsockopt(
+                    m_clientSocket, SOL_SOCKET, SO_RCVTIMEO,
+                    &timeout, sizeof(timeout)) != 0) {
+                const auto error = errno;
+                closeSockets();
+                throw std::system_error(
+                    error, std::generic_category(),
+                    "failed to configure simulated UDP client timeout");
+            }
+        }
+
+        void closeSockets() noexcept {
+            if (m_clientSocket >= 0) {
+                ::close(m_clientSocket);
+                m_clientSocket = -1;
+            }
+            if (m_serverSocket >= 0) {
+                ::close(m_serverSocket);
+                m_serverSocket = -1;
+            }
+        }
+
+        void stop() noexcept {
+            if (!m_responder.joinable()) {
+                closeSockets();
+
+                return;
+            }
+
+            m_stopping.store(true, std::memory_order_release);
+            static_cast<void>(::send(
+                m_clientSocket, m_request.data(),
+                m_request.size(), 0));
+            m_responder.join();
+            closeSockets();
+        }
+
+        void configureResponderCpu() {
+            if (!m_configuration.responderCpu.has_value()) {
+                return;
+            }
+            if (*m_configuration.responderCpu >= CPU_SETSIZE) {
+                throw std::runtime_error(
+                    "simulated UDP responder CPU exceeds CPU_SETSIZE");
+            }
+
+            cpu_set_t affinity;
+            CPU_ZERO(&affinity);
+            CPU_SET(*m_configuration.responderCpu, &affinity);
+            if (const auto error = pthread_setaffinity_np(
+                    pthread_self(), sizeof(affinity), &affinity);
+                error != 0) {
+                throw std::system_error(
+                    error, std::generic_category(),
+                    "failed to pin simulated UDP responder");
+            }
+        }
+
+        void completeStartup(const std::string &error = {}) {
+            {
+                std::scoped_lock lock(m_startupMutex);
+                m_startupError = error;
+                m_startupComplete = true;
+            }
+            m_startupCv.notify_all();
+        }
+
+        void runResponder() noexcept {
+            try {
+                configureResponderCpu();
+            } catch (const std::exception &error) {
+                completeStartup(error.what());
+
+                return;
+            }
+            completeStartup();
+
+            auto request = std::array<std::byte,
+                SIMULATED_UDP_PAYLOAD_SIZE>{};
+            auto peer = sockaddr_in{};
+            for (;;) {
+                auto peerSize = static_cast<socklen_t>(sizeof(peer));
+                const auto received = ::recvfrom(
+                    m_serverSocket, request.data(), request.size(), 0,
+                    reinterpret_cast<sockaddr *>(&peer), &peerSize);
+                if (m_stopping.load(std::memory_order_acquire)) {
+                    return;
+                }
+                if (received != static_cast<ssize_t>(request.size())) {
+                    continue;
+                }
+
+                const auto responseTime = std::chrono::steady_clock::now()
+                    + m_configuration.responseDelay;
+                while (std::chrono::steady_clock::now() < responseTime) {
+                    std::atomic_signal_fence(
+                        std::memory_order_seq_cst);
+                }
+                const auto sent = ::sendto(
+                    m_serverSocket, request.data(), request.size(), 0,
+                    reinterpret_cast<const sockaddr *>(&peer), peerSize);
+                static_cast<void>(sent);
+            }
+        }
+
+        SimulatedUdpConfiguration m_configuration;
+        int m_serverSocket = -1;
+        int m_clientSocket = -1;
+        std::thread m_responder;
+        std::mutex m_startupMutex;
+        std::condition_variable m_startupCv;
+        std::string m_startupError;
+        bool m_startupComplete = false;
+        std::atomic<bool> m_stopping{false};
+        std::uint64_t m_sequence = 0;
+        std::array<std::byte, SIMULATED_UDP_PAYLOAD_SIZE> m_request{};
+        std::array<std::byte, SIMULATED_UDP_PAYLOAD_SIZE> m_response{};
+    };
+
     class TemporaryTriggeredInputs final
         : public ngc::ProductionExecutorIo,
           public ngc::IpcExecutorPolicy {
     public:
+        explicit TemporaryTriggeredInputs(
+            const std::optional<SimulatedUdpConfiguration> simulatedUdp =
+                std::nullopt) {
+            if (simulatedUdp.has_value()) {
+                m_simulatedUdp =
+                    std::make_unique<SimulatedUdpExchange>(*simulatedUdp);
+            }
+        }
+
         void sampleDigitalInputs(
             const ngc::ProductionExecutorMotionContext &,
             ngc::ProductionExecutorDigitalInputs &inputs) noexcept override {
+            if (m_simulatedUdp && !m_simulatedUdp->exchange()) {
+                m_faultCode.store(1, std::memory_order_release);
+            }
             inputs.reset();
             for (auto &input : m_inputs) {
                 if (input.enabled.load(std::memory_order_acquire)) {
@@ -111,6 +391,10 @@ namespace {
         }
 
         void applyOutputs(const ngc::ProductionExecutorOutputState &) noexcept override { }
+
+        std::uint32_t faultCode() const noexcept override {
+            return m_faultCode.load(std::memory_order_acquire);
+        }
 
         void prepareExecutionItem(
             ngc::ExecutionItem &item,
@@ -255,6 +539,8 @@ namespace {
         ngc::ChunkId m_chunk = 0;
         ngc::position_t m_axisTarget{};
         bool m_preparedInputsArmed = false;
+        std::unique_ptr<SimulatedUdpExchange> m_simulatedUdp;
+        std::atomic<std::uint32_t> m_faultCode{0};
     };
 
     struct LoadedExecutorConfiguration {
@@ -309,6 +595,14 @@ namespace {
         if (options.nonRealtime) {
             runtimeConfiguration.realtime = {};
         }
+        if (options.simulatedUdp.has_value()
+            && options.simulatedUdp->responseDelay
+                >= std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::duration<double>(
+                        runtimeConfiguration.servoPeriod))) {
+            throw std::runtime_error(
+                "simulated UDP response delay must be shorter than the servo period");
+        }
         const auto fingerprint =
             ngc::toml_configuration::combinedFingerprint(
                 machineFingerprint,
@@ -333,7 +627,8 @@ namespace {
         if (options.validateConfigurationOnly) {
             static_cast<void>(makeRuntime(
                 std::move(loaded.runtime),
-                std::make_unique<TemporaryTriggeredInputs>()));
+                std::make_unique<TemporaryTriggeredInputs>(
+                    options.simulatedUdp)));
 
             return 0;
         }
@@ -361,7 +656,8 @@ namespace {
             return 3;
         }
 
-        auto triggeredInputs = std::make_unique<TemporaryTriggeredInputs>();
+        auto triggeredInputs = std::make_unique<TemporaryTriggeredInputs>(
+            options.simulatedUdp);
         auto *triggeredInputsPointer = triggeredInputs.get();
         auto runtime = makeRuntime(
             std::move(loaded.runtime),

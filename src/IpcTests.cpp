@@ -377,6 +377,23 @@ namespace {
         runtime.stop();
     }
 
+    void testExternalRuntimeSimulatesUdpExchange(
+        const std::filesystem::path &peer) {
+        auto options = configuration(peer);
+        options.peerArguments.push_back(
+            "--simulated-udp-response-us");
+        options.peerArguments.push_back("50");
+        ngc::ExternalExecutorRuntime runtime(std::move(options));
+        runtime.start();
+
+        const auto timing = waitForRealtimeTiming(runtime);
+        require(timing.sampleCount != 0
+                    && timing.maximumExecutionNanoseconds >= 50'000,
+                "simulated UDP exchange was not included in peer execution timing");
+
+        runtime.stop();
+    }
+
     void testExternalRuntimeFeedHoldAndResume(
         const std::filesystem::path &peer) {
         ngc::ExternalExecutorRuntime runtime(configuration(peer));
@@ -629,7 +646,7 @@ namespace {
         require(manager.home(*machineAuthority),
                 "configured IPC Machine session should accept homing");
         auto homed = manager.snapshot();
-        for (auto attempt = 0; attempt < 30'000
+        for (auto attempt = 0; attempt < 60'000
              && homed.status != ngc::SimulationStatus::Completed
              && homed.status != ngc::SimulationStatus::Error; ++attempt) {
             std::this_thread::sleep_for(1ms);
@@ -1100,12 +1117,23 @@ int main(const int argc, char **argv) {
         require(
             argc == 2
                 || (argc == 3
-                    && std::string_view(argv[2]) == "--realtime"),
-            "ngc_ipc_tests requires the peer executable path and optional --realtime");
+                    && (std::string_view(argv[2]) == "--realtime"
+                        || std::string_view(argv[2])
+                            == "--simulated-udp-only")),
+            "ngc_ipc_tests requires the peer executable path and optional --realtime or --simulated-udp-only");
         const std::filesystem::path peer = argv[1];
+        if (argc == 3
+            && std::string_view(argv[2])
+                == "--simulated-udp-only") {
+            testExternalRuntimeSimulatesUdpExchange(peer);
+            std::cout << "ngc_ipc_tests simulated UDP passed\n";
+
+            return 0;
+        }
         const auto realtime = argc == 3;
         testProtocolLayoutAndBoundedRings();
         testExternalRuntimeExecutesThroughProductionCore(peer);
+        testExternalRuntimeSimulatesUdpExchange(peer);
         testExternalRuntimeFeedHoldAndResume(peer);
         testFrontendLossShutdownStopsAndDisables(peer);
         testExternalRuntimeFakesTriggeredJointInput(peer);

@@ -22,6 +22,8 @@ namespace ngc {
         void applyOutputs(
             const ProductionExecutorOutputState &outputs) noexcept override;
         [[nodiscard]] std::uint32_t faultCode() const noexcept override;
+        [[nodiscard]] ProductionExecutorIoFaultDiagnostic
+        faultDiagnostic() const noexcept override;
         [[nodiscard]] bool prepareTriggeredJointMove(
             const TriggeredJointMove &move) noexcept override;
 

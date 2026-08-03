@@ -116,10 +116,11 @@ logical-output operands are read-only, while logical-input and field-output
 operands are write-only. Every configured logical input and field output must
 be assigned exactly once, and
 debounce durations written as time are rounded up to fixed servo ticks during
-NRT compilation. The current bare-board commissioning program temporarily
-replaces the disconnected probe and homing field inputs with
-motion-context-derived levels; the physical mappings must be restored before
-any motion or spindle hardware is connected. Its bounded adapter stages
+NRT compilation. The physical backend program maps the prior LinuxCNC input
+semantics directly: active-low INPUT1 supplies shared X/Y1/Z home, active-high
+INPUT2 supplies external-enable permission, active-low INPUT3 and INPUT4 are
+ANDed and debounced for 10 servo ticks to supply the probe, and active-low
+INPUT5 supplies Y2 home. Its bounded adapter stages
 commanded joint velocities as StepGen rates, requires
 the watchdog for enabled motion, and converts any invalid cyclic exchange into
 an executor host fault and safe output image. Its optional HostMot2 DPLL path
@@ -129,8 +130,25 @@ period, holds nonzero StepGen rates until the observed phase error converges
 within a configured guard band, and latches a fault if a ready DPLL later
 leaves that band. The Mesa executor adapter aligns returned accumulator
 subcounts to commanded joint coordinates only while stationary, rebases
-deliberate stationary coordinate assignments, and otherwise applies bounded
-proportional position correction on top of commanded joint velocity. It holds
+stable stationary coordinates after emitting the final feed-forward interval,
+and otherwise applies bounded
+proportional position correction on top of position-difference feed-forward. At a
+stationary target, it commands zero StepGen rate because accumulator feedback
+counts generated steps rather than physical motion, and stationary correction
+could only produce persistent forward/reverse dithering. To preserve the
+LinuxCNC `error-previous-target` loop semantics, the adapter tracks the target
+associated with each staged StepGen command and compares the latched
+accumulator position with the target that was actually active during that
+latch interval, extrapolated to the DPLL latch time. As with LinuxCNC's
+unconnected `command-deriv` input and `FF1 = 1`, feed-forward is the commanded
+position difference over one servo period, not endpoint instantaneous
+velocity. Because the combined cyclic exchange stages newly calculated rates
+until the following exchange, its extra correction delay requires
+`position_gain * servo_period < 1`; the production physical configuration uses
+500 per second, for a dimensionless gain of 0.5 at its one-millisecond period.
+The independent generated-step following-error monitor remains active. A zero
+maximum generated-step error disables that
+monitor only for explicit commissioning diagnostics. It holds
 motion until DPLL-backed feedback is aligned and faults on moving alignment or
 following-error violations. Disabled and faulted executor
 states suppress the watchdog, StepGen motion, and digital outputs.
@@ -164,7 +182,8 @@ CRC. Startup establishes stop before reading and validating PD004, PD005,
 PD011, and PD141 through PD144. Commands write bounded frequency before
 forward/reverse control, status polling reports scaled speed and current, and
 every response is checked for slave, function, payload length, echoed selector
-or command, and CRC. The configured spindle remains disabled pending physical
+or frequency, control-status acknowledgement, and CRC. The configured spindle
+remains disabled pending physical
 commissioning. `ngc_huanyang_spindle_diagnostic` is the standalone NRT
 commissioning boundary. Its default operation establishes Stop, reports the
 validated setup parameters, and polls status without commanding Run. Only the
@@ -178,15 +197,11 @@ rings without synthetic triggered inputs.
 When `motion.safety` identifies a verified external-enable logical input and
 its explicit `high` or `low` active polarity, loss of that level latches a
 backend fault and safe outputs. A normal physical-peer
-start is rejected when that safety input is not configured. For bare-board
-commissioning only, the current configuration maps the physical field-input
-name `external_enable_field` to logical `external_enable` with active-high
-polarity. INPUT2 is temporarily energized from the board's PTC-protected +5VP
-supply with INPUT COMMON grounded; removing that voltage must latch
-`MESA_EXTERNAL_ENABLE_FAULT` and safe outputs. This commissioning wire proves
-input polarity and executor response only and must be replaced with verified
-E-stop/enable feedback before any drive, motor, spindle, or other output is
-powered. The process is the application's configured Machine target but has not
+start is rejected when that safety input is not configured. The current
+configuration maps the physical field-input name `external_enable_field` to
+logical `external_enable` with active-high polarity. Loss of INPUT2 from the
+external E-stop/enable circuit must latch `MESA_EXTERNAL_ENABLE_FAULT` and safe
+outputs. The process is the application's configured Machine target but has not
 completed staged physical commissioning. The typed Mesa backend
 configuration loader shares only generic,
 source-aware TOML field validation with the frontend machine loader and keeps

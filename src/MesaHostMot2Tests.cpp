@@ -16,6 +16,7 @@
 #include <string_view>
 
 #include "machine/DigitalIoProgram.h"
+#include "machine/ProductionExecutorCore.h"
 #include "mesa/HostMot2CyclicIo.h"
 #include "mesa/HostMot2Discovery.h"
 #include "mesa/HostMot2Latency.h"
@@ -566,10 +567,19 @@ namespace {
                 std::string>{std::unexpected(
                     "configuration did not load")};
 
-        require(configuration.has_value()
-                && machine.has_value()
-                && ioProgram.has_value()
-                && ioProgram->instructionCount() == 35
+        require(
+            configuration.has_value(),
+            configuration.error_or(
+                "proposed Mesa backend configuration did not load"));
+        require(
+            machine.has_value(),
+            machine.error_or(
+                "proposed machine configuration did not load"));
+        require(
+            ioProgram.has_value(),
+            ioProgram.error_or(
+                "proposed Mesa I/O program did not compile"));
+        require(ioProgram->instructionCount() == 9
                 && configuration->address == "10.10.10.10"
                 && configuration->linearUnit
                     == ngc::mesa::MesaLinearUnit::Millimeter
@@ -587,7 +597,7 @@ namespace {
                     == ngc::mesa::MesaSafetyPolarity::ActiveHigh
                 && configuration->fieldInputs.size() == 5
                 && configuration->stepGenerators.size() == 4,
-                "proposed Mesa backend configuration did not load");
+                "proposed Mesa backend configuration was decoded incorrectly");
         const std::array expectedChannels{
             std::uint8_t{1}, std::uint8_t{2},
             std::uint8_t{3}, std::uint8_t{0},
@@ -600,44 +610,60 @@ namespace {
                     && stepGenerator.channel
                         == expectedChannels[index]
                     && stepGenerator.stepsPerUnit == 160.0
+                    && stepGenerator.positionGainPerSecond == 500.0
                     && stepGenerator.maximumCorrectionVelocity == 5.0
                     && stepGenerator.maximumGeneratedStepError == 2.0,
-                    "Mesa StepGen configuration was decoded incorrectly");
+                    std::format(
+                        "Mesa StepGen {} was decoded incorrectly: joint={} "
+                        "channel={} scale={} gain={} correction={} error={}",
+                        index, stepGenerator.joint,
+                        stepGenerator.channel,
+                        stepGenerator.stepsPerUnit,
+                        stepGenerator.positionGainPerSecond,
+                        stepGenerator.maximumCorrectionVelocity,
+                        stepGenerator.maximumGeneratedStepError));
         }
 
         auto fieldInputs = ngc::FieldDigitalInputImage{};
+        fieldInputs[1] = true;
         fieldInputs[2] = true;
+        fieldInputs[3] = true;
+        fieldInputs[4] = true;
+        fieldInputs[5] = true;
         auto logicalInputs = ngc::LogicalDigitalInputImage{};
-        auto motion = ngc::ProductionExecutorMotionContext{};
-        ioProgram->executeInputs({}, {}, motion, logicalInputs);
-        require(logicalInputs.none(),
-                "commissioning program asserted a disconnected input");
+        ioProgram->executeInputs(fieldInputs, {}, {}, logicalInputs);
+        require(logicalInputs[3] && !logicalInputs[0]
+                    && !logicalInputs[1] && !logicalInputs[2],
+                "inactive physical inputs did not preserve LinuxCNC polarity");
 
-        motion.flags =
-            ngc::PRODUCTION_EXECUTOR_MOTION_IS_PROBE;
-        motion.axisStart.z = 1.0;
-        motion.axisTarget.z = -1.0;
-        motion.axisPosition.z = -0.6;
-        ioProgram->executeInputs(
-            fieldInputs, {}, motion, logicalInputs);
-        require(logicalInputs[0] && logicalInputs[3]
-                    && !logicalInputs[1]
-                    && !logicalInputs[2],
-                "commissioning program did not synthesize tool probing");
+        fieldInputs[1] = false;
+        ioProgram->executeInputs(fieldInputs, {}, {}, logicalInputs);
+        require(logicalInputs[1] && logicalInputs[3]
+                    && !logicalInputs[0] && !logicalInputs[2],
+                "active-low shared-home input was not mapped");
+        fieldInputs[1] = true;
 
-        motion = {};
-        motion.flags =
-            ngc::PRODUCTION_EXECUTOR_MOTION_IS_HOMING;
-        motion.moveJoints = ngc::JointMask{1} << 2;
-        motion.triggerJoints = ngc::JointMask{1} << 2;
-        motion.jointStart[2] = 1.0;
-        motion.jointPosition[2] = 0.79;
-        ioProgram->executeInputs(
-            fieldInputs, {}, motion, logicalInputs);
+        fieldInputs[5] = false;
+        ioProgram->executeInputs(fieldInputs, {}, {}, logicalInputs);
         require(logicalInputs[2] && logicalInputs[3]
-                    && !logicalInputs[0]
-                    && !logicalInputs[1],
-                "commissioning program did not synthesize joint homing");
+                    && !logicalInputs[0] && !logicalInputs[1],
+                "active-low Y2 home input was not mapped independently");
+        fieldInputs[5] = true;
+
+        fieldInputs[3] = false;
+        ioProgram->executeInputs(fieldInputs, {}, {}, logicalInputs);
+        require(!logicalInputs[0],
+                "one active probe channel bypassed the physical AND");
+        fieldInputs[4] = false;
+        for (auto tick = 0; tick < 9; ++tick) {
+            ioProgram->executeInputs(fieldInputs, {}, {}, logicalInputs);
+            require(!logicalInputs[0],
+                    "physical probe debounce completed too early");
+        }
+        ioProgram->executeInputs(fieldInputs, {}, {}, logicalInputs);
+        require(logicalInputs[0] && logicalInputs[3]
+                    && !logicalInputs[1] && !logicalInputs[2],
+                "dual active-low probe inputs did not debounce active");
     }
 
     void testRejectsIncompatibleSevenI96IdentityAndModules() {
@@ -943,7 +969,9 @@ namespace {
     std::unique_ptr<ngc::mesa::HostMot2CyclicIo>
     sevenI96CyclicIo(
         DatagramFixtureTransport &transport,
-        const bool enableDpll = false) {
+        const bool enableDpll = false,
+        const std::int32_t sampleOffsetNanoseconds = -50'000,
+        const std::uint32_t maximumPhaseErrorNanoseconds = 25'000) {
         const auto capabilities =
             ngc::mesa::validateSevenI96Capabilities(
                 sevenI96Inventory());
@@ -962,9 +990,11 @@ namespace {
                 ? ngc::mesa::HostMot2DpllConfiguration{
                     .enabled = true,
                     .stepGeneratorTimer = 1,
-                    .stepGeneratorSampleOffsetNanoseconds = -50'000,
+                    .stepGeneratorSampleOffsetNanoseconds =
+                        sampleOffsetNanoseconds,
                     .servoPeriodNanoseconds = 1'000'000,
-                    .maximumPhaseErrorNanoseconds = 25'000,
+                    .maximumPhaseErrorNanoseconds =
+                        maximumPhaseErrorNanoseconds,
                     .convergenceCycles = 1,
                 }
                 : ngc::mesa::HostMot2DpllConfiguration{},
@@ -1669,6 +1699,34 @@ namespace {
                 "digital I/O program read an undeclared logical output");
     }
 
+    void testRejectsUnstableMesaPositionGain() {
+        DatagramFixtureTransport transport;
+        auto io = sevenI96CyclicIo(transport, true);
+        constexpr std::array<ngc::DigitalInputId, 0> logicalInputs{};
+        constexpr std::array<ngc::DigitalOutputId, 0> logicalOutputs{};
+        auto program = ngc::DigitalIoProgram::compile(
+            "", 0, logicalInputs, 0, logicalOutputs, 0.001);
+        require(program.has_value(),
+                "unstable-gain fixture program did not compile");
+        constexpr std::array mappings{
+            ngc::mesa::MesaStepGeneratorMapping{
+                .joint = 0,
+                .stepGenerator = 0,
+                .stepsPerMachineUnit = 4'000.0,
+                .positionGainPerSecond = 1'000.0,
+                .maximumCorrectionVelocity = 0.1,
+                .maximumGeneratedStepError = 2.0,
+            },
+        };
+
+        const auto adapter = ngc::mesa::MesaProductionExecutorIo::create(
+            std::move(io), std::move(*program), mappings);
+
+        require(!adapter.has_value()
+                    && adapter.error().contains("inverse servo period"),
+                "marginal delayed-loop position gain was not rejected");
+    }
+
     void testBridgesMesaInputsAndStepGeneratorsToExecutorIo() {
         DatagramFixtureTransport transport;
         auto io = sevenI96CyclicIo(transport, true);
@@ -1699,7 +1757,7 @@ namespace {
                 .joint = 0,
                 .stepGenerator = 0,
                 .stepsPerMachineUnit = 4'000.0,
-                .positionGainPerSecond = 1'000.0,
+                .positionGainPerSecond = 500.0,
                 .maximumCorrectionVelocity = 0.1,
                 .maximumGeneratedStepError = 2.0,
             },
@@ -1740,7 +1798,7 @@ namespace {
         outputs.commandedJoints.velocity[0] = 0.25;
         (*adapter)->applyOutputs(outputs);
         response = transport.response(50);
-        putLittleEndian32(response.subspan(12), 3 * 65'536);
+        putLittleEndian32(response.subspan(12), 2 * 65'536);
         putCyclicConfirmation(response, 40, 4, 4);
 
         (*adapter)->sampleDigitalInputs({}, inputs);
@@ -1749,7 +1807,7 @@ namespace {
             transport.request(), 0x2000);
         require(littleEndian32(stepRates.data)
                     == static_cast<std::uint32_t>(
-                        static_cast<std::int32_t>(42'949.67296)),
+                        static_cast<std::int32_t>(2'147.483648)),
                 "Mesa executor I/O mapped the wrong joint StepGen rate");
         require(littleEndian32(
                     findRequestWrite(
@@ -1759,7 +1817,7 @@ namespace {
         outputs.commandedJoints.position[0] = 0.001'012'5;
         (*adapter)->applyOutputs(outputs);
         response = transport.response(50);
-        putLittleEndian32(response.subspan(12), 3 * 65'536);
+        putLittleEndian32(response.subspan(12), 2 * 65'536);
         putCyclicConfirmation(response, 40, 5, 5);
 
         (*adapter)->sampleDigitalInputs({}, inputs);
@@ -1767,10 +1825,23 @@ namespace {
         require(
             littleEndian32(
                 findRequestWrite(
-                    transport.request(), 0x2000).data)
+                        transport.request(), 0x2000).data)
                 == static_cast<std::uint32_t>(
-                    static_cast<std::int32_t>(60'129.542144)),
-            "Mesa StepGen position error did not produce bounded correction");
+                        static_cast<std::int32_t>(154'618.822656)),
+            "Mesa StepGen previous-target error did not produce bounded correction");
+
+        outputs.commandedJoints.position[0] = 4.75 / 4'000.0;
+        outputs.commandedJoints.velocity[0] = 0.0;
+        (*adapter)->applyOutputs(outputs);
+        require(
+            (*adapter)->pendingOutputs()
+                    .stepGenerators[0].stepsPerSecond != 0.0,
+            "final motion interval was omitted when its endpoint was stationary");
+        (*adapter)->applyOutputs(outputs);
+        require(
+            (*adapter)->pendingOutputs()
+                    .stepGenerators[0].stepsPerSecond == 0.0,
+            "stable stationary target retained a StepGen correction rate");
 
         response = transport.response(50);
         putLittleEndian32(response.subspan(32), 1);
@@ -1883,6 +1954,12 @@ namespace {
         outputs.commandedJoints.position[0] = 0.4;
         outputs.commandedJoints.velocity[0] = 0.1;
         (*adapter)->applyOutputs(outputs);
+        response = transport.response(50);
+        putCyclicConfirmation(response, 40, 4, 4);
+        (*adapter)->sampleDigitalInputs({}, inputs);
+
+        outputs.commandedJoints.position[0] = 0.4001;
+        (*adapter)->applyOutputs(outputs);
 
         require(
             (*adapter)->faultCode()
@@ -1891,11 +1968,23 @@ namespace {
                 && !(*adapter)->pendingOutputs()
                     .stepGeneratorsEnabled,
             "Mesa following error did not latch a safe-output fault");
+        const auto faultDiagnostic =
+            (*adapter)->faultDiagnostic();
+        require(
+            faultDiagnostic.code
+                    == ngc::mesa::MESA_STEPGEN_FOLLOWING_ERROR_FAULT
+                && faultDiagnostic.joint == 0
+                && std::abs(
+                    faultDiagnostic.followingErrorSteps) > 2.0
+                && std::isfinite(faultDiagnostic.targetPosition)
+                && std::isfinite(faultDiagnostic.actualPosition),
+            "Mesa following-error detail was not retained");
     }
 
-    void testMesaAccumulatorFeedbackPreventsCumulativeJitterDrift() {
+    void testMesaDelayedPositionCorrectionSettles() {
         DatagramFixtureTransport transport;
-        auto io = sevenI96CyclicIo(transport, true);
+        auto io = sevenI96CyclicIo(
+            transport, true, -500'000, 400'000);
         auto response = transport.queueResponse(14);
         putLittleEndian32(response, 48);
         putCyclicConfirmation(response, 4, 1, 1);
@@ -1913,7 +2002,7 @@ namespace {
                 .joint = 0,
                 .stepGenerator = 0,
                 .stepsPerMachineUnit = stepsPerUnit,
-                .positionGainPerSecond = 100.0,
+                .positionGainPerSecond = 500.0,
                 .maximumCorrectionVelocity = 0.1,
                 .maximumGeneratedStepError = 2.0,
             },
@@ -1931,17 +2020,26 @@ namespace {
         (*adapter)->sampleDigitalInputs({}, inputs);
 
         constexpr auto servoPeriod = 0.001;
-        constexpr auto velocity = 0.25;
-        constexpr auto iterationCount = 200;
+        constexpr auto motionCycles = 200;
+        constexpr auto iterationCount = motionCycles + 200;
+        constexpr auto motionDuration =
+            servoPeriod * motionCycles;
+        constexpr auto distance = 0.04;
+        const auto pi = std::acos(-1.0);
         auto accumulatorSubcounts = 0.0;
-        auto midpointTrackingOffset = 0.0;
-        auto lastStepsPerSecond = 0.0;
+        auto activeStepsPerSecond = 0.0;
+        auto maximumPendingRateError = 0.0;
+        auto previousPosition = 0.0;
+        auto finalPendingRate = 0.0;
+        auto movingFinalRateError = 0.0;
+        auto earlyCorrectionPeak = 0.0;
+        auto middleCorrectionPeak = 0.0;
+        auto lateCorrectionPeak = 0.0;
         for (auto iteration = 1;
              iteration <= iterationCount; ++iteration) {
-            outputs.commandedJoints.position[0] =
-                velocity * servoPeriod * iteration;
-            outputs.commandedJoints.velocity[0] = velocity;
-            (*adapter)->applyOutputs(outputs);
+            if (iteration == 50) {
+                accumulatorSubcounts += 0.5 * 65'536.0;
+            }
             response = transport.response(50);
             putLittleEndian32(
                 response.subspan(12),
@@ -1976,36 +2074,245 @@ namespace {
             const auto stepsPerSecond =
                 static_cast<double>(rate)
                 * 100'000'000.0 / 4'294'967'296.0;
-            lastStepsPerSecond = stepsPerSecond;
+            constexpr auto latchLead = 0.000'5;
             accumulatorSubcounts +=
-                stepsPerSecond * 65'536.0 * servoPeriod;
-            if (iteration == iterationCount / 2) {
-                midpointTrackingOffset =
-                    accumulatorSubcounts
-                        / (stepsPerUnit * 65'536.0)
-                    - outputs.commandedJoints.position[0];
+                (activeStepsPerSecond * latchLead
+                    + stepsPerSecond
+                        * (servoPeriod - latchLead))
+                * 65'536.0;
+            activeStepsPerSecond = stepsPerSecond;
+
+            const auto time = std::min(
+                servoPeriod * iteration, motionDuration);
+            const auto phase = pi * time / motionDuration;
+            const auto position = 0.5 * distance
+                * (1.0 - std::cos(phase));
+            outputs.commandedJoints.position[0] =
+                position;
+            outputs.commandedJoints.velocity[0] =
+                time < motionDuration
+                    ? 0.5 * distance * pi / motionDuration
+                        * std::sin(phase)
+                    : 0.0;
+            outputs.commandedJoints.acceleration[0] =
+                time < motionDuration
+                    ? 0.5 * distance * pi * pi
+                        / (motionDuration * motionDuration)
+                        * std::cos(phase)
+                    : 0.0;
+            (*adapter)->applyOutputs(outputs);
+            const auto feedForwardVelocity =
+                (position - previousPosition) / servoPeriod;
+            previousPosition = position;
+            finalPendingRate = (*adapter)->pendingOutputs()
+                .stepGenerators[0].stepsPerSecond;
+            const auto correctionRateError = finalPendingRate
+                - feedForwardVelocity * stepsPerUnit;
+            maximumPendingRateError = std::max(
+                maximumPendingRateError,
+                std::abs(correctionRateError));
+            if (iteration >= 50 && iteration < 100) {
+                earlyCorrectionPeak = std::max(
+                    earlyCorrectionPeak,
+                    std::abs(correctionRateError));
+            } else if (iteration < 150) {
+                middleCorrectionPeak = std::max(
+                    middleCorrectionPeak,
+                    std::abs(correctionRateError));
+            } else if (iteration < motionCycles) {
+                lateCorrectionPeak = std::max(
+                    lateCorrectionPeak,
+                    std::abs(correctionRateError));
+            }
+            if (iteration == motionCycles - 1) {
+                movingFinalRateError = correctionRateError;
             }
         }
 
-        const auto actualPosition =
-            accumulatorSubcounts
-            / (stepsPerUnit * 65'536.0);
-        const auto finalTrackingOffset =
-            actualPosition
-            - outputs.commandedJoints.position[0];
         require(
-            std::abs(
-                finalTrackingOffset - midpointTrackingOffset)
-                < 2.0 / (stepsPerUnit * 65'536.0),
+            maximumPendingRateError > 240.0
+                && maximumPendingRateError < 251.0
+                && earlyCorrectionPeak > 240.0
+                && earlyCorrectionPeak < 251.0
+                && middleCorrectionPeak
+                    < earlyCorrectionPeak * 0.01
+                && lateCorrectionPeak
+                    < middleCorrectionPeak * 0.1
+                && std::abs(movingFinalRateError) < 0.1
+                && std::abs(finalPendingRate) < 0.1,
             std::format(
-                "DPLL-latched accumulator feedback accumulated position "
-                "drift: midpoint offset {} final offset {}",
-                midpointTrackingOffset, finalTrackingOffset));
-        require(std::abs(finalTrackingOffset)
-                    < velocity * servoPeriod * 2.1
-                && std::abs(lastStepsPerSecond - 1'000.0) < 0.1,
-                "Mesa accumulator feedback did not settle to bounded "
-                "nominal-rate tracking");
+                "delayed P=500 correction modulated a smooth StepGen "
+                "profile by {} steps/s; correction peaks were {}, {}, and {}; retained {} steps/s before stop and settled at {} steps/s",
+                maximumPendingRateError, earlyCorrectionPeak,
+                middleCorrectionPeak, lateCorrectionPeak,
+                movingFinalRateError, finalPendingRate));
+    }
+
+    void testMesaFeedbackSurvivesTriggeredJointStop() {
+        DatagramFixtureTransport transport;
+        auto io = sevenI96CyclicIo(
+            transport, true, -500'000, 400'000);
+        auto response = transport.queueResponse(14);
+        putLittleEndian32(response, 48);
+        putCyclicConfirmation(response, 4, 1, 1);
+        response = transport.queueResponse(10);
+        putCyclicConfirmation(response, 0, 2, 2);
+        constexpr std::array<ngc::DigitalInputId, 1> logicalInputs{0};
+        constexpr std::array<ngc::DigitalOutputId, 0> logicalOutputs{};
+        auto program = ngc::DigitalIoProgram::compile(
+            "mov in0, fieldin0", 1, logicalInputs, 0,
+            logicalOutputs, 0.001);
+        require(program.has_value(),
+                "triggered-stop input program did not compile");
+        constexpr auto stepsPerUnit = 4'064.0;
+        constexpr std::array mappings{
+            ngc::mesa::MesaStepGeneratorMapping{
+                .joint = 0,
+                .stepGenerator = 0,
+                .stepsPerMachineUnit = stepsPerUnit,
+                .positionGainPerSecond = 500.0,
+                .maximumCorrectionVelocity = 0.2,
+                .maximumGeneratedStepError = 2.0,
+            },
+        };
+        auto adapter = ngc::mesa::MesaProductionExecutorIo::create(
+            std::move(io), std::move(*program), mappings);
+        require(adapter.has_value(),
+                "triggered-stop Mesa adapter fixture was rejected");
+
+        auto core = ngc::ProductionExecutorCore(0.001);
+        require(core.trySubmit(ngc::ResetRequest{1, 1})
+                    == ngc::SubmitResult::Submitted,
+                "triggered-stop core rejected reset");
+        core.serviceImmediate();
+        require(core.trySubmit(ngc::EnableRequest{2})
+                    == ngc::SubmitResult::Submitted,
+                "triggered-stop core rejected enable");
+        core.serviceImmediate();
+        (*adapter)->applyOutputs(core.outputState());
+
+        auto move = ngc::TriggeredJointMove{};
+        move.epoch = 1;
+        move.id = 1;
+        move.branch = 1;
+        move.moveId = 1;
+        move.joints = ngc::JointMask{1};
+        move.targetMode = ngc::JointTargetMode::Relative;
+        move.target[0] = 1.0;
+        move.limits.velocity[0] = 0.06;
+        move.limits.acceleration[0] = 25.1;
+        move.limits.jerk[0] = 101.0;
+        require(move.triggers.push({
+                    0, 0, ngc::InputCondition::Active,
+                }),
+                "triggered-stop fixture trigger did not fit");
+        move.triggerRequired = true;
+        require(core.tryPublish(ngc::ExecutionItem{move})
+                    == ngc::PublishResult::Published,
+                "triggered-stop core rejected move");
+        require(core.trySubmit(ngc::ResumeRequest{3, 1})
+                    == ngc::SubmitResult::Submitted,
+                "triggered-stop core rejected resume");
+        core.serviceImmediate();
+        (*adapter)->applyOutputs(core.outputState());
+
+        auto accumulatorSubcounts = 0.0;
+        auto activeStepsPerSecond = 0.0;
+        auto sequence = std::uint32_t{3};
+        auto triggered = false;
+        auto completed = false;
+        auto inputs = ngc::ProductionExecutorDigitalInputs{};
+        for (auto tick = 0; tick < 20'000 && !completed; ++tick) {
+            response = transport.response(50);
+            if (triggered) {
+                putLittleEndian32(response, 1);
+            }
+            putLittleEndian32(
+                response.subspan(12),
+                static_cast<std::uint32_t>(
+                    std::llround(accumulatorSubcounts)));
+            putCyclicConfirmation(
+                response, 40, sequence, sequence);
+            ++sequence;
+
+            (*adapter)->sampleDigitalInputs(
+                core.motionContext(), inputs);
+            require(
+                (*adapter)->faultCode() == 0,
+                std::format(
+                    "Mesa feedback faulted at triggered-stop tick {}",
+                    tick));
+            const auto rateWord = littleEndian32(
+                findRequestWrite(
+                    transport.request(), 0x2000).data);
+            const auto sentStepsPerSecond =
+                static_cast<double>(
+                    std::bit_cast<std::int32_t>(rateWord))
+                * 100'000'000.0 / 4'294'967'296.0;
+            constexpr auto latchLead = 0.000'5;
+            accumulatorSubcounts +=
+                (activeStepsPerSecond * latchLead
+                    + sentStepsPerSecond
+                        * (0.001 - latchLead))
+                * 65'536.0;
+            activeStepsPerSecond = sentStepsPerSecond;
+
+            core.setDigitalInputSamples(inputs);
+            core.servoTick();
+            (*adapter)->applyOutputs(core.outputState());
+            triggered = triggered
+                || core.outputState().commandedJoints.position[0]
+                    >= 0.2;
+            auto event = ngc::ExecutionEvent{};
+            while (core.tryTakeEvent(event)) {
+                const auto *result =
+                    std::get_if<ngc::TriggeredJointMoveCompleted>(
+                        &event);
+                completed = completed
+                    || (result && result->move == move.moveId);
+            }
+        }
+
+        require(completed,
+                "triggered-stop Mesa/core fixture did not complete");
+
+        auto calibrated = ngc::JointVector{};
+        calibrated[0] = 0.1;
+        require(core.trySubmit(ngc::SetJointPositionRequest{
+                    4, ngc::JointMask{1}, calibrated,
+                }) == ngc::SubmitResult::Submitted,
+                "triggered-stop core rejected coordinate assignment");
+        for (auto tick = 0; tick < 4; ++tick) {
+            response = transport.response(50);
+            putLittleEndian32(
+                response.subspan(12),
+                static_cast<std::uint32_t>(
+                    std::llround(accumulatorSubcounts)));
+            putCyclicConfirmation(
+                response, 40, sequence, sequence);
+            ++sequence;
+            (*adapter)->sampleDigitalInputs(
+                core.motionContext(), inputs);
+            require((*adapter)->faultCode() == 0,
+                    "Mesa feedback faulted while assigning the homing coordinate");
+            const auto rateWord = littleEndian32(
+                findRequestWrite(
+                    transport.request(), 0x2000).data);
+            const auto sentStepsPerSecond =
+                static_cast<double>(
+                    std::bit_cast<std::int32_t>(rateWord))
+                * 100'000'000.0 / 4'294'967'296.0;
+            constexpr auto latchLead = 0.000'5;
+            accumulatorSubcounts +=
+                (activeStepsPerSecond * latchLead
+                    + sentStepsPerSecond
+                        * (0.001 - latchLead))
+                * 65'536.0;
+            activeStepsPerSecond = sentStepsPerSecond;
+            core.setDigitalInputSamples(inputs);
+            core.servoTick();
+            (*adapter)->applyOutputs(core.outputState());
+        }
     }
 }
 
@@ -2034,10 +2341,12 @@ int main() {
         testExecutesBoundedDigitalIoProgram();
         testExecutesMotionContextDigitalIoProgram();
         testRejectsInvalidDigitalIoPrograms();
+        testRejectsUnstableMesaPositionGain();
         testBridgesMesaInputsAndStepGeneratorsToExecutorIo();
         testExternalEnableLossFaultsMesaExecutorIo();
         testRebasesStationaryMesaCoordinatesAndFaultsFollowingError();
-        testMesaAccumulatorFeedbackPreventsCumulativeJitterDrift();
+        testMesaDelayedPositionCorrectionSettles();
+        testMesaFeedbackSurvivesTriggeredJointStop();
     } catch (const std::exception &error) {
         std::cerr << "Mesa HostMot2 test failure: "
                   << error.what() << '\n';

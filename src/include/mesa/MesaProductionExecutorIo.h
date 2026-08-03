@@ -63,6 +63,8 @@ namespace ngc::mesa {
         void applyOutputs(
             const ProductionExecutorOutputState &outputs) noexcept override;
         [[nodiscard]] std::uint32_t faultCode() const noexcept override;
+        [[nodiscard]] ProductionExecutorIoFaultDiagnostic
+        faultDiagnostic() const noexcept override;
 
         [[nodiscard]] const HostMot2CyclicOutputImage &
         pendingOutputs() const noexcept;
@@ -85,6 +87,9 @@ namespace ngc::mesa {
         std::optional<MesaExecutorSafetyInput> m_safetyInput;
         HostMot2CyclicOutputImage m_pendingOutputs;
         JointMotionState m_lastCommandedJoints;
+        JointMotionState m_pendingCommandedJoints;
+        JointMotionState m_activeCommandedJoints;
+        JointMotionState m_sampledFeedbackTargetJoints;
         std::array<std::int64_t, MAX_JOINTS>
             m_sampledAccumulatorSubcounts{};
         std::array<double, MAX_JOINTS>
@@ -92,6 +97,7 @@ namespace ngc::mesa {
         FieldDigitalInputImage m_fieldInputs;
         LogicalDigitalOutputImage m_logicalOutputs;
         std::uint32_t m_faultCode = 0;
+        ProductionExecutorIoFaultDiagnostic m_faultDiagnostic;
         bool m_lastExecutorEnabled = false;
         bool m_accumulatorFeedbackAvailable = false;
         bool m_accumulatorFeedbackAligned = false;

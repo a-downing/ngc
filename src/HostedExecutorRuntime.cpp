@@ -193,6 +193,7 @@ namespace ngc {
 
         m_stopping.store(false, std::memory_order_release);
         m_startupComplete = false;
+        m_ioFaultTimingPublished = false;
         m_startupError.clear();
         *m_timingAccumulator = {};
         RealtimeTimingSummary staleTiming;
@@ -397,6 +398,24 @@ namespace ngc {
         m_io->sampleDigitalInputs(
             m_core->motionContext(), m_inputs);
         if (const auto fault = m_io->faultCode(); fault != 0) {
+            if (!m_ioFaultTimingPublished) {
+                const auto diagnostic = m_io->faultDiagnostic();
+                auto &accumulator = *m_timingAccumulator;
+                auto &timing = accumulator.summary;
+                timing.ioFaultCode = diagnostic.code;
+                timing.ioFaultJoint = diagnostic.joint;
+                timing.ioFaultFollowingErrorSteps =
+                    diagnostic.followingErrorSteps;
+                timing.ioFaultTargetPosition =
+                    diagnostic.targetPosition;
+                timing.ioFaultActualPosition =
+                    diagnostic.actualPosition;
+                timing.ioFaultDpllPhaseErrorNanoseconds =
+                    diagnostic.dpllPhaseErrorNanoseconds;
+                accumulator.ticksSincePublicationAttempt =
+                    m_timingPublicationTicks;
+                m_ioFaultTimingPublished = true;
+            }
             m_core->reportHostFault(fault);
         } else {
             m_core->setDigitalInputSamples(m_inputs);

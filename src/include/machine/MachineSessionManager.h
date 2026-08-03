@@ -1243,6 +1243,18 @@ private:
             runtime.maximumTickExecutionSeconds;
     }
 
+    void copyRealtimeTimingSnapshot() {
+        ngc::RealtimeTimingSummary timing;
+        while (m_runtime.tryTakeRealtimeTiming(timing)) {
+            if (!m_snapshot.realtimeTiming) {
+                m_snapshot.realtimeTiming = timing;
+            } else {
+                ngc::mergeRealtimeTiming(
+                    *m_snapshot.realtimeTiming, timing);
+            }
+        }
+    }
+
     void clearPresentation() {
         m_machineSession.presentationTracker().clearTracking();
     }
@@ -1406,6 +1418,7 @@ private:
         const auto result = m_machineSession.runHoming(startingPosition);
 
         std::scoped_lock lock(m_mutex);
+        copyRealtimeTimingSnapshot();
         m_running = false;
         m_stop = false;
         m_snapshot.activity = ngc::SimulationActivity::Idle;

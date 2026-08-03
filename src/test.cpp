@@ -298,8 +298,8 @@ input = "shared_home"
 condition = "active"
 home_position = 12.75
 switch_position = 13.85
-search_velocity = 2
-latch_velocity = 0.2
+search_velocity = 0.6
+latch_velocity = 0.06
 backoff_distance = 0.25
 final_velocity = 0.0
 [[joints]]
@@ -317,8 +317,8 @@ input = "shared_home"
 condition = "active"
 home_position = 1
 switch_position = -0.1
-search_velocity = -2
-latch_velocity = -0.2
+search_velocity = -0.6
+latch_velocity = -0.06
 backoff_distance = 0.25
 final_velocity = 0.0
 [[joints]]
@@ -336,8 +336,8 @@ input = "y2_home"
 condition = "active"
 home_position = 1
 switch_position = -0.14
-search_velocity = -2
-latch_velocity = -0.2
+search_velocity = -0.6
+latch_velocity = -0.06
 backoff_distance = 0.25
 final_velocity = 0.0
 [[joints]]
@@ -355,8 +355,8 @@ input = "shared_home"
 condition = "active"
 home_position = -1
 switch_position = 0.1
-search_velocity = 2
-latch_velocity = 0.2
+search_velocity = 0.6
+latch_velocity = 0.06
 backoff_distance = 0.25
 final_velocity = 0.0
 [homing]

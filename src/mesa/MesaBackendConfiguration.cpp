@@ -371,13 +371,13 @@ namespace ngc::mesa {
                     toml_configuration::requiredBool(
                         *table, "invert_direction", path);
                 const auto gain =
-                    toml_configuration::positiveNumber(
+                    toml_configuration::number(
                         *table, "position_gain", path);
                 const auto correction =
                     toml_configuration::positiveNumber(
                         *table, "maximum_correction_velocity", path);
                 const auto maximumError =
-                    toml_configuration::positiveNumber(
+                    toml_configuration::number(
                         *table, "maximum_generated_step_error", path);
                 if (!joint || !channel || !scale || !invert
                     || !gain || !correction || !maximumError) {
@@ -393,6 +393,20 @@ namespace ngc::mesa {
                         });
 
                     return std::unexpected(*found);
+                }
+                if (*gain < 0.0) {
+                    return std::unexpected(
+                        toml_configuration::error(
+                            path, "position_gain",
+                            "must be greater than or equal to zero",
+                            table->get("position_gain")));
+                }
+                if (*maximumError < 0.0) {
+                    return std::unexpected(
+                        toml_configuration::error(
+                            path, "maximum_generated_step_error",
+                            "must be greater than or equal to zero",
+                            table->get("maximum_generated_step_error")));
                 }
                 if (*joint < 0
                     || *joint >= static_cast<std::int64_t>(MAX_JOINTS)

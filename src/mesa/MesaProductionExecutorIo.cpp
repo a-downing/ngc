@@ -115,6 +115,9 @@ namespace ngc::mesa {
             return std::unexpected(
                 "Mesa StepGen position feedback requires the HostMot2 DPLL");
         }
+        const auto servoPeriodSeconds = static_cast<double>(
+            io->dpllConfiguration().servoPeriodNanoseconds)
+            / 1'000'000'000.0;
 
         auto mappedJoints = JointMask{0};
         auto mappedStepGenerators =
@@ -135,14 +138,21 @@ namespace ngc::mesa {
                     "Mesa StepGen mapping requires finite positive steps per machine unit");
             }
             if (!std::isfinite(mapping.positionGainPerSecond)
-                || mapping.positionGainPerSecond <= 0.0
+                || mapping.positionGainPerSecond < 0.0
                 || !std::isfinite(mapping.maximumCorrectionVelocity)
                 || mapping.maximumCorrectionVelocity <= 0.0
                 || !std::isfinite(mapping.maximumGeneratedStepError)
-                || mapping.maximumGeneratedStepError <= 0.0) {
+                || mapping.maximumGeneratedStepError < 0.0) {
                 return std::unexpected(
-                    "Mesa StepGen mapping requires positive bounded "
+                    "Mesa StepGen mapping requires nonnegative feedback limits and positive bounded "
                     "position-feedback parameters");
+            }
+            if (mapping.positionGainPerSecond
+                    * servoPeriodSeconds >= 1.0) {
+                return std::unexpected(
+                    "Mesa StepGen position gain must be less than the inverse "
+                    "servo period because the combined cyclic exchange delays "
+                    "correction by one cycle");
             }
 
             const auto joint =
@@ -209,6 +219,11 @@ namespace ngc::mesa {
 
             return;
         }
+
+        m_sampledFeedbackTargetJoints =
+            m_activeCommandedJoints;
+        m_activeCommandedJoints =
+            m_pendingCommandedJoints;
 
         const auto &mesaInputs =
             m_io->inputImage();
@@ -288,6 +303,12 @@ namespace ngc::mesa {
         if (m_faultCode != 0 || !outputs.executorEnabled) {
             m_logicalOutputs.reset();
             m_lastCommandedJoints = outputs.commandedJoints;
+            m_pendingCommandedJoints =
+                outputs.commandedJoints;
+            m_activeCommandedJoints =
+                outputs.commandedJoints;
+            m_sampledFeedbackTargetJoints =
+                outputs.commandedJoints;
             m_lastExecutorEnabled = false;
             m_accumulatorFeedbackAligned = false;
             m_pendingOutputs = next;
@@ -310,28 +331,25 @@ namespace ngc::mesa {
                     static_cast<double>(
                         dpll.stepGeneratorSampleOffsetNanoseconds)
                     / 1'000'000'000.0;
-                const auto desiredPosition = jointPositionAtOffset(
-                    outputs.commandedJoints,
+                auto feedbackTargetPosition = jointPositionAtOffset(
+                    m_sampledFeedbackTargetJoints,
                     mapping.joint, latchOffset);
                 const auto subcountsPerMachineUnit =
                     mapping.stepsPerMachineUnit
                     * STEPGEN_SUBCOUNTS_PER_STEP;
-                const auto stationaryCoordinateChange =
+                const auto stableStationary =
                     jointIsStationary(
                         outputs.commandedJoints, mapping.joint)
                     && jointIsStationary(
-                        m_lastCommandedJoints, mapping.joint)
-                    && std::abs(
+                        m_lastCommandedJoints, mapping.joint);
+                if (stableStationary) {
+                    feedbackTargetPosition =
                         outputs.commandedJoints.position[
-                            mapping.joint]
-                        - m_lastCommandedJoints.position[
-                            mapping.joint])
-                        > STATIONARY_TOLERANCE;
-                if (stationaryCoordinateChange) {
+                            mapping.joint];
                     m_accumulatorOriginSubcounts[index] =
                         static_cast<double>(
                             m_sampledAccumulatorSubcounts[index])
-                        - desiredPosition
+                        - feedbackTargetPosition
                             * subcountsPerMachineUnit;
                 }
                 const auto actualPosition =
@@ -340,26 +358,50 @@ namespace ngc::mesa {
                         - m_accumulatorOriginSubcounts[index])
                     / subcountsPerMachineUnit;
                 const auto followingError =
-                    desiredPosition - actualPosition;
+                    feedbackTargetPosition - actualPosition;
                 if (!std::isfinite(followingError)
-                    || std::abs(
+                    || (mapping.maximumGeneratedStepError > 0.0
+                        && std::abs(
                         followingError
                             * mapping.stepsPerMachineUnit)
-                        > mapping.maximumGeneratedStepError) {
+                        > mapping.maximumGeneratedStepError)) {
                     m_faultCode =
                         MESA_STEPGEN_FOLLOWING_ERROR_FAULT;
+                    m_faultDiagnostic = {
+                        .code = m_faultCode,
+                        .joint = mapping.joint,
+                        .followingErrorSteps =
+                            followingError
+                                * mapping.stepsPerMachineUnit,
+                        .targetPosition = feedbackTargetPosition,
+                        .actualPosition = actualPosition,
+                        .dpllPhaseErrorNanoseconds =
+                            m_io->inputImage().dpll
+                                .phaseErrorNanoseconds,
+                    };
                     m_pendingOutputs = {};
 
                     return;
                 }
+                const auto feedForwardVelocity =
+                    stableStationary
+                        ? 0.0
+                        : (outputs.commandedJoints.position[
+                                mapping.joint]
+                            - m_lastCommandedJoints.position[
+                                mapping.joint])
+                            / (static_cast<double>(
+                                dpll.servoPeriodNanoseconds)
+                                / 1'000'000'000.0);
                 const auto correction = std::clamp(
-                    followingError
-                        * mapping.positionGainPerSecond,
+                    stableStationary
+                        ? 0.0
+                        : followingError
+                            * mapping.positionGainPerSecond,
                     -mapping.maximumCorrectionVelocity,
                     mapping.maximumCorrectionVelocity);
                 commandVelocity =
-                    outputs.commandedJoints.velocity[
-                        mapping.joint] + correction;
+                    feedForwardVelocity + correction;
             } else if (m_accumulatorFeedbackAvailable
                 && !jointIsStationary(
                     outputs.commandedJoints,
@@ -387,12 +429,19 @@ namespace ngc::mesa {
         }
 
         m_lastCommandedJoints = outputs.commandedJoints;
+        m_pendingCommandedJoints =
+            outputs.commandedJoints;
         m_lastExecutorEnabled = true;
         m_pendingOutputs = next;
     }
 
     std::uint32_t MesaProductionExecutorIo::faultCode() const noexcept {
         return m_faultCode;
+    }
+
+    ProductionExecutorIoFaultDiagnostic
+    MesaProductionExecutorIo::faultDiagnostic() const noexcept {
+        return m_faultDiagnostic;
     }
 
     const HostMot2CyclicOutputImage &

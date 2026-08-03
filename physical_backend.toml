@@ -36,60 +36,21 @@ watchdog_timeout = 0.005
 #   gpio.004.in_not -> probe channel 1
 #   gpio.005.in_not -> Y2 home
 #
-# The eventual physical probe is the AND of the two active-low channels,
-# debounced for 10 one-millisecond servo samples.
-#
-# TEMPORARY BARE-BOARD COMMISSIONING POLICY: the program currently replaces
-# the disconnected probe and homing field inputs. It synthesizes a probe
-# transition 0.5 machine units before the Z target of a Z-moving axis-space
-# triggered move and synthesizes each requested homing input after its joint
-# moves 0.2 backend joint units from the phase start. This exercises tool
-# probing and homing through the physical executor without switches. Restore
-# the physical mappings before a drive, motor, spindle, or other output is
-# connected.
+# The physical probe is the AND of the two active-low channels, debounced for
+# 10 one-millisecond servo samples, matching the prior LinuxCNC HAL.
 io_program = """
 mov external_enable, external_enable_field
 
-test r0, motion_flags, IS_PROBE
-sub r1, atarget_z, apos_z
-abs r1, r1
-le r2, r1, 0.5
-sub r3, atarget_z, astart_z
-abs r3, r3
-ge r4, r3, 0.000000001
-and r5, r0, r4
-and tool_probe, r5, r2
+not r0, shared_home_field
+mov shared_home, r0
 
-test r3, motion_flags, IS_HOMING
+not r1, probe_0_field
+not r2, probe_1_field
+and r3, r1, r2
+debounce tool_probe, r3, 10ms
 
-test r4, trigger_joints, JOINT_0
-sub r5, jpos_0, jstart_0
-abs r5, r5
-ge r6, r5, 0.2
-and r7, r4, r6
-
-test r8, trigger_joints, JOINT_1
-sub r9, jpos_1, jstart_1
-abs r9, r9
-ge r10, r9, 0.2
-and r11, r8, r10
-
-test r12, trigger_joints, JOINT_3
-sub r13, jpos_3, jstart_3
-abs r13, r13
-ge r14, r13, 0.2
-and r15, r12, r14
-
-or r16, r7, r11
-or r17, r16, r15
-and shared_home, r3, r17
-
-test r18, trigger_joints, JOINT_2
-sub r19, jpos_2, jstart_2
-abs r19, r19
-ge r20, r19, 0.2
-and r21, r18, r20
-and y2_home, r3, r21
+not r4, y2_home_field
+mov y2_home, r4
 """
 
 [motion.field_inputs]
@@ -99,12 +60,8 @@ probe_0_field = 3
 probe_1_field = 4
 y2_home_field = 5
 
-# Bare-board commissioning maps INPUT2 to external enable. INPUT2 is energized
-# from the board's PTC-protected +5VP supply with INPUT COMMON grounded. Loss
-# of that voltage is therefore the inactive/faulted state. This temporary wire
-# proves input polarity and executor fault handling only; replace it with
-# verified E-stop/enable-permission feedback before powering any drive, motor,
-# spindle, or other output.
+# INPUT2 receives active-high external E-stop/enable permission. Loss of that
+# level is the inactive/faulted state.
 [motion.safety]
 enable_input = "external_enable"
 active = "high"
@@ -124,10 +81,10 @@ direction_setup = 0.000010
 direction_hold = 0.000010
 
 # Latch all StepGen accumulators on DPLL timer 1, 500 microseconds before the
-# FPGA's predicted HostMot2 read phase. This exceeds the observed roughly
-# 275 microsecond non-PREEMPT_RT host variation. The physical-backend loader
-# must derive the DPLL base frequency from machine.toml's authoritative servo
-# period.
+# FPGA's predicted HostMot2 read phase. The larger lead is required because
+# this host's validated 400 microsecond phase guard must remain strictly inside
+# the latch lead. The physical-backend loader derives the DPLL base frequency
+# from machine.toml's authoritative servo period.
 [motion.dpll]
 enabled = true
 stepgen_timer = 1
@@ -143,7 +100,10 @@ joint = 0
 channel = 1
 steps_per_unit = 160.0
 invert_direction = false
-position_gain = 1000.0
+# The combined cyclic exchange adds one correction cycle compared with
+# LinuxCNC's read -> PID -> write ordering. P=500 gives a dimensionless loop
+# gain of 0.5 at the 1 ms servo period; P=1000 is marginal and oscillates.
+position_gain = 500.0
 maximum_correction_velocity = 5.0
 maximum_generated_step_error = 2.0
 
@@ -153,7 +113,7 @@ joint = 1
 channel = 2
 steps_per_unit = 160.0
 invert_direction = false
-position_gain = 1000.0
+position_gain = 500.0
 maximum_correction_velocity = 5.0
 maximum_generated_step_error = 2.0
 
@@ -163,7 +123,7 @@ joint = 2
 channel = 3
 steps_per_unit = 160.0
 invert_direction = false
-position_gain = 1000.0
+position_gain = 500.0
 maximum_correction_velocity = 5.0
 maximum_generated_step_error = 2.0
 
@@ -173,7 +133,7 @@ joint = 3
 channel = 0
 steps_per_unit = 160.0
 invert_direction = false
-position_gain = 1000.0
+position_gain = 500.0
 maximum_correction_velocity = 5.0
 maximum_generated_step_error = 2.0
 
@@ -185,10 +145,11 @@ maximum_generated_step_error = 2.0
 # 4064 steps/inch / 25.4 mm/inch = 160 steps/mm. With the machine's 5 mm-pitch
 # ball screws, this is 800 commanded steps per screw revolution.
 #
-# The position loop uses commanded velocity as feed-forward and P=1000
-# proportional correction. Correction is limited to 5 mm/s and exists only to
-# remove small host/FPGA phase discrepancies. More than two generated steps of
-# disagreement is a fault rather than a request for aggressive catch-up.
+# As in the prior LinuxCNC `FF1 = 1` loop, feed-forward is the commanded
+# position difference over one servo period rather than endpoint instantaneous
+# velocity. The bounded proportional term corrects generated accumulator
+# disagreement using the target associated with the latched interval. More
+# than two generated steps of disagreement is a fault.
 #
 # The generic HostMot2 cyclic layer and active board diagnostic implement this
 # DPLL behavior. The diagnostic combines this file with machine.toml's

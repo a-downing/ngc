@@ -166,7 +166,7 @@ namespace {
                 case 0x03:
                     m_observation->control = request[3];
                     payload = {
-                        1, 0x03, 1, request[3], 0, 0,
+                        1, 0x03, 1, 0, 0, 0,
                     };
                     payloadSize = 4;
                     break;
@@ -267,7 +267,7 @@ namespace {
             "physical configuration lost its Mesa motion role");
         require(
             configuration->runtime.realtimeEnabled
-                && configuration->runtime.realtimeCpu == 15
+                && configuration->runtime.realtimeCpu == 3
                 && configuration->runtime.realtimePriority == 98
                 && configuration->runtime.lockMemory,
             "physical configuration lost its executor host policy");

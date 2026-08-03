@@ -8,6 +8,7 @@
 #include <mutex>
 #include <string>
 #include <thread>
+#include <type_traits>
 
 #include "config/BackendRuntimeConfiguration.h"
 #include "machine/BackendRuntime.h"
@@ -22,6 +23,18 @@ namespace ngc {
 
     using ProductionExecutorDigitalInputs = LogicalDigitalInputImage;
 
+    struct ProductionExecutorIoFaultDiagnostic {
+        std::uint32_t code = 0;
+        std::uint32_t joint = 0;
+        double followingErrorSteps = 0.0;
+        double targetPosition = 0.0;
+        double actualPosition = 0.0;
+        std::int32_t dpllPhaseErrorNanoseconds = 0;
+    };
+    static_assert(
+        std::is_trivially_copyable_v<
+            ProductionExecutorIoFaultDiagnostic>);
+
     class ProductionExecutorIo {
     public:
         virtual ~ProductionExecutorIo() = default;
@@ -33,6 +46,10 @@ namespace ngc {
             const ProductionExecutorOutputState &outputs) noexcept = 0;
         [[nodiscard]] virtual std::uint32_t faultCode() const noexcept {
             return 0;
+        }
+        [[nodiscard]] virtual ProductionExecutorIoFaultDiagnostic
+        faultDiagnostic() const noexcept {
+            return {};
         }
         [[nodiscard]] virtual bool prepareTriggeredJointMove(
             const TriggeredJointMove &) noexcept {
@@ -113,6 +130,7 @@ namespace ngc {
         std::thread m_servoThread;
         bool m_started = false;
         bool m_startupComplete = false;
+        bool m_ioFaultTimingPublished = false;
         std::string m_startupError;
         std::atomic<bool> m_stopping{false};
         std::atomic<std::uint64_t> m_servoTicks{0};

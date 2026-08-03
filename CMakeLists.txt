@@ -265,7 +265,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
         tools/ngc_mesa_stepgen_diagnostic.cpp)
     target_link_libraries(
         ngc_mesa_stepgen_diagnostic
-        PRIVATE ngc_core ngc_mesa_configuration)
+        PRIVATE ngc_core ngc_mesa_configuration ngc_mesa_executor)
     ngc_target_defaults(ngc_mesa_stepgen_diagnostic)
 
     add_executable(

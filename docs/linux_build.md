@@ -286,6 +286,22 @@ NVMe queue assigned to an isolated CPU should be active there.
 
 #### StepGen timing validation
 
+Before commanding any StepGen, the configured physical input assembly can be
+checked with the no-motion monitor:
+
+```bash
+./build/ngc_mesa_stepgen_diagnostic --monitor-inputs
+```
+
+This mode services only input acquisition. It keeps the watchdog, all
+StepGens, and all digital outputs disabled, prints the initial raw and logical
+input image, and then prints each change. Stop it with Ctrl+C. In the current
+configuration, manually verify the active-low shared-home INPUT1, both
+active-low probe channels INPUT3 and INPUT4 (the logical probe becomes active
+only after both remain low for 10 servo ticks), and the independent active-low
+Y2-home INPUT5. It also shows the active-high external-enable INPUT2. This
+test does not initiate probing, homing, or any other motion.
+
 Build and run the active diagnostic only on an isolated bare board with the
 commissioning safety conditions described below:
 
@@ -536,15 +552,13 @@ adapter. The Huanyang spindle role remains configured but disabled until its
 physical commissioning is complete. Its Linux serial implementation uses
 bounded transaction timeouts and the Huanyang proprietary RTU packet shape,
 establishes stop before reading the VFD's stored setup, and validates all
-responses. It has not yet been exercised against physical VFD hardware. For
-bare-board commissioning only, the
-current configuration treats energized INPUT2 as the active-high
+responses. The current configuration treats energized INPUT2 as the active-high
 `external_enable` through the named physical operand
-`external_enable_field`. For isolated bare-board testing, INPUT COMMON is
-grounded and INPUT2 is energized from the board's PTC-protected +5VP supply.
+`external_enable_field`.
 Removing that voltage must latch the external-enable fault and safe outputs.
-This temporary wire is not verified E-stop or enable-permission feedback.
-Replace it before powering any drive, motor, spindle, or other output. A normal
+INPUT1 is the active-low shared X/Y1/Z home input, INPUT3 and INPUT4 are the
+active-low probe channels combined and debounced for 10 servo ticks, and INPUT5
+is the active-low Y2 home input, matching the prior LinuxCNC HAL. A normal
 invocation is launched by the application's external-runtime IPC boundary; do
 not select it as the Machine target beyond this isolated commissioning setup until
 the staged checks are complete.
