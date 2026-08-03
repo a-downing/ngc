@@ -5553,6 +5553,68 @@ G1 F60 X2
                 "terminal driver failure should leave no active backend motion");
     }
 
+    void testDriverFailureAbortsWhenControlledStopIsRejected() {
+        ngc::TrajectoryLimits limits;
+        ngc::MockMotionBackend backend(
+            ngc::FeedHoldConfiguration { 2.0, 10.0 }, limits);
+        ngc::PreparedGeometryForwardChannel forward;
+        ngc::GeometryFeedbackChannel feedback;
+        std::atomic<bool> cancelled { false };
+        ngc::PreparedTrajectoryExecutionDriver driver(
+            backend, forward, feedback, cancelled, limits);
+        ngc::SessionCommandQueue commands;
+        ngc::ProgramExecutionController controller(
+            backend, driver, commands);
+        constexpr ngc::EpochId epoch = 29;
+
+        require(driver.begin(epoch),
+                "rejected failure-stop fixture should initialize the trajectory driver");
+        controller.begin(epoch);
+        require(backend.trySubmit(ngc::StartRequest { 1, epoch })
+                    == ngc::SubmitResult::Submitted,
+                "rejected failure-stop fixture should start an empty backend epoch");
+        backend.advanceTick(0.0, true);
+        driver.serviceBackend([&](const ngc::ExecutionEvent &event) {
+            controller.observeBackendEvent(event);
+        });
+        ngc::ExecutionSnapshot snapshot;
+        while (backend.tryTakeSnapshot(snapshot)) { }
+        require(snapshot.state == ngc::BackendState::Running,
+                "the empty backend epoch should be running without active motion");
+        require(forward.tryPush(
+                    std::make_unique<ngc::PreparedStreamMessage>(
+                        ngc::PreparedFailure {
+                            epoch, 1, "prepared failure before backend motion",
+                        })),
+                "rejected failure-stop fixture should publish its driver error");
+        require(!driver.pumpOne(
+                    [](const auto &, const auto &, const auto &,
+                       const auto &, const auto) { }),
+                "the rejected failure-stop fixture should observe its driver error");
+        controller.observeDriverState();
+
+        controller.service(snapshot, false);
+        auto sawRejectedStop = false;
+        auto sawSuccessfulAbort = false;
+        const auto observeEvent = [&](const ngc::ExecutionEvent &event) {
+            if (const auto *completed = std::get_if<ngc::RequestCompleted>(&event)) {
+                sawRejectedStop = sawRejectedStop || !completed->succeeded;
+                sawSuccessfulAbort = sawSuccessfulAbort || completed->succeeded;
+            }
+            controller.observeBackendEvent(event);
+        };
+        backend.advanceTick(0.0, true);
+        driver.serviceBackend(observeEvent);
+
+        backend.advanceTick(0.0, true);
+        driver.serviceBackend(observeEvent);
+        require(sawRejectedStop && sawSuccessfulAbort
+                    && controller.state() == ngc::ProgramExecutionState::Error
+                    && controller.error()
+                        == "prepared failure before backend motion",
+                "a rejected failure stop should fall back to Abort and preserve the driver error");
+    }
+
     void testMockBackendFeedHoldStopBranchIsFatal() {
         ngc::TrajectoryLimits limits;
         limits.pathAcceleration = 4.0;
@@ -8433,17 +8495,12 @@ int main() {
         testInterpreterCancellationInterruptsEvaluation();
         testPresentationTrackerActivatesMarkersInExecutionOrder();
         testPresentationTrackerDefersBlockCompletionAndResetsState();
-        std::cerr << "checkpoint simulation start\n";
         testMachineSessionManagerStartsSimulationPlayback();
         testSimulationPresentationFollowsNestedToolChangeExecution();
         testSimulationToolPoseFollowsMotionAfterCalibratingToolChange();
-        std::cerr << "checkpoint adaptive start\n";
         testAdaptivePocketsStartsSimulation();
-        std::cerr << "checkpoint prepared G64 refill\n";
         testTimedSimulationRefillsMultiPacketContinuousBatch();
-        std::cerr << "checkpoint snapshots\n";
         testTimedSimulationPublishesSnapshotsDuringPlanning();
-        std::cerr << "checkpoint preview\n";
         testImmediatePreviewBuildsGeometryWithoutTrajectoryExecution();
         testGeometryProducerBlendsAcrossMotionModeChanges();
         testGeometryProducerPreparesExactStopPreviewSlices();
@@ -8456,6 +8513,7 @@ int main() {
         testMockBackendFeedHoldBrakesAlongActiveTrajectory();
         testMockBackendControlledStopBrakesAndCannotResume();
         testDriverFailureStopsAndAbortsBeforeBecomingTerminal();
+        testDriverFailureAbortsWhenControlledStopIsRejected();
         testMockBackendFeedHoldStopBranchIsFatal();
         testMockBackendFeedHoldPausesAndResumesProbeApproach();
         testMockBackendProbeContactDuringFeedHoldStopIsDetected();

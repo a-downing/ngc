@@ -269,7 +269,9 @@ namespace ngc {
                    && !completed->succeeded) {
             m_pendingControlledStopRequest.reset();
             m_controlledStopInProgress = false;
-            if (!m_error) {
+            if (m_error) {
+                requestFailureAbort();
+            } else {
                 fail("motion backend rejected the controlled-stop request");
             }
         }
