@@ -2729,7 +2729,9 @@ public:
                 ImGui::Text("%s  % .4f%s", axisLabel(axis.axis), axisValue(simulation.machinePosition, axis.axis),
                             homed ? "" : "  unhomed");
                 ImGui::SameLine(std::max(100.0f, ImGui::GetWindowWidth() - 130.0f));
-                const ngc::JogTarget target { ngc::JogTargetType::JointGroup, jogAxis(axis.axis), joints };
+                const ngc::JogTarget target = m_jogTargetMode == 0
+                    ? ngc::JogTarget { ngc::JogTargetType::Axis, jogAxis(axis.axis), 0 }
+                    : ngc::JogTarget { ngc::JogTargetType::JointGroup, jogAxis(axis.axis), joints };
                 const ngc::JogMotionLimits stopLimits { velocity, acceleration, jerk };
                 const ngc::JogMotionLimits limits {
                     velocity,
