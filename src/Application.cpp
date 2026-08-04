@@ -2759,11 +2759,9 @@ public:
                     std::min(joint.maxAcceleration, m_joggingConfiguration.acceleration),
                     std::min(joint.maxJerk, m_joggingConfiguration.jerk),
                 };
-                const auto low = std::min(joint.minimum * joint.coordinateScale,
-                                          joint.maximum * joint.coordinateScale);
-                const auto high = std::max(joint.minimum * joint.coordinateScale,
-                                           joint.maximum * joint.coordinateScale);
-                const ngc::JogTravelRange travel { low, high, homed };
+                const auto range = ngc::jointCoordinateRange(joint);
+                const ngc::JogTravelRange travel {
+                    range.minimum, range.maximum, homed };
                 submitDirection(std::format("-##joint{}", joint.id), target, limits, stopLimits, travel, -1.0,
                                 m_individualJogEnabled);
                 ImGui::SameLine();

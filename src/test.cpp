@@ -127,11 +127,15 @@ namespace {
             const ngc::TriggeredJointMove &move) noexcept override {
             std::scoped_lock lock(m_mutex);
             m_triggers.assign(move.triggers.begin(), move.triggers.end());
-            m_ticksUntilTrigger = m_triggers.empty() ? 0 : 20;
+            m_ticksUntilTrigger = (move.checkTriggersAtStart
+                || m_triggers.empty()) ? 0 : 20;
             for (const auto &trigger : m_triggers) {
                 m_inputs[trigger.input] =
-                    trigger.condition == ngc::InputCondition::Inactive
-                    || trigger.condition == ngc::InputCondition::FallingEdge;
+                    move.checkTriggersAtStart
+                    ? trigger.condition == ngc::InputCondition::Active
+                        || trigger.condition == ngc::InputCondition::RisingEdge
+                    : trigger.condition == ngc::InputCondition::Inactive
+                        || trigger.condition == ngc::InputCondition::FallingEdge;
             }
 
             return true;
@@ -2001,6 +2005,62 @@ final_move_together = true
             requireNear(actual, expected,
                         "homing controller should finish each axis at configured home");
         }
+    }
+
+    void testHomingControllerRejectsSwitchThatRemainsActiveAfterBackoff() {
+        const auto configuration = fixtureMachineConfiguration();
+        require(configuration.has_value(),
+                configuration ? "" : configuration.error());
+        ngc::InProcessSimulationRuntime runtime(*configuration);
+        runtime.setTickMultiplier(1000);
+        ngc::HomingController controller(
+            configuration->axes, configuration->joints,
+            configuration->homing, runtime.endpoint());
+        const ngc::HomingRuntimeCallbacks callbacks {
+            .stopRequested = [] {
+                return false;
+            },
+            .prepareTriggeredMove = [&](
+                const ngc::TriggeredJointMove &move) {
+                for (const auto &trigger : move.triggers) {
+                    const auto joint = std::ranges::find(
+                        configuration->joints, trigger.joint,
+                        &ngc::JointConfiguration::id);
+                    if (joint == configuration->joints.end()) {
+                        return false;
+                    }
+                    auto position = joint->homing.switchPosition
+                        * joint->coordinateScale;
+                    if (move.checkTriggersAtStart) {
+                        const auto direction = std::copysign(
+                            1.0, joint->homing.searchVelocity
+                                * joint->coordinateScale);
+                        position = direction > 0.0 ? -1.0e6 : 1.0e6;
+                    }
+                    if (!runtime.configureSyntheticJointInput(
+                            move.moveId, trigger.joint, position)) {
+                        return false;
+                    }
+                }
+
+                return true;
+            },
+            .serviceImmediate = [&] {
+                runtime.advanceImmediate(0.0);
+            },
+            .advanceServiceMotionPeriod = [&] {
+                return runtime.advanceServiceMotionPeriod();
+            },
+            .waitForServiceMotion = [] { },
+            .observe = {},
+        };
+
+        const auto homing = controller.run(1, {}, callbacks);
+        require(!homing
+                    && homing.error().find(
+                        "remained active after backoff")
+                        != std::string::npos,
+                "homing accepted a switch that did not release after backoff");
     }
 
 #ifdef __linux__
@@ -8535,6 +8595,7 @@ int main() {
         testProductionExecutorTimingBackpressureDoesNotBlockServo();
 #endif
         testHomingControllerOwnsBackendNeutralSequence();
+        testHomingControllerRejectsSwitchThatRemainsActiveAfterBackoff();
 #ifdef __linux__
         testHostedExecutorRuntimeRunsHomingController();
 #endif

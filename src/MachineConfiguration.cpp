@@ -14,6 +14,17 @@
 #include "config/TomlConfiguration.h"
 
 namespace ngc {
+    JointCoordinateRange jointCoordinateRange(
+        const JointConfiguration &joint) noexcept {
+        const auto first = joint.minimum * joint.coordinateScale;
+        const auto second = joint.maximum * joint.coordinateScale;
+
+        return {
+            .minimum = std::min(first, second),
+            .maximum = std::max(first, second),
+        };
+    }
+
     namespace {
         using toml_configuration::integer;
         using toml_configuration::number;

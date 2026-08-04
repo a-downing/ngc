@@ -151,6 +151,8 @@ namespace ngc::execution_item {
             if (move.epoch == 0 || move.id == 0 || move.branch == 0
                 || move.moveId == 0 || move.joints == 0
                 || (move.joints & ~validJointMask) != 0
+                || (move.positionEnvelope.joints & ~move.joints) != 0
+                || (move.checkTriggersAtStart && !move.triggerRequired)
                 || (move.targetMode != JointTargetMode::Absolute
                     && move.targetMode != JointTargetMode::Relative)) {
                 return false;
@@ -168,7 +170,14 @@ namespace ngc::execution_item {
                     || !std::isfinite(move.limits.acceleration[joint])
                     || move.limits.acceleration[joint] <= 0.0
                     || !std::isfinite(move.limits.jerk[joint])
-                    || move.limits.jerk[joint] <= 0.0) {
+                    || move.limits.jerk[joint] <= 0.0
+                    || ((move.positionEnvelope.joints & mask) != 0
+                        && (!std::isfinite(
+                            move.positionEnvelope.minimum[joint])
+                            || !std::isfinite(
+                                move.positionEnvelope.maximum[joint])
+                            || move.positionEnvelope.minimum[joint]
+                                > move.positionEnvelope.maximum[joint]))) {
                     return false;
                 }
             }

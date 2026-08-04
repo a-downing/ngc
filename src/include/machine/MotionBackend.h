@@ -1,8 +1,10 @@
 #pragma once
 
+#include <algorithm>
 #include <array>
 #include <atomic>
 #include <bitset>
+#include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <limits>
@@ -229,6 +231,13 @@ namespace ngc {
         InputCondition condition = InputCondition::Active;
     };
 
+    struct JointPositionEnvelope {
+        JointMask joints = 0;
+        JointVector minimum{};
+        JointVector maximum{};
+        bool enforceAxisLimits = false;
+    };
+
     enum class JointTargetMode : std::uint8_t { Absolute, Relative };
 
     // A bounded executor-owned point-to-point move terminated by a sampled
@@ -260,9 +269,46 @@ namespace ngc {
         JointTargetMode targetMode = JointTargetMode::Absolute;
         JointVector target{};
         JointMotionLimits limits{};
+        JointPositionEnvelope positionEnvelope{};
         FixedArray<JointTrigger, MAX_JOINTS> triggers;
         bool triggerRequired = false;
+        bool checkTriggersAtStart = false;
     };
+
+    inline void assignJointPositionEnvelope(
+        TriggeredJointMove &move, const JointVector &startingPosition,
+        const bool enforceAxisLimits = false) noexcept {
+        move.positionEnvelope = {
+            .joints = move.joints,
+            .enforceAxisLimits = enforceAxisLimits,
+        };
+        for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+            const auto mask = static_cast<JointMask>(
+                JointMask{1} << joint);
+            if ((move.joints & mask) == 0) {
+                continue;
+            }
+
+            const auto start = startingPosition[joint];
+            const auto target = move.targetMode == JointTargetMode::Relative
+                ? start + move.target[joint] : move.target[joint];
+            move.positionEnvelope.minimum[joint] =
+                std::min(start, target);
+            move.positionEnvelope.maximum[joint] =
+                std::max(start, target);
+        }
+    }
+
+    [[nodiscard]] inline bool jointPositionWithinEnvelope(
+        const JointPositionEnvelope &envelope, const JointId joint,
+        const double position, const double tolerance = 0.0) noexcept {
+        const auto mask = static_cast<JointMask>(
+            JointMask{1} << joint);
+        return (envelope.joints & mask) == 0
+            || (std::isfinite(position)
+                && position >= envelope.minimum[joint] - tolerance
+                && position <= envelope.maximum[joint] + tolerance);
+    }
 
     using ExecutionItem = std::variant<PlanChunk, TriggeredMove, TriggeredJointMove>;
     static_assert(std::is_trivially_copyable_v<ExecutionItem>);

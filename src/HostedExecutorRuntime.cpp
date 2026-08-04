@@ -122,8 +122,9 @@ namespace ngc {
 
                 mapping.joints |= JointMask{1} << id;
                 mapping.coordinateScale[id] = joint->coordinateScale;
-                result.executor.jointMinimum[id] = joint->minimum;
-                result.executor.jointMaximum[id] = joint->maximum;
+                const auto range = jointCoordinateRange(*joint);
+                result.executor.jointMinimum[id] = range.minimum;
+                result.executor.jointMaximum[id] = range.maximum;
                 result.executor.positionLimitedJoints |= JointMask{1} << id;
             }
         }

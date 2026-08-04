@@ -13,7 +13,7 @@
 
 namespace ngc {
     inline constexpr std::uint64_t IPC_MAGIC = 0x4e47435f49504331ULL;
-    inline constexpr std::uint32_t IPC_ABI_VERSION = 6;
+    inline constexpr std::uint32_t IPC_ABI_VERSION = 7;
     inline constexpr std::size_t IPC_EXECUTION_CAPACITY = 8;
     inline constexpr std::size_t IPC_CONTROL_CAPACITY = 16;
     inline constexpr std::size_t IPC_EVENT_CAPACITY = 64;

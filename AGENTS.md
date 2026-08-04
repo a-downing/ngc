@@ -103,6 +103,11 @@ triggered moves, feed hold generates a constrained stop while retaining the
 target and input condition, continues sampling during braking, and regenerates
 the remaining approach on Resume. A sampled trigger during braking supersedes
 the feed hold and completes through the ordinary triggered-stop result.
+Homing joint moves carry executor-checked absolute position envelopes derived
+from each phase's actual starting position and resolved target. After the
+fixed backoff, homing samples the opposite switch level at zero motion before
+starting the slow search; it does not require an arbitrary minimum travel
+before accepting the slow-search trigger.
 `HostedExecutorRuntime` is the production-shaped `BackendRuntime` host for
 the core. It derives fixed-capacity executor mappings and limits from typed
 machine configuration, owns fixed-period ticking and stopped-state synchronous

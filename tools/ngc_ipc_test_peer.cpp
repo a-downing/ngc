@@ -455,23 +455,35 @@ namespace {
             m_epoch = move.epoch;
             m_chunk = move.id;
             m_kind = Kind::Joint;
-            for (const auto &trigger : move.triggers) {
-                const auto start = starting.position[trigger.joint];
+            auto targetChanged = false;
+            for (const auto &jointTrigger : move.triggers) {
+                const auto start = starting.position[jointTrigger.joint];
                 const auto delta = move.targetMode == ngc::JointTargetMode::Absolute
-                    ? move.target[trigger.joint] - start
-                    : move.target[trigger.joint];
-                if (std::abs(delta) <= TEMPORARY_TRIGGER_DISTANCE) {
+                    ? move.target[jointTrigger.joint] - start
+                    : move.target[jointTrigger.joint];
+                if (!move.checkTriggersAtStart
+                    && std::abs(delta) <= TEMPORARY_TRIGGER_DISTANCE) {
                     const auto extended =
                         std::copysign(2.0 * TEMPORARY_TRIGGER_DISTANCE, delta);
-                    move.target[trigger.joint] =
+                    move.target[jointTrigger.joint] =
                         move.targetMode == ngc::JointTargetMode::Absolute
                         ? start + extended : extended;
+                    targetChanged = true;
                 }
                 auto &input = m_inputs[m_inputCount];
-                input.joint = trigger.joint;
+                input.joint = jointTrigger.joint;
                 input.jointStart = start;
-                armInput(input, trigger.input, trigger.condition);
+                armInput(
+                    input, jointTrigger.input, jointTrigger.condition);
+                if (move.checkTriggersAtStart) {
+                    trigger(input);
+                }
                 ++m_inputCount;
+            }
+            if (targetChanged && move.positionEnvelope.joints != 0) {
+                ngc::assignJointPositionEnvelope(
+                    move, starting.position,
+                    move.positionEnvelope.enforceAxisLimits);
             }
         }
 

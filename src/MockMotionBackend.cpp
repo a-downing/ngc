@@ -1241,12 +1241,40 @@ namespace ngc {
             return std::nullopt;
         }
 
+        bool syntheticJointConditionMet(
+                const TriggeredJointMove &move,
+                const JointTrigger &trigger) const {
+            const auto transition = syntheticJointTransition(
+                move.moveId, trigger.joint);
+            const auto joint = std::ranges::find(
+                m_joints, trigger.joint, &JointConfiguration::id);
+            if (!transition || joint == m_joints.end()) {
+                return false;
+            }
+
+            const auto direction = std::copysign(
+                1.0, joint->homing.searchVelocity
+                    * joint->coordinateScale);
+            const auto active = direction
+                * (m_snapshot.commandedJoints.position[trigger.joint]
+                    - *transition) >= -1e-12;
+            return trigger.condition == InputCondition::Active
+                    || trigger.condition == InputCondition::RisingEdge
+                ? active : !active;
+        }
+
         bool calculateJointApproach(const TriggeredJointMove &move, const JointId joint) {
             auto &runtime = m_jointRuntime[joint];
             runtime = {};
             runtime.start = m_snapshot.commandedJoints.position[joint];
             runtime.target = move.targetMode == JointTargetMode::Relative
                 ? runtime.start + move.target[joint] : move.target[joint];
+            if (!jointPositionWithinEnvelope(
+                    move.positionEnvelope, joint, runtime.start, 1e-9)
+                || !jointPositionWithinEnvelope(
+                    move.positionEnvelope, joint, runtime.target, 1e-9)) {
+                return false;
+            }
             const auto distance = runtime.target - runtime.start;
             runtime.direction = distance < 0.0 ? -1.0 : 1.0;
             if(std::abs(distance) <= 1e-12) { runtime.finished = true; return true; }
@@ -1276,14 +1304,17 @@ namespace ngc {
         }
 
         bool beginJointStop(const TriggeredJointMove &move, const JointId joint,
-                            const bool triggered = true) {
+                            const bool triggered = true,
+                            const JointMotionState *sampledState = nullptr) {
             auto &runtime = m_jointRuntime[joint];
+            const auto &state = sampledState != nullptr
+                ? *sampledState : m_snapshot.commandedJoints;
             runtime.stopping = true;
             runtime.triggered = triggered;
             runtime.elapsed = 0.0;
-            runtime.triggerPosition = m_snapshot.commandedJoints.position[joint];
-            runtime.triggerVelocity = m_snapshot.commandedJoints.velocity[joint];
-            runtime.triggerAcceleration = m_snapshot.commandedJoints.acceleration[joint];
+            runtime.triggerPosition = state.position[joint];
+            runtime.triggerVelocity = state.velocity[joint];
+            runtime.triggerAcceleration = state.acceleration[joint];
             if (triggered) {
                 m_triggeredJoints |= JointMask{1} << joint;
             }
@@ -1359,6 +1390,27 @@ namespace ngc {
 
         void advanceTriggeredJoints(double &seconds) {
             const auto &move = std::get<TriggeredJointMove>(activeItem());
+            if (move.checkTriggersAtStart) {
+                for (const auto &trigger : move.triggers) {
+                    auto &runtime = m_jointRuntime[trigger.joint];
+                    if (!runtime.finished) {
+                        faultTriggered();
+
+                        return;
+                    }
+                    if (syntheticJointConditionMet(move, trigger)) {
+                        if (!beginJointStop(move, trigger.joint)) {
+                            faultTriggered();
+
+                            return;
+                        }
+                    }
+                }
+                completeTriggeredJoints();
+                seconds = 0.0;
+
+                return;
+            }
             const auto elapsed = seconds;
             auto state = m_snapshot.commandedJoints;
             bool allFinished = true;
@@ -1378,7 +1430,7 @@ namespace ngc {
                     const auto transition = syntheticJointTransition(move.moveId, joint);
                     const auto crossed = transition && runtime.direction * (position - *transition) >= -1e-12;
                     if(crossed) {
-                        if(!beginJointStop(move, joint)) { faultTriggered(); return; }
+                        if(!beginJointStop(move, joint, true, &state)) { faultTriggered(); return; }
                     } else {
                         if(runtime.elapsed + 1e-12 >= duration) {
                             state.position[joint] = runtime.target;
@@ -1391,6 +1443,15 @@ namespace ngc {
                     state.velocity[joint] = 0.0;
                     state.acceleration[joint] = 0.0;
                     runtime.finished = true;
+                }
+            }
+            for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+                if (!jointPositionWithinEnvelope(
+                        move.positionEnvelope, joint,
+                        state.position[joint], 1e-9)) {
+                    faultTriggered();
+
+                    return;
                 }
             }
             applyJointMotionState(state);

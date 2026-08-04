@@ -56,6 +56,9 @@ namespace ngc {
         [[nodiscard]] TriggeredJointMove makeMove(
             const HomingGroupConfiguration &group, EpochId epoch, bool triggered,
             bool slow, bool backoff);
+        [[nodiscard]] TriggeredJointMove makeReleaseCheck(
+            const HomingGroupConfiguration &group, EpochId epoch,
+            const JointMotionState &state);
         [[nodiscard]] bool submitControl(
             const ControlRequest &request, const HomingRuntimeCallbacks &callbacks);
         [[nodiscard]] std::expected<bool, std::string> setJointPositions(

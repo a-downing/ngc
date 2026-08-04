@@ -31,6 +31,20 @@ namespace ngc {
 
             return position.x;
         }
+
+        InputCondition releasedCondition(
+            const InputCondition condition) noexcept {
+            switch (condition) {
+                case InputCondition::Active:
+                case InputCondition::RisingEdge:
+                    return InputCondition::Inactive;
+                case InputCondition::Inactive:
+                case InputCondition::FallingEdge:
+                    return InputCondition::Active;
+            }
+
+            return InputCondition::Inactive;
+        }
     }
 
     HomingController::HomingController(std::vector<AxisConfiguration> axes,
@@ -82,7 +96,9 @@ namespace ngc {
         }
 
         for (const auto &group : m_homing.groups) {
-            const auto fast = makeMove(group, epoch, true, false, false);
+            auto fast = makeMove(group, epoch, true, false, false);
+            assignJointPositionEnvelope(
+                fast, m_observation.joints.position);
             const auto fastResult = executeMove(fast, callbacks);
             if (!fastResult) {
                 return std::unexpected(fastResult.error());
@@ -108,6 +124,8 @@ namespace ngc {
                     - searchDirection * joint->homing.backoffDistance
                         * std::abs(joint->coordinateScale);
             }
+            assignJointPositionEnvelope(
+                backoff, fastResult->stoppedState.position);
             const auto backoffResult = executeMove(backoff, callbacks);
             if (!backoffResult) {
                 return std::unexpected(backoffResult.error());
@@ -133,7 +151,26 @@ namespace ngc {
                 }
             }
 
-            const auto slow = makeMove(group, epoch, true, true, false);
+            auto releaseCheck = makeReleaseCheck(
+                group, epoch, backoffResult->stoppedState);
+            assignJointPositionEnvelope(
+                releaseCheck, backoffResult->stoppedState.position);
+            const auto releaseResult = executeMove(
+                releaseCheck, callbacks);
+            if (!releaseResult) {
+                return std::unexpected(releaseResult.error());
+            }
+            if (releaseResult->status == TriggeredMoveStatus::Aborted) {
+                return result(HomingOutcome::Stopped, 0);
+            }
+            if (releaseResult->status != TriggeredMoveStatus::Triggered) {
+                return std::unexpected(
+                    "homing switch remained active after backoff");
+            }
+
+            auto slow = makeMove(group, epoch, true, true, false);
+            assignJointPositionEnvelope(
+                slow, releaseResult->stoppedState.position);
             const auto slowResult = executeMove(slow, callbacks);
             if (!slowResult) {
                 return std::unexpected(slowResult.error());
@@ -164,7 +201,9 @@ namespace ngc {
                     : established.error());
             }
 
-            const auto finalMove = makeMove(group, epoch, false, false, false);
+            auto finalMove = makeMove(group, epoch, false, false, false);
+            assignJointPositionEnvelope(
+                finalMove, m_observation.joints.position);
             const auto finalResult = executeMove(finalMove, callbacks);
             if (!finalResult) {
                 return std::unexpected(finalResult.error());
@@ -208,13 +247,15 @@ namespace ngc {
             const auto scale = joint->coordinateScale;
             const auto searchDirection =
                 std::copysign(1.0, joint->homing.searchVelocity * scale);
-            const auto range = (joint->maximum - joint->minimum) * std::abs(scale);
+            const auto coordinateRange = jointCoordinateRange(*joint);
+            const auto range = coordinateRange.maximum - coordinateRange.minimum;
             if (backoff) {
                 move.target[id] =
                     -searchDirection * joint->homing.backoffDistance * std::abs(scale);
             } else if (triggered) {
                 move.target[id] = searchDirection * (slow
-                    ? std::max(2.0 * joint->homing.backoffDistance * std::abs(scale), 0.01)
+                    ? std::max(2.0 * joint->homing.backoffDistance,
+                               0.01) * std::abs(scale)
                     : range + 2.0 * joint->homing.backoffDistance * std::abs(scale));
             } else {
                 move.target[id] = joint->homing.homePosition * scale;
@@ -237,6 +278,29 @@ namespace ngc {
             }
         }
         move.triggerRequired = triggered;
+
+        return move;
+    }
+
+    TriggeredJointMove HomingController::makeReleaseCheck(
+        const HomingGroupConfiguration &group, const EpochId epoch,
+        const JointMotionState &state) {
+        auto move = makeMove(group, epoch, false, false, true);
+        move.targetMode = JointTargetMode::Absolute;
+        move.triggerRequired = true;
+        move.checkTriggersAtStart = true;
+        for (const auto id : group.joints) {
+            const auto *joint = configuredJoint(id);
+            if (!joint) {
+                continue;
+            }
+
+            move.target[id] = state.position[id];
+            (void)move.triggers.push({
+                id, joint->homing.input,
+                releasedCondition(joint->homing.condition),
+            });
+        }
 
         return move;
     }

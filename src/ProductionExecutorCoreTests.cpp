@@ -1394,6 +1394,51 @@ namespace {
                     "homing sequence changed an unselected joint");
     }
 
+    ngc::TriggeredMoveStatus runInitialJointInputCheck(
+        const bool inputLevel) {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        initialize(*core, 81);
+
+        auto move = triggeredJointMove(
+            81, 811, 0, 911, 1'011);
+        move.joints = ngc::JointMask{1};
+        move.targetMode = ngc::JointTargetMode::Absolute;
+        move.target[0] = 0.0;
+        move.triggers = {};
+        require(move.triggers.push({
+                    0, 21, ngc::InputCondition::Inactive,
+                }),
+                "initial joint-input check trigger did not fit");
+        move.triggerRequired = true;
+        move.checkTriggersAtStart = true;
+        ngc::assignJointPositionEnvelope(move, ngc::JointVector{});
+        core->setDigitalInputSample(21, inputLevel);
+        require(core->tryPublish(ngc::ExecutionItem{move})
+                    == ngc::PublishResult::Published,
+                "initial joint-input check was not published");
+        require(core->trySubmit(ngc::StartRequest{3, move.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "initial joint-input check did not accept start");
+
+        core->servoTick();
+        const auto completions =
+            selectEvents<ngc::TriggeredJointMoveCompleted>(
+                takeEvents(*core));
+        require(completions.size() == 1,
+                "initial joint-input check did not complete in place");
+
+        return completions[0].status;
+    }
+
+    void testInitialJointInputCheckRequiresExpectedLevel() {
+        require(runInitialJointInputCheck(false)
+                    == ngc::TriggeredMoveStatus::Triggered,
+                "released joint input was not accepted at move start");
+        require(runInitialJointInputCheck(true)
+                    == ngc::TriggeredMoveStatus::ReachedTarget,
+                "active joint input incorrectly passed its release check");
+    }
+
     void testControlledStopAbortsTriggeredJointMove() {
         auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
         initialize(*core, 90);
@@ -2854,6 +2899,7 @@ int main() {
         testPlanContinuesIntoTriggeredMove();
         testTriggeredJointsStopIndependentlyAndRetainState();
         testHomingControlSequence();
+        testInitialJointInputCheckRequiresExpectedLevel();
         testControlledStopAbortsTriggeredJointMove();
         testControlledStopAbortsAxisTriggeredMove();
         testControlledStopCancelsOrdinaryPlan();

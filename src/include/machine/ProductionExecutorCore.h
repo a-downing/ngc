@@ -225,8 +225,14 @@ namespace ngc {
 
         void serviceIngress() noexcept;
         void serviceControl(const ControlRequest &request) noexcept;
+        [[nodiscard]] bool commitMotionState(
+            const MotionState &axes, const JointMotionState &joints,
+            const JointPositionEnvelope *envelope,
+            bool enforceConfiguredLimits) noexcept;
         [[nodiscard]] bool applyAxisMotionState(const MotionState &state) noexcept;
-        void applyJointMotionState(const JointMotionState &state) noexcept;
+        [[nodiscard]] bool applyJointMotionState(
+            const JointMotionState &state,
+            const JointPositionEnvelope *envelope = nullptr) noexcept;
         void assignJointCoordinates(const JointMotionState &state) noexcept;
         void activateNext() noexcept;
         void advanceActive(double seconds) noexcept;

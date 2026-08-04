@@ -481,20 +481,20 @@ namespace ngc {
         return result;
     }
 
-    bool ProductionExecutorCore::applyAxisMotionState(
-        const MotionState &state) noexcept {
-        const auto previous = m_snapshot.commanded;
-        auto commandedJoints = m_snapshot.commandedJoints;
-        axis_joint_state_projection::advanceFromAxes(
-            m_configuration.axes, previous, state,
-            commandedJoints);
-        const auto position = axisValues(state.position);
+    bool ProductionExecutorCore::commitMotionState(
+        const MotionState &axes, const JointMotionState &joints,
+        const JointPositionEnvelope *envelope,
+        const bool enforceConfiguredLimits) noexcept {
+        const auto position = axisValues(axes.position);
         const auto minimum = axisValues(m_configuration.axisPosition.minimum);
         const auto maximum = axisValues(m_configuration.axisPosition.maximum);
         for (auto axis = std::size_t{0}; axis < position.size(); ++axis) {
             if (!std::isfinite(position[axis])
-               || position[axis] < minimum[axis] - POSITION_LIMIT_TOLERANCE
-               || position[axis] > maximum[axis] + POSITION_LIMIT_TOLERANCE) {
+                || (enforceConfiguredLimits
+                    && (position[axis]
+                            < minimum[axis] - POSITION_LIMIT_TOLERANCE
+                        || position[axis]
+                            > maximum[axis] + POSITION_LIMIT_TOLERANCE))) {
                 faultSoftLimit();
 
                 return false;
@@ -502,36 +502,55 @@ namespace ngc {
         }
         for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
             const auto mask = static_cast<JointMask>(JointMask{1} << joint);
-            if ((m_configuration.positionLimitedJoints & mask) != 0
-               && (!std::isfinite(commandedJoints.position[joint])
-                   || commandedJoints.position[joint]
-                        < m_configuration.jointMinimum[joint]
-                            - POSITION_LIMIT_TOLERANCE
-                   || commandedJoints.position[joint]
-                        > m_configuration.jointMaximum[joint]
-                            + POSITION_LIMIT_TOLERANCE)) {
+            const auto value = joints.position[joint];
+            const auto outsideConfigured = enforceConfiguredLimits
+                && (m_configuration.positionLimitedJoints & mask) != 0
+                && (value < m_configuration.jointMinimum[joint]
+                        - POSITION_LIMIT_TOLERANCE
+                    || value > m_configuration.jointMaximum[joint]
+                        + POSITION_LIMIT_TOLERANCE);
+            const auto outsideEnvelope = envelope != nullptr
+                && !jointPositionWithinEnvelope(
+                    *envelope, joint, value,
+                    POSITION_LIMIT_TOLERANCE);
+            if (!std::isfinite(value)
+                || outsideConfigured || outsideEnvelope) {
                 faultSoftLimit();
 
                 return false;
             }
         }
 
-        m_snapshot.commandedJoints = commandedJoints;
-        m_snapshot.commanded = state;
-        m_snapshot.feedback = state;
+        m_snapshot.commanded = axes;
+        m_snapshot.commandedJoints = joints;
+        m_snapshot.feedback = axes;
         m_snapshot.feedbackJoints = m_snapshot.commandedJoints;
 
         return true;
     }
 
-    void ProductionExecutorCore::applyJointMotionState(
-        const JointMotionState &state) noexcept {
+    bool ProductionExecutorCore::applyAxisMotionState(
+        const MotionState &state) noexcept {
+        const auto previous = m_snapshot.commanded;
+        auto commandedJoints = m_snapshot.commandedJoints;
+        axis_joint_state_projection::advanceFromAxes(
+            m_configuration.axes, previous, state,
+            commandedJoints);
+
+        return commitMotionState(state, commandedJoints, nullptr, true);
+    }
+
+    bool ProductionExecutorCore::applyJointMotionState(
+        const JointMotionState &state,
+        const JointPositionEnvelope *envelope) noexcept {
+        auto axes = m_snapshot.commanded;
         axis_joint_state_projection::advanceFromJoints(
             m_configuration.axes, m_snapshot.commandedJoints, state,
-            m_snapshot.commanded);
-        m_snapshot.commandedJoints = state;
-        m_snapshot.feedback = m_snapshot.commanded;
-        m_snapshot.feedbackJoints = m_snapshot.commandedJoints;
+            axes);
+
+        return commitMotionState(
+            axes, state, envelope,
+            envelope != nullptr && envelope->enforceAxisLimits);
     }
 
     void ProductionExecutorCore::assignJointCoordinates(
@@ -1519,6 +1538,14 @@ namespace ngc {
         runtime.start = state.position[joint];
         runtime.target = move.targetMode == JointTargetMode::Relative
             ? state.position[joint] + move.target[joint] : move.target[joint];
+        if (!jointPositionWithinEnvelope(
+                move.positionEnvelope, joint, runtime.start,
+                POSITION_LIMIT_TOLERANCE)
+            || !jointPositionWithinEnvelope(
+                move.positionEnvelope, joint, runtime.target,
+                POSITION_LIMIT_TOLERANCE)) {
+            return false;
+        }
         if (std::abs(runtime.target - state.position[joint]) <= 1e-12
             && std::abs(state.velocity[joint]) <= 1e-12
             && std::abs(state.acceleration[joint]) <= 1e-12) {
@@ -1603,6 +1630,30 @@ namespace ngc {
     void ProductionExecutorCore::advanceTriggeredJoints(
         double &seconds) noexcept {
         const auto move = activeTriggeredJointMove();
+        if (move.checkTriggersAtStart) {
+            for (const auto &trigger : move.triggers) {
+                auto &runtime = m_triggeredJoints[trigger.joint];
+                if (!runtime.finished) {
+                    faultTriggered();
+
+                    return;
+                }
+                if (!triggeredJointInputConditionMet(trigger)) {
+                    continue;
+                }
+
+                runtime.triggerPosition =
+                    m_snapshot.commandedJoints.position[trigger.joint];
+                runtime.triggerVelocity = 0.0;
+                runtime.triggerAcceleration = 0.0;
+                m_triggeredJointMask |= static_cast<JointMask>(
+                    JointMask{1} << trigger.joint);
+            }
+            completeTriggeredJoints();
+            seconds = 0.0;
+
+            return;
+        }
         for (const auto &trigger : move.triggers) {
             auto &runtime = m_triggeredJoints[trigger.joint];
             if (!runtime.finished && !runtime.stopping
@@ -1650,7 +1701,10 @@ namespace ngc {
             state.acceleration[joint] = 0.0;
             runtime.finished = true;
         }
-        applyJointMotionState(state);
+        if (!applyJointMotionState(
+                state, &move.positionEnvelope)) {
+            return;
+        }
         seconds = 0.0;
 
         for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
@@ -1826,9 +1880,37 @@ namespace ngc {
             state.velocity[joint] = jog.velocity;
             state.acceleration[joint] = jog.acceleration;
         }
-        applyJointMotionState(state);
+        auto envelope = JointPositionEnvelope{};
+        if (jog.travel.enabled) {
+            envelope.joints = jog.target.joints;
+            envelope.enforceAxisLimits = true;
+            const auto displacementMinimum =
+                jog.travel.minimum - jog.axisOrigin;
+            const auto displacementMaximum =
+                jog.travel.maximum - jog.axisOrigin;
+            for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+                const auto mask =
+                    static_cast<JointMask>(JointMask{1} << joint);
+                if ((jog.target.joints & mask) == 0) {
+                    continue;
+                }
+                envelope.minimum[joint] =
+                    jog.jointOrigin[joint] + displacementMinimum;
+                envelope.maximum[joint] =
+                    jog.jointOrigin[joint] + displacementMaximum;
+                if ((m_configuration.positionLimitedJoints & mask) != 0) {
+                    envelope.minimum[joint] = std::max(
+                        envelope.minimum[joint],
+                        m_configuration.jointMinimum[joint]);
+                    envelope.maximum[joint] = std::min(
+                        envelope.maximum[joint],
+                        m_configuration.jointMaximum[joint]);
+                }
+            }
+        }
 
-        return true;
+        return applyJointMotionState(
+            state, jog.travel.enabled ? &envelope : nullptr);
     }
 
     bool ProductionExecutorCore::calculateJogPosition(

@@ -77,6 +77,22 @@ namespace {
                 configuration ? "" : configuration.error());
     }
 
+    void testJointCoordinateRangeAppliesAndOrdersScale() {
+        auto joint = ngc::JointConfiguration{};
+        joint.minimum = -2.0;
+        joint.maximum = 5.0;
+
+        joint.coordinateScale = 0.5;
+        auto range = ngc::jointCoordinateRange(joint);
+        require(range.minimum == -1.0 && range.maximum == 2.5,
+                "positive joint scale was not applied to its coordinate range");
+
+        joint.coordinateScale = -2.0;
+        range = ngc::jointCoordinateRange(joint);
+        require(range.minimum == -10.0 && range.maximum == 4.0,
+                "negative joint scale did not reorder its coordinate range");
+    }
+
     void testUnsupportedHomingModesAreRejected() {
         const auto path = std::filesystem::path {NGC_SOURCE_DIR} / "machine.toml";
         const auto source = readFile(path);
@@ -115,6 +131,7 @@ namespace {
 int main() {
     try {
         testRepositoryConfigurationLoads();
+        testJointCoordinateRangeAppliesAndOrdersScale();
         testUnsupportedHomingModesAreRejected();
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';

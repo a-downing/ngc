@@ -95,6 +95,14 @@ namespace ngc {
         JointHomingConfiguration homing;
     };
 
+    struct JointCoordinateRange {
+        double minimum = 0.0;
+        double maximum = 0.0;
+    };
+
+    [[nodiscard]] JointCoordinateRange jointCoordinateRange(
+        const JointConfiguration &joint) noexcept;
+
     struct HomingGroupConfiguration {
         std::string name;
         std::uint32_t sequence = 0;
