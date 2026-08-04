@@ -395,7 +395,7 @@ namespace {
             ngc::setIpcConnectionState(
                 region, ngc::IpcConnectionState::PeerLost);
             static_cast<void>(
-                ngc::stopExecutorAfterFrontendLoss(*runtime));
+                ngc::stopExecutorSafely(*runtime));
             runtime->stop();
 
             return 3;
@@ -430,6 +430,8 @@ namespace {
         for (;;) {
             if (ngc::ipcConnectionState(region)
                 == ngc::IpcConnectionState::StopRequested) {
+                static_cast<void>(
+                    ngc::stopExecutorSafely(*runtime));
                 runtime->stop();
                 ngc::setIpcConnectionState(
                     region, ngc::IpcConnectionState::PeerStopped);

@@ -51,5 +51,5 @@ namespace ngc {
         bool m_pendingItemPrepared = false;
     };
 
-    [[nodiscard]] ExecutionSnapshot stopExecutorAfterFrontendLoss(BackendRuntime &runtime);
+    [[nodiscard]] ExecutionSnapshot stopExecutorSafely(BackendRuntime &runtime);
 }

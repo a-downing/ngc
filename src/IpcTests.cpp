@@ -537,7 +537,7 @@ namespace {
         const auto moving = waitForMotionProgress(runtime, 0.1);
 
         const auto stopped =
-            ngc::stopExecutorAfterFrontendLoss(runtime);
+            ngc::stopExecutorSafely(runtime);
         require(stopped.state == ngc::BackendState::Disabled,
                 "frontend-loss shutdown should disable the executor");
         require(stopped.commanded.position.x

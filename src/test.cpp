@@ -1947,7 +1947,7 @@ final_move_together = true
                     && snapshot.activeChunk == 0,
                 "frontend-loss setup should be running without a plan");
 
-        const auto stopped = ngc::stopExecutorAfterFrontendLoss(runtime);
+        const auto stopped = ngc::stopExecutorSafely(runtime);
         require(stopped.state == ngc::BackendState::Disabled,
                 "frontend loss should disable a running executor without a plan");
     }

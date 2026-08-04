@@ -143,7 +143,7 @@ namespace ngc {
         return progressed;
     }
 
-    ExecutionSnapshot stopExecutorAfterFrontendLoss(BackendRuntime &runtime) {
+    ExecutionSnapshot stopExecutorSafely(BackendRuntime &runtime) {
         constexpr RequestId internalRequest = 0;
         auto &backend = runtime.endpoint();
         auto snapshot = ExecutionSnapshot{};
