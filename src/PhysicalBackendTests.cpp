@@ -127,6 +127,7 @@ namespace {
         bool corruptCrc = false;
         bool corruptFunction = false;
         bool corruptEcho = false;
+        std::uint8_t controlStatus = 0;
     };
 
     class FakeSerialTransport final
@@ -177,7 +178,8 @@ namespace {
                 case 0x03:
                     m_observation->control = request[3];
                     payload = {
-                        1, 0x03, 1, 0, 0, 0,
+                        1, 0x03, 1,
+                        m_observation->controlStatus, 0, 0,
                     };
                     payloadSize = 4;
                     break;
@@ -567,6 +569,43 @@ namespace {
             "failed Huanyang safe stop changed prior safe state");
     }
 
+    void testHuanyangRejectsControlErrorAcknowledgements() {
+        auto startupObservation =
+            std::make_shared<HuanyangObservation>();
+        startupObservation->controlStatus = 1;
+        const auto rejectedStartup =
+            ngc::physical::HuanyangSpindleHardware::create(
+                huanyangConfiguration(),
+                std::make_unique<FakeSerialTransport>(
+                    startupObservation));
+        require(
+            !rejectedStartup.has_value(),
+            "Huanyang spindle accepted a rejected startup stop");
+
+        auto observation =
+            std::make_shared<HuanyangObservation>();
+        auto hardware =
+            ngc::physical::HuanyangSpindleHardware::create(
+                huanyangConfiguration(),
+                std::make_unique<FakeSerialTransport>(
+                    observation));
+        require(
+            hardware.has_value(),
+            "Huanyang spindle did not initialize");
+
+        observation->controlStatus = 1;
+        require(
+            !(*hardware)->applyDesired({
+                .enabled = true,
+                .direction = ngc::Direction::CW,
+                .speed = 12000.0,
+            }),
+            "Huanyang spindle accepted a rejected run command");
+        require(
+            !(*hardware)->applyDesired({}),
+            "Huanyang spindle accepted a rejected stop command");
+    }
+
 #ifdef __linux__
     void testPosixSerialTransportWithPseudoTerminal() {
         const auto master = posix_openpt(
@@ -672,6 +711,7 @@ int main() {
         testSpindleCommunicationFailureEstablishesSafeStop();
         testHuanyangCrcAndProtocolScaling();
         testHuanyangRejectsInvalidResponsesAndCommands();
+        testHuanyangRejectsControlErrorAcknowledgements();
 #ifdef __linux__
         testPosixSerialTransportWithPseudoTerminal();
 #endif
