@@ -83,6 +83,8 @@ namespace ngc {
     public:
         static constexpr std::size_t PLAN_CAPACITY = 8;
         static constexpr std::size_t CONTROL_CAPACITY = 16;
+        static constexpr std::size_t INGRESS_CAPACITY =
+            PLAN_CAPACITY + CONTROL_CAPACITY;
         static constexpr std::size_t EVENT_CAPACITY =
             PLAN_CAPACITY * (MAX_EXECUTION_MARKERS_PER_CHUNK + 5)
             + CONTROL_CAPACITY;
@@ -129,6 +131,27 @@ namespace ngc {
             std::atomic<bool> occupied{false};
             ExecutionItem item{};
             std::uint64_t normalMotionNanoseconds = 0;
+        };
+
+        enum class IngressKind : std::uint8_t {
+            PublishedPlan,
+            Control,
+        };
+
+        struct IngressRecord {
+            ControlRequest control{};
+            std::uint8_t planSlot = 0;
+            IngressKind kind = IngressKind::Control;
+        };
+        static_assert(std::is_trivially_copyable_v<IngressRecord>);
+
+        struct PlanQueue {
+            std::array<std::uint8_t, PLAN_CAPACITY> slots{};
+            std::size_t head = 0;
+            std::size_t size = 0;
+
+            [[nodiscard]] bool tryPush(std::uint8_t slot) noexcept;
+            [[nodiscard]] bool tryPop(std::uint8_t &slot) noexcept;
         };
 
         struct TriggeredRuntime {
@@ -195,7 +218,8 @@ namespace ngc {
             bool resuming = false;
         };
 
-        void serviceControls() noexcept;
+        void serviceIngress() noexcept;
+        void serviceControl(const ControlRequest &request) noexcept;
         void applyAxisMotionState(const MotionState &state) noexcept;
         void applyJointMotionState(const JointMotionState &state) noexcept;
         void assignJointCoordinates(const JointMotionState &state) noexcept;
@@ -261,6 +285,7 @@ namespace ngc {
         void emit(const ExecutionEvent &event) noexcept;
         void fault(std::uint32_t code) noexcept;
         void discardExecution() noexcept;
+        void discardIngress() noexcept;
         void release(std::uint8_t index) noexcept;
         void accountForDequeued(std::uint8_t index) noexcept;
         void publishSnapshot() noexcept;
@@ -291,12 +316,18 @@ namespace ngc {
         }
 
         std::array<PlanSlot, PLAN_CAPACITY> m_planSlots;
-        SpscChannel<std::uint8_t, PLAN_CAPACITY> m_plans;
-        SpscChannel<ControlRequest, CONTROL_CAPACITY> m_controls;
+        // Exactly one NRT thread at a time owns both tryPublish() and
+        // trySubmit(). Their shared ingress queue defines the order between
+        // plan publication and ordinary controls. Ownership may transfer only
+        // after the previous owner has quiesced. Emergency stop remains on its
+        // dedicated out-of-band control block.
+        SpscChannel<IngressRecord, INGRESS_CAPACITY> m_ingress;
+        PlanQueue m_plans;
         SpscChannel<ExecutionEvent, EVENT_CAPACITY> m_events;
         SpscChannel<ExecutionSnapshot, SNAPSHOT_CAPACITY> m_snapshots;
         std::atomic<std::uint64_t> m_queuedNormalMotionNanoseconds{0};
         std::atomic<std::uint32_t> m_queuedExecutionItems{0};
+        std::atomic<std::uint32_t> m_queuedControls{0};
         ExecutionSnapshot m_snapshot;
         std::optional<std::uint8_t> m_active;
         std::optional<JogRuntime> m_jog;

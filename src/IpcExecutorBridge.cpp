@@ -84,6 +84,9 @@ namespace ngc {
     }
 
     bool IpcExecutorBridge::submitInputs() noexcept {
+        // This bridge loop is the executor's sole ordinary-ingress producer.
+        // Keep both publication and control submission on this thread so their
+        // order is preserved by ProductionExecutorCore's shared SPSC queue.
         auto progressed = false;
         if (!m_pendingItem.has_value()) {
             ExecutionItem item;

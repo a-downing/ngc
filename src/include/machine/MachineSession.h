@@ -389,6 +389,9 @@ namespace ngc {
         std::unique_ptr<GeometryStreamProducer> m_geometryProducer;
         std::thread m_geometryThread;
         BackendRuntime &m_runtime;
+        // The owning MachineSessionHost thread serializes every ordinary
+        // tryPublish()/trySubmit() call through this endpoint. The geometry
+        // thread prepares data only and must never use backend ingress.
         MotionBackend &m_backend;
         PreparedTrajectoryExecutionDriver m_driver;
         PresentationTracker m_presentationTracker;

@@ -758,6 +758,39 @@ namespace {
                 "disable did not establish a safe spindle output");
     }
 
+    void testIngressPreservesPlanControlOrdering() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        initialize(*core, 23);
+
+        const auto abandoned =
+            linearChunk(23, 231, 0, 331, 431, 0.0, 1.0, 0.5);
+        const auto replacement =
+            linearChunk(24, 241, 0, 341, 441, 0.0, 1.0, 0.5);
+        require(core->tryPublish(abandoned)
+                    == ngc::PublishResult::Published,
+                "pre-reset plan did not fit in ordered ingress");
+        require(core->trySubmit(ngc::ResetRequest{3, replacement.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "ordered-ingress reset did not fit");
+        require(core->tryPublish(replacement)
+                    == ngc::PublishResult::Published,
+                "post-reset plan did not fit in ordered ingress");
+        require(core->trySubmit(ngc::StartRequest{4, replacement.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "post-reset start did not fit in ordered ingress");
+
+        core->servoTick();
+        const auto events = takeEvents(*core);
+        const auto snapshot = latestSnapshot(*core);
+        const auto accepted = selectEvents<ngc::ChunkAccepted>(events);
+        require(snapshot.state == ngc::BackendState::Running
+                    && snapshot.activeChunk == replacement.id,
+                "ordered ingress did not activate the post-reset plan");
+        require(accepted.size() == 1
+                    && accepted[0].chunk == replacement.id,
+                "ordered ingress admitted a plan from before reset");
+    }
+
     void testMismatchedContinuationStopsSafely() {
         auto core = std::make_unique<ngc::ProductionExecutorCore>(0.25);
         initialize(*core, 30);
@@ -2765,6 +2798,7 @@ int main() {
         testRequiredContinuationUnderrunFaultsAfterStopTail();
         testScheduledSpindleEventsFollowExecutionCursor();
         testAbortSuppressesFutureScheduledEvents();
+        testIngressPreservesPlanControlOrdering();
         testMismatchedContinuationStopsSafely();
         testTriggeredMoveReachesTargetAtRest();
         testPublishesTriggeredMotionContext();

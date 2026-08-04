@@ -60,9 +60,14 @@ implementation of the production-shaped backend contract.
 allocation-free execution core for normal `PlanChunk` motion, axis-space
 triggered moves, joint-space triggered moves, stop branches, markers,
 retirement, snapshots, faults, scheduled spindle-output events,
-ordinary-plan controlled stop, and executor-owned jogging. Scheduled output
-events activate exactly once before their indexed normal execution span. Feed
-hold retains the event cursor, Resume does not replay applied events, and
+ordinary-plan controlled stop, and executor-owned jogging.
+Plan-slot descriptors and inline ordinary controls share one ordered SPSC
+ingress queue. Exactly one NRT thread at a time owns both publication and
+control submission; ownership can transfer only after the prior owner has
+quiesced. Emergency stop remains out of band.
+Scheduled output events activate exactly once before their indexed normal
+execution span. Feed hold retains the event cursor, Resume does not replay
+applied events, and
 controlled stop suppresses events on the abandoned horizon. Disable, Reset,
 Abort, and faults establish the safe spindle output. The hosting servo thread
 reads the latest fixed-size output state directly after each tick; it is not an

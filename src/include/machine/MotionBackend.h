@@ -414,6 +414,9 @@ namespace ngc {
 
     // NRT-facing endpoint. Calls only access bounded communication storage; they
     // never invoke the servo loop, allocate, wait, or acquire an RT-owned mutex.
+    // Exactly one NRT thread at a time owns both tryPublish() and trySubmit() so
+    // implementations can preserve one order across plans and ordinary controls.
+    // Ownership may transfer only after the previous owner has quiesced.
     class MotionBackend {
     public:
         virtual ~MotionBackend() = default;

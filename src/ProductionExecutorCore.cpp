@@ -157,6 +157,31 @@ namespace ngc {
 
     }
 
+    bool ProductionExecutorCore::PlanQueue::tryPush(
+        const std::uint8_t slot) noexcept {
+        if (size == slots.size()) {
+            return false;
+        }
+
+        slots[(head + size) % slots.size()] = slot;
+        ++size;
+
+        return true;
+    }
+
+    bool ProductionExecutorCore::PlanQueue::tryPop(
+        std::uint8_t &slot) noexcept {
+        if (size == 0) {
+            return false;
+        }
+
+        slot = slots[head];
+        head = (head + 1) % slots.size();
+        --size;
+
+        return true;
+    }
+
     ProductionExecutorCore::ProductionExecutorCore(
         const double servoPeriod,
         ProductionExecutorConfiguration configuration)
@@ -231,7 +256,10 @@ namespace ngc {
             m_queuedNormalMotionNanoseconds.fetch_add(
                 slot.normalMotionNanoseconds, std::memory_order_release);
             m_queuedExecutionItems.fetch_add(1, std::memory_order_release);
-            if (m_plans.tryPush(index)) {
+            if (m_ingress.tryPush(IngressRecord{
+                    .planSlot = index,
+                    .kind = IngressKind::PublishedPlan,
+                })) {
                 return PublishResult::Published;
             }
 
@@ -248,8 +276,20 @@ namespace ngc {
 
     SubmitResult ProductionExecutorCore::trySubmit(
         const ControlRequest &request) noexcept {
-        return m_controls.tryPush(request)
-            ? SubmitResult::Submitted : SubmitResult::Full;
+        const auto previous = m_queuedControls.fetch_add(
+            1, std::memory_order_acq_rel);
+        if (previous >= CONTROL_CAPACITY) {
+            m_queuedControls.fetch_sub(1, std::memory_order_acq_rel);
+
+            return SubmitResult::Full;
+        }
+        if (m_ingress.tryPush(IngressRecord{.control = request})) {
+            return SubmitResult::Submitted;
+        }
+
+        m_queuedControls.fetch_sub(1, std::memory_order_acq_rel);
+
+        return SubmitResult::Full;
     }
 
     bool ProductionExecutorCore::tryTakeEvent(ExecutionEvent &event) noexcept {
@@ -270,8 +310,7 @@ namespace ngc {
             m_jog.reset();
         }
 
-        ControlRequest control;
-        while (m_controls.tryPop(control)) { }
+        discardIngress();
         ExecutionEvent event;
         while (m_events.tryPop(event)) { }
         ExecutionSnapshot snapshot;
@@ -291,7 +330,7 @@ namespace ngc {
     }
 
     void ProductionExecutorCore::serviceImmediate() noexcept {
-        serviceControls();
+        serviceIngress();
         publishSnapshot();
     }
 
@@ -306,7 +345,7 @@ namespace ngc {
     }
 
     void ProductionExecutorCore::servoTick(const bool shouldPublishSnapshot) noexcept {
-        serviceControls();
+        serviceIngress();
 
         if (m_snapshot.state == BackendState::Running
             || m_snapshot.state == BackendState::Holding) {
@@ -339,6 +378,7 @@ namespace ngc {
 
     void ProductionExecutorCore::latchEmergencyStop(const std::uint32_t code) noexcept {
         discardExecution();
+        discardIngress();
         if (m_jog.has_value()) {
             abandonJog(JogStopReason::Aborted);
         }
@@ -446,258 +486,274 @@ namespace ngc {
         m_snapshot.feedbackJoints = state;
     }
 
-    void ProductionExecutorCore::serviceControls() noexcept {
-        ControlRequest request;
-        while (m_controls.tryPop(request)) {
-            std::visit([&](const auto &value) {
-                using T = std::decay_t<decltype(value)>;
-                auto success = false;
-                if constexpr (std::same_as<T, EnableRequest>) {
-                    success = !m_jog.has_value()
-                        && (m_snapshot.state == BackendState::Disabled
-                            || m_snapshot.state == BackendState::Held);
-                    if (success) {
-                        m_snapshot.state = BackendState::Held;
-                        m_snapshot.faultCode = 0;
-                        m_faultEventEmitted = false;
-                    }
-                } else if constexpr (std::same_as<T, DisableRequest>) {
-                    if (m_jog.has_value()) {
-                        abandonJog(JogStopReason::Disabled);
-                    }
-                    discardExecution();
-                    m_snapshot.state = BackendState::Disabled;
-                    m_snapshot.commanded.velocity = {};
-                    m_snapshot.commanded.acceleration = {};
-                    m_snapshot.feedback = m_snapshot.commanded;
-                    m_snapshot.commandedJoints.velocity = {};
-                    m_snapshot.commandedJoints.acceleration = {};
-                    m_snapshot.feedbackJoints =
-                        m_snapshot.commandedJoints;
-                    m_outputState = {};
-                    success = true;
-                } else if constexpr (std::same_as<T, StartRequest>) {
-                    success = !m_jog.has_value()
-                        && m_snapshot.state == BackendState::Held
-                        && !m_feedRetiming.held
-                        && value.epoch != 0 && value.epoch == m_snapshot.epoch
-                        && value.epoch != m_controlledStoppedEpoch;
-                    if (success) {
-                        resetFeedRetiming();
-                        m_snapshot.state = BackendState::Running;
-                    }
-                } else if constexpr (std::same_as<T, ResumeRequest>) {
-                    const auto feedHeld = m_feedRetiming.held;
-                    success = !m_jog.has_value()
-                        && m_snapshot.state == BackendState::Held
-                        && value.epoch != 0
-                        && value.epoch == m_snapshot.epoch
-                        && value.epoch != m_controlledStoppedEpoch;
-                    if (success && feedHeld) {
-                        success = m_active.has_value() && !m_stopping;
-                        if (success && std::holds_alternative<PlanChunk>(
-                                m_planSlots[*m_active].item)) {
-                            m_feedRetiming.held = false;
-                            m_feedRetiming.resuming = true;
-                            m_feedRetiming.acceleration = 0.0;
-                            m_feedRetiming.jerk = 0.0;
-                            m_snapshot.state = BackendState::Running;
-                        } else if (success
-                                   && std::holds_alternative<TriggeredMove>(
-                                       m_planSlots[*m_active].item)) {
-                            success = !m_triggered.stopping
-                                && initializeTriggered();
-                            if (success) {
-                                resetFeedRetiming();
-                                m_snapshot.state = BackendState::Running;
-                            }
-                        } else {
-                            success = false;
-                        }
-                    } else if (success) {
-                        success = !m_active.has_value()
-                            && m_queuedExecutionItems.load(
-                                std::memory_order_acquire) != 0;
-                    }
-                    if (success && !feedHeld) {
-                        resetFeedRetiming();
-                        m_snapshot.state = BackendState::Running;
-                    }
-                } else if constexpr (std::same_as<T, FeedHoldRequest>) {
-                    success = !m_jog.has_value()
-                        && m_snapshot.state == BackendState::Running
-                        && !m_feedRetiming.resuming
-                        && m_active.has_value() && !m_stopping;
+    void ProductionExecutorCore::serviceIngress() noexcept {
+        IngressRecord record;
+        while (m_ingress.tryPop(record)) {
+            if (record.kind == IngressKind::PublishedPlan) {
+                if (!m_plans.tryPush(record.planSlot)) {
+                    accountForDequeued(record.planSlot);
+                    release(record.planSlot);
+                    fault(INVALID_EXECUTION_STATE_FAULT);
+                }
+
+                continue;
+            }
+
+            m_queuedControls.fetch_sub(1, std::memory_order_acq_rel);
+            serviceControl(record.control);
+        }
+    }
+
+    void ProductionExecutorCore::serviceControl(
+        const ControlRequest &request) noexcept {
+        std::visit([&](const auto &value) {
+            using T = std::decay_t<decltype(value)>;
+            auto success = false;
+            if constexpr (std::same_as<T, EnableRequest>) {
+                success = !m_jog.has_value()
+                    && (m_snapshot.state == BackendState::Disabled
+                        || m_snapshot.state == BackendState::Held);
+                if (success) {
+                    m_snapshot.state = BackendState::Held;
+                    m_snapshot.faultCode = 0;
+                    m_faultEventEmitted = false;
+                }
+            } else if constexpr (std::same_as<T, DisableRequest>) {
+                if (m_jog.has_value()) {
+                    abandonJog(JogStopReason::Disabled);
+                }
+                discardExecution();
+                m_snapshot.state = BackendState::Disabled;
+                m_snapshot.commanded.velocity = {};
+                m_snapshot.commanded.acceleration = {};
+                m_snapshot.feedback = m_snapshot.commanded;
+                m_snapshot.commandedJoints.velocity = {};
+                m_snapshot.commandedJoints.acceleration = {};
+                m_snapshot.feedbackJoints =
+                    m_snapshot.commandedJoints;
+                m_outputState = {};
+                success = true;
+            } else if constexpr (std::same_as<T, StartRequest>) {
+                success = !m_jog.has_value()
+                    && m_snapshot.state == BackendState::Held
+                    && !m_feedRetiming.held
+                    && value.epoch != 0 && value.epoch == m_snapshot.epoch
+                    && value.epoch != m_controlledStoppedEpoch;
+                if (success) {
+                    resetFeedRetiming();
+                    m_snapshot.state = BackendState::Running;
+                }
+            } else if constexpr (std::same_as<T, ResumeRequest>) {
+                const auto feedHeld = m_feedRetiming.held;
+                success = !m_jog.has_value()
+                    && m_snapshot.state == BackendState::Held
+                    && value.epoch != 0
+                    && value.epoch == m_snapshot.epoch
+                    && value.epoch != m_controlledStoppedEpoch;
+                if (success && feedHeld) {
+                    success = m_active.has_value() && !m_stopping;
                     if (success && std::holds_alternative<PlanChunk>(
                             m_planSlots[*m_active].item)) {
-                        success = feedHoldAvailable();
+                        m_feedRetiming.held = false;
+                        m_feedRetiming.resuming = true;
+                        m_feedRetiming.acceleration = 0.0;
+                        m_feedRetiming.jerk = 0.0;
+                        m_snapshot.state = BackendState::Running;
                     } else if (success
                                && std::holds_alternative<TriggeredMove>(
                                    m_planSlots[*m_active].item)) {
                         success = !m_triggered.stopping
-                            && beginTriggeredStop(
-                                TriggeredMoveStatus::ReachedTarget, true);
-                    } else {
-                        success = false;
-                    }
-                    if (success) {
-                        m_feedRetiming.holding = true;
-                        m_feedRetiming.held = false;
-                        m_snapshot.state = BackendState::Holding;
-                    }
-                } else if constexpr (std::same_as<T, ControlledStopRequest>) {
-                    const auto stoppingJog = m_jog.has_value();
-                    if (stoppingJog) {
-                        success =
-                            beginJogStop(JogStopReason::RequestedStop);
-                    } else {
-                        success = (m_snapshot.state == BackendState::Running
-                                || m_snapshot.state == BackendState::Holding
-                                || (m_snapshot.state == BackendState::Held
-                                    && m_feedRetiming.held))
-                            && m_active.has_value();
-                    }
-                    if (success && !stoppingJog
-                        && std::holds_alternative<PlanChunk>(
-                            m_planSlots[*m_active].item)) {
-                        success = !m_stopping && beginPlanStop();
+                            && initializeTriggered();
                         if (success) {
                             resetFeedRetiming();
+                            m_snapshot.state = BackendState::Running;
                         }
-                    } else if (success && !stoppingJog
-                        && std::holds_alternative<TriggeredMove>(
-                            m_planSlots[*m_active].item)) {
-                        if (m_triggered.stopping) {
-                            success = false;
-                        } else if (!beginTriggeredStop(
-                                       TriggeredMoveStatus::Aborted)) {
-                            success = false;
-                            faultTriggered();
-                        } else {
-                            resetFeedRetiming();
-                        }
-                    } else if (success && !stoppingJog
-                               && std::holds_alternative<TriggeredJointMove>(
-                                   m_planSlots[*m_active].item)) {
-                        const auto &move = activeTriggeredJointMove();
-                        m_triggeredJointCompletionStatus =
-                            TriggeredMoveStatus::Aborted;
-                        for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
-                            const auto mask =
-                                static_cast<JointMask>(JointMask{1} << joint);
-                            auto &runtime = m_triggeredJoints[joint];
-                            if ((move.joints & mask) == 0 || runtime.finished
-                                || runtime.stopping) {
-                                continue;
-                            }
-                            if (!beginTriggeredJointStop(
-                                    move, joint, false)) {
-                                success = false;
-                                faultTriggered();
-                                break;
-                            }
-                        }
-                    } else if (!stoppingJog) {
+                    } else {
                         success = false;
                     }
-                    if (success && !stoppingJog) {
-                        m_snapshot.state = BackendState::Holding;
-                    }
-                } else if constexpr (std::same_as<T, AbortRequest>) {
-                    if (m_jog.has_value()) {
-                        success = beginJogStop(JogStopReason::Aborted);
-                    } else {
-                        discardExecution();
-                        m_snapshot.state = BackendState::Held;
-                        auto stopped = m_snapshot.commanded;
-                        stopped.velocity = {};
-                        stopped.acceleration = {};
-                        applyAxisMotionState(stopped);
-                        success = true;
-                    }
+                } else if (success) {
+                    success = !m_active.has_value()
+                        && m_queuedExecutionItems.load(
+                            std::memory_order_acquire) != 0;
+                }
+                if (success && !feedHeld) {
+                    resetFeedRetiming();
+                    m_snapshot.state = BackendState::Running;
+                }
+            } else if constexpr (std::same_as<T, FeedHoldRequest>) {
+                success = !m_jog.has_value()
+                    && m_snapshot.state == BackendState::Running
+                    && !m_feedRetiming.resuming
+                    && m_active.has_value() && !m_stopping;
+                if (success && std::holds_alternative<PlanChunk>(
+                        m_planSlots[*m_active].item)) {
+                    success = feedHoldAvailable();
+                } else if (success
+                           && std::holds_alternative<TriggeredMove>(
+                               m_planSlots[*m_active].item)) {
+                    success = !m_triggered.stopping
+                        && beginTriggeredStop(
+                            TriggeredMoveStatus::ReachedTarget, true);
+                } else {
+                    success = false;
+                }
+                if (success) {
+                    m_feedRetiming.holding = true;
+                    m_feedRetiming.held = false;
+                    m_snapshot.state = BackendState::Holding;
+                }
+            } else if constexpr (std::same_as<T, ControlledStopRequest>) {
+                const auto stoppingJog = m_jog.has_value();
+                if (stoppingJog) {
+                    success =
+                        beginJogStop(JogStopReason::RequestedStop);
+                } else {
+                    success = (m_snapshot.state == BackendState::Running
+                            || m_snapshot.state == BackendState::Holding
+                            || (m_snapshot.state == BackendState::Held
+                                && m_feedRetiming.held))
+                        && m_active.has_value();
+                }
+                if (success && !stoppingJog
+                    && std::holds_alternative<PlanChunk>(
+                        m_planSlots[*m_active].item)) {
+                    success = !m_stopping && beginPlanStop();
                     if (success) {
-                        m_outputState = {};
+                        resetFeedRetiming();
                     }
-                } else if constexpr (std::same_as<T, ResetRequest>) {
-                    const auto enabled =
-                        m_snapshot.state != BackendState::Disabled;
-                    if (m_jog.has_value()) {
-                        abandonJog(JogStopReason::Aborted);
+                } else if (success && !stoppingJog
+                    && std::holds_alternative<TriggeredMove>(
+                        m_planSlots[*m_active].item)) {
+                    if (m_triggered.stopping) {
+                        success = false;
+                    } else if (!beginTriggeredStop(
+                                   TriggeredMoveStatus::Aborted)) {
+                        success = false;
+                        faultTriggered();
+                    } else {
+                        resetFeedRetiming();
                     }
-                    discardExecution();
-                    const auto commanded = m_snapshot.commanded;
-                    const auto feedback = m_snapshot.feedback;
-                    const auto commandedJoints = m_snapshot.commandedJoints;
-                    const auto feedbackJoints = m_snapshot.feedbackJoints;
-                    m_snapshot = {};
-                    m_snapshot.state = enabled
-                        ? BackendState::Held : BackendState::Disabled;
-                    m_snapshot.epoch = value.nextEpoch;
-                    m_snapshot.commanded = commanded;
-                    m_snapshot.feedback = feedback;
-                    m_snapshot.commandedJoints = commandedJoints;
-                    m_snapshot.feedbackJoints = feedbackJoints;
-                    m_planStop.reset();
-                    m_controlledStoppedEpoch = 0;
-                    m_outputState = {};
-                    m_faultEventEmitted = false;
-                    success = value.nextEpoch != 0;
-                } else if constexpr (std::same_as<T, SetJointPositionRequest>) {
-                    constexpr auto validJointMask =
-                        static_cast<JointMask>(
-                            (JointMask{1} << MAX_JOINTS) - 1);
-                    success = !m_jog.has_value()
-                        && m_snapshot.state == BackendState::Held
-                        && !m_active.has_value() && value.joints != 0
-                        && (value.joints & ~validJointMask) == 0;
-                    for (JointId joint = 0;
-                         success && joint < MAX_JOINTS; ++joint) {
+                } else if (success && !stoppingJog
+                           && std::holds_alternative<TriggeredJointMove>(
+                               m_planSlots[*m_active].item)) {
+                    const auto &move = activeTriggeredJointMove();
+                    m_triggeredJointCompletionStatus =
+                        TriggeredMoveStatus::Aborted;
+                    for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
                         const auto mask =
                             static_cast<JointMask>(JointMask{1} << joint);
-                        if ((value.joints & mask) != 0
-                            && !std::isfinite(value.position[joint])) {
+                        auto &runtime = m_triggeredJoints[joint];
+                        if ((move.joints & mask) == 0 || runtime.finished
+                            || runtime.stopping) {
+                            continue;
+                        }
+                        if (!beginTriggeredJointStop(
+                                move, joint, false)) {
                             success = false;
+                            faultTriggered();
+                            break;
                         }
                     }
-                    if (success) {
-                        auto state = m_snapshot.commandedJoints;
-                        for (JointId joint = 0;
-                             joint < MAX_JOINTS; ++joint) {
-                            const auto mask =
-                                static_cast<JointMask>(
-                                    JointMask{1} << joint);
-                            if ((value.joints & mask) == 0) {
-                                continue;
-                            }
-                            state.position[joint] = value.position[joint];
-                            state.velocity[joint] = 0.0;
-                            state.acceleration[joint] = 0.0;
-                        }
-                        assignJointCoordinates(state);
-                    }
-                } else if constexpr (
-                    std::same_as<T, StartContinuousJogRequest>
-                    || std::same_as<T, StartIncrementalJogRequest>) {
-                    success = initializeJog(value);
-                } else if constexpr (
-                    std::same_as<T, RenewJogLeaseRequest>) {
-                    success = m_jog.has_value() && m_jog->continuous
-                        && !m_jog->stopping && m_jog->id == value.jog;
-                    if (success) {
-                        m_jog->leaseTicks = m_jog->leasePeriod;
-                    }
-                } else if constexpr (
-                    std::same_as<T, SetContinuousJogVelocityRequest>) {
-                    success = m_jog.has_value() && m_jog->id == value.jog
-                        && setContinuousJogVelocity(value.signedVelocity);
-                } else if constexpr (std::same_as<T, StopJogRequest>) {
-                    success = m_jog.has_value() && m_jog->id == value.jog
-                        && beginJogStop(JogStopReason::RequestedStop);
+                } else if (!stoppingJog) {
+                    success = false;
                 }
+                if (success && !stoppingJog) {
+                    m_snapshot.state = BackendState::Holding;
+                }
+            } else if constexpr (std::same_as<T, AbortRequest>) {
+                if (m_jog.has_value()) {
+                    success = beginJogStop(JogStopReason::Aborted);
+                } else {
+                    discardExecution();
+                    m_snapshot.state = BackendState::Held;
+                    auto stopped = m_snapshot.commanded;
+                    stopped.velocity = {};
+                    stopped.acceleration = {};
+                    applyAxisMotionState(stopped);
+                    success = true;
+                }
+                if (success) {
+                    m_outputState = {};
+                }
+            } else if constexpr (std::same_as<T, ResetRequest>) {
+                const auto enabled =
+                    m_snapshot.state != BackendState::Disabled;
+                if (m_jog.has_value()) {
+                    abandonJog(JogStopReason::Aborted);
+                }
+                discardExecution();
+                const auto commanded = m_snapshot.commanded;
+                const auto feedback = m_snapshot.feedback;
+                const auto commandedJoints = m_snapshot.commandedJoints;
+                const auto feedbackJoints = m_snapshot.feedbackJoints;
+                m_snapshot = {};
+                m_snapshot.state = enabled
+                    ? BackendState::Held : BackendState::Disabled;
+                m_snapshot.epoch = value.nextEpoch;
+                m_snapshot.commanded = commanded;
+                m_snapshot.feedback = feedback;
+                m_snapshot.commandedJoints = commandedJoints;
+                m_snapshot.feedbackJoints = feedbackJoints;
+                m_planStop.reset();
+                m_controlledStoppedEpoch = 0;
+                m_outputState = {};
+                m_faultEventEmitted = false;
+                success = value.nextEpoch != 0;
+            } else if constexpr (std::same_as<T, SetJointPositionRequest>) {
+                constexpr auto validJointMask =
+                    static_cast<JointMask>(
+                        (JointMask{1} << MAX_JOINTS) - 1);
+                success = !m_jog.has_value()
+                    && m_snapshot.state == BackendState::Held
+                    && !m_active.has_value() && value.joints != 0
+                    && (value.joints & ~validJointMask) == 0;
+                for (JointId joint = 0;
+                     success && joint < MAX_JOINTS; ++joint) {
+                    const auto mask =
+                        static_cast<JointMask>(JointMask{1} << joint);
+                    if ((value.joints & mask) != 0
+                        && !std::isfinite(value.position[joint])) {
+                        success = false;
+                    }
+                }
+                if (success) {
+                    auto state = m_snapshot.commandedJoints;
+                    for (JointId joint = 0;
+                         joint < MAX_JOINTS; ++joint) {
+                        const auto mask =
+                            static_cast<JointMask>(
+                                JointMask{1} << joint);
+                        if ((value.joints & mask) == 0) {
+                            continue;
+                        }
+                        state.position[joint] = value.position[joint];
+                        state.velocity[joint] = 0.0;
+                        state.acceleration[joint] = 0.0;
+                    }
+                    assignJointCoordinates(state);
+                }
+            } else if constexpr (
+                std::same_as<T, StartContinuousJogRequest>
+                || std::same_as<T, StartIncrementalJogRequest>) {
+                success = initializeJog(value);
+            } else if constexpr (
+                std::same_as<T, RenewJogLeaseRequest>) {
+                success = m_jog.has_value() && m_jog->continuous
+                    && !m_jog->stopping && m_jog->id == value.jog;
+                if (success) {
+                    m_jog->leaseTicks = m_jog->leasePeriod;
+                }
+            } else if constexpr (
+                std::same_as<T, SetContinuousJogVelocityRequest>) {
+                success = m_jog.has_value() && m_jog->id == value.jog
+                    && setContinuousJogVelocity(value.signedVelocity);
+            } else if constexpr (std::same_as<T, StopJogRequest>) {
+                success = m_jog.has_value() && m_jog->id == value.jog
+                    && beginJogStop(JogStopReason::RequestedStop);
+            }
 
-                emit(RequestCompleted{value.id, success});
-            }, request);
-        }
+            emit(RequestCompleted{value.id, success});
+        }, request);
     }
 
     void ProductionExecutorCore::activateNext() noexcept {
@@ -2259,6 +2315,18 @@ namespace ngc {
             TriggeredMoveStatus::ReachedTarget;
         m_stopTailFaultCode = 0;
         m_snapshot.activeJoints = 0;
+    }
+
+    void ProductionExecutorCore::discardIngress() noexcept {
+        IngressRecord record;
+        while (m_ingress.tryPop(record)) {
+            if (record.kind == IngressKind::PublishedPlan) {
+                accountForDequeued(record.planSlot);
+                release(record.planSlot);
+            } else {
+                m_queuedControls.fetch_sub(1, std::memory_order_acq_rel);
+            }
+        }
     }
 
     void ProductionExecutorCore::release(const std::uint8_t index) noexcept {

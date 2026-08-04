@@ -28,6 +28,8 @@ namespace ngc {
             MotionBackend &backend,
             IpcExecutorPolicy *policy = nullptr) noexcept;
 
+        // One NRT bridge thread must own service(true), which serializes plan
+        // publication and ordinary controls into the executor's shared ingress.
         bool service(bool consume) noexcept;
         [[nodiscard]] std::uint64_t completedControls() const noexcept;
 
