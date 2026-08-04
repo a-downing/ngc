@@ -6,6 +6,14 @@ Never use LaTeX in responses for this repository because the Codex UI does not r
 
 Keep this file focused on durable repository-wide constraints. Do not turn it into a changelog, benchmark notebook, dated checkpoint, or task backlog. Verify implementation claims against current code and tests, and update this guide when an architectural invariant changes.
 
+For general exploratory bug hunts, do not select the absence of a frontend
+heartbeat or liveness lease for the external Machine executor as a finding.
+Live-but-unresponsive frontend supervision is explicitly deferred and is not a
+current project concern. Investigate it only when the task specifically asks
+about IPC liveness, frontend hangs, or communication-timeout behavior. Continue
+to treat actual frontend process loss, backend-process loss, hardware transport
+failure, and the existing external-enable/E-stop paths as safety-relevant.
+
 For C++ changes, follow the repository's dedicated [C++ style guide](docs/cpp_style.md). Treat it as the formatting authority for new and modified C++ code.
 
 ## Continuous-path terminology
