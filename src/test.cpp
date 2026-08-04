@@ -36,6 +36,7 @@
 #include "machine/PresentationTracker.h"
 #ifdef __linux__
 #include "machine/HostedExecutorRuntime.h"
+#include "machine/IpcExecutorBridge.h"
 #endif
 #include "machine/SpscChannel.h"
 #include "machine/SplineHandleOptimization.h"
@@ -1924,6 +1925,31 @@ final_move_together = true
                 "production timing should report failed nonblocking publications after recovery");
 
         runtime.stop();
+    }
+
+    void testFrontendLossDisablesRunningExecutorWithoutPlan() {
+        ngc::HostedExecutorRuntimeConfiguration configuration;
+        ngc::HostedExecutorRuntime runtime(configuration);
+        auto &backend = runtime.endpoint();
+        const auto submit = [&](const ngc::ControlRequest &request) {
+            require(backend.trySubmit(request) == ngc::SubmitResult::Submitted,
+                    "frontend-loss setup control should fit");
+            runtime.serviceImmediate();
+        };
+
+        submit(ngc::ResetRequest{1, 1});
+        submit(ngc::EnableRequest{2});
+        submit(ngc::StartRequest{3, 1});
+
+        ngc::ExecutionSnapshot snapshot;
+        while (backend.tryTakeSnapshot(snapshot)) { }
+        require(snapshot.state == ngc::BackendState::Running
+                    && snapshot.activeChunk == 0,
+                "frontend-loss setup should be running without a plan");
+
+        const auto stopped = ngc::stopExecutorAfterFrontendLoss(runtime);
+        require(stopped.state == ngc::BackendState::Disabled,
+                "frontend loss should disable a running executor without a plan");
     }
 #endif
 
@@ -8610,6 +8636,7 @@ int main() {
         testInProcessSimulationRuntimePersistsAcrossTimedEpochs();
 #ifdef __linux__
         testHostedExecutorRuntimeOwnsFixedPeriodLifecycle();
+        testFrontendLossDisablesRunningExecutorWithoutPlan();
         testHostedExecutorRuntimePublishesBoundedTiming();
         testHostedExecutorRuntimeReportsIoFault();
         testProductionExecutorTimingBackpressureDoesNotBlockServo();

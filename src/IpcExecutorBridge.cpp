@@ -147,75 +147,62 @@ namespace ngc {
         constexpr RequestId internalRequest = 0;
         auto &backend = runtime.endpoint();
         auto snapshot = ExecutionSnapshot{};
-        auto stopPending = false;
-        auto snapshotSeen = false;
-        auto stopResult = std::optional<bool>{};
         const auto service = [&] {
             runtime.serviceImmediate();
             runtime.waitForServiceMotion();
         };
-
-        ExecutionEvent staleEvent;
-        while (backend.tryTakeEvent(staleEvent)) { }
-        while (backend.tryTakeSnapshot(snapshot)) { }
-
-        for (;;) {
-            auto completedThisIteration = false;
+        const auto drain = [&] {
+            auto snapshotSeen = false;
             ExecutionEvent event;
-            while (backend.tryTakeEvent(event)) {
-                const auto *completed =
-                    std::get_if<RequestCompleted>(&event);
-                if (completed != nullptr
-                    && completed->request == internalRequest) {
-                    stopPending = false;
-                    stopResult = completed->succeeded;
-                    completedThisIteration = true;
-                }
-            }
+            while (backend.tryTakeEvent(event)) { }
             while (backend.tryTakeSnapshot(snapshot)) {
                 snapshotSeen = true;
             }
 
-            if (completedThisIteration) {
-                snapshotSeen = false;
+            return snapshotSeen;
+        };
+        const auto submitAndWait = [&](const ControlRequest &request) {
+            while (backend.trySubmit(request) != SubmitResult::Submitted) {
                 service();
-                continue;
-            }
-            if (stopResult.has_value() && snapshotSeen
-                && (snapshot.state == BackendState::Held
-                    || snapshot.state == BackendState::Faulted
-                    || snapshot.state == BackendState::Disabled)) {
-                break;
-            }
-            if (stopResult.has_value() && !*stopResult) {
-                stopResult.reset();
-            }
-            if (!stopPending
-                && !stopResult.has_value()
-                && backend.trySubmit(
-                    ControlledStopRequest{internalRequest})
-                    == SubmitResult::Submitted) {
-                stopPending = true;
             }
 
+            for (;;) {
+                service();
+                ExecutionEvent event;
+                while (backend.tryTakeEvent(event)) {
+                    if (const auto *completed =
+                            std::get_if<RequestCompleted>(&event);
+                        completed != nullptr
+                        && completed->request == internalRequest) {
+                        while (backend.tryTakeSnapshot(snapshot)) { }
+
+                        return completed->succeeded;
+                    }
+                }
+                while (backend.tryTakeSnapshot(snapshot)) { }
+            }
+        };
+
+        while (!drain()) {
             service();
         }
 
-        auto disablePending = false;
-        while (snapshot.state != BackendState::Disabled) {
-            ExecutionEvent event;
-            while (backend.tryTakeEvent(event)) { }
-            while (backend.tryTakeSnapshot(snapshot)) { }
-            if (snapshot.state == BackendState::Disabled) {
-                break;
+        if ((snapshot.state == BackendState::Running
+                || snapshot.state == BackendState::Holding)
+            && submitAndWait(ControlledStopRequest{internalRequest})) {
+            while (snapshot.state != BackendState::Held
+                && snapshot.state != BackendState::Faulted
+                && snapshot.state != BackendState::Disabled) {
+                service();
+                static_cast<void>(drain());
             }
-            if (!disablePending
-                && backend.trySubmit(DisableRequest{internalRequest})
-                    == SubmitResult::Submitted) {
-                disablePending = true;
+        }
+        if (snapshot.state != BackendState::Disabled) {
+            static_cast<void>(submitAndWait(DisableRequest{internalRequest}));
+            while (snapshot.state != BackendState::Disabled) {
+                service();
+                static_cast<void>(drain());
             }
-
-            service();
         }
 
         // Disable is staged by applyOutputs() after its servo tick. One more
