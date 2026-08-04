@@ -2897,8 +2897,11 @@ G1 F60 X2
             snapshot=worker.snapshot();
         }
         require(snapshot.status==ngc::SimulationStatus::Completed,std::format(
-            "timed simulation should refill and terminal-compile a continuous batch before its rapid: {}",
-            snapshot.error));
+            "timed simulation should refill and terminal-compile a continuous batch before its rapid: "
+            "status={} backend={} fault={} error='{}'",
+            static_cast<int>(snapshot.status),
+            static_cast<int>(snapshot.trajectoryBackendState),
+            snapshot.trajectoryBackendFaultCode, snapshot.error));
         requireNear(snapshot.machinePosition.x,9.0,
                     "motion after the ended rolling G64 chain should execute");
         require(snapshot.trajectoryPlanning.planChunks>8
@@ -3339,6 +3342,7 @@ G1 F60 X2
     void testSimulationDriverFailureAppearsInGuiStatusStream() {
         ngc::MachineSessionManager worker(UNIT,{
             .pathAcceleration=0.0,.rapidSpeed=100.0,.arcChordTolerance=0.0001,.pathJerk=10.0,
+            .axisPosition = {},
         });
         const auto authority = worker.state().authority;
         require(worker.powerOn(authority), "Simulation should power on explicitly");
@@ -5102,6 +5106,7 @@ G1 F60 X2
             .axisVelocity = {2.0, 2.0, 2.0, 2.0, 2.0, 2.0},
             .axisAcceleration = {4.0, 4.0, 4.0, 4.0, 4.0, 4.0},
             .axisJerk = {20.0, 20.0, 20.0, 20.0, 20.0, 20.0},
+            .axisPosition = {},
         };
         ngc::TrajectoryCompiler compiler(limits);
         compiler.reset(95, points.front());
@@ -6230,6 +6235,7 @@ G1 F60 X2
             .rapidSpeed = 120.0,
             .arcChordTolerance = 0.0001,
             .pathJerk = JERK,
+            .axisPosition = {},
         });
         planner.reset(9);
 
@@ -6302,6 +6308,7 @@ G1 F60 X2
             .pathAcceleration = std::numeric_limits<double>::infinity(),
             .rapidSpeed = 120.0,
             .arcChordTolerance = 0.0001,
+            .axisPosition = {},
         });
         instantaneous.reset(10);
         const auto constantSpeed = instantaneous.compile(
@@ -6317,6 +6324,47 @@ G1 F60 X2
                     "constant-speed line duration should be distance divided by feed");
     }
 
+    void testTrajectoryCompilerRejectsAxisPositionLimitViolations() {
+        ngc::TrajectoryLimits limits;
+        limits.axisPosition.minimum.x = -1.0;
+        limits.axisPosition.maximum.x = 1.0;
+        ngc::TrajectoryCompiler compiler(limits);
+        compiler.reset(1);
+
+        const auto accepted = compiler.compile(
+            ngc::MoveLine{{}, {1.0, 0, 0, 0, 0, 0}, 60.0});
+        require(accepted.has_value(),
+                accepted ? "" : accepted.error());
+
+        compiler.reset(2);
+        const auto rejected = compiler.compile(
+            ngc::MoveLine{{}, {1.1, 0, 0, 0, 0, 0}, 60.0});
+        require(!rejected.has_value()
+                    && rejected.error().contains("axis X")
+                    && rejected.error().contains("outside"),
+                "the frontend compiler accepted an out-of-range line");
+
+        ngc::AxisPolynomialSpan interior;
+        interior.degree = ngc::ExecutionPolynomialDegree::Quintic;
+        interior.coefficients[0].x = 4.0;
+        interior.coefficients[1].x = -4.0;
+        const auto range = ngc::trajectory_detail::axisPositionRange(
+            interior, &ngc::position_t::x);
+        requireNear(range.minimum, 0.0,
+                    "position-range validation lost the polynomial endpoints");
+        requireNear(range.maximum, 1.0,
+                    "position-range validation missed an interior extremum");
+
+        const ngc::ProbeMove probe {
+            1, {}, {1.1, 0, 0, 0, 0, 0}, 60.0, true, false,
+        };
+        const auto rejectedProbe = compiler.compileTriggeredMove(probe);
+        require(!rejectedProbe.has_value()
+                    && rejectedProbe.error().contains("triggered-move target")
+                    && rejectedProbe.error().contains("axis X"),
+                "the frontend compiler accepted an out-of-range probe target");
+    }
+
     void testExactStopPlannerEnforcesIndependentAxisLimits() {
         constexpr auto infinity = std::numeric_limits<double>::infinity();
         ngc::TrajectoryCompiler planner({
@@ -6327,6 +6375,7 @@ G1 F60 X2
             .axisVelocity = { 0.25, 0.5, infinity, 0.1, infinity, infinity },
             .axisAcceleration = { 0.5, 1.0, infinity, 0.2, infinity, infinity },
             .axisJerk = { 2.0, 4.0, infinity, 0.5, infinity, infinity },
+            .axisPosition = {},
         });
         planner.reset(11);
 
@@ -6351,6 +6400,7 @@ G1 F60 X2
             .axisVelocity = { 0.2, 0.35, infinity, infinity, infinity, infinity },
             .axisAcceleration = { 0.3, 0.6, infinity, infinity, infinity, infinity },
             .axisJerk = { 2.0, 3.0, infinity, infinity, infinity, infinity },
+            .axisPosition = {},
         });
         const ngc::position_t arcStart { 1, 0, 0, 0, 0, 0 };
         arcPlanner.reset(12, arcStart);
@@ -6917,6 +6967,7 @@ G1 F60 X2
                            3.333333333,3.333333333,3.333333333},
             .axisAcceleration={20,20,20,20,20,20},
             .axisJerk={501,501,501,501,501,501},
+            .axisPosition = {},
         };
         const std::array accelerationControls{
             ngc::position_t{},
@@ -7415,6 +7466,7 @@ G1 F60 X2
                            3.333333333,3.333333333,3.333333333},
             .axisAcceleration={20,20,20,20,20,20},
             .axisJerk={501,501,501,501,501,501},
+            .axisPosition = {},
         });
         compiler.reset(93,first);
         const auto planned=compiler.compileContinuous(*prepared,0.005);
@@ -7580,6 +7632,7 @@ G1 F60 X2
                 .pathAcceleration = std::numeric_limits<double>::infinity(),
                 .rapidSpeed = 120.0,
                 .arcChordTolerance = TOLERANCE,
+                .axisPosition = {},
             });
             planner.reset(20, from);
             const auto chunk = planner.compile(ngc::MoveArc { from, to, {}, { 0, 0, 1 }, 60.0 });
@@ -7624,6 +7677,7 @@ G1 F60 X2
             .pathAcceleration = std::numeric_limits<double>::infinity(),
             .rapidSpeed = 120.0,
             .arcChordTolerance = TOLERANCE,
+            .axisPosition = {},
         });
         planner.reset(41, start);
         const auto first = planner.compile(firstArc);
@@ -7657,6 +7711,7 @@ G1 F60 X2
             .pathAcceleration = std::numeric_limits<double>::infinity(),
             .rapidSpeed = 120.0,
             .arcChordTolerance = TOLERANCE,
+            .axisPosition = {},
         });
         const ngc::position_t lineStart { 2, 0, 0, 0, 0, 0 };
         lineThenArc.reset(42, lineStart);
@@ -7697,6 +7752,7 @@ G1 F60 X2
             .rapidSpeed = 120.0,
             .arcChordTolerance = 0.0001,
             .pathJerk = JERK,
+            .axisPosition = {},
         });
         const ngc::position_t start { 1, 0, 0, 0, 0, 0 };
         planner.reset(43, start);
@@ -7884,6 +7940,12 @@ G1 F60 X2
                         &&configured.maxJerk>0.0,
                     "each logical axis should load positive independent motion limits");
             const auto member=component(coordinate);
+            requireNear(configuration->trajectory.axisPosition.minimum.*member,
+                        configured.minimum,
+                        "trajectory limits should retain each configured axis minimum");
+            requireNear(configuration->trajectory.axisPosition.maximum.*member,
+                        configured.maximum,
+                        "trajectory limits should retain each configured axis maximum");
             requireNear(configuration->trajectory.axisVelocity.*member,configured.maxVelocity,
                         "trajectory limits should retain each configured axis velocity");
             requireNear(configuration->trajectory.axisAcceleration.*member,configured.maxAcceleration,
@@ -8253,6 +8315,7 @@ G1 F60 X2
                 std::numeric_limits<double>::infinity(), 1.0,
                 std::numeric_limits<double>::infinity(), std::numeric_limits<double>::infinity(),
                 std::numeric_limits<double>::infinity() },
+            .axisPosition = {},
         });
         planner.reset(3, {});
         const ngc::ProbeMove probeCommand {
@@ -8567,6 +8630,7 @@ int main() {
         testProductionExecutorBackendConformance();
 #endif
         testExactStopPlannerCompilesLinesAndArcs();
+        testTrajectoryCompilerRejectsAxisPositionLimitViolations();
         testInfiniteJerkTrajectoryTimeMatchesAnalyticLine();
         testExactStopPlannerEnforcesIndependentAxisLimits();
         testPreparedArcJunctionMatchesSourceCurvature();

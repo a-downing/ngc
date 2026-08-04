@@ -46,7 +46,7 @@ GeometryStreamProducer
        -> MotionBackend
 ```
 
-`Worker` retains immutable prepared curves and presentation metadata as Preview's sole toolpath representation. `MachineSessionManager` owns the persistent Simulation session that consumes the same prepared stream through `PreparedTrajectoryExecutionDriver`. Ordinary motion becomes timed axis-polynomial `PlanChunk` values; probes and homing/service moves use executor-owned triggered moves.
+`Worker` retains immutable prepared curves and presentation metadata as Preview's sole toolpath representation. `MachineSessionManager` owns the persistent Simulation session that consumes the same prepared stream through `PreparedTrajectoryExecutionDriver`. Ordinary motion becomes timed axis-polynomial `PlanChunk` values; probes and homing/service moves use executor-owned triggered moves. Before publication, the NRT trajectory compiler proves the per-axis position range of every normal and stop-tail execution span against configured soft limits and validates triggered-move endpoints. The RT executor independently checks each current commanded axis position and projected limited-joint position before committing it; a violation faults motion and preserves the last valid command.
 
 `InProcessSimulationRuntime` owns the persistent `MockMotionBackend`, its sleeping
 servo-scheduler thread, accelerated-playback coordination, synthetic input

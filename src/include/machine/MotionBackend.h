@@ -27,6 +27,25 @@ namespace ngc {
         position_t acceleration{};
     };
 
+    struct AxisPositionLimits {
+        position_t minimum = {
+            -std::numeric_limits<double>::infinity(),
+            -std::numeric_limits<double>::infinity(),
+            -std::numeric_limits<double>::infinity(),
+            -std::numeric_limits<double>::infinity(),
+            -std::numeric_limits<double>::infinity(),
+            -std::numeric_limits<double>::infinity(),
+        };
+        position_t maximum = {
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(),
+            std::numeric_limits<double>::infinity(),
+        };
+    };
+
     enum class ExecutionPolynomialDegree : std::uint8_t {
         Cubic = 3,
         Quintic = 5,

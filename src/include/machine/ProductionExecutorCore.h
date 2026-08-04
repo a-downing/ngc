@@ -41,6 +41,10 @@ namespace ngc {
 
     struct ProductionExecutorConfiguration {
         AxisJointMappings axes{};
+        AxisPositionLimits axisPosition;
+        JointVector jointMinimum{};
+        JointVector jointMaximum{};
+        JointMask positionLimitedJoints = 0;
         ProductionExecutorFeedHoldConfiguration feedHold{};
         // Physical axis-space authority reserved for cancelling ordinary
         // PlanChunk motion. Zero limits leave that operation unavailable.
@@ -55,6 +59,7 @@ namespace ngc {
         PRODUCTION_EXECUTOR_MOTION_IS_PROBE = 1U << 0;
     inline constexpr std::uint32_t
         PRODUCTION_EXECUTOR_MOTION_IS_HOMING = 1U << 1;
+    inline constexpr std::uint32_t SOFT_LIMIT_INVARIANT_FAULT = 0x534C'0001;
 
     struct ProductionExecutorMotionContext {
         position_t axisPosition{};
@@ -220,7 +225,7 @@ namespace ngc {
 
         void serviceIngress() noexcept;
         void serviceControl(const ControlRequest &request) noexcept;
-        void applyAxisMotionState(const MotionState &state) noexcept;
+        [[nodiscard]] bool applyAxisMotionState(const MotionState &state) noexcept;
         void applyJointMotionState(const JointMotionState &state) noexcept;
         void assignJointCoordinates(const JointMotionState &state) noexcept;
         void activateNext() noexcept;
@@ -267,7 +272,7 @@ namespace ngc {
         [[nodiscard]] double jogCoordinate(const JogTarget &target) const noexcept;
         [[nodiscard]] double jogVelocity(const JogTarget &target) const noexcept;
         [[nodiscard]] double jogAcceleration(const JogTarget &target) const noexcept;
-        void applyJogState() noexcept;
+        [[nodiscard]] bool applyJogState() noexcept;
         bool calculateJogPosition(double distance, double velocity) noexcept;
         bool calculateJogVelocity(double targetVelocity) noexcept;
         bool initializeJog(const StartContinuousJogRequest &request) noexcept;
@@ -283,6 +288,7 @@ namespace ngc {
         void applyScheduledEventsForCurrentSpan() noexcept;
         void emitExecutionMarkersThrough(double parameter) noexcept;
         void emit(const ExecutionEvent &event) noexcept;
+        void faultSoftLimit() noexcept;
         void fault(std::uint32_t code) noexcept;
         void discardExecution() noexcept;
         void discardIngress() noexcept;

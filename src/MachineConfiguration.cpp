@@ -433,6 +433,8 @@ namespace ngc {
                             path, prefix + ".joints", "a joint may belong to only one logical axis", axisTable));
                 result.axes.push_back({ axis, std::move(*jointIds), *minimum, *maximum,
                                         *maxVelocity, *maxAcceleration, *maxJerk });
+                axisComponent(result.trajectory.axisPosition.minimum, axis) = *minimum;
+                axisComponent(result.trajectory.axisPosition.maximum, axis) = *maximum;
                 axisComponent(result.trajectory.axisVelocity, axis) = *maxVelocity;
                 axisComponent(result.trajectory.axisAcceleration, axis) = *maxAcceleration;
                 axisComponent(result.trajectory.axisJerk, axis) = *maxJerk;

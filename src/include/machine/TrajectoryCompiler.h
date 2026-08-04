@@ -95,6 +95,12 @@ namespace ngc {
 
         double maximumAxisVelocity(const AxisPolynomialSpan &span,
             const double position_t::*component);
+        struct AxisPositionRange {
+            double minimum = 0.0;
+            double maximum = 0.0;
+        };
+        AxisPositionRange axisPositionRange(const AxisPolynomialSpan &span,
+            const double position_t::*component);
         double maximumAxisAcceleration(const AxisPolynomialSpan &span,
             const double position_t::*component);
         double maximumAxisJerk(const AxisPolynomialSpan &span,
@@ -585,6 +591,7 @@ namespace ngc {
         position_t axisVelocity = unlimitedAxes();       // Machine units per second.
         position_t axisAcceleration = unlimitedAxes();   // Machine units per second squared.
         position_t axisJerk = unlimitedAxes();           // Machine units per second cubed.
+        AxisPositionLimits axisPosition;
         // Minimum NRT rolling-horizon duration; proof may extend it.
         double lookaheadDuration = 2.0;
     };

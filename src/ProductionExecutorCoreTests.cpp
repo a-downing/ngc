@@ -291,6 +291,53 @@ namespace {
                 "faulted executor output retained hardware enable");
     }
 
+    void testAxisMotionSoftLimitGuardFaultsBeforeCommit() {
+        ngc::ProductionExecutorConfiguration configuration;
+        auto &x = configuration.axes[
+            static_cast<std::size_t>(ngc::AxisId::X)];
+        x.joints = ngc::JointMask{1};
+        x.coordinateScale[0] = 2.0;
+        configuration.axisPosition.minimum.x = -1.0;
+        configuration.axisPosition.maximum.x = 1.0;
+        configuration.positionLimitedJoints = ngc::JointMask{1};
+        configuration.jointMinimum[0] = -1.0;
+        configuration.jointMaximum[0] = 0.75;
+        ngc::ProductionExecutorCore core(0.5, configuration);
+        initialize(core, 1);
+
+        const auto chunk = linearChunk(
+            1, 1, 0, 1, 1, 0.0, 0.5, 1.0);
+        require(core.tryPublish(chunk) == ngc::PublishResult::Published,
+                "soft-limit guard fixture did not publish");
+        require(core.trySubmit(ngc::StartRequest{3, 1})
+                    == ngc::SubmitResult::Submitted,
+                "soft-limit guard fixture did not start");
+
+        core.servoTick();
+        takeEvents(core);
+        auto snapshot = latestSnapshot(core);
+        requireNear(snapshot.commanded.position.x, 0.25,
+                    "soft-limit guard rejected an in-range command");
+        requireNear(snapshot.commandedJoints.position[0], 0.5,
+                    "soft-limit guard projected the in-range joint incorrectly");
+
+        core.servoTick();
+        const auto events = takeEvents(core);
+        snapshot = latestSnapshot(core);
+        const auto faults = selectEvents<ngc::BackendFault>(events);
+        require(snapshot.state == ngc::BackendState::Faulted
+                    && snapshot.faultCode == ngc::SOFT_LIMIT_INVARIANT_FAULT
+                    && faults.size() == 1
+                    && faults[0].code == ngc::SOFT_LIMIT_INVARIANT_FAULT,
+                "an out-of-range projected joint did not latch a soft-limit fault");
+        requireNear(snapshot.commanded.position.x, 0.25,
+                    "soft-limit fault committed the invalid axis command");
+        requireNear(snapshot.commandedJoints.position[0], 0.5,
+                    "soft-limit fault committed the invalid joint command");
+        require(!core.outputState().executorEnabled,
+                "soft-limit fault left executor outputs enabled");
+    }
+
     void testEmergencyStopFaultsSafelyAndResetsDisabled() {
         ngc::ProductionExecutorCore core(0.001);
         require(core.trySubmit(ngc::EnableRequest{1})
@@ -2789,6 +2836,7 @@ int main() {
     try {
         testAxisJointStateProjection();
         testPublishesFixedExecutorIoState();
+        testAxisMotionSoftLimitGuardFaultsBeforeCommit();
         testEmergencyStopFaultsSafelyAndResetsDisabled();
         testFixedTickExecutionAndAccounting();
         testAxisSpacePlanUpdatesMappedJoints();

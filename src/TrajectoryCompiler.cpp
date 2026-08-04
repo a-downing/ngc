@@ -871,6 +871,101 @@ namespace ngc {
             &position_t::x, &position_t::y, &position_t::z,
             &position_t::a, &position_t::b, &position_t::c,
         };
+        constexpr std::array AXIS_NAMES {'X', 'Y', 'Z', 'A', 'B', 'C'};
+        constexpr double POSITION_LIMIT_TOLERANCE = 1e-9;
+
+        bool axisPositionControlHullWithinLimits(
+                const AxisPolynomialSpan &span,
+                const double position_t::*component,
+                const double minimum, const double maximum) {
+            const auto origin = span.origin.*component;
+            const auto c1 = span.coefficients[0].*component;
+            const auto c2 = span.coefficients[1].*component;
+            const auto c3 = span.coefficients[2].*component;
+            const auto inside = [&](const double value) {
+                return std::isfinite(value)
+                    && value >= minimum - POSITION_LIMIT_TOLERANCE
+                    && value <= maximum + POSITION_LIMIT_TOLERANCE;
+            };
+            if (span.degree == ExecutionPolynomialDegree::Cubic) {
+                return inside(origin)
+                    && inside(origin + c1 / 3.0)
+                    && inside(origin + 2.0 * c1 / 3.0 + c2 / 3.0)
+                    && inside(origin + c1 + c2 + c3);
+            }
+
+            const auto c4 = span.coefficients[3].*component;
+            const auto c5 = span.coefficients[4].*component;
+            return inside(origin)
+                && inside(origin + c1 / 5.0)
+                && inside(origin + 2.0 * c1 / 5.0 + c2 / 10.0)
+                && inside(origin + 3.0 * c1 / 5.0 + 3.0 * c2 / 10.0
+                    + c3 / 10.0)
+                && inside(origin + 4.0 * c1 / 5.0 + 3.0 * c2 / 5.0
+                    + 2.0 * c3 / 5.0 + c4 / 5.0)
+                && inside(origin + c1 + c2 + c3 + c4 + c5);
+        }
+
+        std::optional<std::string> axisPositionViolation(
+                const position_t &position, const AxisPositionLimits &limits,
+                const std::string_view context) {
+            for (std::size_t axis = 0; axis < AXIS_COMPONENTS.size(); ++axis) {
+                const auto component = AXIS_COMPONENTS[axis];
+                const auto value = position.*component;
+                if (!std::isfinite(value)
+                   || value < limits.minimum.*component - POSITION_LIMIT_TOLERANCE
+                   || value > limits.maximum.*component + POSITION_LIMIT_TOLERANCE) {
+                    return std::format(
+                        "{} axis {} position {} is outside [{}, {}]",
+                        context, AXIS_NAMES[axis], value,
+                        limits.minimum.*component, limits.maximum.*component);
+                }
+            }
+
+            return std::nullopt;
+        }
+
+        std::optional<std::string> planChunkPositionViolation(
+                const PlanChunk &chunk, const AxisPositionLimits &limits) {
+            const auto validate = [&](const auto &spans,
+                                      const std::string_view section)
+                    -> std::optional<std::string> {
+                for (const auto &span : spans) {
+                    for (std::size_t axis = 0;
+                            axis < AXIS_COMPONENTS.size(); ++axis) {
+                        const auto component = AXIS_COMPONENTS[axis];
+                        if (axisPositionControlHullWithinLimits(
+                                span, component, limits.minimum.*component,
+                                limits.maximum.*component)) {
+                            continue;
+                        }
+                        const auto range = trajectory_detail::axisPositionRange(
+                            span, component);
+                        if (!std::isfinite(range.minimum)
+                           || !std::isfinite(range.maximum)
+                           || range.minimum < limits.minimum.*component
+                                - POSITION_LIMIT_TOLERANCE
+                           || range.maximum > limits.maximum.*component
+                                + POSITION_LIMIT_TOLERANCE) {
+                            return std::format(
+                                "trajectory chunk {} {} execution span {} axis {} "
+                                "range [{}, {}] is outside [{}, {}]",
+                                chunk.id, section, span.id, AXIS_NAMES[axis],
+                                range.minimum, range.maximum,
+                                limits.minimum.*component,
+                                limits.maximum.*component);
+                        }
+                    }
+                }
+
+                return std::nullopt;
+            };
+            if (auto violation = validate(chunk.normalMotion, "normal")) {
+                return violation;
+            }
+
+            return validate(chunk.stopTail, "stop-tail");
+        }
 
         struct QuinticConstraintBounds {
             double maximumRatio = 0.0;
@@ -1308,6 +1403,38 @@ namespace ngc {
             }
         }
 
+        AxisPositionRange axisPositionRange(const AxisPolynomialSpan &span,
+                const double position_t::*component) {
+            const std::vector<double> position {
+                span.origin.*component,
+                span.coefficients[0].*component,
+                span.coefficients[1].*component,
+                span.coefficients[2].*component,
+                span.coefficients[3].*component,
+                span.coefficients[4].*component,
+            };
+            std::vector<double> velocity {
+                position[1], 2.0 * position[2], 3.0 * position[3],
+                4.0 * position[4], 5.0 * position[5],
+            };
+            auto result = AxisPositionRange {
+                .minimum = std::min(
+                    evaluatePolynomial(position, 0.0),
+                    evaluatePolynomial(position, 1.0)),
+                .maximum = std::max(
+                    evaluatePolynomial(position, 0.0),
+                    evaluatePolynomial(position, 1.0)),
+            };
+            for (const auto parameter :
+                    polynomialRootsInUnitInterval(std::move(velocity))) {
+                const auto value = evaluatePolynomial(position, parameter);
+                result.minimum = std::min(result.minimum, value);
+                result.maximum = std::max(result.maximum, value);
+            }
+
+            return result;
+        }
+
         double maximumAxisVelocity(const AxisPolynomialSpan &span,
                 const double position_t::*component) {
             const auto c = componentCoefficients(span, component);
@@ -1705,6 +1832,10 @@ namespace ngc {
             })) {
             return std::unexpected(
                 "trajectory chunk execution-marker capacity exceeded");
+        }
+        if (auto violation = planChunkPositionViolation(
+                chunk, m_limits.axisPosition)) {
+            return std::unexpected(std::move(*violation));
         }
         m_previousBranch = chunk.branch;
         return chunk;
@@ -3456,6 +3587,12 @@ namespace ngc {
         if (!requestedEndState.has_value()) {
             result->chunks.back().stopTailPolicy = StopTailPolicy::StopAllowed;
         }
+        for (const auto &chunk : result->chunks) {
+            if (auto violation = planChunkPositionViolation(
+                    chunk, m_limits.axisPosition)) {
+                return std::unexpected(std::move(*violation));
+            }
+        }
 
         m_nextChunk=nextChunk;
         m_nextSpan=nextSpan;
@@ -3563,6 +3700,16 @@ namespace ngc {
         const auto length = std::sqrt(delta.x*delta.x + delta.y*delta.y + delta.z*delta.z
             + delta.a*delta.a + delta.b*delta.b + delta.c*delta.c);
         if(length <= 1e-12) return std::unexpected("triggered move must have nonzero length");
+        if (auto violation = axisPositionViolation(
+                command.from(), m_limits.axisPosition,
+                "triggered-move start")) {
+            return std::unexpected(std::move(*violation));
+        }
+        if (auto violation = axisPositionViolation(
+                command.target(), m_limits.axisPosition,
+                "triggered-move target")) {
+            return std::unexpected(std::move(*violation));
+        }
         const auto direction = scaled(delta, 1.0 / length);
         const auto magnitudes = [&](const double limit) {
             return position_t { std::abs(direction.x)*limit, std::abs(direction.y)*limit,

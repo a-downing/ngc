@@ -18,6 +18,7 @@ namespace ngc {
         constexpr std::uint32_t FEED_RETIMING_FAULT = 4;
         constexpr std::uint32_t FEED_RETIMING_STOP_BRANCH_FAULT = 5;
         constexpr double DYNAMIC_LIMIT_TOLERANCE = 1.01;
+        constexpr double POSITION_LIMIT_TOLERANCE = 1e-9;
 
         double magnitude(const position_t &value) noexcept {
             return std::sqrt(value.x * value.x + value.y * value.y
@@ -233,6 +234,30 @@ namespace ngc {
                 }
             }
             m_configuredJoints |= axis.joints;
+        }
+        const auto minimum = axisValues(m_configuration.axisPosition.minimum);
+        const auto maximum = axisValues(m_configuration.axisPosition.maximum);
+        for (auto axis = std::size_t{0}; axis < minimum.size(); ++axis) {
+            if (std::isnan(minimum[axis]) || std::isnan(maximum[axis])
+               || minimum[axis] >= maximum[axis]) {
+                throw std::invalid_argument(
+                    "production executor axis position limits must be ordered");
+            }
+        }
+        if ((m_configuration.positionLimitedJoints & ~m_configuredJoints) != 0) {
+            throw std::invalid_argument(
+                "production executor position limits reference unconfigured joints");
+        }
+        for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+            const auto mask = static_cast<JointMask>(JointMask{1} << joint);
+            if ((m_configuration.positionLimitedJoints & mask) != 0
+               && (!std::isfinite(m_configuration.jointMinimum[joint])
+                   || !std::isfinite(m_configuration.jointMaximum[joint])
+                   || m_configuration.jointMinimum[joint]
+                        >= m_configuration.jointMaximum[joint])) {
+                throw std::invalid_argument(
+                    "production executor joint position limits must be finite and ordered");
+            }
         }
     }
 
@@ -456,15 +481,47 @@ namespace ngc {
         return result;
     }
 
-    void ProductionExecutorCore::applyAxisMotionState(
+    bool ProductionExecutorCore::applyAxisMotionState(
         const MotionState &state) noexcept {
         const auto previous = m_snapshot.commanded;
+        auto commandedJoints = m_snapshot.commandedJoints;
         axis_joint_state_projection::advanceFromAxes(
             m_configuration.axes, previous, state,
-            m_snapshot.commandedJoints);
+            commandedJoints);
+        const auto position = axisValues(state.position);
+        const auto minimum = axisValues(m_configuration.axisPosition.minimum);
+        const auto maximum = axisValues(m_configuration.axisPosition.maximum);
+        for (auto axis = std::size_t{0}; axis < position.size(); ++axis) {
+            if (!std::isfinite(position[axis])
+               || position[axis] < minimum[axis] - POSITION_LIMIT_TOLERANCE
+               || position[axis] > maximum[axis] + POSITION_LIMIT_TOLERANCE) {
+                faultSoftLimit();
+
+                return false;
+            }
+        }
+        for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
+            const auto mask = static_cast<JointMask>(JointMask{1} << joint);
+            if ((m_configuration.positionLimitedJoints & mask) != 0
+               && (!std::isfinite(commandedJoints.position[joint])
+                   || commandedJoints.position[joint]
+                        < m_configuration.jointMinimum[joint]
+                            - POSITION_LIMIT_TOLERANCE
+                   || commandedJoints.position[joint]
+                        > m_configuration.jointMaximum[joint]
+                            + POSITION_LIMIT_TOLERANCE)) {
+                faultSoftLimit();
+
+                return false;
+            }
+        }
+
+        m_snapshot.commandedJoints = commandedJoints;
         m_snapshot.commanded = state;
         m_snapshot.feedback = state;
         m_snapshot.feedbackJoints = m_snapshot.commandedJoints;
+
+        return true;
     }
 
     void ProductionExecutorCore::applyJointMotionState(
@@ -669,8 +726,7 @@ namespace ngc {
                     auto stopped = m_snapshot.commanded;
                     stopped.velocity = {};
                     stopped.acceleration = {};
-                    applyAxisMotionState(stopped);
-                    success = true;
+                    success = applyAxisMotionState(stopped);
                 }
                 if (success) {
                     m_outputState = {};
@@ -984,7 +1040,9 @@ namespace ngc {
         auto held = m_snapshot.commanded;
         held.velocity = {};
         held.acceleration = {};
-        applyAxisMotionState(held);
+        if (!applyAxisMotionState(held)) {
+            return;
+        }
         m_snapshot.executionRate = 0.0;
         m_snapshot.executionRateAcceleration = 0.0;
         emit(BackendHeld{
@@ -1084,11 +1142,13 @@ namespace ngc {
         std::array<double, 6> acceleration{};
         stop.trajectory.at_time(
             stop.elapsed, position, velocity, acceleration);
-        applyAxisMotionState({
+        if (!applyAxisMotionState({
             stop.origin.position + axisPosition(position),
             axisPosition(velocity),
             axisPosition(acceleration),
-        });
+        })) {
+            return;
+        }
         m_snapshot.spanProgress = duration > 0.0
             ? std::clamp(stop.elapsed / duration, 0.0, 1.0) : 1.0;
         seconds -= consumed;
@@ -1105,7 +1165,9 @@ namespace ngc {
         auto stopped = m_snapshot.commanded;
         stopped.velocity = {};
         stopped.acceleration = {};
-        applyAxisMotionState(stopped);
+        if (!applyAxisMotionState(stopped)) {
+            return;
+        }
 
         emit(ChunkRetired{epoch, activeChunk().id});
         release(*m_active);
@@ -1171,9 +1233,13 @@ namespace ngc {
             const auto reference =
                 evaluateExecutionPolynomial(span, parameter);
             if (retiming) {
-                applyAxisMotionState(retimedState(reference));
+                if (!applyAxisMotionState(retimedState(reference))) {
+                    return;
+                }
             } else {
-                applyAxisMotionState(reference.state);
+                if (!applyAxisMotionState(reference.state)) {
+                    return;
+                }
             }
             emitExecutionMarkersThrough(parameter);
             if (m_snapshot.state == BackendState::Faulted) {
@@ -1325,7 +1391,9 @@ namespace ngc {
             stopped.position = move.target;
             stopped.velocity = {};
             stopped.acceleration = {};
-            applyAxisMotionState(stopped);
+            if (!applyAxisMotionState(stopped)) {
+                return;
+            }
             completeTriggered(TriggeredMoveStatus::ReachedTarget);
 
             return;
@@ -1336,7 +1404,9 @@ namespace ngc {
             auto stopped = m_snapshot.commanded;
             stopped.velocity = {};
             stopped.acceleration = {};
-            applyAxisMotionState(stopped);
+            if (!applyAxisMotionState(stopped)) {
+                return;
+            }
             if (m_triggered.feedHoldStopping) {
                 finishTriggeredFeedHold();
             } else {
@@ -1350,8 +1420,10 @@ namespace ngc {
         m_triggered.elapsed += consumed;
         const auto origin = m_triggered.stopping
             ? m_triggered.stopOrigin.position : m_triggered.start;
-        applyAxisMotionState(
-            triggeredStateAt(m_triggered.elapsed, origin));
+        if (!applyAxisMotionState(
+                triggeredStateAt(m_triggered.elapsed, origin))) {
+            return;
+        }
         m_snapshot.spanProgress = duration > 0.0
             ? std::clamp(m_triggered.elapsed / duration, 0.0, 1.0) : 1.0;
         seconds -= consumed;
@@ -1363,7 +1435,9 @@ namespace ngc {
             auto stopped = m_snapshot.commanded;
             stopped.velocity = {};
             stopped.acceleration = {};
-            applyAxisMotionState(stopped);
+            if (!applyAxisMotionState(stopped)) {
+                return;
+            }
             if (m_triggered.feedHoldStopping) {
                 finishTriggeredFeedHold();
             } else {
@@ -1377,7 +1451,9 @@ namespace ngc {
         stopped.position = move.target;
         stopped.velocity = {};
         stopped.acceleration = {};
-        applyAxisMotionState(stopped);
+        if (!applyAxisMotionState(stopped)) {
+            return;
+        }
         completeTriggered(TriggeredMoveStatus::ReachedTarget);
     }
 
@@ -1726,7 +1802,7 @@ namespace ngc {
         return 0.0;
     }
 
-    void ProductionExecutorCore::applyJogState() noexcept {
+    bool ProductionExecutorCore::applyJogState() noexcept {
         const auto &jog = *m_jog;
         if (jog.target.type == JogTargetType::Axis) {
             auto state = m_snapshot.commanded;
@@ -1736,9 +1812,7 @@ namespace ngc {
                 jog.velocity;
             axisComponent(state.acceleration, jog.target.axis) =
                 jog.acceleration;
-            applyAxisMotionState(state);
-
-            return;
+            return applyAxisMotionState(state);
         }
 
         auto state = m_snapshot.commandedJoints;
@@ -1753,6 +1827,8 @@ namespace ngc {
             state.acceleration[joint] = jog.acceleration;
         }
         applyJointMotionState(state);
+
+        return true;
     }
 
     bool ProductionExecutorCore::calculateJogPosition(
@@ -1976,7 +2052,9 @@ namespace ngc {
             && std::abs(jog.acceleration) <= 1e-12) {
             jog.velocity = 0.0;
             jog.acceleration = 0.0;
-            applyJogState();
+            if (!applyJogState()) {
+                return false;
+            }
             completeJog();
 
             return true;
@@ -2011,7 +2089,9 @@ namespace ngc {
             jog.position += jog.cruiseVelocity * seconds;
             jog.velocity = jog.cruiseVelocity;
             jog.acceleration = 0.0;
-            applyJogState();
+            if (!applyJogState()) {
+                return;
+            }
 
             return;
         }
@@ -2022,7 +2102,9 @@ namespace ngc {
         jog.elapsed += consumed;
         jog.trajectory.at_time(
             jog.elapsed, jog.position, jog.velocity, jog.acceleration);
-        applyJogState();
+        if (!applyJogState()) {
+            return;
+        }
         if (jog.elapsed + 1e-12 < duration) {
             return;
         }
@@ -2031,7 +2113,9 @@ namespace ngc {
         if (jog.stopping) {
             jog.velocity = 0.0;
             jog.acceleration = 0.0;
-            applyJogState();
+            if (!applyJogState()) {
+                return;
+            }
             completeJog();
 
             return;
@@ -2042,7 +2126,9 @@ namespace ngc {
                 jog.position += jog.cruiseVelocity * remaining;
                 jog.velocity = jog.cruiseVelocity;
                 jog.acceleration = 0.0;
-                applyJogState();
+                if (!applyJogState()) {
+                    return;
+                }
             }
 
             return;
@@ -2052,7 +2138,9 @@ namespace ngc {
         jog.acceleration = 0.0;
         jog.stopReason = jog.continuous
             ? JogStopReason::LimitReached : JogStopReason::TargetReached;
-        applyJogState();
+        if (!applyJogState()) {
+            return;
+        }
         completeJog();
     }
 
@@ -2076,7 +2164,9 @@ namespace ngc {
         m_jog->velocity = 0.0;
         m_jog->acceleration = 0.0;
         m_jog->stopReason = reason;
-        applyJogState();
+        if (!applyJogState()) {
+            return;
+        }
         completeJog();
     }
 
@@ -2116,7 +2206,9 @@ namespace ngc {
         }
 
         const auto chunk = activeChunk();
-        applyAxisMotionState(chunk.stopState);
+        if (!applyAxisMotionState(chunk.stopState)) {
+            return;
+        }
         m_snapshot.lastBranch = chunk.branch;
         if (m_stopTailFaultCode != 0) {
             const auto faultCode = m_stopTailFaultCode;
@@ -2279,6 +2371,20 @@ namespace ngc {
         if (!m_events.tryPush(event)) {
             fault(EVENT_OVERFLOW_FAULT);
         }
+    }
+
+    void ProductionExecutorCore::faultSoftLimit() noexcept {
+        if (m_jog.has_value()) {
+            const auto jog = *m_jog;
+            m_snapshot.activeJoints = 0;
+            emit(JogStopped{
+                jog.id, jog.target, JogStopReason::Fault,
+                m_snapshot.commanded, m_snapshot.commandedJoints,
+            });
+            m_jog.reset();
+        }
+        discardExecution();
+        fault(SOFT_LIMIT_INVARIANT_FAULT);
     }
 
     void ProductionExecutorCore::fault(const std::uint32_t code) noexcept {

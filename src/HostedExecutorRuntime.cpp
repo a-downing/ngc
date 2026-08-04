@@ -91,6 +91,10 @@ namespace ngc {
 
         for (const auto &axis : configuration.axes) {
             auto &mapping = result.executor.axes[axisIndex(axis.axis)];
+            component(result.executor.axisPosition.minimum, axis.axis) =
+                axis.minimum;
+            component(result.executor.axisPosition.maximum, axis.axis) =
+                axis.maximum;
             auto &stopVelocity =
                 component(result.executor.controlledStopLimits.velocity, axis.axis);
             auto &stopAcceleration =
@@ -118,6 +122,9 @@ namespace ngc {
 
                 mapping.joints |= JointMask{1} << id;
                 mapping.coordinateScale[id] = joint->coordinateScale;
+                result.executor.jointMinimum[id] = joint->minimum;
+                result.executor.jointMaximum[id] = joint->maximum;
+                result.executor.positionLimitedJoints |= JointMask{1} << id;
             }
         }
 

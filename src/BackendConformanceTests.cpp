@@ -477,8 +477,11 @@ namespace ngc::test {
                     "controlled stop did not permanently reject epoch resume");
 
             fixture.initialize(41);
+            const auto abortStart =
+                fixture.latestSnapshot().commanded.position.x;
             const auto abortedChunk =
-                linearChunk(41, 602, 0, 702, 803, 0.0, 1.0, 1.0);
+                linearChunk(41, 602, 0, 702, 803,
+                    abortStart, abortStart + 1.0, 1.0);
             require(target,
                     fixture.backend().tryPublish(abortedChunk)
                         == PublishResult::Published,
