@@ -83,12 +83,11 @@ namespace ngc {
     void SpindleWorker::run() noexcept {
         while (!m_stopping.load(std::memory_order_acquire)) {
             auto desired = SpindleEvent{};
-            auto found = false;
             while (m_commands.tryPop(desired)) {
-                found = true;
-            }
-            if (found && !m_hardware->applyDesired(desired)) {
-                latchFault(SPINDLE_COMMUNICATION_FAULT);
+                if (!m_hardware->applyDesired(desired)) {
+                    latchFault(SPINDLE_COMMUNICATION_FAULT);
+                    break;
+                }
             }
 
             auto status = SpindleHardwareStatus{};

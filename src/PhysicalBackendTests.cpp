@@ -7,12 +7,14 @@
 #include <filesystem>
 #include <format>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <print>
 #include <span>
 #include <stdexcept>
 #include <string_view>
 #include <thread>
+#include <vector>
 
 #ifdef __linux__
 #include <cstdlib>
@@ -36,9 +38,12 @@ namespace {
 
     struct SpindleObservation {
         std::atomic<std::uint32_t> commands{0};
+        std::atomic<std::uint32_t> polls{0};
         std::atomic<std::uint32_t> stops{0};
         std::atomic<bool> enabled{false};
         std::atomic<double> speed{0.0};
+        std::mutex historyMutex;
+        std::vector<ngc::SpindleEvent> history;
     };
 
     class ObservedSpindle final : public ngc::SpindleHardware {
@@ -57,6 +62,10 @@ namespace {
                 desired.speed, std::memory_order_release);
             m_observation->commands.fetch_add(
                 1, std::memory_order_release);
+            {
+                std::scoped_lock lock(m_observation->historyMutex);
+                m_observation->history.push_back(desired);
+            }
 
             return !m_failCommands;
         }
@@ -70,6 +79,8 @@ namespace {
                 .speed = m_observation->speed.load(
                     std::memory_order_acquire),
             };
+            m_observation->polls.fetch_add(
+                1, std::memory_order_release);
 
             return true;
         }
@@ -337,6 +348,52 @@ namespace {
                 && !observation->enabled.load(
                     std::memory_order_acquire),
             "spindle worker shutdown did not establish safe stop");
+    }
+
+    void testSpindleWorkerPreservesCommandOrder() {
+        auto observation =
+            std::make_shared<SpindleObservation>();
+        ngc::SpindleWorker worker(
+            std::make_unique<ObservedSpindle>(observation), 100ms);
+        worker.start();
+        waitFor(
+            [&] {
+                return observation->polls.load(
+                    std::memory_order_acquire) != 0;
+            },
+            "spindle worker did not begin polling");
+
+        require(worker.tryCommand({
+                    .enabled = true,
+                    .direction = ngc::Direction::CW,
+                    .speed = 12000.0,
+                })
+                && worker.tryCommand({})
+                && worker.tryCommand({
+                    .enabled = true,
+                    .direction = ngc::Direction::CCW,
+                    .speed = 6000.0,
+                }),
+            "spindle worker rejected an ordered command burst");
+        waitFor(
+            [&] {
+                return observation->commands.load(
+                    std::memory_order_acquire) == 3;
+            },
+            "spindle worker dropped an ordered command");
+        worker.stop();
+
+        std::scoped_lock lock(observation->historyMutex);
+        require(
+            observation->history.size() == 3
+                && observation->history[0].enabled
+                && observation->history[0].direction
+                    == ngc::Direction::CW
+                && !observation->history[1].enabled
+                && observation->history[2].enabled
+                && observation->history[2].direction
+                    == ngc::Direction::CCW,
+            "spindle worker changed command order");
     }
 
     void testSpindleCommunicationFailureEstablishesSafeStop() {
@@ -611,6 +668,7 @@ int main() {
     try {
         testLoadsPhysicalBackendConfiguration();
         testPhysicalIoPublishesSpindleOffServoThread();
+        testSpindleWorkerPreservesCommandOrder();
         testSpindleCommunicationFailureEstablishesSafeStop();
         testHuanyangCrcAndProtocolScaling();
         testHuanyangRejectsInvalidResponsesAndCommands();
