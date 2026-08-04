@@ -235,6 +235,61 @@ namespace {
         ngc::ExecutionSnapshot snapshot;
     };
 
+    struct PlanContinuationRun {
+        std::vector<ngc::ExecutionEvent> events;
+        ngc::ExecutionSnapshot snapshot;
+    };
+
+    PlanContinuationRun runPlanContinuation(ngc::PlanChunk continuation) {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.25);
+        initialize(*core, 31);
+
+        const auto first =
+            linearChunk(31, 311, 0, 411, 511, 0.0, 1.0, 0.5);
+        require(core->tryPublish(first) == ngc::PublishResult::Published
+                    && core->tryPublish(continuation)
+                        == ngc::PublishResult::Published,
+                "continuity-check fixture did not publish");
+        require(core->trySubmit(ngc::StartRequest{3, first.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "continuity-check start did not fit");
+
+        PlanContinuationRun run;
+        for (auto tick = 0; tick < 10; ++tick) {
+            core->servoTick();
+            auto current = takeEvents(*core);
+            run.events.insert(
+                run.events.end(), current.begin(), current.end());
+            run.snapshot = latestSnapshot(*core);
+            if (run.snapshot.state == ngc::BackendState::Held
+                || run.snapshot.state == ngc::BackendState::Faulted) {
+                break;
+            }
+        }
+
+        return run;
+    }
+
+    void requireDiscontinuousContinuation(
+        const PlanContinuationRun &run, const ngc::ChunkId continuation) {
+        const auto rejected = selectEvents<ngc::ChunkRejected>(run.events);
+        const auto branches = selectEvents<ngc::BranchSelected>(run.events);
+        const auto faults = selectEvents<ngc::BackendFault>(run.events);
+        require(rejected.size() == 1 && rejected[0].chunk == continuation,
+                "discontinuous plan continuation was not rejected");
+        require(branches.size() == 1
+                    && branches[0].choice == ngc::BranchChoice::Stop,
+                "discontinuous plan continuation did not use the stop tail");
+        require(run.snapshot.state == ngc::BackendState::Faulted
+                    && run.snapshot.faultCode
+                        == ngc::PLAN_CONTINUATION_DISCONTINUITY_FAULT,
+                "plan continuity fault was not latched after the stop tail");
+        require(faults.size() == 1
+                    && faults[0].code
+                        == ngc::PLAN_CONTINUATION_DISCONTINUITY_FAULT,
+                "plan continuity failure did not emit its dedicated fault");
+    }
+
     ngc::JogMotionLimits jogLimits() {
         return {
             .velocity = 0.5,
@@ -563,7 +618,7 @@ namespace {
         initialize(*core, 20);
 
         auto first =
-            linearChunk(20, 201, 0, 301, 401, 0.0, 1.0, 1.0);
+            linearChunk(20, 201, 0, 301, 401, 0.0, 1.0, 0.5);
         auto second =
             linearChunk(20, 202, 301, 302, 403, 1.0, 2.0, 0.5);
         require(first.markers.push({501, 0, 0.0})
@@ -879,6 +934,57 @@ namespace {
                     && faults[0].code
                         == ngc::PLAN_CONTINUATION_DISCONTINUITY_FAULT,
                 "discontinuous continuation did not emit its dedicated fault");
+    }
+
+    void testPositionDiscontinuousContinuationStopsSafely() {
+        auto continuation =
+            linearChunk(31, 312, 411, 412, 513, 1.0, 2.0, 0.5);
+        continuation.normalMotion[0].origin.x += 1e-4;
+
+        const auto run = runPlanContinuation(continuation);
+
+        requireDiscontinuousContinuation(run, continuation.id);
+    }
+
+    void testVelocityDiscontinuousContinuationStopsSafely() {
+        auto continuation =
+            linearChunk(31, 312, 411, 412, 513, 1.0, 2.0, 0.5);
+        continuation.normalMotion[0].coefficients[0].x += 1e-4;
+
+        const auto run = runPlanContinuation(continuation);
+
+        requireDiscontinuousContinuation(run, continuation.id);
+    }
+
+    void testAccelerationDiscontinuousContinuationStopsSafely() {
+        auto continuation =
+            linearChunk(31, 312, 411, 412, 513, 1.0, 2.0, 0.5);
+        continuation.normalMotion[0].coefficients[1].x += 1e-4;
+
+        const auto run = runPlanContinuation(continuation);
+
+        requireDiscontinuousContinuation(run, continuation.id);
+    }
+
+    void testContinuousPlanTransitionIsAccepted() {
+        const auto continuation =
+            linearChunk(31, 312, 411, 412, 513, 1.0, 2.0, 0.5);
+
+        const auto run = runPlanContinuation(continuation);
+
+        const auto rejected = selectEvents<ngc::ChunkRejected>(run.events);
+        const auto branches = selectEvents<ngc::BranchSelected>(run.events);
+        require(run.snapshot.state == ngc::BackendState::Held,
+                "continuous plan transition did not finish held");
+        require(rejected.empty(),
+                "continuous plan transition was rejected");
+        require(branches.size() == 2
+                    && branches[0].choice == ngc::BranchChoice::Continue
+                    && branches[0].continuation == continuation.id
+                    && branches[1].choice == ngc::BranchChoice::Stop,
+                "continuous plan transition did not select its continuation");
+        require(selectEvents<ngc::BackendFault>(run.events).empty(),
+                "continuous plan transition faulted");
     }
 
     void testTriggeredMoveReachesTargetAtRest() {
@@ -2893,6 +2999,10 @@ int main() {
         testAbortSuppressesFutureScheduledEvents();
         testIngressPreservesPlanControlOrdering();
         testMismatchedContinuationStopsSafely();
+        testPositionDiscontinuousContinuationStopsSafely();
+        testVelocityDiscontinuousContinuationStopsSafely();
+        testAccelerationDiscontinuousContinuationStopsSafely();
+        testContinuousPlanTransitionIsAccepted();
         testTriggeredMoveReachesTargetAtRest();
         testPublishesTriggeredMotionContext();
         testSampledTriggerGeneratesConstrainedStop();

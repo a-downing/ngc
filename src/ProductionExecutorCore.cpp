@@ -2320,9 +2320,25 @@ namespace ngc {
         const auto current = activeChunk();
         if (hasContinuation) {
             const auto &continuation = m_planSlots[continuationIndex].item;
-            if (execution_item::epoch(continuation) == current.epoch
-                && execution_item::predecessor(continuation)
-                    == current.branch) {
+            const auto matchesCurrentBranch =
+                execution_item::epoch(continuation) == current.epoch
+                && execution_item::predecessor(continuation) == current.branch;
+            auto continuous = true;
+            if (const auto *chunk = std::get_if<PlanChunk>(&continuation);
+                matchesCurrentBranch && chunk != nullptr) {
+                constexpr auto POSITION_TOLERANCE = 1e-8;
+                constexpr auto VELOCITY_TOLERANCE = 1e-7;
+                constexpr auto ACCELERATION_TOLERANCE = 1e-7;
+                const auto start = executionSpanStart(chunk->normalMotion[0]);
+                continuous = (start.position - current.branchState.position).length()
+                        <= POSITION_TOLERANCE
+                    && (start.velocity - current.branchState.velocity).length()
+                        <= VELOCITY_TOLERANCE
+                    && (start.acceleration
+                        - current.branchState.acceleration).length()
+                        <= ACCELERATION_TOLERANCE;
+            }
+            if (matchesCurrentBranch && continuous) {
                 emit(BranchSelected{
                     current.epoch, current.branch, BranchChoice::Continue,
                     execution_item::id(continuation),
