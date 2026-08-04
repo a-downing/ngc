@@ -12,15 +12,13 @@
 
 #include <ruckig/ruckig.hpp>
 
+#include "machine/AxisJointStateProjection.h"
 #include "machine/EmergencyStop.h"
 #include "machine/MotionBackend.h"
 #include "machine/SpscChannel.h"
 
 namespace ngc {
-    struct ProductionExecutorAxisMapping {
-        JointMask joints = 0;
-        JointVector coordinateScale{};
-    };
+    using ProductionExecutorAxisMapping = AxisJointMapping;
 
     struct ProductionExecutorFeedHoldConfiguration {
         // Both zero leave ordinary-plan feed hold unavailable. Positive values
@@ -42,9 +40,7 @@ namespace ngc {
     };
 
     struct ProductionExecutorConfiguration {
-        std::array<
-            ProductionExecutorAxisMapping,
-            static_cast<std::size_t>(AxisId::C) + 1> axes{};
+        AxisJointMappings axes{};
         ProductionExecutorFeedHoldConfiguration feedHold{};
         // Physical axis-space authority reserved for cancelling ordinary
         // PlanChunk motion. Zero limits leave that operation unavailable.
@@ -201,6 +197,8 @@ namespace ngc {
 
         void serviceControls() noexcept;
         void applyAxisMotionState(const MotionState &state) noexcept;
+        void applyJointMotionState(const JointMotionState &state) noexcept;
+        void assignJointCoordinates(const JointMotionState &state) noexcept;
         void activateNext() noexcept;
         void advanceActive(double seconds) noexcept;
         void advancePlan(double &seconds) noexcept;

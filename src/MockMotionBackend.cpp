@@ -13,6 +13,7 @@
 
 #include <ruckig/ruckig.hpp>
 
+#include "machine/AxisJointStateProjection.h"
 #include "machine/SpscChannel.h"
 
 namespace ngc {
@@ -65,6 +66,10 @@ namespace ngc {
         position_t thirdDerivative(
                 const AxisPolynomialSpan &span, const double u) {
             return evaluateExecutionPolynomial(span, u).jerk;
+        }
+
+        bool samePosition(const position_t &left, const position_t &right) {
+            return (left - right).length() <= 1e-9;
         }
     }
 
@@ -161,12 +166,13 @@ namespace ngc {
         std::optional<JogRuntime> m_jog;
         std::vector<AxisConfiguration> m_axes;
         std::vector<JointConfiguration> m_joints;
+        AxisJointMappings m_axisMappings{};
 
     public:
         Impl() = default;
         Impl(const std::vector<AxisConfiguration> &axes,
              const std::vector<JointConfiguration> &joints)
-            : m_axes(axes), m_joints(joints) { }
+            : Impl(FeedHoldConfiguration{}, TrajectoryLimits{}, axes, joints) { }
 
         void restoreStationaryState(const StationaryBackendState &state) noexcept {
             if (m_active) {
@@ -264,38 +270,30 @@ namespace ngc {
             return result;
         }
 
-        void updateConfiguredAxisFromJoints(const Machine::Axis axis) {
-            double position = 0.0;
-            double velocity = 0.0;
-            double acceleration = 0.0;
-            std::size_t count = 0;
-            for(const auto &joint : m_joints) {
-                if(joint.axis != axis || std::abs(joint.coordinateScale) <= 1e-12) continue;
-                position += m_snapshot.commandedJoints.position[joint.id] / joint.coordinateScale;
-                velocity += m_snapshot.commandedJoints.velocity[joint.id] / joint.coordinateScale;
-                acceleration += m_snapshot.commandedJoints.acceleration[joint.id] / joint.coordinateScale;
-                ++count;
-            }
-            if(count == 0) return;
-            const auto id = static_cast<AxisId>(static_cast<std::uint8_t>(axis));
-            axisComponent(m_snapshot.commanded.position, id) = position / static_cast<double>(count);
-            axisComponent(m_snapshot.commanded.velocity, id) = velocity / static_cast<double>(count);
-            axisComponent(m_snapshot.commanded.acceleration, id) = acceleration / static_cast<double>(count);
-            m_snapshot.feedback = m_snapshot.commanded;
+        void applyAxisMotionState(const MotionState &state) {
+            axis_joint_state_projection::advanceFromAxes(
+                m_axisMappings, m_snapshot.commanded, state,
+                m_snapshot.commandedJoints);
+            m_snapshot.commanded = state;
+            m_snapshot.feedback = state;
+            m_snapshot.feedbackJoints = m_snapshot.commandedJoints;
         }
 
-        void updateConfiguredJointsFromAxis(const AxisId axis) {
-            const auto machineAxis = static_cast<Machine::Axis>(static_cast<std::uint8_t>(axis));
-            for(const auto &joint : m_joints) {
-                if(joint.axis != machineAxis) continue;
-                m_snapshot.commandedJoints.position[joint.id]
-                    = axisComponent(m_snapshot.commanded.position, axis) * joint.coordinateScale;
-                m_snapshot.commandedJoints.velocity[joint.id]
-                    = axisComponent(m_snapshot.commanded.velocity, axis) * joint.coordinateScale;
-                m_snapshot.commandedJoints.acceleration[joint.id]
-                    = axisComponent(m_snapshot.commanded.acceleration, axis) * joint.coordinateScale;
-            }
-            m_snapshot.feedbackJoints = m_snapshot.commandedJoints;
+        void applyJointMotionState(const JointMotionState &state) {
+            axis_joint_state_projection::advanceFromJoints(
+                m_axisMappings, m_snapshot.commandedJoints, state,
+                m_snapshot.commanded);
+            m_snapshot.commandedJoints = state;
+            m_snapshot.feedback = m_snapshot.commanded;
+            m_snapshot.feedbackJoints = state;
+        }
+
+        void assignJointCoordinates(const JointMotionState &state) {
+            m_snapshot.commandedJoints = state;
+            axis_joint_state_projection::assignFromJoints(
+                m_axisMappings, state, m_snapshot.commanded);
+            m_snapshot.feedback = m_snapshot.commanded;
+            m_snapshot.feedbackJoints = state;
         }
 
     public:
@@ -305,7 +303,15 @@ namespace ngc {
              const std::vector<AxisConfiguration> &axes,
              const std::vector<JointConfiguration> &joints)
             : m_feedHoldLimits(feedHold), m_trajectoryLimits(trajectory),
-              m_axes(axes), m_joints(joints) { }
+              m_axes(axes), m_joints(joints) {
+            for (const auto &joint : m_joints) {
+                const auto axis = static_cast<AxisId>(
+                    static_cast<std::uint8_t>(joint.axis));
+                auto &mapping = m_axisMappings[static_cast<std::size_t>(axis)];
+                mapping.joints |= JointMask{1} << joint.id;
+                mapping.coordinateScale[joint.id] = joint.coordinateScale;
+            }
+        }
 
         PublishResult publish(const ExecutionItem &item) noexcept {
             if (!execution_item::valid(item)) {
@@ -412,8 +418,7 @@ namespace ngc {
                 const auto u = span.duration > 0.0 ? std::clamp(m_spanElapsed * span.inverseDuration, 0.0, 1.0) : 1.0;
                 m_snapshot.activeSpan = span.id;
                 m_snapshot.spanProgress = u;
-                m_snapshot.commanded = retimedState(span, u);
-                m_snapshot.feedback = m_snapshot.commanded;
+                applyAxisMotionState(retimedState(span, u));
                 emitExecutionMarkersThrough(u);
                 const auto jerk = retimedJerk(span, u);
                 m_currentProgramJerkMagnitude.store(magnitude(jerk), std::memory_order_relaxed);
@@ -685,9 +690,10 @@ namespace ngc {
             m_executionRateAcceleration = 0.0;
             m_executionRateJerk = 0.0;
             m_snapshot.state = BackendState::Held;
-            m_snapshot.commanded.velocity = {};
-            m_snapshot.commanded.acceleration = {};
-            m_snapshot.feedback = m_snapshot.commanded;
+            auto stopped = m_snapshot.commanded;
+            stopped.velocity = {};
+            stopped.acceleration = {};
+            applyAxisMotionState(stopped);
             m_snapshot.executionRate = 0.0;
             m_snapshot.executionRateAcceleration = 0.0;
             if (m_controlledStopping) {
@@ -822,20 +828,22 @@ namespace ngc {
         void applyJogState() {
             const auto &jog = *m_jog;
             if(jog.target.type == JogTargetType::Axis) {
-                axisComponent(m_snapshot.commanded.position, jog.target.axis) = jog.axisOrigin + jog.position;
-                axisComponent(m_snapshot.commanded.velocity, jog.target.axis) = jog.velocity;
-                axisComponent(m_snapshot.commanded.acceleration, jog.target.axis) = jog.acceleration;
-                m_snapshot.feedback = m_snapshot.commanded;
-                updateConfiguredJointsFromAxis(jog.target.axis);
+                auto state = m_snapshot.commanded;
+                axisComponent(state.position, jog.target.axis) = jog.axisOrigin + jog.position;
+                axisComponent(state.velocity, jog.target.axis) = jog.velocity;
+                axisComponent(state.acceleration, jog.target.axis) = jog.acceleration;
+                applyAxisMotionState(state);
+
                 return;
             }
+            auto state = m_snapshot.commandedJoints;
             for(JointId joint = 0; joint < MAX_JOINTS; ++joint) {
                 if((jog.target.joints & (JointMask{1} << joint)) == 0) continue;
-                m_snapshot.commandedJoints.position[joint] = jog.jointOrigin[joint] + jog.position;
-                m_snapshot.commandedJoints.velocity[joint] = jog.velocity;
-                m_snapshot.commandedJoints.acceleration[joint] = jog.acceleration;
+                state.position[joint] = jog.jointOrigin[joint] + jog.position;
+                state.velocity[joint] = jog.velocity;
+                state.acceleration[joint] = jog.acceleration;
             }
-            m_snapshot.feedbackJoints = m_snapshot.commandedJoints;
+            applyJointMotionState(state);
         }
 
         bool calculateJogPosition(const double distance, const double velocity) {
@@ -1134,9 +1142,10 @@ namespace ngc {
             m_feedHolding = false;
             m_feedHeld = true;
             m_snapshot.state = BackendState::Held;
-            m_snapshot.commanded.velocity = {};
-            m_snapshot.commanded.acceleration = {};
-            m_snapshot.feedback = m_snapshot.commanded;
+            auto stopped = m_snapshot.commanded;
+            stopped.velocity = {};
+            stopped.acceleration = {};
+            applyAxisMotionState(stopped);
             emit(BackendHeld {
                 m_snapshot.epoch, m_snapshot.commanded, BackendHoldReason::FeedHold,
             });
@@ -1167,10 +1176,11 @@ namespace ngc {
         void advanceTriggered(double &seconds) {
             const auto &move = std::get<TriggeredMove>(activeItem());
             if(m_triggered.length <= 1e-12 && !m_triggered.stopping) {
-                m_snapshot.commanded.position = move.target;
-                m_snapshot.commanded.velocity = {};
-                m_snapshot.commanded.acceleration = {};
-                m_snapshot.feedback = m_snapshot.commanded;
+                auto state = m_snapshot.commanded;
+                state.position = move.target;
+                state.velocity = {};
+                state.acceleration = {};
+                applyAxisMotionState(state);
                 completeTriggered(TriggeredMoveStatus::ReachedTarget);
                 return;
             }
@@ -1179,8 +1189,8 @@ namespace ngc {
             m_triggered.elapsed += consumed;
             const auto origin = m_triggered.stopping
                 ? m_triggered.stopOrigin.position : m_triggered.start;
-            m_snapshot.commanded = triggeredStateAt(m_triggered.elapsed, origin);
-            m_snapshot.feedback = m_snapshot.commanded;
+            applyAxisMotionState(
+                triggeredStateAt(m_triggered.elapsed, origin));
             m_snapshot.spanProgress = duration > 0.0
                 ? std::clamp(m_triggered.elapsed / duration, 0.0, 1.0) : 1.0;
             recordTriggeredPosition(m_triggered.stopping && !m_triggered.feedHoldStopping);
@@ -1196,10 +1206,11 @@ namespace ngc {
                     return;
                 }
                 if(m_triggered.elapsed + 1e-12 >= duration) {
-                    m_snapshot.commanded.position = move.target;
-                    m_snapshot.commanded.velocity = {};
-                    m_snapshot.commanded.acceleration = {};
-                    m_snapshot.feedback = m_snapshot.commanded;
+                    auto state = m_snapshot.commanded;
+                    state.position = move.target;
+                    state.velocity = {};
+                    state.acceleration = {};
+                    applyAxisMotionState(state);
                     completeTriggered(TriggeredMoveStatus::ReachedTarget);
                 }
             } else {
@@ -1214,9 +1225,10 @@ namespace ngc {
                     }
                 }
                 if(m_triggered.elapsed + 1e-12 >= duration) {
-                    m_snapshot.commanded.velocity = {};
-                    m_snapshot.commanded.acceleration = {};
-                    m_snapshot.feedback = m_snapshot.commanded;
+                    auto state = m_snapshot.commanded;
+                    state.velocity = {};
+                    state.acceleration = {};
+                    applyAxisMotionState(state);
                     if(m_triggered.feedHoldStopping) finishTriggeredFeedHold();
                     else completeTriggered(m_triggered.completionStatus);
                 }
@@ -1348,6 +1360,7 @@ namespace ngc {
         void advanceTriggeredJoints(double &seconds) {
             const auto &move = std::get<TriggeredJointMove>(activeItem());
             const auto elapsed = seconds;
+            auto state = m_snapshot.commandedJoints;
             bool allFinished = true;
             for(JointId joint = 0; joint < MAX_JOINTS; ++joint) {
                 if((move.joints & (JointMask{1} << joint)) == 0) continue;
@@ -1358,9 +1371,9 @@ namespace ngc {
                 runtime.elapsed = std::min(runtime.elapsed + elapsed, duration);
                 double position = 0.0, velocity = 0.0, acceleration = 0.0;
                 runtime.trajectory.at_time(runtime.elapsed, position, velocity, acceleration);
-                m_snapshot.commandedJoints.position[joint] = position;
-                m_snapshot.commandedJoints.velocity[joint] = velocity;
-                m_snapshot.commandedJoints.acceleration[joint] = acceleration;
+                state.position[joint] = position;
+                state.velocity[joint] = velocity;
+                state.acceleration[joint] = acceleration;
                 if(!runtime.stopping) {
                     const auto transition = syntheticJointTransition(move.moveId, joint);
                     const auto crossed = transition && runtime.direction * (position - *transition) >= -1e-12;
@@ -1368,19 +1381,19 @@ namespace ngc {
                         if(!beginJointStop(move, joint)) { faultTriggered(); return; }
                     } else {
                         if(runtime.elapsed + 1e-12 >= duration) {
-                            m_snapshot.commandedJoints.position[joint] = runtime.target;
-                            m_snapshot.commandedJoints.velocity[joint] = 0.0;
-                            m_snapshot.commandedJoints.acceleration[joint] = 0.0;
+                            state.position[joint] = runtime.target;
+                            state.velocity[joint] = 0.0;
+                            state.acceleration[joint] = 0.0;
                             runtime.finished = true;
                         }
                     }
                 } else if(runtime.elapsed + 1e-12 >= duration) {
-                    m_snapshot.commandedJoints.velocity[joint] = 0.0;
-                    m_snapshot.commandedJoints.acceleration[joint] = 0.0;
+                    state.velocity[joint] = 0.0;
+                    state.acceleration[joint] = 0.0;
                     runtime.finished = true;
                 }
             }
-            m_snapshot.feedbackJoints = m_snapshot.commandedJoints;
+            applyJointMotionState(state);
             seconds = 0.0;
             if(!allFinished) {
                 allFinished = true;
@@ -1590,15 +1603,14 @@ namespace ngc {
                         m_snapshot.feedbackJoints = feedbackJoints;
                     } else if constexpr(std::same_as<T, SetJointPositionRequest>) {
                         success = m_snapshot.state == BackendState::Held && !m_active;
+                        auto state = m_snapshot.commandedJoints;
                         if(success) for(JointId joint = 0; joint < MAX_JOINTS; ++joint) {
                             if((value.joints & (JointMask{1} << joint)) == 0) continue;
-                            m_snapshot.commandedJoints.position[joint] = value.position[joint];
-                            m_snapshot.commandedJoints.velocity[joint] = 0.0;
-                            m_snapshot.commandedJoints.acceleration[joint] = 0.0;
-                            m_snapshot.feedbackJoints = m_snapshot.commandedJoints;
+                            state.position[joint] = value.position[joint];
+                            state.velocity[joint] = 0.0;
+                            state.acceleration[joint] = 0.0;
                         }
-                        if(success) for(const auto &axis : m_axes)
-                            updateConfiguredAxisFromJoints(axis.axis);
+                        if(success) assignJointCoordinates(state);
                     } else if constexpr(std::same_as<T, StartContinuousJogRequest>
                                         || std::same_as<T, StartIncrementalJogRequest>) {
                         success = initializeJog(value);
@@ -1628,6 +1640,19 @@ namespace ngc {
                     execution_item::epoch(item),
                     execution_item::id(item) });
                 release(index);
+                return;
+            }
+            if (const auto *chunk = std::get_if<PlanChunk>(&item);
+                chunk != nullptr
+                && !samePosition(
+                    executionSpanStart(chunk->normalMotion[0]).position,
+                    m_snapshot.commanded.position)) {
+                emit(ChunkRejected { chunk->epoch, chunk->id });
+                release(index);
+                m_snapshot.state = BackendState::Faulted;
+                m_snapshot.faultCode = PLAN_START_DISCONTINUITY_FAULT;
+                emit(BackendFault { PLAN_START_DISCONTINUITY_FAULT });
+
                 return;
             }
             m_active = index;
@@ -1661,8 +1686,7 @@ namespace ngc {
                 emit(ChunkRetired { chunk.epoch, chunk.id });
                 if (m_stopTailFaultCode != 0) {
                     const auto faultCode = m_stopTailFaultCode;
-                    m_snapshot.commanded = chunk.stopState;
-                    m_snapshot.feedback = m_snapshot.commanded;
+                    applyAxisMotionState(chunk.stopState);
                     m_snapshot.lastBranch = chunk.branch;
                     discardExecutionHorizon();
                     m_snapshot.state = BackendState::Faulted;

@@ -243,6 +243,36 @@ namespace ngc::test {
                     "a required triggered-joint move without triggers was accepted");
         }
 
+        void verifyInitialPlanContinuity(const BackendConformanceTarget &target) {
+            RuntimeFixture fixture(target, target.createRuntime());
+            fixture.initialize(2);
+
+            const auto discontinuous =
+                linearChunk(2, 21, 0, 31, 41, 0.1, 0.2, 0.1);
+            require(target,
+                    fixture.backend().tryPublish(discontinuous)
+                        == PublishResult::Published,
+                    "the discontinuous-plan fixture was not published");
+            require(target,
+                    fixture.backend().trySubmit(StartRequest{
+                        fixture.nextRequest(), discontinuous.epoch})
+                        == SubmitResult::Submitted,
+                    "the discontinuous-plan fixture did not accept start");
+            fixture.servicePeriod();
+            const auto events = fixture.takeEvents();
+            const auto snapshot = fixture.latestSnapshot();
+            const auto rejected = selectEvents<ChunkRejected>(events);
+            const auto faults = selectEvents<BackendFault>(events);
+            require(target,
+                    snapshot.state == BackendState::Faulted
+                        && snapshot.faultCode == PLAN_START_DISCONTINUITY_FAULT
+                        && rejected.size() == 1
+                        && rejected[0].chunk == discontinuous.id
+                        && faults.size() == 1
+                        && faults[0].code == PLAN_START_DISCONTINUITY_FAULT,
+                    "a discontinuous initial plan did not fault consistently");
+        }
+
         void verifyPublicationMarkersAndRepeatedEpochs(
             const BackendConformanceTarget &target) {
             RuntimeFixture fixture(target, target.createRuntime());
@@ -292,7 +322,7 @@ namespace ngc::test {
                     "the dependent horizon did not stop at its declared terminal state");
 
             fixture.initialize(11);
-            auto repeated = linearChunk(11, 103, 0, 203, 305, 0.0, 0.025, 0.025);
+            auto repeated = linearChunk(11, 103, 0, 203, 305, 0.1, 0.125, 0.025);
             require(target, repeated.markers.push({405, 0, 0.5}),
                     "repeated-epoch marker did not fit");
             require(target,
@@ -572,6 +602,7 @@ namespace ngc::test {
 
         verifyRuntimeLifecycle(target);
         verifyExecutionItemValidation(target);
+        verifyInitialPlanContinuity(target);
         verifyPublicationMarkersAndRepeatedEpochs(target);
         verifyTriggeredJointMotion(target);
         verifyJogLease(target);

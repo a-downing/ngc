@@ -28,6 +28,41 @@ namespace {
         }
     }
 
+    void testAxisJointStateProjection() {
+        ngc::AxisJointMappings mappings;
+        auto &x = mappings[static_cast<std::size_t>(ngc::AxisId::X)];
+        x.joints = ngc::JointMask{1} | ngc::JointMask{1} << 1;
+        x.coordinateScale[0] = 1.0;
+        x.coordinateScale[1] = -2.0;
+
+        ngc::MotionState axes;
+        axes.position.x = 4.0;
+        ngc::JointMotionState previousJoints;
+        previousJoints.position[0] = 5.0;
+        previousJoints.position[1] = -10.0;
+        auto nextJoints = previousJoints;
+        nextJoints.position[0] = 5.2;
+        nextJoints.position[1] = -10.4;
+        nextJoints.velocity[0] = 0.5;
+        nextJoints.velocity[1] = -1.0;
+        nextJoints.acceleration[0] = 0.25;
+        nextJoints.acceleration[1] = -0.5;
+
+        ngc::axis_joint_state_projection::advanceFromJoints(
+            mappings, previousJoints, nextJoints, axes);
+        requireNear(axes.position.x, 4.2,
+                    "joint motion did not preserve the logical-axis offset");
+        requireNear(axes.velocity.x, 0.5,
+                    "joint motion did not normalize coupled velocity");
+        requireNear(axes.acceleration.x, 0.25,
+                    "joint motion did not normalize coupled acceleration");
+
+        ngc::axis_joint_state_projection::assignFromJoints(
+            mappings, nextJoints, axes);
+        requireNear(axes.position.x, 5.2,
+                    "joint coordinate assignment did not rebase the axis");
+    }
+
     ngc::AxisPolynomialSpan linearSpan(const ngc::SpanId id,
                                        const double from, const double to,
                                        const double duration) {
@@ -2188,7 +2223,14 @@ namespace {
     }
 
     void testIncrementalJointGroupJogReachesTarget() {
-        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        ngc::ProductionExecutorConfiguration configuration;
+        auto &x = configuration.axes[
+            static_cast<std::size_t>(ngc::AxisId::X)];
+        x.joints = ngc::JointMask{1} | ngc::JointMask{1} << 1;
+        x.coordinateScale[0] = 1.0;
+        x.coordinateScale[1] = 1.0;
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(
+            0.01, configuration);
         initialize(*core, 50);
 
         const ngc::StartIncrementalJogRequest request{
@@ -2230,8 +2272,24 @@ namespace {
                     "incremental jog retained joint velocity");
         requireNear(run.snapshot.commandedJoints.acceleration[1], 0.0,
                     "incremental jog retained joint acceleration");
+        requireNear(run.snapshot.commanded.position.x, 0.25,
+                    "incremental joint-group jog left its logical axis stale");
         require(run.snapshot.activeJoints == 0,
                 "completed incremental jog retained active joints");
+
+        const auto chunk =
+            linearChunk(50, 501, 0, 601, 701, 0.25, 0.35, 0.1);
+        require(core->tryPublish(chunk) == ngc::PublishResult::Published,
+                "post-jog axis plan was not published");
+        require(core->trySubmit(ngc::StartRequest{11, chunk.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "post-jog axis plan did not accept start");
+        core->servoTick();
+        const auto postJogEvents = takeEvents(*core);
+        const auto postJogSnapshot = latestSnapshot(*core);
+        require(postJogSnapshot.state != ngc::BackendState::Faulted
+                    && selectEvents<ngc::BackendFault>(postJogEvents).empty(),
+                "post-jog axis plan saw a stale executor origin");
 
         auto previousAcceleration = 0.0;
         for (const auto &sample : run.samples) {
@@ -2452,7 +2510,7 @@ namespace {
                     && stopped[0].reason
                         == ngc::JogStopReason::TargetReached,
                 "logical-axis jog did not complete");
-        requireNear(run.snapshot.commanded.position.x, 0.2,
+        requireNear(run.snapshot.commanded.position.x, 1.2,
                     "logical-axis jog missed its coordinate target");
         requireNear(run.snapshot.commandedJoints.position[0], 1.2,
                     "logical-axis jog did not preserve the first joint offset");
@@ -2696,6 +2754,7 @@ int main() {
         std::declval<ngc::ProductionExecutorCore &>().servoTick()));
 
     try {
+        testAxisJointStateProjection();
         testPublishesFixedExecutorIoState();
         testEmergencyStopFaultsSafelyAndResetsDisabled();
         testFixedTickExecutionAndAccounting();

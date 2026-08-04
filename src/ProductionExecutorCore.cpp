@@ -17,7 +17,6 @@ namespace ngc {
         constexpr std::uint32_t JOG_GENERATION_FAULT = 3;
         constexpr std::uint32_t FEED_RETIMING_FAULT = 4;
         constexpr std::uint32_t FEED_RETIMING_STOP_BRANCH_FAULT = 5;
-        constexpr std::uint32_t PLAN_START_DISCONTINUITY_FAULT = 6;
         constexpr double DYNAMIC_LIMIT_TOLERANCE = 1.01;
 
         double magnitude(const position_t &value) noexcept {
@@ -419,33 +418,32 @@ namespace ngc {
 
     void ProductionExecutorCore::applyAxisMotionState(
         const MotionState &state) noexcept {
-        const auto previousPosition = m_snapshot.commanded.position;
+        const auto previous = m_snapshot.commanded;
+        axis_joint_state_projection::advanceFromAxes(
+            m_configuration.axes, previous, state,
+            m_snapshot.commandedJoints);
         m_snapshot.commanded = state;
         m_snapshot.feedback = state;
-
-        for (std::size_t axisIndex = 0;
-             axisIndex < m_configuration.axes.size(); ++axisIndex) {
-            const auto axis = static_cast<AxisId>(axisIndex);
-            const auto &mapping = m_configuration.axes[axisIndex];
-            const auto positionDelta = axisComponent(state.position, axis)
-                - axisComponent(previousPosition, axis);
-            for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
-                const auto mask =
-                    static_cast<JointMask>(JointMask{1} << joint);
-                if ((mapping.joints & mask) == 0) {
-                    continue;
-                }
-
-                const auto scale = mapping.coordinateScale[joint];
-                m_snapshot.commandedJoints.position[joint] +=
-                    positionDelta * scale;
-                m_snapshot.commandedJoints.velocity[joint] =
-                    axisComponent(state.velocity, axis) * scale;
-                m_snapshot.commandedJoints.acceleration[joint] =
-                    axisComponent(state.acceleration, axis) * scale;
-            }
-        }
         m_snapshot.feedbackJoints = m_snapshot.commandedJoints;
+    }
+
+    void ProductionExecutorCore::applyJointMotionState(
+        const JointMotionState &state) noexcept {
+        axis_joint_state_projection::advanceFromJoints(
+            m_configuration.axes, m_snapshot.commandedJoints, state,
+            m_snapshot.commanded);
+        m_snapshot.commandedJoints = state;
+        m_snapshot.feedback = m_snapshot.commanded;
+        m_snapshot.feedbackJoints = m_snapshot.commandedJoints;
+    }
+
+    void ProductionExecutorCore::assignJointCoordinates(
+        const JointMotionState &state) noexcept {
+        m_snapshot.commandedJoints = state;
+        axis_joint_state_projection::assignFromJoints(
+            m_configuration.axes, state, m_snapshot.commanded);
+        m_snapshot.feedback = m_snapshot.commanded;
+        m_snapshot.feedbackJoints = state;
     }
 
     void ProductionExecutorCore::serviceControls() noexcept {
@@ -662,6 +660,7 @@ namespace ngc {
                         }
                     }
                     if (success) {
+                        auto state = m_snapshot.commandedJoints;
                         for (JointId joint = 0;
                              joint < MAX_JOINTS; ++joint) {
                             const auto mask =
@@ -670,14 +669,11 @@ namespace ngc {
                             if ((value.joints & mask) == 0) {
                                 continue;
                             }
-                            m_snapshot.commandedJoints.position[joint] =
-                                value.position[joint];
-                            m_snapshot.commandedJoints.velocity[joint] = 0.0;
-                            m_snapshot.commandedJoints.acceleration[joint] =
-                                0.0;
+                            state.position[joint] = value.position[joint];
+                            state.velocity[joint] = 0.0;
+                            state.acceleration[joint] = 0.0;
                         }
-                        m_snapshot.feedbackJoints =
-                            m_snapshot.commandedJoints;
+                        assignJointCoordinates(state);
                     }
                 } else if constexpr (
                     std::same_as<T, StartContinuousJogRequest>
@@ -1487,6 +1483,7 @@ namespace ngc {
             }
         }
 
+        auto state = m_snapshot.commandedJoints;
         for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
             const auto mask = static_cast<JointMask>(JointMask{1} << joint);
             if ((move.joints & mask) == 0) {
@@ -1507,21 +1504,21 @@ namespace ngc {
             double acceleration = 0.0;
             runtime.trajectory.at_time(
                 runtime.elapsed, position, velocity, acceleration);
-            m_snapshot.commandedJoints.position[joint] = position;
-            m_snapshot.commandedJoints.velocity[joint] = velocity;
-            m_snapshot.commandedJoints.acceleration[joint] = acceleration;
+            state.position[joint] = position;
+            state.velocity[joint] = velocity;
+            state.acceleration[joint] = acceleration;
             if (runtime.elapsed + 1e-12 < duration) {
                 continue;
             }
 
             if (!runtime.stopping) {
-                m_snapshot.commandedJoints.position[joint] = runtime.target;
+                state.position[joint] = runtime.target;
             }
-            m_snapshot.commandedJoints.velocity[joint] = 0.0;
-            m_snapshot.commandedJoints.acceleration[joint] = 0.0;
+            state.velocity[joint] = 0.0;
+            state.acceleration[joint] = 0.0;
             runtime.finished = true;
         }
-        m_snapshot.feedbackJoints = m_snapshot.commandedJoints;
+        applyJointMotionState(state);
         seconds = 0.0;
 
         for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
@@ -1688,19 +1685,18 @@ namespace ngc {
             return;
         }
 
+        auto state = m_snapshot.commandedJoints;
         for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
             const auto mask =
                 static_cast<JointMask>(JointMask{1} << joint);
             if ((jog.target.joints & mask) == 0) {
                 continue;
             }
-            m_snapshot.commandedJoints.position[joint] =
-                jog.jointOrigin[joint] + jog.position;
-            m_snapshot.commandedJoints.velocity[joint] = jog.velocity;
-            m_snapshot.commandedJoints.acceleration[joint] =
-                jog.acceleration;
+            state.position[joint] = jog.jointOrigin[joint] + jog.position;
+            state.velocity[joint] = jog.velocity;
+            state.acceleration[joint] = jog.acceleration;
         }
-        m_snapshot.feedbackJoints = m_snapshot.commandedJoints;
+        applyJointMotionState(state);
     }
 
     bool ProductionExecutorCore::calculateJogPosition(
