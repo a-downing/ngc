@@ -71,6 +71,7 @@ namespace ngc {
             return std::unexpected("jogging runtime callbacks are incomplete");
         }
 
+        m_backend.discardPendingOutput();
         m_observation = {.machinePosition = startingPosition};
         m_nextRequest = std::numeric_limits<RequestId>::max() - 16;
 

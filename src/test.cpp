@@ -1927,11 +1927,26 @@ final_move_together = true
     }
 #endif
 
+    void resetEmergencyStopLeavingBackendEvents(ngc::BackendRuntime &runtime) {
+        runtime.requestEmergencyStop(ngc::EmergencyStopSource::Gui);
+        static_cast<void>(runtime.advanceServiceMotionPeriod());
+        require(runtime.emergencyStopStatus().latchedSources != 0,
+                "homing stale-event fixture did not latch its emergency stop");
+
+        runtime.releaseEmergencyStop(ngc::EmergencyStopSource::Gui);
+        const auto resetGeneration = runtime.requestEmergencyStopReset();
+        static_cast<void>(runtime.advanceServiceMotionPeriod());
+        const auto reset = runtime.emergencyStopStatus();
+        require(reset.acknowledgedResetGeneration == resetGeneration
+                    && reset.latchedSources == 0
+                    && reset.resetResult == ngc::EmergencyStopResetResult::Cleared,
+                "homing stale-event fixture did not reset its emergency stop");
+    }
+
     void testHomingControllerOwnsBackendNeutralSequence() {
         const auto configuration = fixtureMachineConfiguration();
         require(configuration.has_value(), configuration ? "" : configuration.error());
         ngc::InProcessSimulationRuntime runtime(*configuration);
-        runtime.setTickMultiplier(1000);
         ngc::HomingController controller(
             configuration->axes, configuration->joints, configuration->homing,
             runtime.endpoint());
@@ -1970,8 +1985,11 @@ final_move_together = true
             6.0, 6.0, -6.0, 0.0, 0.0, 0.0,
         };
 
+        resetEmergencyStopLeavingBackendEvents(runtime);
+        runtime.setTickMultiplier(1000);
         const auto homing = controller.run(1, startingPosition, callbacks);
-        require(homing.has_value(), homing ? "" : homing.error());
+        require(homing.has_value(), homing ? ""
+            : "mock homing after emergency-stop reset failed: " + homing.error());
         require(homing->outcome == ngc::HomingOutcome::Completed,
                 "backend-neutral homing controller should complete its sequence");
         ngc::JointMask configuredJoints = 0;
@@ -2095,8 +2113,10 @@ final_move_together = true
             6.0, 6.0, -6.0, 0.0, 0.0, 0.0,
         };
 
+        resetEmergencyStopLeavingBackendEvents(runtime);
         const auto homing = controller.run(1, startingPosition, callbacks);
-        require(homing.has_value(), homing ? "" : homing.error());
+        require(homing.has_value(), homing ? ""
+            : "hosted homing after emergency-stop reset failed: " + homing.error());
         require(homing->outcome == ngc::HomingOutcome::Completed,
                 "production executor runtime should complete backend-neutral homing");
         ngc::JointMask configuredJoints = 0;

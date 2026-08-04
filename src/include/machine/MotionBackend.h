@@ -489,6 +489,17 @@ namespace ngc {
         virtual SubmitResult trySubmit(const ControlRequest &request) noexcept = 0;
         virtual bool tryTakeEvent(ExecutionEvent &event) noexcept = 0;
         virtual bool tryTakeSnapshot(ExecutionSnapshot &snapshot) noexcept = 0;
+
+        void discardPendingEvents() noexcept {
+            ExecutionEvent event;
+            while (tryTakeEvent(event)) { }
+        }
+
+        void discardPendingOutput() noexcept {
+            discardPendingEvents();
+            ExecutionSnapshot snapshot;
+            while (tryTakeSnapshot(snapshot)) { }
+        }
     };
 
     // Simulation clock control is deliberately not part of the physical backend contract.

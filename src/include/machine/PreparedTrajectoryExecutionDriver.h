@@ -226,8 +226,7 @@ namespace ngc {
               m_cancelled(cancelled), m_planner(limits) { }
 
         bool begin(const GeometryEpoch epoch = 1, const position_t &position = {}) {
-            ExecutionEvent stale;
-            while(m_backend.tryTakeEvent(stale)) { }
+            m_backend.discardPendingOutput();
             m_pending.reset();
             m_pendingItem = 0;
             m_deferredMessage.reset();

@@ -69,6 +69,7 @@ namespace ngc {
             return std::unexpected("homing runtime callbacks are incomplete");
         }
 
+        m_backend.discardPendingOutput();
         m_observation = {.machinePosition = startingPosition};
         m_nextRequest = 1;
         m_nextChunk = 1;
@@ -348,8 +349,7 @@ namespace ngc {
 
     std::expected<TriggeredJointMoveCompleted, std::string> HomingController::executeMove(
         const TriggeredJointMove &move, const HomingRuntimeCallbacks &callbacks) {
-        ExecutionEvent discarded;
-        while (m_backend.tryTakeEvent(discarded)) { }
+        m_backend.discardPendingEvents();
         if (!callbacks.prepareTriggeredMove(move)) {
             return std::unexpected("homing runtime failed to prepare a triggered move");
         }
