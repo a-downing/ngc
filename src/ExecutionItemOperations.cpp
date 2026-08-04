@@ -80,6 +80,10 @@ namespace ngc::execution_item {
 
         bool validPlanChunk(const PlanChunk &chunk) noexcept {
             if (chunk.epoch == 0 || chunk.id == 0 || chunk.branch == 0
+                || !chunk.normalMotion.validSize()
+                || !chunk.stopTail.validSize()
+                || !chunk.events.validSize()
+                || !chunk.markers.validSize()
                 || chunk.normalMotion.size == 0
                 || chunk.stopTail.size == 0
                 || (chunk.stopTailPolicy != StopTailPolicy::ContinuationRequired
@@ -150,6 +154,7 @@ namespace ngc::execution_item {
                 static_cast<JointMask>((JointMask{1} << MAX_JOINTS) - 1);
             if (move.epoch == 0 || move.id == 0 || move.branch == 0
                 || move.moveId == 0 || move.joints == 0
+                || !move.triggers.validSize()
                 || (move.joints & ~validJointMask) != 0
                 || (move.positionEnvelope.joints & ~move.joints) != 0
                 || (move.checkTriggersAtStart && !move.triggerRequired)

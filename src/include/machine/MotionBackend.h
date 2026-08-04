@@ -154,8 +154,11 @@ namespace ngc {
         std::uint32_t size = 0;
 
         constexpr bool push(const T &value) noexcept {
-            if(size == Capacity) return false;
+            if (size >= Capacity) {
+                return false;
+            }
             values[size++] = value;
+
             return true;
         }
 
@@ -163,8 +166,9 @@ namespace ngc {
         constexpr const T &operator[](const std::size_t index) const noexcept { return values[index]; }
         constexpr auto begin() noexcept { return values.begin(); }
         constexpr auto begin() const noexcept { return values.begin(); }
-        constexpr auto end() noexcept { return values.begin() + size; }
-        constexpr auto end() const noexcept { return values.begin() + size; }
+        constexpr auto end() noexcept { return values.begin() + std::min<std::size_t>(size, Capacity); }
+        constexpr auto end() const noexcept { return values.begin() + std::min<std::size_t>(size, Capacity); }
+        constexpr bool validSize() const noexcept { return size <= Capacity; }
     };
 
     struct PlanChunk {
