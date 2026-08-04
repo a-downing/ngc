@@ -52,7 +52,6 @@ namespace ngc::operator_control {
         PendantVelocityConfiguration m_velocity;
         double m_servoPeriod = 0.0;
         std::vector<AxisConfiguration> m_axes;
-        std::vector<JointConfiguration> m_joints;
         std::optional<PendingIncrement> m_pending;
         std::optional<PendingVelocity> m_pendingVelocity;
         std::optional<JogId> m_activeJog;

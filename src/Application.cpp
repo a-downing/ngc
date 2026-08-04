@@ -2712,16 +2712,25 @@ public:
         if(m_jogTargetMode < 2) {
             for(const auto &axis : m_axes) {
                 ngc::JointMask joints = 0;
-                auto velocity = axis.maxVelocity;
-                auto acceleration = axis.maxAcceleration;
-                auto jerk = std::numeric_limits<double>::infinity();
+                ngc::JogMotionLimits jointGroupLimits {
+                    std::numeric_limits<double>::infinity(),
+                    std::numeric_limits<double>::infinity(),
+                    std::numeric_limits<double>::infinity(),
+                };
                 for(const auto id : axis.joints) {
                     joints |= ngc::JointMask { 1 } << id;
-                    const auto found = std::ranges::find(m_joints, id, &ngc::JointConfiguration::id);
-                    if(found != m_joints.end()) {
-                        velocity = std::min(velocity, found->maxVelocity);
-                        acceleration = std::min(acceleration, found->maxAcceleration);
-                        jerk = std::min(jerk, found->maxJerk);
+                    if (m_jogTargetMode == 1) {
+                        const auto found = std::ranges::find(
+                            m_joints, id, &ngc::JointConfiguration::id);
+                        if (found != m_joints.end()) {
+                            jointGroupLimits.velocity = std::min(
+                                jointGroupLimits.velocity, found->maxVelocity);
+                            jointGroupLimits.acceleration = std::min(
+                                jointGroupLimits.acceleration,
+                                found->maxAcceleration);
+                            jointGroupLimits.jerk = std::min(
+                                jointGroupLimits.jerk, found->maxJerk);
+                        }
                     }
                 }
                 const auto homed = (simulation.homedJoints & joints) == joints;
@@ -2732,11 +2741,15 @@ public:
                 const ngc::JogTarget target = m_jogTargetMode == 0
                     ? ngc::JogTarget { ngc::JogTargetType::Axis, jogAxis(axis.axis), 0 }
                     : ngc::JogTarget { ngc::JogTargetType::JointGroup, jogAxis(axis.axis), joints };
-                const ngc::JogMotionLimits stopLimits { velocity, acceleration, jerk };
+                const ngc::JogMotionLimits stopLimits = m_jogTargetMode == 0
+                    ? ngc::JogMotionLimits {
+                        axis.maxVelocity, axis.maxAcceleration, axis.maxJerk,
+                    }
+                    : jointGroupLimits;
                 const ngc::JogMotionLimits limits {
-                    velocity,
-                    std::min(acceleration, m_joggingConfiguration.acceleration),
-                    std::min(jerk, m_joggingConfiguration.jerk),
+                    stopLimits.velocity,
+                    std::min(stopLimits.acceleration, m_joggingConfiguration.acceleration),
+                    std::min(stopLimits.jerk, m_joggingConfiguration.jerk),
                 };
                 const ngc::JogTravelRange travel { axis.minimum, axis.maximum, homed };
                 submitDirection(std::format("-##{}", axisLabel(axis.axis)), target, limits, stopLimits,

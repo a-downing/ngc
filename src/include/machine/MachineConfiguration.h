@@ -56,6 +56,8 @@ namespace ngc {
         std::vector<JointId> joints;
         double minimum = 0.0;
         double maximum = 0.0;
+        // Resolved logical-axis limits constrained by every mapped joint and
+        // its coordinate scale at the configuration-loader boundary.
         double maxVelocity = 0.0;
         double maxAcceleration = 0.0;
         double maxJerk = 0.0;

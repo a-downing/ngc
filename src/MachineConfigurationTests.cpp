@@ -1,5 +1,6 @@
 #include <array>
 #include <chrono>
+#include <cmath>
 #include <expected>
 #include <filesystem>
 #include <format>
@@ -93,6 +94,49 @@ namespace {
                 "negative joint scale did not reorder its coordinate range");
     }
 
+    void testAxisMotionLimitsAccountForEveryMappedJointScale() {
+        const auto path = std::filesystem::path {NGC_SOURCE_DIR} / "machine.toml";
+        auto source = readFile(path);
+        replaceFirst(source,
+                     "[axes.y]\njoints = [1, 2]\nminimum = 0\nmaximum = 33.25\n"
+                     "max_velocity = 3.33333333333\nmax_acceleration = 5.1\n"
+                     "max_jerk = 101\n",
+                     "[axes.y]\njoints = [1, 2]\nminimum = 0\nmaximum = 33.25\n"
+                     "max_velocity = 100\nmax_acceleration = 100\nmax_jerk = 100\n");
+        replaceFirst(source,
+                     "name = \"y1\"\naxis = \"y\"\ncoordinate_scale = 1.0",
+                     "name = \"y1\"\naxis = \"y\"\ncoordinate_scale = 2.0");
+        replaceFirst(source,
+                     "name = \"y2\"\naxis = \"y\"\ncoordinate_scale = 1.0",
+                     "name = \"y2\"\naxis = \"y\"\ncoordinate_scale = -4.0");
+
+        const auto configuration = loadSource(source);
+        require(configuration.has_value(),
+                configuration ? "" : configuration.error());
+        const auto axis = std::ranges::find(
+            configuration->axes, ngc::Machine::Axis::Y,
+            &ngc::AxisConfiguration::axis);
+        require(axis != configuration->axes.end(),
+                "scaled multi-joint test should retain the Y axis");
+        const auto closeEnough = [](const double left, const double right) {
+            return std::abs(left - right) <= 1e-12;
+        };
+        require(closeEnough(axis->maxVelocity, 3.33333333333 / 4.0)
+                    && closeEnough(axis->maxAcceleration, 25.1 / 4.0)
+                    && closeEnough(axis->maxJerk, 101.0 / 4.0),
+                "logical-axis limits should use the tightest scaled joint limits");
+        require(closeEnough(
+                        configuration->trajectory.axisVelocity.y,
+                        axis->maxVelocity)
+                    && closeEnough(
+                        configuration->trajectory.axisAcceleration.y,
+                        axis->maxAcceleration)
+                    && closeEnough(
+                        configuration->trajectory.axisJerk.y,
+                        axis->maxJerk),
+                "trajectory limits should use the resolved logical-axis limits");
+    }
+
     void testUnsupportedHomingModesAreRejected() {
         const auto path = std::filesystem::path {NGC_SOURCE_DIR} / "machine.toml";
         const auto source = readFile(path);
@@ -132,6 +176,7 @@ int main() {
     try {
         testRepositoryConfigurationLoads();
         testJointCoordinateRangeAppliesAndOrdersScale();
+        testAxisMotionLimitsAccountForEveryMappedJointScale();
         testUnsupportedHomingModesAreRejected();
     } catch (const std::exception &error) {
         std::cerr << error.what() << '\n';

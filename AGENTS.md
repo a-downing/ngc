@@ -384,6 +384,7 @@ Tests are framework-free executables, with the core suite in `src/test.cpp`. The
 - When `homing.require_before_motion` is true, Program and MDI admission requires every configured joint to be homed. Accepting any new homing operation immediately invalidates prior homing confidence; only complete successful homing restores it. Homing and pre-homing joint service motion remain available.
 - A positive homing `backoff_distance` means clearance behind the fast-trigger position. `switch_position` is assigned at the slow latch and `home_position` is the final post-latch destination.
 - Jog start limits come from `[jogging]`; jog stop and lease-expiry authority comes from the physical axis/joint limits carried in `stopLimits`.
+- The typed configuration resolves each logical axis velocity, acceleration, and jerk limit against every mapped joint limit divided by the absolute joint coordinate scale. Axis-space planning and jogging consume those resolved limits; service/pre-homing joint-group jogging continues to use raw joint-space limits.
 
 Preserve these interpreter decisions:
 

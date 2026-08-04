@@ -446,9 +446,6 @@ namespace ngc {
                                         *maxVelocity, *maxAcceleration, *maxJerk });
                 axisComponent(result.trajectory.axisPosition.minimum, axis) = *minimum;
                 axisComponent(result.trajectory.axisPosition.maximum, axis) = *maximum;
-                axisComponent(result.trajectory.axisVelocity, axis) = *maxVelocity;
-                axisComponent(result.trajectory.axisAcceleration, axis) = *maxAcceleration;
-                axisComponent(result.trajectory.axisJerk, axis) = *maxJerk;
             }
 
             std::unordered_set<DigitalInputId> inputIds;
@@ -577,6 +574,25 @@ namespace ngc {
                             path, std::format("axes.{}.joints", axisName(axis.axis)),
                             "joint axis does not match its logical-axis table", axes));
                 }
+
+            for (auto &axis : result.axes) {
+                for (const auto id : axis.joints) {
+                    const auto *joint = findJoint(result.joints, id);
+                    const auto scale = std::abs(joint->coordinateScale);
+                    axis.maxVelocity = std::min(
+                        axis.maxVelocity, joint->maxVelocity / scale);
+                    axis.maxAcceleration = std::min(
+                        axis.maxAcceleration, joint->maxAcceleration / scale);
+                    axis.maxJerk = std::min(
+                        axis.maxJerk, joint->maxJerk / scale);
+                }
+                axisComponent(result.trajectory.axisVelocity, axis.axis) =
+                    axis.maxVelocity;
+                axisComponent(result.trajectory.axisAcceleration, axis.axis) =
+                    axis.maxAcceleration;
+                axisComponent(result.trajectory.axisJerk, axis.axis) =
+                    axis.maxJerk;
+            }
 
             const auto requireBeforeMotion = requiredBool(*homing, "require_before_motion", path);
             if(!requireBeforeMotion) return std::unexpected(requireBeforeMotion.error());

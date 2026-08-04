@@ -37,13 +37,22 @@ namespace ngc::operator_control {
             }
             return "?";
         }
+
+        JointMask jointMask(const AxisConfiguration &axis) noexcept {
+            JointMask result = 0;
+            for (const auto id : axis.joints) {
+                result |= JointMask {1} << id;
+            }
+
+            return result;
+        }
     }
 
     JogController::JogController(const MachineConfiguration &configuration)
         : m_jogging(configuration.jogging), m_step(configuration.pendant.step),
           m_velocity(configuration.pendant.velocity),
           m_servoPeriod(configuration.simulation.servoPeriod),
-          m_axes(configuration.axes), m_joints(configuration.joints) { }
+          m_axes(configuration.axes) { }
 
     void JogController::consume(const pendant::Intent &intent) {
         std::visit([&](const auto &value) {
@@ -209,25 +218,12 @@ namespace ngc::operator_control {
         if(axis == m_axes.end())
             return std::unexpected(std::format(
                 "pendant selected unconfigured axis {}", axisName(*selectedAxis)));
-        auto velocityLimit = axis->maxVelocity;
-        for(const auto id : axis->joints) {
-            const auto joint = std::ranges::find(m_joints, id, &JointConfiguration::id);
-            if(joint == m_joints.end())
-                return std::unexpected(std::format(
-                    "pendant axis {} references missing joint {}", axisName(*selectedAxis), id));
-            const auto scale = std::abs(joint->coordinateScale);
-            if(scale <= 1e-12)
-                return std::unexpected(std::format(
-                    "pendant axis {} references joint {} with an invalid coordinate scale",
-                    axisName(*selectedAxis), id));
-            velocityLimit = std::min(velocityLimit, joint->maxVelocity / scale);
-        }
         const auto fraction = std::clamp(
             std::abs(static_cast<double>(pending.countsPerSecond))
                 / m_velocity.fullScaleCountsPerSecond,
             0.0, 1.0);
         const auto sign = pending.countsPerSecond < 0 ? -1.0 : 1.0;
-        return sign * velocityLimit * m_velocity.maxVelocityScale * fraction;
+        return sign * axis->maxVelocity * m_velocity.maxVelocityScale * fraction;
     }
 
     std::expected<StartContinuousJogRequest, std::string>
@@ -240,25 +236,7 @@ namespace ngc::operator_control {
             return std::unexpected(std::format(
                 "pendant selected unconfigured axis {}", axisName(*selectedAxis)));
 
-        JointMask joints = 0;
-        auto velocityLimit = axis->maxVelocity;
-        auto acceleration = axis->maxAcceleration;
-        auto jerk = axis->maxJerk;
-        for(const auto id : axis->joints) {
-            joints |= JointMask { 1 } << id;
-            const auto joint = std::ranges::find(m_joints, id, &JointConfiguration::id);
-            if(joint == m_joints.end())
-                return std::unexpected(std::format(
-                    "pendant axis {} references missing joint {}", axisName(*selectedAxis), id));
-            const auto scale = std::abs(joint->coordinateScale);
-            if(scale <= 1e-12)
-                return std::unexpected(std::format(
-                    "pendant axis {} references joint {} with an invalid coordinate scale",
-                    axisName(*selectedAxis), id));
-            velocityLimit = std::min(velocityLimit, joint->maxVelocity / scale);
-            acceleration = std::min(acceleration, joint->maxAcceleration / scale);
-            jerk = std::min(jerk, joint->maxJerk / scale);
-        }
+        const auto joints = jointMask(*axis);
         if(joints == 0) return std::unexpected("pendant selected an axis without configured joints");
         if((snapshot.homedJoints & joints) != joints)
             return std::unexpected(std::format(
@@ -277,13 +255,16 @@ namespace ngc::operator_control {
             .id = nextRequestId(),
             .jog = nextJogId(),
             .target = { JogTargetType::Axis, backendAxis(*selectedAxis), 0 },
-            .signedVelocity = sign * velocityLimit * m_velocity.maxVelocityScale * fraction,
+            .signedVelocity = sign * axis->maxVelocity
+                * m_velocity.maxVelocityScale * fraction,
             .limits = {
-                velocityLimit,
-                std::min(acceleration, m_jogging.acceleration),
-                std::min(jerk, m_jogging.jerk),
+                axis->maxVelocity,
+                std::min(axis->maxAcceleration, m_jogging.acceleration),
+                std::min(axis->maxJerk, m_jogging.jerk),
             },
-            .stopLimits = { velocityLimit, acceleration, jerk },
+            .stopLimits = {
+                axis->maxVelocity, axis->maxAcceleration, axis->maxJerk,
+            },
             .travel = { axis->minimum, axis->maximum, true },
             .leaseTicks = leaseTicks,
         };
@@ -302,37 +283,21 @@ namespace ngc::operator_control {
         if(axis == m_axes.end())
             return std::unexpected(std::format("pendant selected unconfigured axis {}", axisName(*selectedAxis)));
 
-        JointMask joints = 0;
-        auto velocity = axis->maxVelocity;
-        auto acceleration = axis->maxAcceleration;
-        auto jerk = axis->maxJerk;
-        for(const auto id : axis->joints) {
-            joints |= JointMask { 1 } << id;
-            const auto joint = std::ranges::find(m_joints, id, &JointConfiguration::id);
-            if(joint == m_joints.end())
-                return std::unexpected(std::format(
-                    "pendant axis {} references missing joint {}", axisName(*selectedAxis), id));
-            const auto scale = std::abs(joint->coordinateScale);
-            if(scale <= 1e-12)
-                return std::unexpected(std::format(
-                    "pendant axis {} references joint {} with an invalid coordinate scale",
-                    axisName(*selectedAxis), id));
-            velocity = std::min(velocity, joint->maxVelocity / scale);
-            acceleration = std::min(acceleration, joint->maxAcceleration / scale);
-            jerk = std::min(jerk, joint->maxJerk / scale);
-        }
+        const auto joints = jointMask(*axis);
         if(joints == 0) return std::unexpected("pendant selected an axis without configured joints");
         if((snapshot.homedJoints & joints) != joints)
             return std::unexpected(std::format(
                 "pendant cannot jog unhomed axis {}", axisName(*selectedAxis)));
 
-        const JogMotionLimits stopLimits { velocity, acceleration, jerk };
+        const JogMotionLimits stopLimits {
+            axis->maxVelocity, axis->maxAcceleration, axis->maxJerk,
+        };
         return StartIncrementalJogRequest {
             .id = nextRequestId(),
             .jog = nextJogId(),
             .target = { JogTargetType::Axis, backendAxis(*selectedAxis), 0 },
             .distance = pending.distance,
-            .velocity = velocity,
+            .velocity = axis->maxVelocity,
             .limits = stopLimits,
             .stopLimits = stopLimits,
             .travel = { axis->minimum, axis->maximum, true },
