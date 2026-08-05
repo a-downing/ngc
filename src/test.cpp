@@ -124,6 +124,8 @@ namespace {
         void applyOutputs(
             const ngc::ProductionExecutorOutputState &) noexcept override { }
 
+        void establishSafeOutputs() noexcept override { }
+
         [[nodiscard]] bool prepareTriggeredJointMove(
             const ngc::TriggeredJointMove &move) noexcept override {
             std::scoped_lock lock(m_mutex);
@@ -149,9 +151,13 @@ namespace {
         std::uint32_t m_ticksUntilTrigger = 0;
     };
 
-    class FaultingProductionExecutorIo final
+    class ObservingProductionExecutorIo final
         : public ngc::ProductionExecutorIo {
     public:
+        explicit ObservingProductionExecutorIo(
+            const std::uint32_t fault = 0) noexcept
+            : m_fault(fault) { }
+
         void sampleDigitalInputs(
             const ngc::ProductionExecutorMotionContext &,
             ngc::ProductionExecutorDigitalInputs &inputs) noexcept override {
@@ -163,12 +169,21 @@ namespace {
             lastOutputs = outputs;
         }
 
-        [[nodiscard]] std::uint32_t faultCode() const noexcept override {
-            return fault;
+        void establishSafeOutputs() noexcept override {
+            lastOutputs = {};
+            safeOutputsEstablished = true;
         }
 
-        static constexpr std::uint32_t fault = 0x1234'5678;
+        [[nodiscard]] std::uint32_t faultCode() const noexcept override {
+            return m_fault;
+        }
+
+        static constexpr std::uint32_t TEST_FAULT = 0x1234'5678;
         ngc::ProductionExecutorOutputState lastOutputs;
+        bool safeOutputsEstablished = false;
+
+    private:
+        std::uint32_t m_fault;
     };
 #endif
 
@@ -1906,7 +1921,8 @@ final_move_together = true
 
     void testHostedExecutorRuntimeReportsIoFault() {
         ngc::HostedExecutorRuntimeConfiguration configuration;
-        auto io = std::make_unique<FaultingProductionExecutorIo>();
+        auto io = std::make_unique<ObservingProductionExecutorIo>(
+            ObservingProductionExecutorIo::TEST_FAULT);
         const auto *observation = io.get();
         ngc::HostedExecutorRuntime runtime(
             configuration, std::move(io));
@@ -1917,15 +1933,55 @@ final_move_together = true
         require(runtime.endpoint().tryTakeSnapshot(snapshot)
                     && snapshot.state == ngc::BackendState::Faulted
                     && snapshot.faultCode
-                        == FaultingProductionExecutorIo::fault,
+                        == ObservingProductionExecutorIo::TEST_FAULT,
                 "production runtime did not report its I/O fault");
         require(!observation->lastOutputs.executorEnabled,
                 "production runtime retained enabled outputs after an I/O fault");
 
         const auto stopped = ngc::stopExecutorSafely(runtime);
         require(stopped.state == ngc::BackendState::Faulted
-                    && stopped.faultCode == FaultingProductionExecutorIo::fault,
+                    && stopped.faultCode
+                        == ObservingProductionExecutorIo::TEST_FAULT,
                 "faulted executor shutdown should preserve the terminal fault state");
+
+        runtime.start();
+        runtime.stop();
+        require(observation->safeOutputsEstablished,
+                "faulted runtime stop did not establish safe physical outputs");
+    }
+
+    void testHostedExecutorRuntimeMakesDirectStopTerminalAndSafe() {
+        ngc::HostedExecutorRuntimeConfiguration configuration;
+        auto io = std::make_unique<ObservingProductionExecutorIo>();
+        const auto *observation = io.get();
+        ngc::HostedExecutorRuntime runtime(
+            configuration, std::move(io));
+        auto &backend = runtime.endpoint();
+        const auto submit = [&](const ngc::ControlRequest &request) {
+            require(backend.trySubmit(request) == ngc::SubmitResult::Submitted,
+                    "direct-stop setup control should fit");
+            runtime.serviceImmediate();
+        };
+
+        submit(ngc::ResetRequest{1, 1});
+        submit(ngc::EnableRequest{2});
+        submit(ngc::StartRequest{3, 1});
+        ngc::ExecutionSnapshot snapshot;
+        while (backend.tryTakeSnapshot(snapshot)) { }
+        require(snapshot.state == ngc::BackendState::Running
+                    && observation->lastOutputs.executorEnabled,
+                "direct-stop fixture did not enable its executor outputs");
+
+        runtime.start();
+        runtime.stop();
+
+        while (backend.tryTakeSnapshot(snapshot)) { }
+        require(snapshot.state == ngc::BackendState::Faulted
+                    && snapshot.faultCode
+                        == ngc::PRODUCTION_EXECUTOR_RUNTIME_STOP_FAULT
+                    && observation->safeOutputsEstablished
+                    && !observation->lastOutputs.executorEnabled,
+                "direct runtime stop did not become terminal with safe outputs");
     }
 
     void testProductionExecutorTimingBackpressureDoesNotBlockServo() {
@@ -8555,6 +8611,7 @@ int main() {
         testFrontendLossDisablesRunningExecutorWithoutPlan();
         testHostedExecutorRuntimePublishesBoundedTiming();
         testHostedExecutorRuntimeReportsIoFault();
+        testHostedExecutorRuntimeMakesDirectStopTerminalAndSafe();
         testProductionExecutorTimingBackpressureDoesNotBlockServo();
 #endif
         testHomingControllerOwnsBackendNeutralSequence();

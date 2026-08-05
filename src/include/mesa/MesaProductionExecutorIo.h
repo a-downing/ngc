@@ -62,6 +62,7 @@ namespace ngc::mesa {
             ProductionExecutorDigitalInputs &inputs) noexcept override;
         void applyOutputs(
             const ProductionExecutorOutputState &outputs) noexcept override;
+        void establishSafeOutputs() noexcept override;
         [[nodiscard]] std::uint32_t faultCode() const noexcept override;
         [[nodiscard]] ProductionExecutorIoFaultDiagnostic
         faultDiagnostic() const noexcept override;
@@ -79,6 +80,7 @@ namespace ngc::mesa {
                 stepGenerators,
             std::optional<MesaExecutorSafetyInput>
                 safetyInput) noexcept;
+        [[nodiscard]] bool exchangePendingOutputs() noexcept;
 
         std::unique_ptr<HostMot2CyclicIo> m_io;
         DigitalIoProgram m_ioProgram;

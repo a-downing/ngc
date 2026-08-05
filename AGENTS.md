@@ -129,8 +129,12 @@ the core. It derives fixed-capacity executor mappings and limits from typed
 machine configuration, owns fixed-period ticking and stopped-state synchronous
 service stepping, samples a fixed-size digital-input image before each tick,
 and applies the fixed-size output state afterward through an injected I/O
-boundary. The physical Mesa integration slice exposes unmodified board input
-levels through globally unique bare field-input names and executes an
+boundary. After its servo thread quiesces, runtime stop faults any executor
+that remains enabled and synchronously establishes the composed I/O safe state;
+Mesa commits a final zero-output cyclic exchange and the spindle worker
+acknowledges its safe stop before shutdown returns. The physical Mesa
+integration slice exposes unmodified board input levels through globally
+unique bare field-input names and executes an
 NRT-compiled, fixed-capacity double-register program. In addition to Boolean
 `mov`, `not`, `and`, `or`, `xor`, and stateful `debounce`, the program provides
 `sub`, `abs`, `le`, `ge`, and integral-mask `test`. Before input sampling, it

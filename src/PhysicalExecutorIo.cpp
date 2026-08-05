@@ -53,6 +53,15 @@ namespace ngc {
         }
     }
 
+    void PhysicalExecutorIo::establishSafeOutputs() noexcept {
+        m_motion->establishSafeOutputs();
+        if (m_spindle) {
+            m_spindle->establishSafeStop();
+            m_spindle->waitForSafeStop();
+            m_lastSpindle.reset();
+        }
+    }
+
     std::uint32_t
     PhysicalExecutorIo::faultCode() const noexcept {
         const auto motionFault = m_motion->faultCode();

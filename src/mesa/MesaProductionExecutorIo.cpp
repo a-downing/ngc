@@ -204,19 +204,7 @@ namespace ngc::mesa {
         const ProductionExecutorMotionContext &motion,
         ProductionExecutorDigitalInputs &inputs) noexcept {
         inputs.reset();
-        if (m_faultCode != 0) {
-            return;
-        }
-
-        const auto result = m_io->cycle(m_pendingOutputs);
-        if (result.fault != HostMot2CyclicIoFault::None
-            || !result.inputsValid) {
-            m_faultCode = executorFaultCode(result.fault);
-            if (m_faultCode == 0) {
-                m_faultCode = executorFaultCode(
-                    HostMot2CyclicIoFault::Transport);
-            }
-
+        if (m_faultCode != 0 || !exchangePendingOutputs()) {
             return;
         }
 
@@ -436,6 +424,28 @@ namespace ngc::mesa {
             outputs.commandedJoints;
         m_lastExecutorEnabled = true;
         m_pendingOutputs = next;
+    }
+
+    void MesaProductionExecutorIo::establishSafeOutputs() noexcept {
+        applyOutputs({});
+        static_cast<void>(exchangePendingOutputs());
+    }
+
+    bool MesaProductionExecutorIo::exchangePendingOutputs() noexcept {
+        const auto result = m_io->cycle(m_pendingOutputs);
+        if (result.fault == HostMot2CyclicIoFault::None
+            && result.inputsValid) {
+            return true;
+        }
+
+        if (m_faultCode == 0) {
+            m_faultCode = executorFaultCode(
+                result.fault == HostMot2CyclicIoFault::None
+                    ? HostMot2CyclicIoFault::Transport
+                    : result.fault);
+        }
+
+        return false;
     }
 
     std::uint32_t MesaProductionExecutorIo::faultCode() const noexcept {

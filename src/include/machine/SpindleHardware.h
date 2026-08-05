@@ -54,6 +54,7 @@ namespace ngc {
         void start();
         void stop() noexcept;
         void establishSafeStop() noexcept;
+        void waitForSafeStop() const noexcept;
         [[nodiscard]] bool tryRearmAndCommand(
             const SpindleEvent &desired) noexcept;
         [[nodiscard]] std::uint32_t faultCode() const noexcept;

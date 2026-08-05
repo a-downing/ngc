@@ -21,6 +21,7 @@ namespace ngc {
             ProductionExecutorDigitalInputs &inputs) noexcept override;
         void applyOutputs(
             const ProductionExecutorOutputState &outputs) noexcept override;
+        void establishSafeOutputs() noexcept override;
         [[nodiscard]] std::uint32_t faultCode() const noexcept override;
         [[nodiscard]] ProductionExecutorIoFaultDiagnostic
         faultDiagnostic() const noexcept override;

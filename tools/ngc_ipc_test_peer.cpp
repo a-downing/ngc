@@ -392,6 +392,8 @@ namespace {
 
         void applyOutputs(const ngc::ProductionExecutorOutputState &) noexcept override { }
 
+        void establishSafeOutputs() noexcept override { }
+
         std::uint32_t faultCode() const noexcept override {
             return m_faultCode.load(std::memory_order_acquire);
         }

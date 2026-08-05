@@ -55,6 +55,14 @@ namespace ngc {
             std::memory_order_acq_rel));
     }
 
+    void SpindleWorker::waitForSafeStop() const noexcept {
+        auto state = m_safety.load(std::memory_order_acquire);
+        while (state != SpindleSafetyState::SafeStopped) {
+            m_safety.wait(state, std::memory_order_acquire);
+            state = m_safety.load(std::memory_order_acquire);
+        }
+    }
+
     bool SpindleWorker::tryRearmAndCommand(
         const SpindleEvent &desired) noexcept {
         if (m_faultCode.load(std::memory_order_acquire) != 0) {
@@ -104,9 +112,11 @@ namespace ngc {
                 while (m_commands.tryPop(desired)) { }
                 m_hardware->safeStop();
                 auto expected = SpindleSafetyState::StopRequested;
-                static_cast<void>(m_safety.compare_exchange_strong(
+                if (m_safety.compare_exchange_strong(
                     expected, SpindleSafetyState::SafeStopped,
-                    std::memory_order_acq_rel));
+                    std::memory_order_acq_rel)) {
+                    m_safety.notify_all();
+                }
             }
             if (faultCode() != 0) {
                 break;
@@ -163,6 +173,10 @@ namespace ngc {
         }
 
         m_hardware->safeStop();
+        m_safety.store(
+            SpindleSafetyState::SafeStopped,
+            std::memory_order_release);
+        m_safety.notify_all();
         m_communicationHealthy.store(
             false, std::memory_order_release);
         m_atSpeed.store(false, std::memory_order_release);

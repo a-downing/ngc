@@ -1727,6 +1727,47 @@ namespace {
                 "marginal delayed-loop position gain was not rejected");
     }
 
+    void testMesaExecutorCommitsSafeOutputs() {
+        DatagramFixtureTransport transport;
+        auto io = sevenI96CyclicIo(transport);
+        auto response = transport.queueResponse(10);
+        putCyclicConfirmation(response, 0, 1, 1);
+        constexpr std::array<ngc::DigitalInputId, 0> logicalInputs{};
+        constexpr std::array<ngc::DigitalOutputId, 0> logicalOutputs{};
+        auto program = ngc::DigitalIoProgram::compile(
+            "", 0, logicalInputs, 0, logicalOutputs, 0.001);
+        require(program.has_value(),
+                "safe-output digital I/O program did not compile");
+        auto adapter = ngc::mesa::MesaProductionExecutorIo::create(
+            std::move(io), std::move(*program));
+        require(adapter.has_value(),
+                "safe-output Mesa executor adapter was rejected");
+        auto outputs = ngc::ProductionExecutorOutputState{};
+        outputs.executorEnabled = true;
+        (*adapter)->applyOutputs(outputs);
+        require((*adapter)->pendingOutputs().watchdogEnabled,
+                "safe-output fixture did not stage enabled hardware");
+        response = transport.response(46);
+        putCyclicConfirmation(response, 36, 2, 2);
+
+        (*adapter)->establishSafeOutputs();
+
+        const auto request = transport.request();
+        const auto stepRates = findRequestWrite(request, 0x2000);
+        require(
+            (*adapter)->faultCode() == 0
+                && !(*adapter)->pendingOutputs().watchdogEnabled
+                && std::ranges::all_of(
+                    stepRates.data,
+                    [](const std::byte value) {
+                        return value == std::byte{};
+                    })
+                && littleEndian32(
+                    findRequestWrite(request, 0x0C00).data)
+                    == 0x8000'0000,
+            "Mesa executor did not commit its safe cyclic output image");
+    }
+
     void testBridgesMesaInputsAndStepGeneratorsToExecutorIo() {
         DatagramFixtureTransport transport;
         auto io = sevenI96CyclicIo(transport, true);
@@ -1983,6 +2024,23 @@ namespace {
                 && std::isfinite(faultDiagnostic.targetPosition)
                 && std::isfinite(faultDiagnostic.actualPosition),
             "Mesa following-error detail was not retained");
+        response = transport.response(50);
+        putCyclicConfirmation(response, 40, 5, 5);
+
+        (*adapter)->establishSafeOutputs();
+
+        require(
+            std::ranges::all_of(
+                findRequestWrite(
+                    transport.request(), 0x2000).data,
+                [](const std::byte value) {
+                    return value == std::byte{};
+                })
+                && littleEndian32(
+                    findRequestWrite(
+                        transport.request(), 0x0C00).data)
+                    == 0x8000'0000,
+            "faulted Mesa executor did not commit its safe output image");
     }
 
     void testMesaDelayedPositionCorrectionSettles() {
@@ -2346,6 +2404,7 @@ int main() {
         testExecutesMotionContextDigitalIoProgram();
         testRejectsInvalidDigitalIoPrograms();
         testRejectsUnstableMesaPositionGain();
+        testMesaExecutorCommitsSafeOutputs();
         testBridgesMesaInputsAndStepGeneratorsToExecutorIo();
         testExternalEnableLossFaultsMesaExecutorIo();
         testRebasesStationaryMesaCoordinatesAndFaultsFollowingError();

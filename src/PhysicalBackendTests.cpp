@@ -133,6 +133,10 @@ namespace {
                 std::memory_order_release);
         }
 
+        void establishSafeOutputs() noexcept override {
+            lastEnabled.store(false, std::memory_order_release);
+        }
+
         std::atomic<bool> lastEnabled{false};
     };
 
@@ -375,16 +379,13 @@ namespace {
                     std::memory_order_acquire) == 1,
                 "unchanged spindle state was republished");
 
-            outputs.safeOutputsRequired = true;
-            io.applyOutputs(outputs);
-            waitFor(
-                [&] {
-                    return observation->stops.load(
-                            std::memory_order_acquire) != 0
-                        && !observation->enabled.load(
-                            std::memory_order_acquire);
-                },
-                "physical I/O did not establish the requested safe spindle state");
+            io.establishSafeOutputs();
+            require(
+                observation->stops.load(
+                        std::memory_order_acquire) != 0
+                    && !observation->enabled.load(
+                        std::memory_order_acquire),
+                "physical I/O returned before establishing its safe spindle state");
         }
         require(
             observation->stops.load(
@@ -474,15 +475,12 @@ namespace {
         observation->releaseCommand.store(
             true, std::memory_order_release);
         observation->releaseCommand.notify_one();
-        waitFor(
-            [&] {
-                return observation->stops.load(
-                    std::memory_order_acquire) != 0;
-            },
-            "spindle worker did not establish its priority safe stop");
+        worker.waitForSafeStop();
         require(
-            observation->commands.load(
-                std::memory_order_acquire) == 0,
+            observation->stops.load(
+                    std::memory_order_acquire) != 0
+                && observation->commands.load(
+                    std::memory_order_acquire) == 0,
             "spindle worker executed queued commands before its safe stop");
         observation->pauseCommand.store(
             false, std::memory_order_release);

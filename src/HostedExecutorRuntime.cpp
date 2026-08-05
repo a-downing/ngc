@@ -24,6 +24,8 @@ namespace ngc {
 
             void applyOutputs(
                 const ProductionExecutorOutputState &) noexcept override { }
+
+            void establishSafeOutputs() noexcept override { }
         };
 
         std::size_t axisIndex(const Machine::Axis axis) noexcept {
@@ -269,6 +271,15 @@ namespace ngc {
             m_stopping.store(true, std::memory_order_release);
         }
         m_servoThread.join();
+
+        if (m_core->outputState().executorEnabled) {
+            const auto ioFault = m_io->faultCode();
+            m_core->latchEmergencyStop(
+                ioFault != 0
+                    ? ioFault
+                    : PRODUCTION_EXECUTOR_RUNTIME_STOP_FAULT);
+        }
+        m_io->establishSafeOutputs();
 
         std::scoped_lock lock(m_lifecycleMutex);
         m_started = false;

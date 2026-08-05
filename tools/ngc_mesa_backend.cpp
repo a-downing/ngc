@@ -224,11 +224,52 @@ namespace {
         return result;
     }
 
+    struct ResolvedMesaExecutorConfiguration {
+        std::uint32_t servoPeriodNanoseconds;
+        std::vector<ngc::mesa::MesaStepGeneratorMapping> mappings;
+        ngc::mesa::MesaExecutorSafetyInput safetyInput;
+        ngc::DigitalIoProgram ioProgram;
+    };
+
+    ResolvedMesaExecutorConfiguration resolveExecutorConfiguration(
+        const ngc::MachineConfiguration &machine,
+        const ngc::physical::PhysicalBackendConfiguration &physical) {
+        const auto &mesa = physical.motion;
+        if (!mesa.safety.has_value()) {
+            throw std::runtime_error(
+                "Mesa physical backend requires a configured "
+                "motion.safety enable input");
+        }
+        if (!physical.runtime.realtimeEnabled) {
+            throw std::runtime_error(
+                "the Mesa physical backend requires configured "
+                "real-time CPU and priority");
+        }
+        auto ioProgram = ngc::mesa::compileMesaDigitalIoProgram(
+            machine, mesa);
+        if (!ioProgram) {
+            throw std::runtime_error(ioProgram.error());
+        }
+
+        return {
+            .servoPeriodNanoseconds = servoPeriodNanoseconds(machine),
+            .mappings = stepGeneratorMappings(machine, mesa),
+            .safetyInput = {
+                .input = resolveInput(
+                    machine, mesa.safety->enableInput),
+                .requiredLevel = mesa.safety->polarity
+                    == ngc::mesa::MesaSafetyPolarity::ActiveHigh,
+            },
+            .ioProgram = std::move(*ioProgram),
+        };
+    }
+
     std::unique_ptr<ngc::HostedExecutorRuntime> makeRuntime(
         const ngc::MachineConfiguration &machine,
         const ngc::physical::PhysicalBackendConfiguration
             &physical,
-        ngc::mesa::Lbp16UdpTransport &transport) {
+        ngc::mesa::Lbp16UdpTransport &transport,
+        ResolvedMesaExecutorConfiguration resolved) {
         const auto &mesa = physical.motion;
         const auto inventory =
             ngc::mesa::discoverHostMot2(transport);
@@ -241,8 +282,6 @@ namespace {
             throw std::runtime_error(capabilities.error());
         }
 
-        const auto periodNanoseconds =
-            servoPeriodNanoseconds(machine);
         auto cyclicConfiguration =
             ngc::mesa::HostMot2CyclicConfiguration{
                 .watchdogTimeoutNanoseconds =
@@ -250,7 +289,7 @@ namespace {
                 .dpll = mesa.dpll,
             };
         cyclicConfiguration.dpll.servoPeriodNanoseconds =
-            periodNanoseconds;
+            resolved.servoPeriodNanoseconds;
         auto cyclic = ngc::mesa::HostMot2CyclicIo::create(
             transport, physicalLayout(*capabilities, mesa),
             cyclicConfiguration);
@@ -258,29 +297,10 @@ namespace {
             throw std::runtime_error(cyclic.error());
         }
 
-        const auto mappings =
-            stepGeneratorMappings(machine, mesa);
-        if (!mesa.safety.has_value()) {
-            throw std::runtime_error(
-                "Mesa physical backend requires a configured "
-                "motion.safety enable input");
-        }
-        const auto safetyInput = ngc::mesa::MesaExecutorSafetyInput{
-            .input = resolveInput(
-                machine, mesa.safety->enableInput),
-            .requiredLevel = mesa.safety->polarity
-                == ngc::mesa::MesaSafetyPolarity::ActiveHigh,
-        };
-        auto ioProgram =
-            ngc::mesa::compileMesaDigitalIoProgram(
-                machine, mesa);
-        if (!ioProgram) {
-            throw std::runtime_error(ioProgram.error());
-        }
         auto motion = ngc::mesa::MesaProductionExecutorIo::create(
             std::move(*cyclic),
-            std::move(*ioProgram),
-            mappings, safetyInput);
+            std::move(resolved.ioProgram),
+            resolved.mappings, resolved.safetyInput);
         if (!motion) {
             throw std::runtime_error(motion.error());
         }
@@ -320,30 +340,10 @@ namespace {
             throw std::runtime_error(physical.error());
         }
         const auto &mesa = physical->motion;
-        static_cast<void>(servoPeriodNanoseconds(*machine));
-        if (mesa.safety.has_value()) {
-            static_cast<void>(resolveInput(
-                *machine, mesa.safety->enableInput));
-        }
-        static_cast<void>(stepGeneratorMappings(*machine, mesa));
-        const auto ioProgram =
-            ngc::mesa::compileMesaDigitalIoProgram(
-                *machine, mesa);
-        if (!ioProgram) {
-            throw std::runtime_error(ioProgram.error());
-        }
+        auto resolved = resolveExecutorConfiguration(
+            *machine, *physical);
         if (options.validateConfigurationOnly) {
             return 0;
-        }
-        if (!mesa.safety.has_value()) {
-            throw std::runtime_error(
-                "Mesa physical backend requires a configured "
-                "motion.safety enable input");
-        }
-        if (!physical->runtime.realtimeEnabled) {
-            throw std::runtime_error(
-                "the Mesa physical backend requires configured "
-                "real-time CPU and priority");
         }
 
         auto memory = ngc::ipc_detail::SharedMemory::open(
@@ -381,7 +381,8 @@ namespace {
             throw std::runtime_error(transport.error());
         }
         auto runtime = makeRuntime(
-            *machine, *physical, **transport);
+            *machine, *physical, **transport,
+            std::move(resolved));
         runtime->attachEmergencyStopControl(region.emergencyStop);
         if (ngc::ipc_detail::parentProcessId()
             != region.frontendProcessId) {

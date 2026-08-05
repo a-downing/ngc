@@ -20,6 +20,8 @@
 namespace ngc {
     inline constexpr std::uint32_t
         PRODUCTION_EXECUTOR_DEADLINE_MISS_FAULT = 0x52540001;
+    inline constexpr std::uint32_t
+        PRODUCTION_EXECUTOR_RUNTIME_STOP_FAULT = 0x52540002;
 
     using ProductionExecutorDigitalInputs = LogicalDigitalInputImage;
 
@@ -44,6 +46,9 @@ namespace ngc {
             ProductionExecutorDigitalInputs &inputs) noexcept = 0;
         virtual void applyOutputs(
             const ProductionExecutorOutputState &outputs) noexcept = 0;
+        // Called after cyclic execution has quiesced. This must complete the
+        // hardware-specific safe-output operation before returning.
+        virtual void establishSafeOutputs() noexcept = 0;
         [[nodiscard]] virtual std::uint32_t faultCode() const noexcept {
             return 0;
         }
