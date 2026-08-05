@@ -23,12 +23,19 @@ namespace ngc {
         std::uint32_t faultCode = 0;
     };
 
+    enum class SpindleSafetyState : std::uint8_t {
+        Armed,
+        StopRequested,
+        SafeStopped,
+    };
+
     class SpindleHardware {
     public:
         virtual ~SpindleHardware() = default;
 
         [[nodiscard]] virtual bool applyDesired(
-            const SpindleEvent &desired) noexcept = 0;
+            const SpindleEvent &desired,
+            const std::atomic<SpindleSafetyState> &safety) noexcept = 0;
         [[nodiscard]] virtual bool pollStatus(
             SpindleHardwareStatus &status) noexcept = 0;
         virtual void safeStop() noexcept = 0;
@@ -47,19 +54,12 @@ namespace ngc {
         void start();
         void stop() noexcept;
         void establishSafeStop() noexcept;
-        [[nodiscard]] bool tryRearm() noexcept;
-        [[nodiscard]] bool tryCommand(
+        [[nodiscard]] bool tryRearmAndCommand(
             const SpindleEvent &desired) noexcept;
         [[nodiscard]] std::uint32_t faultCode() const noexcept;
         [[nodiscard]] SpindleHardwareStatus status() const noexcept;
 
     private:
-        enum class SafeStopState : std::uint8_t {
-            Armed,
-            Requested,
-            Established,
-        };
-
         void run() noexcept;
         void latchFault(std::uint32_t fault) noexcept;
 
@@ -70,7 +70,8 @@ namespace ngc {
         SpscChannel<SpindleEvent, COMMAND_CAPACITY> m_commands;
         std::atomic<bool> m_stopping{false};
         std::atomic<bool> m_started{false};
-        std::atomic<SafeStopState> m_safeStopState{SafeStopState::Armed};
+        std::atomic<SpindleSafetyState> m_safety{
+            SpindleSafetyState::Armed};
         std::atomic<std::uint32_t> m_faultCode{0};
         std::atomic<bool> m_communicationHealthy{false};
         std::atomic<bool> m_atSpeed{false};

@@ -49,29 +49,22 @@ namespace ngc {
     }
 
     void SpindleWorker::establishSafeStop() noexcept {
-        auto expected = SafeStopState::Armed;
-        static_cast<void>(m_safeStopState.compare_exchange_strong(
-            expected, SafeStopState::Requested,
+        auto expected = SpindleSafetyState::Armed;
+        static_cast<void>(m_safety.compare_exchange_strong(
+            expected, SpindleSafetyState::StopRequested,
             std::memory_order_acq_rel));
     }
 
-    bool SpindleWorker::tryRearm() noexcept {
-        if (faultCode() != 0) {
+    bool SpindleWorker::tryRearmAndCommand(
+        const SpindleEvent &desired) noexcept {
+        if (m_faultCode.load(std::memory_order_acquire) != 0) {
             return false;
         }
-
-        auto expected = SafeStopState::Established;
-
-        return m_safeStopState.compare_exchange_strong(
-            expected, SafeStopState::Armed,
-            std::memory_order_acq_rel);
-    }
-
-    bool SpindleWorker::tryCommand(
-        const SpindleEvent &desired) noexcept {
-        if (m_faultCode.load(std::memory_order_acquire) != 0
-            || m_safeStopState.load(std::memory_order_acquire)
-                != SafeStopState::Armed) {
+        auto safety = SpindleSafetyState::SafeStopped;
+        if (!m_safety.compare_exchange_strong(
+                safety, SpindleSafetyState::Armed,
+                std::memory_order_acq_rel)
+            && safety != SpindleSafetyState::Armed) {
             return false;
         }
         if (!m_commands.tryPush(desired)) {
@@ -106,37 +99,35 @@ namespace ngc {
     void SpindleWorker::run() noexcept {
         while (!m_stopping.load(std::memory_order_acquire)) {
             auto desired = SpindleEvent{};
-            if (m_safeStopState.load(std::memory_order_acquire)
-                == SafeStopState::Requested) {
+            if (m_safety.load(std::memory_order_acquire)
+                == SpindleSafetyState::StopRequested) {
                 while (m_commands.tryPop(desired)) { }
                 m_hardware->safeStop();
-                auto expected = SafeStopState::Requested;
-                static_cast<void>(m_safeStopState.compare_exchange_strong(
-                    expected, SafeStopState::Established,
+                auto expected = SpindleSafetyState::StopRequested;
+                static_cast<void>(m_safety.compare_exchange_strong(
+                    expected, SpindleSafetyState::SafeStopped,
                     std::memory_order_acq_rel));
             }
             if (faultCode() != 0) {
                 break;
             }
+            if (m_safety.load(std::memory_order_acquire)
+                != SpindleSafetyState::Armed) {
+                std::this_thread::sleep_for(m_pollingPeriod);
+
+                continue;
+            }
             while (m_commands.tryPop(desired)) {
-                if (m_safeStopState.load(std::memory_order_acquire)
-                    != SafeStopState::Armed) {
+                if (m_safety.load(std::memory_order_acquire)
+                    != SpindleSafetyState::Armed) {
                     break;
                 }
-                if (!m_hardware->applyDesired(desired)) {
+                if (!m_hardware->applyDesired(
+                        desired, m_safety)) {
                     latchFault(SPINDLE_COMMUNICATION_FAULT);
                     establishSafeStop();
                     break;
                 }
-            }
-
-            const auto safeStopState =
-                m_safeStopState.load(std::memory_order_acquire);
-            if (safeStopState != SafeStopState::Armed) {
-                if (safeStopState == SafeStopState::Established) {
-                    std::this_thread::sleep_for(m_pollingPeriod);
-                }
-                continue;
             }
 
             auto status = SpindleHardwareStatus{};
@@ -164,8 +155,8 @@ namespace ngc {
                 establishSafeStop();
                 continue;
             }
-            if (m_safeStopState.load(std::memory_order_acquire)
-                != SafeStopState::Armed) {
+            if (m_safety.load(std::memory_order_acquire)
+                != SpindleSafetyState::Armed) {
                 continue;
             }
             std::this_thread::sleep_for(m_pollingPeriod);

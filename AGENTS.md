@@ -201,8 +201,11 @@ an optional `SpindleHardware` behind a bounded RT-to-NRT `SpindleWorker`;
 serial communication never runs in the servo cycle, and worker shutdown or a
 latched spindle communication fault establishes the spindle safe stop. Safety
 stops bypass and discard the ordinary ordered spindle-command queue, and the
-worker rejects further commands until the executor explicitly rearms it. The
-Huanyang spindle hardware uses an NRT Linux serial transport with bounded
+worker rejects further commands until the executor explicitly rearms it with
+a complete desired state. One atomic safety state owns request, safe-stop
+acknowledgement, and rearm; compound hardware commands recheck it between
+serial transactions so a superseded frequency write cannot be followed by Run.
+The Huanyang spindle hardware uses an NRT Linux serial transport with bounded
 transaction timeouts and the device's proprietary RTU packet shape and Modbus
 CRC. Startup establishes stop before reading and validating PD004, PD005,
 PD011, and PD141 through PD144. Commands write bounded frequency before

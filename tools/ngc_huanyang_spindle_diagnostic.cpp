@@ -17,6 +17,9 @@
 #include "physical/SerialTransport.h"
 
 namespace {
+    const std::atomic<ngc::SpindleSafetyState> ARMED_SPINDLE{
+        ngc::SpindleSafetyState::Armed};
+
     using namespace std::chrono_literals;
 
     volatile std::sig_atomic_t interrupted = 0;
@@ -232,7 +235,7 @@ namespace {
         ngc::physical::HuanyangSpindleHardware &hardware,
         const Options &options,
         const std::string_view phase) {
-        if (!hardware.applyDesired({})) {
+        if (!hardware.applyDesired({}, ARMED_SPINDLE)) {
             throw std::runtime_error(std::format(
                 "Huanyang Stop command failed after {}", phase));
         }
@@ -254,7 +257,7 @@ namespace {
             .direction = direction,
             .speed = *options.commandTestSpeed,
         };
-        if (!hardware.applyDesired(desired)) {
+        if (!hardware.applyDesired(desired, ARMED_SPINDLE)) {
             throw std::runtime_error(std::format(
                 "Huanyang {} command failed", phase));
         }

@@ -36,12 +36,18 @@ namespace {
         }
     }
 
+    const std::atomic<ngc::SpindleSafetyState> ARMED_SPINDLE{
+        ngc::SpindleSafetyState::Armed};
+
     struct SpindleObservation {
         std::atomic<std::uint32_t> commands{0};
         std::atomic<std::uint32_t> polls{0};
         std::atomic<std::uint32_t> stops{0};
         std::atomic<bool> enabled{false};
         std::atomic<double> speed{0.0};
+        std::atomic<bool> pauseCommand{false};
+        std::atomic<bool> commandEntered{false};
+        std::atomic<bool> releaseCommand{false};
         std::mutex historyMutex;
         std::vector<ngc::SpindleEvent> history;
     };
@@ -55,7 +61,20 @@ namespace {
               m_failCommands(failCommands) { }
 
         bool applyDesired(
-            const ngc::SpindleEvent &desired) noexcept override {
+            const ngc::SpindleEvent &desired,
+            const std::atomic<ngc::SpindleSafetyState> &safety) noexcept override {
+            if (m_observation->pauseCommand.load(
+                    std::memory_order_acquire)) {
+                m_observation->commandEntered.store(
+                    true, std::memory_order_release);
+                m_observation->commandEntered.notify_one();
+                m_observation->releaseCommand.wait(
+                    false, std::memory_order_acquire);
+            }
+            if (safety.load(std::memory_order_acquire)
+                != ngc::SpindleSafetyState::Armed) {
+                return true;
+            }
             m_observation->enabled.store(
                 desired.enabled, std::memory_order_release);
             m_observation->speed.store(
@@ -128,6 +147,9 @@ namespace {
         bool corruptFunction = false;
         bool corruptEcho = false;
         std::uint8_t controlStatus = 0;
+        std::atomic<bool> pauseAfterFrequency{false};
+        std::atomic<bool> frequencyWritten{false};
+        std::atomic<bool> releaseFrequency{false};
     };
 
     class FakeSerialTransport final
@@ -199,6 +221,14 @@ namespace {
                     m_observation->frequency =
                         static_cast<std::uint16_t>(
                             request[3] << 8 | request[4]);
+                    if (m_observation->pauseAfterFrequency.load(
+                            std::memory_order_acquire)) {
+                        m_observation->frequencyWritten.store(
+                            true, std::memory_order_release);
+                        m_observation->frequencyWritten.notify_one();
+                        m_observation->releaseFrequency.wait(
+                            false, std::memory_order_acquire);
+                    }
                     payload = {
                         1, 0x05, 2, request[3], request[4], 0,
                     };
@@ -377,13 +407,13 @@ namespace {
             },
             "spindle worker did not begin polling");
 
-        require(worker.tryCommand({
+        require(worker.tryRearmAndCommand({
                     .enabled = true,
                     .direction = ngc::Direction::CW,
                     .speed = 12000.0,
                 })
-                && worker.tryCommand({})
-                && worker.tryCommand({
+                && worker.tryRearmAndCommand({})
+                && worker.tryRearmAndCommand({
                     .enabled = true,
                     .direction = ngc::Direction::CCW,
                     .speed = 6000.0,
@@ -410,11 +440,16 @@ namespace {
             "spindle worker changed command order");
     }
 
+    ngc::physical::HuanyangSpindleConfiguration
+    huanyangConfiguration();
+
     void testSpindleSafeStopSupersedesQueuedCommands() {
         auto observation =
             std::make_shared<SpindleObservation>();
+        observation->pauseCommand.store(
+            true, std::memory_order_release);
         ngc::SpindleWorker worker(
-            std::make_unique<ObservedSpindle>(observation), 100ms);
+            std::make_unique<ObservedSpindle>(observation));
         worker.start();
         waitFor(
             [&] {
@@ -423,18 +458,22 @@ namespace {
             },
             "spindle worker did not begin polling");
 
-        require(worker.tryCommand({
+        require(worker.tryRearmAndCommand({
                     .enabled = true,
                     .direction = ngc::Direction::CW,
                     .speed = 12000.0,
-                })
-                && worker.tryCommand({
-                    .enabled = true,
-                    .direction = ngc::Direction::CCW,
-                    .speed = 6000.0,
                 }),
-            "spindle worker rejected the safe-stop fixture commands");
+            "spindle worker rejected the safe-stop fixture command");
+        waitFor(
+            [&] {
+                return observation->commandEntered.load(
+                    std::memory_order_acquire);
+            },
+            "spindle worker did not enter the fixture command");
         worker.establishSafeStop();
+        observation->releaseCommand.store(
+            true, std::memory_order_release);
+        observation->releaseCommand.notify_one();
         waitFor(
             [&] {
                 return observation->stops.load(
@@ -445,15 +484,9 @@ namespace {
             observation->commands.load(
                 std::memory_order_acquire) == 0,
             "spindle worker executed queued commands before its safe stop");
-        require(!worker.tryCommand({
-                    .enabled = true,
-                    .direction = ngc::Direction::CW,
-                    .speed = 12000.0,
-                }),
-            "safe-stopped spindle worker accepted a command before rearming");
-        require(worker.tryRearm(),
-                "safe-stopped spindle worker did not rearm");
-        require(worker.tryCommand({
+        observation->pauseCommand.store(
+            false, std::memory_order_release);
+        require(worker.tryRearmAndCommand({
                     .enabled = true,
                     .direction = ngc::Direction::CW,
                     .speed = 12000.0,
@@ -468,6 +501,44 @@ namespace {
         worker.stop();
     }
 
+    void testHuanyangSafeStopSuppressesRunAfterFrequency() {
+        auto observation =
+            std::make_shared<HuanyangObservation>();
+        auto hardware =
+            ngc::physical::HuanyangSpindleHardware::create(
+                huanyangConfiguration(),
+                std::make_unique<FakeSerialTransport>(
+                    observation));
+        require(hardware.has_value(),
+                "Huanyang spindle did not initialize");
+
+        auto safety = std::atomic<ngc::SpindleSafetyState>{
+            ngc::SpindleSafetyState::Armed};
+        observation->pauseAfterFrequency.store(
+            true, std::memory_order_release);
+        auto applied = std::atomic<bool>{false};
+        auto command = std::thread([&] {
+            applied.store((*hardware)->applyDesired({
+                .enabled = true,
+                .direction = ngc::Direction::CW,
+                .speed = 12000.0,
+            }, safety), std::memory_order_release);
+        });
+        observation->frequencyWritten.wait(
+            false, std::memory_order_acquire);
+        safety.store(
+            ngc::SpindleSafetyState::StopRequested,
+            std::memory_order_release);
+        observation->releaseFrequency.store(
+            true, std::memory_order_release);
+        observation->releaseFrequency.notify_one();
+        command.join();
+
+        require(applied.load(std::memory_order_acquire)
+                    && observation->control == 0x08,
+                "Huanyang spindle issued Run after a safe-stop request");
+    }
+
     void testSpindleBackpressureDiscardsQueuedCommands() {
         auto observation =
             std::make_shared<SpindleObservation>();
@@ -479,10 +550,10 @@ namespace {
             .speed = 12000.0,
         };
         for (auto index = 0; index < 16; ++index) {
-            require(worker.tryCommand(run),
+            require(worker.tryRearmAndCommand(run),
                     "spindle backpressure fixture filled early");
         }
-        require(!worker.tryCommand(run)
+        require(!worker.tryRearmAndCommand(run)
                     && worker.faultCode()
                         == ngc::SPINDLE_COMMAND_BACKPRESSURE_FAULT,
                 "full spindle queue did not latch backpressure");
@@ -592,7 +663,7 @@ namespace {
                 .enabled = true,
                 .direction = ngc::Direction::CW,
                 .speed = 12000.0,
-            }),
+            }, ARMED_SPINDLE),
             "Huanyang forward command failed");
         require(
             observation->frequency == 20000
@@ -617,14 +688,14 @@ namespace {
                 .enabled = true,
                 .direction = ngc::Direction::CCW,
                 .speed = 6000.0,
-            }),
+            }, ARMED_SPINDLE),
             "Huanyang reverse command failed");
         require(
             observation->frequency == 10000
                 && observation->control == 0x11,
             "Huanyang reverse command used incorrect wire values");
         require(
-            (*hardware)->applyDesired({}),
+            (*hardware)->applyDesired({}, ARMED_SPINDLE),
             "Huanyang stop command failed");
         require(
             observation->control == 0x08,
@@ -647,7 +718,7 @@ namespace {
                 .enabled = true,
                 .direction = ngc::Direction::CW,
                 .speed = 24000.1,
-            }),
+            }, ARMED_SPINDLE),
             "Huanyang spindle accepted excessive speed");
 
         observation->corruptCrc = true;
@@ -703,10 +774,10 @@ namespace {
                 .enabled = true,
                 .direction = ngc::Direction::CW,
                 .speed = 12000.0,
-            }),
+            }, ARMED_SPINDLE),
             "Huanyang spindle accepted a rejected run command");
         require(
-            !(*hardware)->applyDesired({}),
+            !(*hardware)->applyDesired({}, ARMED_SPINDLE),
             "Huanyang spindle accepted a rejected stop command");
     }
 
@@ -815,6 +886,7 @@ int main() {
         testSpindleSafeStopSupersedesQueuedCommands();
         testSpindleBackpressureDiscardsQueuedCommands();
         testSpindleCommunicationFailureEstablishesSafeStop();
+        testHuanyangSafeStopSuppressesRunAfterFrequency();
         testHuanyangCrcAndProtocolScaling();
         testHuanyangRejectsInvalidResponsesAndCommands();
         testHuanyangRejectsControlErrorAcknowledgements();

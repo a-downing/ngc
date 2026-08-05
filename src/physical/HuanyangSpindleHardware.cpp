@@ -144,7 +144,12 @@ namespace ngc::physical {
     }
 
     bool HuanyangSpindleHardware::applyDesired(
-        const SpindleEvent &desired) noexcept {
+        const SpindleEvent &desired,
+        const std::atomic<SpindleSafetyState> &safety) noexcept {
+        if (safety.load(std::memory_order_acquire)
+            != SpindleSafetyState::Armed) {
+            return true;
+        }
         if (!desired.enabled) {
             if (!writeControl(CONTROL_STOP)) {
                 return false;
@@ -174,6 +179,10 @@ namespace ngc::physical {
         if (!writeFrequency(
                 static_cast<std::uint16_t>(hundredths))) {
             return false;
+        }
+        if (safety.load(std::memory_order_acquire)
+            != SpindleSafetyState::Armed) {
+            return true;
         }
         const auto control = desired.direction == Direction::CW
             ? CONTROL_RUN_FORWARD

@@ -37,6 +37,5 @@ namespace ngc {
         std::unique_ptr<ProductionExecutorIo> m_motion;
         std::unique_ptr<SpindleWorker> m_spindle;
         std::optional<SpindleEvent> m_lastSpindle;
-        bool m_safeOutputsRequired = false;
     };
 }

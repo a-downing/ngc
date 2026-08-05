@@ -36,7 +36,8 @@ namespace ngc::physical {
         ~HuanyangSpindleHardware() override;
 
         [[nodiscard]] bool applyDesired(
-            const SpindleEvent &desired) noexcept override;
+            const SpindleEvent &desired,
+            const std::atomic<SpindleSafetyState> &safety) noexcept override;
         [[nodiscard]] bool pollStatus(
             SpindleHardwareStatus &status) noexcept override;
         void safeStop() noexcept override;

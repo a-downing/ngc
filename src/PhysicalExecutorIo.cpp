@@ -38,24 +38,17 @@ namespace ngc {
             return;
         }
         if (outputs.safeOutputsRequired) {
-            if (!m_safeOutputsRequired) {
-                m_spindle->establishSafeStop();
-                m_lastSpindle.reset();
-                m_safeOutputsRequired = true;
-            }
+            m_spindle->establishSafeStop();
+            m_lastSpindle.reset();
 
             return;
         }
-        if (m_safeOutputsRequired && !m_spindle->tryRearm()) {
-            return;
-        }
-        m_safeOutputsRequired = false;
         if (m_lastSpindle.has_value()
                 && sameSpindle(
                     *m_lastSpindle, outputs.spindle)) {
             return;
         }
-        if (m_spindle->tryCommand(outputs.spindle)) {
+        if (m_spindle->tryRearmAndCommand(outputs.spindle)) {
             m_lastSpindle = outputs.spindle;
         }
     }
