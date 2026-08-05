@@ -54,8 +54,10 @@ namespace ngc {
 
     JoggingController::JoggingController(std::vector<AxisConfiguration> axes,
                                          std::vector<JointConfiguration> joints,
-                                         MotionBackend &backend)
-        : m_axes(std::move(axes)), m_joints(std::move(joints)), m_backend(backend) { }
+                                         MotionBackend &backend,
+                                         ExecutorDemandController &demand)
+        : m_axes(std::move(axes)), m_joints(std::move(joints)),
+          m_backend(backend), m_demand(demand) { }
 
     std::expected<JoggingResult, std::string> JoggingController::run(
         const EpochId epoch, const position_t &startingPosition,
@@ -83,10 +85,10 @@ namespace ngc {
                 axisComponent(startingPosition, joint.axis) * joint.coordinateScale;
         }
 
-        if (!submitControl(ResetRequest {m_nextRequest--, epoch}, callbacks)
-            || !submitControl(EnableRequest {m_nextRequest--}, callbacks)) {
+        if (!m_demand.request(epoch, ExecutorDemandMode::Jog)) {
             return std::unexpected("failed to initialize the motion backend for jogging");
         }
+        callbacks.serviceImmediate();
         const auto initialized = setJointPositions(allJoints, initial, callbacks);
         if (!initialized || !*initialized) {
             return std::unexpected(initialized

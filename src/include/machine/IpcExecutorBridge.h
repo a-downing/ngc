@@ -5,6 +5,7 @@
 
 #include "machine/BackendRuntime.h"
 #include "machine/IpcProtocol.h"
+#include "machine/SharedLatestValueMailbox.h"
 
 namespace ngc {
     class IpcExecutorPolicy {
@@ -40,8 +41,10 @@ namespace ngc {
         IpcSharedRegion &m_region;
         BackendRuntime &m_runtime;
         MotionBackend &m_backend;
+        SharedLatestValueConsumer<ExecutorDemand> m_demandConsumer;
         IpcExecutorPolicy *m_policy = nullptr;
         ExecutionSnapshot m_latestSnapshot;
+        std::optional<ExecutorDemand> m_pendingDemand;
         std::optional<ExecutionItem> m_pendingItem;
         std::optional<ControlRequest> m_pendingControl;
         std::optional<ExecutionEvent> m_pendingEvent;

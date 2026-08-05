@@ -13,6 +13,7 @@ namespace ngc {
         : m_region(region),
           m_runtime(runtime),
           m_backend(backend),
+          m_demandConsumer(region.demand),
           m_policy(policy) { }
 
     bool IpcExecutorBridge::service(const bool consume) noexcept {
@@ -84,10 +85,24 @@ namespace ngc {
     }
 
     bool IpcExecutorBridge::submitInputs() noexcept {
-        // This bridge loop is the executor's sole ordinary-ingress producer.
-        // Keep both publication and control submission on this thread so their
-        // order is preserved by ProductionExecutorCore's shared SPSC queue.
+        // This bridge loop is the executor's sole ingress producer. Execution
+        // items and transactions retain their ordered queue, while lifecycle
+        // demand uses its independent latest-value mailbox.
         auto progressed = false;
+        if (!m_pendingDemand.has_value()) {
+            ExecutorDemand demand;
+            if (m_demandConsumer.consumeLatest(demand)) {
+                m_pendingDemand = demand;
+                progressed = true;
+            }
+        }
+        if (m_pendingDemand.has_value()) {
+            const auto result = m_backend.publishDemand(*m_pendingDemand);
+            if (result != DemandPublishResult::Unavailable) {
+                m_pendingDemand.reset();
+                progressed = true;
+            }
+        }
         if (!m_pendingItem.has_value()) {
             ExecutionItem item;
             if (ipcTryPop(m_region.executionItems, item)) {
@@ -144,7 +159,6 @@ namespace ngc {
     }
 
     ExecutionSnapshot stopExecutorSafely(BackendRuntime &runtime) {
-        constexpr RequestId internalRequest = 0;
         auto &backend = runtime.endpoint();
         auto snapshot = ExecutionSnapshot{};
         const auto service = [&] {
@@ -161,35 +175,38 @@ namespace ngc {
 
             return snapshotSeen;
         };
-        const auto submitAndWait = [&](const ControlRequest &request) {
-            while (backend.trySubmit(request) != SubmitResult::Submitted) {
+        auto generation = DemandGeneration{0};
+        const auto demandAndWait = [&](const EpochId epoch,
+                                       const ExecutorDemandMode mode) {
+            const ExecutorDemand demand{
+                .generation = ++generation,
+                .epoch = epoch,
+                .mode = mode,
+            };
+            while (backend.publishDemand(demand)
+                   != DemandPublishResult::Published) {
                 service();
             }
 
-            for (;;) {
+            while (snapshot.acknowledgedDemandGeneration
+                   < demand.generation) {
                 service();
-                ExecutionEvent event;
-                while (backend.tryTakeEvent(event)) {
-                    if (const auto *completed =
-                            std::get_if<RequestCompleted>(&event);
-                        completed != nullptr
-                        && completed->request == internalRequest) {
-                        while (backend.tryTakeSnapshot(snapshot)) { }
-
-                        return completed->succeeded;
-                    }
-                }
-                while (backend.tryTakeSnapshot(snapshot)) { }
+                static_cast<void>(drain());
             }
+
+            return snapshot.demandAccepted;
         };
 
+        service();
         while (!drain()) {
             service();
         }
+        generation = snapshot.acknowledgedDemandGeneration;
 
         if ((snapshot.state == BackendState::Running
                 || snapshot.state == BackendState::Holding)
-            && submitAndWait(ControlledStopRequest{internalRequest})) {
+            && snapshot.epoch != 0
+            && demandAndWait(snapshot.epoch, ExecutorDemandMode::Stop)) {
             while (snapshot.state != BackendState::Held
                 && snapshot.state != BackendState::Faulted
                 && snapshot.state != BackendState::Disabled) {
@@ -198,7 +215,8 @@ namespace ngc {
             }
         }
         if (snapshot.state != BackendState::Disabled) {
-            static_cast<void>(submitAndWait(DisableRequest{internalRequest}));
+            static_cast<void>(demandAndWait(
+                0, ExecutorDemandMode::Disabled));
             while (snapshot.state != BackendState::Disabled) {
                 service();
                 static_cast<void>(drain());

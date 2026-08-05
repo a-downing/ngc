@@ -20,6 +20,7 @@
 
 #include "evaluator/InterpreterSession.h"
 #include "machine/BackendRuntime.h"
+#include "machine/ExecutorDemandController.h"
 #include "machine/GeometryStreamProducer.h"
 #include "machine/HomingController.h"
 #include "machine/JoggingController.h"
@@ -393,6 +394,7 @@ namespace ngc {
         // tryPublish()/trySubmit() call through this endpoint. The geometry
         // thread prepares data only and must never use backend ingress.
         MotionBackend &m_backend;
+        ExecutorDemandController m_executorDemand;
         PreparedTrajectoryExecutionDriver m_driver;
         PresentationTracker m_presentationTracker;
         ExecutionCoordinator m_coordinator;

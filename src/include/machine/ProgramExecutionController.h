@@ -5,6 +5,7 @@
 #include <string>
 
 #include "machine/MotionBackend.h"
+#include "machine/ExecutorDemandController.h"
 #include "machine/ProgramOperationPresentation.h"
 
 namespace ngc {
@@ -22,7 +23,8 @@ namespace ngc {
 
     class ProgramExecutionController {
     public:
-        ProgramExecutionController(MotionBackend &backend, PreparedTrajectoryExecutionDriver &driver,
+        ProgramExecutionController(ExecutorDemandController &demand,
+                                   PreparedTrajectoryExecutionDriver &driver,
                                    SessionCommandQueue &commands);
 
         void begin(EpochId epoch);
@@ -45,7 +47,6 @@ namespace ngc {
     private:
         void consumeCommands();
         void requestControlledStop(const ExecutionSnapshot &snapshot);
-        void requestFailureAbort();
         void requestProgramResume();
         void requestFeedHold();
         void requestFeedResume();
@@ -54,13 +55,12 @@ namespace ngc {
         [[nodiscard]] bool activeUnlocked() const noexcept;
         void fail(std::string error);
 
-        MotionBackend &m_backend;
+        ExecutorDemandController &m_demand;
         PreparedTrajectoryExecutionDriver &m_driver;
         SessionCommandQueue &m_commands;
         mutable std::mutex m_mutex;
         ProgramExecutionState m_state = ProgramExecutionState::Inactive;
         EpochId m_epoch = 0;
-        RequestId m_nextRequest = RequestId { 1 } << 63;
         bool m_stopRequested = false;
         bool m_controlledStopInProgress = false;
         bool m_programPaused = false;
@@ -71,10 +71,6 @@ namespace ngc {
         bool m_feedResumeRequested = false;
         bool m_feedResumeInProgress = false;
         bool m_failureStopComplete = false;
-        std::optional<RequestId> m_pendingFeedHoldRequest;
-        std::optional<RequestId> m_pendingFeedResumeRequest;
-        std::optional<RequestId> m_pendingControlledStopRequest;
-        std::optional<RequestId> m_pendingAbortRequest;
         std::optional<position_t> m_stoppedPosition;
         std::optional<std::string> m_error;
     };

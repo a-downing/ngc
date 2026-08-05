@@ -170,8 +170,11 @@ namespace ngc {
           m_geometryPolicy(std::move(geometryPolicy)),
           m_runtime(runtime),
           m_backend(runtime.endpoint()),
-          m_driver(m_backend, m_geometryForward, m_geometryFeedback, m_geometryCancelled, limits),
-          m_programExecution(m_backend, m_driver, m_coordinator.commands()),
+          m_executorDemand(m_backend),
+          m_driver(m_backend, m_executorDemand, m_geometryForward,
+                   m_geometryFeedback, m_geometryCancelled, limits),
+          m_programExecution(m_executorDemand, m_driver,
+                             m_coordinator.commands()),
           m_limits(limits) { }
 
     MachineSession::~MachineSession() {
@@ -188,6 +191,14 @@ namespace ngc {
 
         try {
             m_runtime.start();
+            if (!m_executorDemand.request(
+                    m_nextEpoch, ExecutorDemandMode::Idle)) {
+                m_runtime.stop();
+                m_coordinator.fault();
+
+                return false;
+            }
+            m_runtime.serviceImmediate();
         } catch (...) {
             try {
                 m_runtime.stop();
@@ -214,6 +225,13 @@ namespace ngc {
         }
 
         try {
+            if (!m_executorDemand.request(
+                    0, ExecutorDemandMode::Disabled)) {
+                m_coordinator.fault();
+
+                return false;
+            }
+            m_runtime.serviceImmediate();
             m_runtime.stop();
         } catch (...) {
             m_coordinator.fault();
@@ -687,13 +705,15 @@ namespace ngc {
         }
         m_requireHomingBeforeMotion = homing.requireBeforeMotion;
         m_homingController = std::make_unique<HomingController>(
-            std::move(axes), std::move(joints), std::move(homing), m_backend);
+            std::move(axes), std::move(joints), std::move(homing), m_backend,
+            m_executorDemand);
     }
 
     void MachineSession::configureJogging(std::vector<AxisConfiguration> axes,
                                           std::vector<JointConfiguration> joints) {
         m_joggingController = std::make_unique<JoggingController>(
-            std::move(axes), std::move(joints), m_backend);
+            std::move(axes), std::move(joints), m_backend,
+            m_executorDemand);
     }
 
     bool MachineSession::homingAvailable() const noexcept {

@@ -14,6 +14,7 @@
 
 #include "machine/AxisJointStateProjection.h"
 #include "machine/EmergencyStop.h"
+#include "machine/LatestValueMailbox.h"
 #include "machine/MotionBackend.h"
 #include "machine/SpscChannel.h"
 
@@ -62,6 +63,7 @@ namespace ngc {
     inline constexpr std::uint32_t SOFT_LIMIT_INVARIANT_FAULT = 0x534C'0001;
 
     struct ProductionExecutorMotionContext {
+        TriggeredMoveId move = 0;
         position_t axisPosition{};
         position_t axisStart{};
         position_t axisTarget{};
@@ -70,6 +72,10 @@ namespace ngc {
         JointVector jointTarget{};
         JointMask moveJoints = 0;
         JointMask triggerJoints = 0;
+        DigitalInputId axisTriggerInput = 0;
+        InputCondition axisTriggerCondition = InputCondition::Active;
+        std::array<DigitalInputId, MAX_JOINTS> jointTriggerInputs{};
+        std::array<InputCondition, MAX_JOINTS> jointTriggerConditions{};
         std::uint32_t flags = 0;
     };
     static_assert(
@@ -84,6 +90,24 @@ namespace ngc {
         bool safeOutputsRequired = true;
     };
     static_assert(std::is_trivially_copyable_v<ProductionExecutorOutputState>);
+
+    struct ProductionExecutorTickObservation {
+        EpochId epoch = 0;
+        ChunkId chunk = 0;
+        SpanId span = 0;
+        MotionState commanded{};
+        position_t spanStart{};
+        position_t jerk{};
+        double programSeconds = 0.0;
+        double executionRate = 1.0;
+        double executionRateAcceleration = 0.0;
+        double executionRateJerk = 0.0;
+        bool feedHolding = false;
+        bool stopTail = false;
+        bool plannedMotion = false;
+        bool crossedChunk = false;
+        TriggeredMoveId completedMove = 0;
+    };
 
     class ProductionExecutorCore final : public MotionBackend {
     public:
@@ -106,6 +130,8 @@ namespace ngc {
         ProductionExecutorCore &operator=(const ProductionExecutorCore &) = delete;
 
         PublishResult tryPublish(const ExecutionItem &item) noexcept override;
+        DemandPublishResult publishDemand(
+            const ExecutorDemand &demand) noexcept override;
         SubmitResult trySubmit(const ControlRequest &request) noexcept override;
         bool tryTakeEvent(ExecutionEvent &event) noexcept override;
         bool tryTakeSnapshot(ExecutionSnapshot &snapshot) noexcept override;
@@ -131,6 +157,9 @@ namespace ngc {
         // The hosting servo thread reads this after servoTick() and maps it to
         // physical outputs. It is not an NRT communication endpoint.
         [[nodiscard]] ProductionExecutorOutputState outputState() const noexcept;
+        [[nodiscard]] ProductionExecutorTickObservation
+        lastTickObservation() const noexcept;
+        [[nodiscard]] ExecutionSnapshot currentSnapshot() const noexcept;
 
     private:
         struct PlanSlot {
@@ -225,7 +254,13 @@ namespace ngc {
         };
 
         void serviceIngress() noexcept;
-        void serviceControl(const ControlRequest &request) noexcept;
+        void serviceDemand() noexcept;
+        void convergeDemand() noexcept;
+        [[nodiscard]] bool demandAllowsActivation() const noexcept;
+        [[nodiscard]] bool stationary() const noexcept;
+        bool beginDemandStop() noexcept;
+        void serviceControl(const ControlRequest &request,
+                            bool demandOwned = false) noexcept;
         [[nodiscard]] bool commitMotionState(
             const MotionState &axes, const JointMotionState &joints,
             const JointPositionEnvelope *envelope,
@@ -335,12 +370,15 @@ namespace ngc {
         // after the previous owner has quiesced. Emergency stop remains on its
         // dedicated out-of-band control block.
         SpscChannel<IngressRecord, INGRESS_CAPACITY> m_ingress;
+        LatestValueMailbox<ExecutorDemand> m_demandMailbox;
         PlanQueue m_plans;
         SpscChannel<ExecutionEvent, EVENT_CAPACITY> m_events;
         SpscChannel<ExecutionSnapshot, SNAPSHOT_CAPACITY> m_snapshots;
         std::atomic<std::uint64_t> m_queuedNormalMotionNanoseconds{0};
         std::atomic<std::uint32_t> m_queuedExecutionItems{0};
         std::atomic<std::uint32_t> m_queuedControls{0};
+        std::atomic<DemandGeneration> m_lastPublishedDemandGeneration{0};
+        ExecutorDemand m_demand;
         ExecutionSnapshot m_snapshot;
         std::optional<std::uint8_t> m_active;
         std::optional<JogRuntime> m_jog;
@@ -354,6 +392,7 @@ namespace ngc {
         std::uint32_t m_nextScheduledEvent = 0;
         std::uint32_t m_nextMarker = 0;
         ProductionExecutorOutputState m_outputState;
+        ProductionExecutorTickObservation m_tickObservation;
         TriggeredRuntime m_triggered;
         std::array<TriggeredJointRuntime, MAX_JOINTS> m_triggeredJoints;
         JointMask m_triggeredJointMask = 0;
@@ -365,5 +404,6 @@ namespace ngc {
         LogicalDigitalInputImage m_previousDigitalInputs;
         bool m_stopping = false;
         bool m_faultEventEmitted = false;
+        bool m_demandEstablished = false;
     };
 }

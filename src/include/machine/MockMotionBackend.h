@@ -26,6 +26,8 @@ namespace ngc {
         MockMotionBackend &operator=(const MockMotionBackend &) = delete;
 
         PublishResult tryPublish(const ExecutionItem &item) noexcept override;
+        DemandPublishResult publishDemand(
+            const ExecutorDemand &demand) noexcept override;
         SubmitResult trySubmit(const ControlRequest &request) noexcept override;
         bool tryTakeEvent(ExecutionEvent &event) noexcept override;
         bool tryTakeSnapshot(ExecutionSnapshot &snapshot) noexcept override;

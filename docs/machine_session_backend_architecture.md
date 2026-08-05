@@ -126,7 +126,7 @@ MachineSessionManager
     |-- HomingController
     |-- PresentationTracker
     `-- InProcessSimulationRuntime
-        |-- MockMotionBackend
+        |-- SimulationExecutor -> ProductionExecutorCore
         `-- simulated servo scheduler
 ```
 
@@ -265,9 +265,11 @@ without importing mock policy. A physical runtime may progress independently;
 the in-process runtime advances its synchronous service clock. This does not
 broaden the RT-facing `MotionBackend` contract.
 
-`InProcessSimulationRuntime` owns `MockMotionBackend`, the simulated servo
-scheduler, accelerated playback coordination, synthetic input policy, and
-mock-only diagnostics.
+`InProcessSimulationRuntime` owns `SimulationExecutor`, a thin adapter around
+`ProductionExecutorCore`, together with the simulated servo scheduler,
+accelerated playback coordination, synthetic input policy, and Simulation-only
+diagnostics. Simulation and Machine consequently exercise the same executor
+state machine.
 
 `ExternalExecutorRuntime` owns the local IPC connection and a
 `MotionBackend` proxy. It does not run a local servo loop.
@@ -651,7 +653,9 @@ ngc_rt_backend process
 The NRT front-end proxy preserves the existing `MotionBackend` operations:
 
 - `tryPublish()` writes one bounded `ExecutionItem`;
-- `trySubmit()` writes one bounded `ControlRequest`;
+- `publishDemand()` publishes one generation-tagged lifecycle demand through a
+  three-slot latest-value mailbox;
+- `trySubmit()` writes one bounded acknowledged stationary or jog transaction;
 - `tryTakeEvent()` reads one bounded `ExecutionEvent`; and
 - `tryTakeSnapshot()` reads one bounded `ExecutionSnapshot`.
 
@@ -664,7 +668,9 @@ The shared-memory protocol requires:
 - clear producer/consumer ownership;
 - no unbounded data or UI/interpreter objects;
 - explicit peer-loss behavior; and
-- no silent dropping, overwriting, reordering, or combining of messages.
+- no silent dropping, overwriting, reordering, or combining of ordered
+  execution items and transactions. Lifecycle demand intentionally coalesces
+  superseded values and acknowledges the generation actually consumed.
 
 The physical executable has an NRT startup phase that validates typed
 configuration, connects to and discovers the board, allocates and locks memory,

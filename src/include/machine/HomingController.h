@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "machine/MachineConfiguration.h"
+#include "machine/ExecutorDemandController.h"
 #include "machine/MotionBackend.h"
 
 namespace ngc {
@@ -44,7 +45,8 @@ namespace ngc {
     public:
         HomingController(std::vector<AxisConfiguration> axes,
                          std::vector<JointConfiguration> joints,
-                         HomingConfiguration homing, MotionBackend &backend);
+                         HomingConfiguration homing, MotionBackend &backend,
+                         ExecutorDemandController &demand);
 
         [[nodiscard]] bool available() const noexcept;
         [[nodiscard]] std::expected<HomingResult, std::string> run(
@@ -75,11 +77,12 @@ namespace ngc {
         std::vector<JointConfiguration> m_joints;
         HomingConfiguration m_homing;
         MotionBackend &m_backend;
+        ExecutorDemandController &m_demand;
         HomingObservation m_observation;
         RequestId m_nextRequest = 1;
         ChunkId m_nextChunk = 1;
         BranchSequence m_branch = 0;
         TriggeredMoveId m_nextMove = 1;
-        std::optional<RequestId> m_stopRequest;
+        bool m_stopRequested = false;
     };
 }

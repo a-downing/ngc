@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "machine/MachineConfiguration.h"
+#include "machine/ExecutorDemandController.h"
 #include "machine/MotionBackend.h"
 
 namespace ngc {
@@ -39,7 +40,8 @@ namespace ngc {
     public:
         JoggingController(std::vector<AxisConfiguration> axes,
                           std::vector<JointConfiguration> joints,
-                          MotionBackend &backend);
+                          MotionBackend &backend,
+                          ExecutorDemandController &demand);
 
         [[nodiscard]] std::expected<JoggingResult, std::string> run(
             EpochId epoch, const position_t &startingPosition,
@@ -61,6 +63,7 @@ namespace ngc {
         std::vector<AxisConfiguration> m_axes;
         std::vector<JointConfiguration> m_joints;
         MotionBackend &m_backend;
+        ExecutorDemandController &m_demand;
         JoggingObservation m_observation;
         RequestId m_nextRequest = 1;
     };

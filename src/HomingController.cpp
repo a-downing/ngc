@@ -49,9 +49,10 @@ namespace ngc {
 
     HomingController::HomingController(std::vector<AxisConfiguration> axes,
                                        std::vector<JointConfiguration> joints,
-                                       HomingConfiguration homing, MotionBackend &backend)
+                                       HomingConfiguration homing, MotionBackend &backend,
+                                       ExecutorDemandController &demand)
         : m_axes(std::move(axes)), m_joints(std::move(joints)),
-          m_homing(std::move(homing)), m_backend(backend) { }
+          m_homing(std::move(homing)), m_backend(backend), m_demand(demand) { }
 
     bool HomingController::available() const noexcept {
         return !m_joints.empty() && !m_homing.groups.empty();
@@ -75,7 +76,7 @@ namespace ngc {
         m_nextChunk = 1;
         m_branch = 0;
         m_nextMove = 1;
-        m_stopRequest.reset();
+        m_stopRequested = false;
 
         JointMask allJoints = 0;
         JointVector initial;
@@ -85,16 +86,21 @@ namespace ngc {
                 axisComponent(startingPosition, joint.axis) * joint.coordinateScale;
         }
 
-        if (!submitControl(ResetRequest {m_nextRequest++, epoch}, callbacks)
-            || !submitControl(EnableRequest {m_nextRequest++}, callbacks)) {
+        if (!m_demand.request(epoch, ExecutorDemandMode::Idle)) {
             return std::unexpected("failed to initialize the motion backend for homing");
         }
+        callbacks.serviceImmediate();
         const auto initialized = setJointPositions(allJoints, initial, callbacks);
         if (!initialized || !*initialized) {
             return std::unexpected(initialized
                 ? "failed to initialize the motion backend for homing"
                 : initialized.error());
         }
+        if (!m_demand.request(epoch, ExecutorDemandMode::Run)) {
+            return std::unexpected(
+                "failed to start the motion backend for homing");
+        }
+        callbacks.serviceImmediate();
 
         for (const auto &group : m_homing.groups) {
             auto fast = makeMove(group, epoch, true, false, false);
@@ -356,18 +362,15 @@ namespace ngc {
         if (m_backend.tryPublish(ExecutionItem {move}) != PublishResult::Published) {
             return std::unexpected("motion backend rejected a homing move");
         }
-        if (!submitControl(ResumeRequest {m_nextRequest++, move.epoch}, callbacks)) {
-            return std::unexpected("motion backend control channel is full while starting homing");
-        }
-
         for (std::size_t guard = 0; guard < 10000000; ++guard) {
-            if (callbacks.stopRequested() && !m_stopRequest) {
-                const auto request = m_nextRequest++;
-                if (!submitControl(ControlledStopRequest {request}, callbacks)) {
+            if (callbacks.stopRequested() && !m_stopRequested) {
+                if (!m_demand.request(
+                        move.epoch, ExecutorDemandMode::Stop)) {
                     return std::unexpected(
-                        "motion backend control channel is full while stopping homing");
+                        "motion backend demand mailbox rejected the homing stop");
                 }
-                m_stopRequest = request;
+                callbacks.serviceImmediate();
+                m_stopRequested = true;
             }
 
             m_observation.servoTicks += callbacks.advanceServiceMotionPeriod();
@@ -385,12 +388,6 @@ namespace ngc {
                     observeSnapshot(stopped, callbacks);
 
                     return *completed;
-                }
-                if (const auto *completed = std::get_if<RequestCompleted>(&event);
-                    completed && m_stopRequest
-                    && completed->request == *m_stopRequest && !completed->succeeded) {
-                    return std::unexpected(
-                        "motion backend rejected the controlled homing stop");
                 }
                 if (const auto *fault = std::get_if<BackendFault>(&event)) {
                     return std::unexpected(

@@ -299,6 +299,26 @@ namespace ngc {
         return PublishResult::Full;
     }
 
+    DemandPublishResult ProductionExecutorCore::publishDemand(
+        const ExecutorDemand &demand) noexcept {
+        if (demand.generation == 0
+            || (demand.mode != ExecutorDemandMode::Disabled
+                && demand.epoch == 0)) {
+            return DemandPublishResult::Invalid;
+        }
+
+        auto previous = m_lastPublishedDemandGeneration.load(
+            std::memory_order_relaxed);
+        if (demand.generation <= previous) {
+            return DemandPublishResult::Invalid;
+        }
+        m_lastPublishedDemandGeneration.store(
+            demand.generation, std::memory_order_relaxed);
+        m_demandMailbox.publish(demand);
+
+        return DemandPublishResult::Published;
+    }
+
     SubmitResult ProductionExecutorCore::trySubmit(
         const ControlRequest &request) noexcept {
         const auto previous = m_queuedControls.fetch_add(
@@ -355,7 +375,10 @@ namespace ngc {
     }
 
     void ProductionExecutorCore::serviceImmediate() noexcept {
+        serviceDemand();
+        convergeDemand();
         serviceIngress();
+        convergeDemand();
         publishSnapshot();
     }
 
@@ -370,13 +393,19 @@ namespace ngc {
     }
 
     void ProductionExecutorCore::servoTick(const bool shouldPublishSnapshot) noexcept {
+        const auto startingChunk = m_snapshot.activeChunk;
+        m_tickObservation = {};
+        serviceDemand();
+        convergeDemand();
         serviceIngress();
+        convergeDemand();
 
         if (m_snapshot.state == BackendState::Running
             || m_snapshot.state == BackendState::Holding) {
             if (m_jog.has_value()) {
                 advanceJog(m_servoPeriod);
-            } else if (!m_active.has_value()) {
+            } else if (!m_active.has_value()
+                       && demandAllowsActivation()) {
                 activateNext();
             }
             if (!m_jog.has_value() && m_active.has_value()
@@ -385,6 +414,9 @@ namespace ngc {
                 advanceActive(m_servoPeriod);
             }
         }
+
+        m_tickObservation.crossedChunk = startingChunk != 0
+            && startingChunk != m_snapshot.activeChunk;
 
         m_previousDigitalInputs = m_digitalInputs;
 
@@ -442,17 +474,24 @@ namespace ngc {
 
         const auto &item = m_planSlots[*m_active].item;
         if (const auto *move = std::get_if<TriggeredMove>(&item)) {
+            result.move = move->moveId;
             result.flags |= PRODUCTION_EXECUTOR_MOTION_IS_PROBE;
             result.axisStart = m_triggered.start;
             result.axisTarget = move->target;
+            result.axisTriggerInput = move->input;
+            result.axisTriggerCondition = move->condition;
         } else if (const auto *move =
                        std::get_if<TriggeredJointMove>(&item)) {
+            result.move = move->moveId;
             result.flags |= PRODUCTION_EXECUTOR_MOTION_IS_HOMING;
             result.moveJoints = move->joints;
             for (const auto &trigger : move->triggers) {
                 result.triggerJoints |=
                     static_cast<JointMask>(
                         JointMask{1} << trigger.joint);
+                result.jointTriggerInputs[trigger.joint] = trigger.input;
+                result.jointTriggerConditions[trigger.joint] =
+                    trigger.condition;
             }
             for (JointId joint = 0; joint < MAX_JOINTS; ++joint) {
                 const auto mask =
@@ -479,6 +518,15 @@ namespace ngc {
             && m_snapshot.state != BackendState::Faulted;
 
         return result;
+    }
+
+    ProductionExecutorTickObservation
+    ProductionExecutorCore::lastTickObservation() const noexcept {
+        return m_tickObservation;
+    }
+
+    ExecutionSnapshot ProductionExecutorCore::currentSnapshot() const noexcept {
+        return m_snapshot;
     }
 
     bool ProductionExecutorCore::commitMotionState(
@@ -580,10 +628,179 @@ namespace ngc {
         }
     }
 
+    void ProductionExecutorCore::serviceDemand() noexcept {
+        ExecutorDemand demand;
+        if (!m_demandMailbox.consumeLatest(demand)) {
+            return;
+        }
+
+        m_demand = demand;
+        m_demandEstablished = true;
+        m_snapshot.acknowledgedDemandGeneration = demand.generation;
+        m_snapshot.demandedMode = demand.mode;
+        m_snapshot.demandAccepted = true;
+    }
+
+    bool ProductionExecutorCore::stationary() const noexcept {
+        return !m_jog.has_value()
+            && (m_snapshot.state == BackendState::Disabled
+                || m_snapshot.state == BackendState::Held)
+            && magnitude(m_snapshot.commanded.velocity) <= 1e-12
+            && magnitude(m_snapshot.commanded.acceleration) <= 1e-12;
+    }
+
+    bool ProductionExecutorCore::demandAllowsActivation() const noexcept {
+        return !m_demandEstablished
+            || (m_demand.mode == ExecutorDemandMode::Run
+                && m_demand.epoch == m_snapshot.epoch
+                && m_demand.epoch != m_controlledStoppedEpoch);
+    }
+
+    bool ProductionExecutorCore::beginDemandStop() noexcept {
+        if (m_jog.has_value()) {
+            return beginJogStop(JogStopReason::RequestedStop);
+        }
+        if (!m_active.has_value()) {
+            discardExecution();
+            m_controlledStoppedEpoch = m_demand.epoch;
+            m_snapshot.state = BackendState::Held;
+            m_outputState = {};
+            emit(BackendHeld{
+                m_snapshot.epoch, m_snapshot.commanded,
+                BackendHoldReason::ControlledStop,
+            });
+
+            return true;
+        }
+
+        serviceControl(ControlledStopRequest{}, true);
+
+        return m_snapshot.state == BackendState::Holding
+            || m_snapshot.state == BackendState::Held;
+    }
+
+    void ProductionExecutorCore::convergeDemand() noexcept {
+        if (!m_demandEstablished || m_snapshot.state == BackendState::Faulted) {
+            return;
+        }
+
+        const auto reject = [&] {
+            m_snapshot.demandAccepted = false;
+        };
+        const auto establishEpoch = [&] {
+            if (m_snapshot.epoch == m_demand.epoch) {
+                return true;
+            }
+            if (!stationary()) {
+                return false;
+            }
+            serviceControl(ResetRequest{0, m_demand.epoch}, true);
+
+            return m_snapshot.epoch == m_demand.epoch;
+        };
+        const auto enable = [&] {
+            if (m_snapshot.state != BackendState::Disabled) {
+                return true;
+            }
+            serviceControl(EnableRequest{}, true);
+
+            return m_snapshot.state == BackendState::Held;
+        };
+
+        switch (m_demand.mode) {
+            case ExecutorDemandMode::Disabled:
+                if (m_snapshot.state == BackendState::Running
+                    || m_snapshot.state == BackendState::Holding) {
+                    if (m_controlledStoppedEpoch != m_snapshot.epoch) {
+                        static_cast<void>(beginDemandStop());
+                    }
+                } else if (m_snapshot.state != BackendState::Disabled) {
+                    serviceControl(DisableRequest{}, true);
+                }
+                return;
+
+            case ExecutorDemandMode::Idle:
+                if (!establishEpoch() || !enable()) {
+                    return;
+                }
+                return;
+
+            case ExecutorDemandMode::Run:
+                if (!establishEpoch() || !enable()) {
+                    return;
+                }
+                if (m_demand.epoch == m_controlledStoppedEpoch) {
+                    reject();
+                    return;
+                }
+                if (m_snapshot.state == BackendState::Held) {
+                    if (m_feedRetiming.held) {
+                        serviceControl(
+                            ResumeRequest{0, m_demand.epoch}, true);
+                    } else if (m_queuedExecutionItems.load(
+                                   std::memory_order_acquire) != 0) {
+                        serviceControl(StartRequest{0, m_demand.epoch}, true);
+                    }
+                }
+                return;
+
+            case ExecutorDemandMode::FeedHold:
+                if (m_snapshot.epoch != m_demand.epoch) {
+                    reject();
+                } else if (m_snapshot.state == BackendState::Running) {
+                    if (m_active.has_value()) {
+                        serviceControl(FeedHoldRequest{}, true);
+                    } else {
+                        m_snapshot.state = BackendState::Held;
+                        resetFeedRetiming();
+                        emit(BackendHeld{
+                            m_snapshot.epoch, m_snapshot.commanded,
+                            BackendHoldReason::FeedHold,
+                        });
+                    }
+                }
+                return;
+
+            case ExecutorDemandMode::Stop:
+                if (m_snapshot.epoch != m_demand.epoch) {
+                    reject();
+                } else if (m_controlledStoppedEpoch != m_demand.epoch
+                           && !beginDemandStop()) {
+                    return;
+                } else if (m_controlledStoppedEpoch == m_demand.epoch
+                           && !m_active.has_value()
+                           && m_queuedExecutionItems.load(
+                               std::memory_order_acquire) != 0) {
+                    discardExecution();
+                }
+                return;
+
+            case ExecutorDemandMode::Jog:
+                if (!establishEpoch() || !enable()) {
+                    return;
+                }
+                return;
+        }
+    }
+
     void ProductionExecutorCore::serviceControl(
-        const ControlRequest &request) noexcept {
+        const ControlRequest &request, const bool demandOwned) noexcept {
         std::visit([&](const auto &value) {
             using T = std::decay_t<decltype(value)>;
+            constexpr auto lifecycleControl =
+                std::same_as<T, EnableRequest>
+                || std::same_as<T, DisableRequest>
+                || std::same_as<T, StartRequest>
+                || std::same_as<T, FeedHoldRequest>
+                || std::same_as<T, ControlledStopRequest>
+                || std::same_as<T, ResumeRequest>
+                || std::same_as<T, AbortRequest>
+                || std::same_as<T, ResetRequest>;
+            if (m_demandEstablished && !demandOwned && lifecycleControl) {
+                emit(RequestCompleted{value.id, false});
+
+                return;
+            }
             auto success = false;
             if constexpr (std::same_as<T, EnableRequest>) {
                 success = !m_jog.has_value()
@@ -773,6 +990,12 @@ namespace ngc {
                 m_snapshot.feedback = feedback;
                 m_snapshot.commandedJoints = commandedJoints;
                 m_snapshot.feedbackJoints = feedbackJoints;
+                if (m_demandEstablished) {
+                    m_snapshot.acknowledgedDemandGeneration =
+                        m_demand.generation;
+                    m_snapshot.demandedMode = m_demand.mode;
+                    m_snapshot.demandAccepted = true;
+                }
                 m_planStop.reset();
                 m_controlledStoppedEpoch = 0;
                 m_outputState = {};
@@ -831,7 +1054,9 @@ namespace ngc {
                     && beginJogStop(JogStopReason::RequestedStop);
             }
 
-            emit(RequestCompleted{value.id, success});
+            if (!demandOwned) {
+                emit(RequestCompleted{value.id, success});
+            }
         }, request);
     }
 
@@ -1264,6 +1489,26 @@ namespace ngc {
                     return;
                 }
             }
+            const auto observedProgramSeconds = retiming
+                ? m_tickObservation.plannedMotion
+                    ? m_tickObservation.programSeconds : m_servoPeriod
+                : m_tickObservation.programSeconds + consumed;
+            m_tickObservation = {
+                .epoch = activeChunk().epoch,
+                .chunk = activeChunk().id,
+                .span = span.id,
+                .commanded = m_snapshot.commanded,
+                .spanStart = executionSpanStart(span).position,
+                .jerk = reference.jerk,
+                .programSeconds = observedProgramSeconds,
+                .executionRate = m_feedRetiming.rate,
+                .executionRateAcceleration =
+                    m_feedRetiming.acceleration,
+                .executionRateJerk = m_feedRetiming.jerk,
+                .feedHolding = m_feedRetiming.holding,
+                .stopTail = m_stopping,
+                .plannedMotion = true,
+            };
             emitExecutionMarkersThrough(parameter);
             if (m_snapshot.state == BackendState::Faulted) {
                 return;
@@ -1441,12 +1686,24 @@ namespace ngc {
         const auto consumed =
             std::min(seconds, std::max(duration - m_triggered.elapsed, 0.0));
         m_triggered.elapsed += consumed;
-        const auto origin = m_triggered.stopping
+        const auto stopping = m_triggered.stopping;
+        const auto origin = stopping
             ? m_triggered.stopOrigin.position : m_triggered.start;
         if (!applyAxisMotionState(
                 triggeredStateAt(m_triggered.elapsed, origin))) {
             return;
         }
+        m_tickObservation = {
+            .epoch = move.epoch,
+            .chunk = move.id,
+            .span = move.moveId,
+            .commanded = m_snapshot.commanded,
+            .spanStart = origin,
+            .programSeconds = consumed,
+            .executionRate = 1.0,
+            .stopTail = stopping,
+            .plannedMotion = true,
+        };
         m_snapshot.spanProgress = duration > 0.0
             ? std::clamp(m_triggered.elapsed / duration, 0.0, 1.0) : 1.0;
         seconds -= consumed;
@@ -1489,6 +1746,7 @@ namespace ngc {
     void ProductionExecutorCore::completeTriggered(
         const TriggeredMoveStatus status) noexcept {
         const auto move = activeTriggeredMove();
+        m_tickObservation.completedMove = move.moveId;
         const auto stopped = m_snapshot.commanded;
         const auto trigger = status == TriggeredMoveStatus::Triggered
             ? m_triggered.triggerState : stopped;
@@ -1723,6 +1981,7 @@ namespace ngc {
 
     void ProductionExecutorCore::completeTriggeredJoints() noexcept {
         const auto move = activeTriggeredJointMove();
+        m_tickObservation.completedMove = move.moveId;
         auto triggerState = m_snapshot.commandedJoints;
         JointMask expectedTriggers = 0;
         for (const auto &trigger : move.triggers) {

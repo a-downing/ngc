@@ -218,6 +218,16 @@ namespace {
         require(ngc::validateIpcSharedRegion(*region, identity())
                     == ngc::IpcRejection::None,
                 "valid IPC region should pass its ABI and identity checks");
+        ngc::SharedLatestValueProducer<ngc::ExecutorDemand> producer(
+            region->demand);
+        ngc::SharedLatestValueConsumer<ngc::ExecutorDemand> consumer(
+            region->demand);
+        producer.publish({1, 2, ngc::ExecutorDemandMode::Run});
+        ngc::ExecutorDemand demand;
+        require(consumer.consumeLatest(demand)
+                    && demand.generation == 1 && demand.epoch == 2
+                    && demand.mode == ngc::ExecutorDemandMode::Run,
+                "initialized IPC demand mailbox should transfer a coherent value");
 
         ++region->abiVersion;
         require(ngc::validateIpcSharedRegion(*region, identity())
@@ -1091,7 +1101,7 @@ sub _tool_change[#tool_number] {
     void testExternalRuntimeReportsBackpressure(
         const std::filesystem::path &peer) {
         auto options = configuration(peer);
-        options.peerArguments = {"--no-consume"};
+        options.peerArguments.push_back("--no-consume");
         ngc::ExternalExecutorRuntime runtime(std::move(options));
         runtime.start();
 
@@ -1128,7 +1138,9 @@ sub _tool_change[#tool_number] {
     void testPeerLossAndInterruptedEpochRefusal(
         const std::filesystem::path &peer) {
         auto options = configuration(peer);
-        options.peerArguments = {"--exit-after-controls", "1"};
+        options.peerArguments.insert(
+            options.peerArguments.end(),
+            {"--exit-after-controls", "1"});
         ngc::ExternalExecutorRuntime runtime(std::move(options));
         runtime.start();
         require(runtime.endpoint().trySubmit(ngc::StartRequest{41, 9})

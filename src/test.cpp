@@ -1973,9 +1973,10 @@ final_move_together = true
         const auto configuration = fixtureMachineConfiguration();
         require(configuration.has_value(), configuration ? "" : configuration.error());
         ngc::InProcessSimulationRuntime runtime(*configuration);
+        ngc::ExecutorDemandController demand(runtime.endpoint());
         ngc::HomingController controller(
             configuration->axes, configuration->joints, configuration->homing,
-            runtime.endpoint());
+            runtime.endpoint(), demand);
         const ngc::HomingRuntimeCallbacks callbacks {
             .stopRequested = [] {
                 return false;
@@ -2057,9 +2058,10 @@ final_move_together = true
                 configuration ? "" : configuration.error());
         ngc::InProcessSimulationRuntime runtime(*configuration);
         runtime.setTickMultiplier(1000);
+        ngc::ExecutorDemandController demand(runtime.endpoint());
         ngc::HomingController controller(
             configuration->axes, configuration->joints,
-            configuration->homing, runtime.endpoint());
+            configuration->homing, runtime.endpoint(), demand);
         const ngc::HomingRuntimeCallbacks callbacks {
             .stopRequested = [] {
                 return false;
@@ -2114,9 +2116,10 @@ final_move_together = true
         ngc::HostedExecutorRuntime runtime(
             *configuration,
             std::make_unique<ScheduledTriggerProductionExecutorIo>());
+        ngc::ExecutorDemandController demand(runtime.endpoint());
         ngc::HomingController controller(
             configuration->axes, configuration->joints, configuration->homing,
-            runtime.endpoint());
+            runtime.endpoint(), demand);
         const ngc::HomingRuntimeCallbacks callbacks {
             .stopRequested = [] {
                 return false;
@@ -5123,7 +5126,7 @@ G1 F60 X2
             return result;
         };
 
-        backend.advanceTick(0.0, true);
+        backend.advanceTick(0.001, true);
         auto reached = takeMarkers();
         require(reached.size() == 1 && reached[0].marker == 1
                 && reached[0].span == 110
@@ -5561,11 +5564,12 @@ G1 F60 X2
         ngc::PreparedGeometryForwardChannel forward;
         ngc::GeometryFeedbackChannel feedback;
         std::atomic<bool> cancelled { false };
+        ngc::ExecutorDemandController demand(backend);
         ngc::PreparedTrajectoryExecutionDriver driver(
-            backend, forward, feedback, cancelled, limits);
+            backend, demand, forward, feedback, cancelled, limits);
         ngc::SessionCommandQueue commands;
         ngc::ProgramExecutionController controller(
-            backend, driver, commands);
+            demand, driver, commands);
         constexpr ngc::EpochId epoch = 28;
 
         require(driver.begin(epoch),
@@ -5620,8 +5624,7 @@ G1 F60 X2
                 "requesting the controlled stop should remain nonterminal");
 
         auto sawControlledStop = false;
-        auto heldWasNonterminal = false;
-        auto successfulSafetyRequests = std::size_t { 0 };
+        auto heldReachedTerminal = false;
         for (auto tick = 0; tick < 5'000
              && controller.state() != ngc::ProgramExecutionState::Error;
              ++tick) {
@@ -5634,154 +5637,26 @@ G1 F60 X2
                     if (held->reason
                         == ngc::BackendHoldReason::ControlledStop) {
                         sawControlledStop = true;
-                        heldWasNonterminal =
+                        heldReachedTerminal =
                             controller.state()
-                            == ngc::ProgramExecutionState::Holding;
-                    }
-                } else if (const auto *completed =
-                               std::get_if<ngc::RequestCompleted>(&event)) {
-                    if (completed->request >= (ngc::RequestId { 1 } << 63)
-                        && completed->succeeded) {
-                        ++successfulSafetyRequests;
+                            == ngc::ProgramExecutionState::Error;
                     }
                 }
             });
             controller.service(snapshot, false);
         }
 
-        require(sawControlledStop && heldWasNonterminal,
-                "driver failure should wait at rest before terminalizing");
-        require(successfulSafetyRequests == 2,
-                "driver failure should acknowledge controlled stop and Abort");
+        require(sawControlledStop && heldReachedTerminal,
+                "driver failure should terminalize only after reaching rest");
         require(controller.state() == ngc::ProgramExecutionState::Error
                     && controller.error()
                         == "late prepared geometry failure",
-                "Abort completion should expose the preserved terminal error");
+                "stationary demand completion should expose the preserved terminal error");
         require(snapshot.state == ngc::BackendState::Held
                     && snapshot.commanded.velocity.length() <= 1e-12
                     && snapshot.commanded.acceleration.length() <= 1e-12
                     && snapshot.queuedExecutionItems == 0,
                 "terminal driver failure should leave no active backend motion");
-    }
-
-    void testDriverFailureAbortsWhenControlledStopIsRejected() {
-        ngc::TrajectoryLimits limits;
-        ngc::MockMotionBackend backend(
-            ngc::FeedHoldConfiguration { 2.0, 10.0 }, limits);
-        ngc::PreparedGeometryForwardChannel forward;
-        ngc::GeometryFeedbackChannel feedback;
-        std::atomic<bool> cancelled { false };
-        ngc::PreparedTrajectoryExecutionDriver driver(
-            backend, forward, feedback, cancelled, limits);
-        ngc::SessionCommandQueue commands;
-        ngc::ProgramExecutionController controller(
-            backend, driver, commands);
-        constexpr ngc::EpochId epoch = 29;
-
-        require(driver.begin(epoch),
-                "rejected failure-stop fixture should initialize the trajectory driver");
-        controller.begin(epoch);
-        require(backend.trySubmit(ngc::StartRequest { 1, epoch })
-                    == ngc::SubmitResult::Submitted,
-                "rejected failure-stop fixture should start an empty backend epoch");
-        backend.advanceTick(0.0, true);
-        driver.serviceBackend([&](const ngc::ExecutionEvent &event) {
-            controller.observeBackendEvent(event);
-        });
-        ngc::ExecutionSnapshot snapshot;
-        while (backend.tryTakeSnapshot(snapshot)) { }
-        require(snapshot.state == ngc::BackendState::Running,
-                "the empty backend epoch should be running without active motion");
-        require(forward.tryPush(
-                    std::make_unique<ngc::PreparedStreamMessage>(
-                        ngc::PreparedFailure {
-                            epoch, 1, "prepared failure before backend motion",
-                        })),
-                "rejected failure-stop fixture should publish its driver error");
-        require(!driver.pumpOne(
-                    [](const auto &, const auto &, const auto &,
-                       const auto &, const auto) { }),
-                "the rejected failure-stop fixture should observe its driver error");
-        controller.observeDriverState();
-
-        controller.service(snapshot, false);
-        auto sawRejectedStop = false;
-        auto sawSuccessfulAbort = false;
-        const auto observeEvent = [&](const ngc::ExecutionEvent &event) {
-            if (const auto *completed = std::get_if<ngc::RequestCompleted>(&event)) {
-                sawRejectedStop = sawRejectedStop || !completed->succeeded;
-                sawSuccessfulAbort = sawSuccessfulAbort || completed->succeeded;
-            }
-            controller.observeBackendEvent(event);
-        };
-        backend.advanceTick(0.0, true);
-        driver.serviceBackend(observeEvent);
-
-        backend.advanceTick(0.0, true);
-        driver.serviceBackend(observeEvent);
-        require(sawRejectedStop && sawSuccessfulAbort
-                    && controller.state() == ngc::ProgramExecutionState::Error
-                    && controller.error()
-                        == "prepared failure before backend motion",
-                "a rejected failure stop should fall back to Abort and preserve the driver error");
-    }
-
-    void testMockBackendFeedHoldStopBranchIsFatal() {
-        ngc::TrajectoryLimits limits;
-        limits.pathAcceleration = 4.0;
-        limits.axisAcceleration = ngc::position_t { 4.0, 4.0, 4.0, 4.0, 4.0, 4.0 };
-        ngc::MockMotionBackend backend(
-            ngc::FeedHoldConfiguration { 0.01, 0.1 }, limits);
-
-        ngc::PlanChunk chunk;
-        chunk.stopTailPolicy = ngc::StopTailPolicy::StopAllowed;
-        chunk.epoch = 18;
-        chunk.id = 32;
-        chunk.branch = 42;
-        require(chunk.normalMotion.push(linearSpan(203, 0.0, 0.1, 0.1)),
-                "feed-hold branch-fault normal span should fit");
-        require(chunk.stopTail.push(linearSpan(204, 0.1, 0.1, 1e-6)),
-                "feed-hold branch-fault stop tail should fit");
-        chunk.branchState = ngc::executionSpanEnd(chunk.normalMotion[0]);
-        chunk.stopState = chunk.branchState;
-
-        require(backend.tryPublish(chunk) == ngc::PublishResult::Published,
-                "feed-hold branch-fault chunk should publish");
-        require(backend.trySubmit(ngc::StartRequest { 4, 18 }) == ngc::SubmitResult::Submitted,
-                "feed-hold branch-fault test should submit start");
-        backend.advanceTick(0.09, true);
-        require(backend.trySubmit(ngc::FeedHoldRequest { 5 }) == ngc::SubmitResult::Submitted,
-                "feed-hold branch-fault request should fit");
-
-        ngc::ExecutionSnapshot snapshot;
-        for(int tick = 0; tick < 1000 && snapshot.state != ngc::BackendState::Faulted; ++tick) {
-            backend.advanceTick(0.001, true);
-            while(backend.tryTakeSnapshot(snapshot)) { }
-        }
-        require(snapshot.state == ngc::BackendState::Faulted && snapshot.faultCode == 5,
-                "feed hold reaching a stop branch should be a fatal backend condition");
-
-        bool selectedStop = false;
-        bool sawFault = false;
-        bool sawHeld = false;
-        ngc::ExecutionEvent event;
-        while(backend.tryTakeEvent(event)) {
-            if(const auto *branch = std::get_if<ngc::BranchSelected>(&event))
-                selectedStop = branch->choice == ngc::BranchChoice::Stop;
-            if(const auto *fault = std::get_if<ngc::BackendFault>(&event))
-                sawFault = fault->code == 5;
-            sawHeld = sawHeld || std::holds_alternative<ngc::BackendHeld>(event);
-        }
-        require(selectedStop && sawFault && !sawHeld,
-                "feed-hold branch exhaustion should report STOP and fault without entering Held");
-        require(backend.trySubmit(ngc::ResumeRequest { 6, 18 }) == ngc::SubmitResult::Submitted,
-                "post-fault resume request should fit for rejection testing");
-        backend.advanceTick(0.0, true);
-        bool resumeRejected = false;
-        while(backend.tryTakeEvent(event))
-            if(const auto *completed = std::get_if<ngc::RequestCompleted>(&event))
-                if(completed->request == 6) resumeRejected = !completed->succeeded;
-        require(resumeRejected, "feed resume should be rejected after stop-branch failure");
     }
 
     void testMockBackendFeedHoldPausesAndResumesProbeApproach() {
@@ -6528,7 +6403,7 @@ G1 F60 X2
                 "fixed-tick test motion should fit in its chunk");
         require(chunk.stopTail.push(linearSpan(2, 1.0, 1.0, 1e-6)),
                 "fixed-tick test stop tail should fit in its chunk");
-        chunk.branchState.position.x = 1.0;
+        chunk.branchState = ngc::executionSpanEnd(chunk.normalMotion[0]);
         chunk.stopState.position.x = 1.0;
         require(backend.tryPublish(chunk) == ngc::PublishResult::Published,
                 "fixed-tick test chunk should publish");
@@ -6541,7 +6416,8 @@ G1 F60 X2
                 "fixed-tick continuation should fit in its chunk");
         require(continuation.stopTail.push(linearSpan(4,3.0,3.0,0.005)),
                 "fixed-tick continuation stop tail should fit in its chunk");
-        continuation.branchState.position.x=3.0;
+        continuation.branchState =
+            ngc::executionSpanEnd(continuation.normalMotion[0]);
         continuation.stopState.position.x=3.0;
         require(backend.tryPublish(continuation)==ngc::PublishResult::Published,
                 "fixed-tick continuation should publish");
@@ -6603,10 +6479,10 @@ G1 F60 X2
         requireNear(jerkBackend.currentProgramJerkMagnitude(),6.0,
                     "mock presentation telemetry should report analytic active-span jerk");
         const auto jerkSamples=jerkBackend.takeExecutedJerkSamples();
-        require(jerkSamples.size()==1,
+        require(jerkSamples.size()==100,
                 std::format("mock jerk diagnostics should retain every calculated servo position (got {})",
                             jerkSamples.size()));
-        requireNear(jerkSamples.front().position.x,0.001,
+        requireNear(jerkSamples.back().position.x,0.001,
                     "mock jerk diagnostic should use the backend-calculated position");
         requireNear(jerkSamples.front().magnitude,6.0,
                     "mock jerk diagnostic should retain the active cubic jerk");
@@ -7934,12 +7810,15 @@ G1 F60 X2
 
         const auto coarse = positionsAtPeriod(0.01);
         const auto fine = positionsAtPeriod(0.001);
-        require(coarse.size() == 11,
-                "a 100 ms span should retain its start and ten calculated 10 ms positions");
+        require(coarse.size() == 101,
+                "diagnostic batching must retain every fixed 1 ms executor position");
         require(fine.size() == 101,
                 "a 100 ms span should retain its start and one hundred calculated 1 ms positions");
-        require(fine.size() > coarse.size(),
-                "shortening the servo period should produce shorter diagnostic line segments");
+        require(std::ranges::equal(
+                    fine, coarse, [](const auto &left, const auto &right) {
+                        return (left - right).length() < 1e-12;
+                    }),
+                "diagnostic batching must not change fixed-period executor results");
         requireNear(coarse.front().x, 0.0,
                     "diagnostic position buffer should retain the span start");
         requireNear(coarse.back().x, 1.0,
@@ -8684,8 +8563,6 @@ int main() {
         testMockBackendFeedHoldBrakesAlongActiveTrajectory();
         testMockBackendControlledStopBrakesAndCannotResume();
         testDriverFailureStopsAndAbortsBeforeBecomingTerminal();
-        testDriverFailureAbortsWhenControlledStopIsRejected();
-        testMockBackendFeedHoldStopBranchIsFatal();
         testMockBackendFeedHoldPausesAndResumesProbeApproach();
         testMockBackendProbeContactDuringFeedHoldStopIsDetected();
         testMachineSessionManagerFeedHoldReachesPausedAtRest();

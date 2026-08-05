@@ -1,23 +1,585 @@
 #include "machine/InProcessSimulationRuntime.h"
 
 #include <algorithm>
+#include <array>
 #include <chrono>
 #include <cmath>
+#include <optional>
 #include <ranges>
+#include <utility>
 
 #include "WindowsServoPacer.h"
+#include "machine/HostedExecutorRuntime.h"
+#include "machine/ProductionExecutorCore.h"
+#include "machine/SpscChannel.h"
+#include "machine/SimulationExecutor.h"
 
 namespace ngc {
+    namespace {
+        constexpr std::size_t SYNTHETIC_INPUT_CAPACITY = 16;
+
+        double dot(const position_t &left, const position_t &right) noexcept {
+            return left.x * right.x + left.y * right.y
+                + left.z * right.z + left.a * right.a
+                + left.b * right.b + left.c * right.c;
+        }
+
+        double magnitude(const position_t &value) noexcept {
+            return std::sqrt(dot(value, value));
+        }
+
+        bool inputLevel(const InputCondition condition,
+                        const bool conditionMet) noexcept {
+            return condition == InputCondition::Active
+                    || condition == InputCondition::RisingEdge
+                ? conditionMet : !conditionMet;
+        }
+
+        ProductionExecutorConfiguration simulationExecutorConfiguration(
+            const MachineConfiguration &configuration) {
+            auto simulation = configuration;
+            simulation.machineExecutor.reset();
+            auto result =
+                hostedExecutorRuntimeConfiguration(simulation).executor;
+            result.controlledStopLimits.velocity =
+                simulation.trajectory.axisVelocity;
+            result.controlledStopLimits.acceleration =
+                simulation.trajectory.axisAcceleration;
+            result.controlledStopLimits.jerk =
+                simulation.trajectory.axisJerk;
+            result.axisPosition = simulation.trajectory.axisPosition;
+            const auto sanitize = [](double &value) {
+                if (std::isnan(value) || value <= 0.0) {
+                    value = std::numeric_limits<double>::infinity();
+                }
+            };
+            sanitize(result.feedHold.pathAcceleration);
+            sanitize(result.feedHold.axisAcceleration.x);
+            sanitize(result.feedHold.axisAcceleration.y);
+            sanitize(result.feedHold.axisAcceleration.z);
+            sanitize(result.feedHold.axisAcceleration.a);
+            sanitize(result.feedHold.axisAcceleration.b);
+            sanitize(result.feedHold.axisAcceleration.c);
+            const auto finiteStopLimit = [](double &value) {
+                if (!std::isfinite(value) || value <= 0.0) {
+                    value = 1.0e9;
+                }
+            };
+            const auto sanitizeStop = [&](position_t &value) {
+                finiteStopLimit(value.x);
+                finiteStopLimit(value.y);
+                finiteStopLimit(value.z);
+                finiteStopLimit(value.a);
+                finiteStopLimit(value.b);
+                finiteStopLimit(value.c);
+            };
+            sanitizeStop(result.controlledStopLimits.velocity);
+            sanitizeStop(result.controlledStopLimits.acceleration);
+            sanitizeStop(result.controlledStopLimits.jerk);
+
+            return result;
+        }
+    }
+
+    class SimulationExecutor::Impl final : public MotionBackend {
+        struct TriggerDescription {
+            TriggeredMoveId move = 0;
+            position_t axisTarget{};
+            FixedArray<JointTrigger, MAX_JOINTS> jointTriggers;
+            JointVector jointTarget{};
+            DigitalInputId axisInput = 0;
+            InputCondition axisCondition = InputCondition::Active;
+            bool jointSpace = false;
+        };
+
+        struct SyntheticTransition {
+            TriggeredMoveId move = 0;
+            JointId joint = MAX_JOINTS;
+            position_t axisPosition{};
+            double jointPosition = 0.0;
+        };
+
+    public:
+        Impl(const double servoPeriod,
+             ProductionExecutorConfiguration configuration,
+             const std::vector<JointConfiguration> &joints = {})
+            : m_core(servoPeriod, std::move(configuration)) {
+            m_jointSearchDirection.fill(1.0);
+            m_jointActiveCondition.fill(InputCondition::Active);
+            for (const auto &joint : joints) {
+                m_jointSearchDirection[joint.id] = std::copysign(
+                    1.0, joint.homing.searchVelocity
+                        * joint.coordinateScale);
+                m_jointActiveCondition[joint.id] =
+                    joint.homing.condition;
+            }
+        }
+
+        PublishResult tryPublish(const ExecutionItem &item) noexcept override {
+            const auto result = m_core.tryPublish(item);
+            if (result != PublishResult::Published) {
+                return result;
+            }
+
+            if (const auto *move = std::get_if<TriggeredMove>(&item)) {
+                (void)m_descriptions.tryPush({
+                    .move = move->moveId,
+                    .axisTarget = move->target,
+                    .jointTriggers = {},
+                    .jointTarget = {},
+                    .axisInput = move->input,
+                    .axisCondition = move->condition,
+                    .jointSpace = false,
+                });
+            } else if (const auto *move =
+                           std::get_if<TriggeredJointMove>(&item)) {
+                (void)m_descriptions.tryPush({
+                    .move = move->moveId,
+                    .jointTriggers = move->triggers,
+                    .jointTarget = move->target,
+                    .jointSpace = true,
+                });
+            }
+
+            return result;
+        }
+
+        DemandPublishResult publishDemand(
+            const ExecutorDemand &demand) noexcept override {
+            return m_core.publishDemand(demand);
+        }
+
+        SubmitResult trySubmit(const ControlRequest &request) noexcept override {
+            return m_core.trySubmit(request);
+        }
+
+        bool tryTakeEvent(ExecutionEvent &event) noexcept override {
+            return m_core.tryTakeEvent(event);
+        }
+
+        bool tryTakeSnapshot(ExecutionSnapshot &snapshot) noexcept override {
+            return m_core.tryTakeSnapshot(snapshot);
+        }
+
+        void restoreStationaryState(
+            const StationaryBackendState &state) noexcept {
+            m_core.restoreStationaryState(
+                state.commanded, state.feedback,
+                state.commandedJoints, state.feedbackJoints);
+        }
+
+        void serviceImmediate() noexcept {
+            m_core.serviceImmediate();
+        }
+
+        bool configureSyntheticInput(
+            const TriggeredMoveId move,
+            const position_t &position) noexcept {
+            return m_transitions.tryPush({
+                .move = move,
+                .axisPosition = position,
+            });
+        }
+
+        bool configureSyntheticJointInput(
+            const TriggeredMoveId move, const JointId joint,
+            const double position) noexcept {
+            return m_transitions.tryPush({
+                .move = move,
+                .joint = joint,
+                .jointPosition = position,
+            });
+        }
+
+        void latchEmergencyStop() noexcept {
+            m_core.latchEmergencyStop();
+        }
+
+        void resetEmergencyStop() noexcept {
+            m_core.resetEmergencyStop();
+        }
+
+        bool advanceTick(const bool publishSnapshot) noexcept {
+            drainSyntheticConfiguration();
+            applySyntheticInputs();
+            m_core.servoTick(publishSnapshot);
+            const auto observation = m_core.lastTickObservation();
+            recordObservation(observation);
+            if (observation.completedMove != 0) {
+                removeMove(observation.completedMove);
+            }
+
+            return observation.crossedChunk;
+        }
+
+        bool advance(const double seconds, const bool publishSnapshot) {
+            if (seconds <= 0.0) {
+                serviceImmediate();
+
+                return false;
+            }
+
+            const auto ticks = static_cast<std::uint64_t>(std::ceil(
+                seconds / m_core.servoPeriod() - 1e-12));
+            auto crossed = false;
+            for (std::uint64_t tick = 0; tick < ticks; ++tick) {
+                crossed = advanceTick(
+                    publishSnapshot && tick + 1 == ticks) || crossed;
+            }
+
+            return crossed;
+        }
+
+        void runUntilIdle(const double tickSeconds) {
+            const auto ticksPerStep = std::max<std::uint64_t>(
+                1, static_cast<std::uint64_t>(
+                    std::ceil(
+                        tickSeconds / m_core.servoPeriod() - 1e-12)));
+            for (std::size_t guard = 0; guard < 10'000'000; ++guard) {
+                for (std::uint64_t tick = 0; tick < ticksPerStep; ++tick) {
+                    (void)advanceTick(false);
+                    const auto snapshot = m_core.currentSnapshot();
+                    if ((snapshot.state == BackendState::Held
+                         || snapshot.state == BackendState::Disabled
+                         || snapshot.state == BackendState::Faulted)
+                        && snapshot.queuedExecutionItems == 0) {
+                        return;
+                    }
+                }
+            }
+        }
+
+        [[nodiscard]] double lastProgramSeconds() const noexcept {
+            return m_lastProgramSeconds;
+        }
+
+        [[nodiscard]] double currentJerkMagnitude() const noexcept {
+            return m_currentJerkMagnitude.load(std::memory_order_relaxed);
+        }
+
+        void clearTrajectoryDiagnostics() {
+            std::scoped_lock lock(m_diagnosticsMutex);
+            m_jerkSamples.clear();
+            m_trajectory = {};
+            m_physicalTime = 0.0;
+            m_referenceTime = 0.0;
+            m_lastProgramSeconds = 0.0;
+            m_currentJerkMagnitude.store(0.0, std::memory_order_relaxed);
+        }
+
+        std::vector<ExecutedJerkSample> takeExecutedJerkSamples() {
+            std::scoped_lock lock(m_diagnosticsMutex);
+
+            return std::exchange(m_jerkSamples, {});
+        }
+
+        MockTrajectorySnapshot trajectorySnapshot() const {
+            std::scoped_lock lock(m_diagnosticsMutex);
+
+            return m_trajectory;
+        }
+
+    private:
+        void drainSyntheticConfiguration() noexcept {
+            TriggerDescription description;
+            while (m_descriptions.tryPop(description)) {
+                (void)m_pendingDescriptions.push(description);
+            }
+            SyntheticTransition transition;
+            while (m_transitions.tryPop(transition)) {
+                (void)m_pendingTransitions.push(transition);
+            }
+        }
+
+        const TriggerDescription *descriptionFor(
+                const TriggeredMoveId active) const noexcept {
+            if (active != 0) {
+                for (const auto &description : m_pendingDescriptions) {
+                    if (description.move == active) {
+                        return &description;
+                    }
+                }
+            }
+
+            return m_pendingDescriptions.size != 0
+                ? &m_pendingDescriptions[0] : nullptr;
+        }
+
+        void applySyntheticInputs() noexcept {
+            LogicalDigitalInputImage inputs;
+            const auto context = m_core.motionContext();
+            const auto *description = descriptionFor(context.move);
+            if (description == nullptr) {
+                m_core.setDigitalInputSamples(inputs);
+                return;
+            }
+
+            for (const auto &transition : m_pendingTransitions) {
+                if (transition.move != description->move) {
+                    continue;
+                }
+                if (!description->jointSpace
+                    && transition.joint == MAX_JOINTS) {
+                    const auto target = context.move == description->move
+                        ? context.axisTarget : description->axisTarget;
+                    const auto current = context.axisPosition;
+                    const auto conditionMet = dot(
+                        target - current,
+                        transition.axisPosition - current) <= 1e-12;
+                    inputs[description->axisInput] = inputLevel(
+                        description->axisCondition, conditionMet);
+                } else if (description->jointSpace
+                           && transition.joint < MAX_JOINTS) {
+                    const auto joint = transition.joint;
+                    const auto current = context.jointPosition[joint];
+                    const auto conditionMet = m_jointSearchDirection[joint]
+                        * (current - transition.jointPosition) >= -1e-12;
+                    for (const auto &trigger :
+                         description->jointTriggers) {
+                        if (trigger.joint == joint) {
+                            inputs[trigger.input] = inputLevel(
+                                m_jointActiveCondition[joint],
+                                conditionMet);
+                        }
+                    }
+                }
+            }
+            m_core.setDigitalInputSamples(inputs);
+        }
+
+        void removeMove(const TriggeredMoveId move) noexcept {
+            for (std::uint32_t index = 0;
+                 index < m_pendingDescriptions.size;) {
+                if (m_pendingDescriptions[index].move != move) {
+                    ++index;
+                    continue;
+                }
+                m_pendingDescriptions[index] = m_pendingDescriptions[
+                    m_pendingDescriptions.size - 1];
+                --m_pendingDescriptions.size;
+            }
+            for (std::uint32_t index = 0;
+                 index < m_pendingTransitions.size;) {
+                if (m_pendingTransitions[index].move != move) {
+                    ++index;
+                    continue;
+                }
+                m_pendingTransitions[index] = m_pendingTransitions[
+                    m_pendingTransitions.size - 1];
+                --m_pendingTransitions.size;
+            }
+        }
+
+        void recordObservation(
+            const ProductionExecutorTickObservation &observation) {
+            m_lastProgramSeconds = observation.programSeconds;
+            if (!observation.plannedMotion) {
+                m_currentJerkMagnitude.store(
+                    0.0, std::memory_order_relaxed);
+                return;
+            }
+
+            const auto jerkMagnitude = magnitude(observation.jerk);
+            m_currentJerkMagnitude.store(
+                jerkMagnitude, std::memory_order_relaxed);
+            std::scoped_lock lock(m_diagnosticsMutex);
+            if (m_trajectory.spans.empty()
+                || m_trajectory.spans.back().epoch != observation.epoch
+                || m_trajectory.spans.back().chunk != observation.chunk
+                || m_trajectory.spans.back().span != observation.span
+                || m_trajectory.spans.back().stopTail
+                    != observation.stopTail) {
+                if (!m_trajectory.spans.empty()
+                    && (m_trajectory.spans.back().positions.empty()
+                        || (m_trajectory.spans.back().positions.back()
+                            - observation.spanStart).length() > 1e-12)) {
+                    m_trajectory.spans.back().positions.push_back(
+                        observation.spanStart);
+                }
+                ExecutedTrajectorySpan span{
+                    .epoch = observation.epoch,
+                    .chunk = observation.chunk,
+                    .span = observation.span,
+                    .stopTail = observation.stopTail,
+                    .positions = {},
+                };
+                span.positions.push_back(observation.spanStart);
+                m_trajectory.spans.push_back(std::move(span));
+            }
+            m_trajectory.spans.back().positions.push_back(
+                observation.commanded.position);
+            ++m_trajectory.revision;
+            m_physicalTime += observation.programSeconds;
+            m_referenceTime += observation.programSeconds
+                * observation.executionRate;
+            m_jerkSamples.push_back({
+                .epoch = observation.epoch,
+                .chunk = observation.chunk,
+                .span = observation.span,
+                .position = observation.commanded.position,
+                .velocity = observation.commanded.velocity,
+                .acceleration = observation.commanded.acceleration,
+                .jerk = observation.jerk,
+                .magnitude = jerkMagnitude,
+                .physicalTime = m_physicalTime,
+                .referenceTime = m_referenceTime,
+                .executionRate = observation.executionRate,
+                .executionRateAcceleration =
+                    observation.executionRateAcceleration,
+                .executionRateJerk = observation.executionRateJerk,
+                .feedHolding = observation.feedHolding,
+                .stopTail = observation.stopTail,
+            });
+        }
+
+        ProductionExecutorCore m_core;
+        SpscChannel<TriggerDescription, SYNTHETIC_INPUT_CAPACITY>
+            m_descriptions;
+        SpscChannel<SyntheticTransition, SYNTHETIC_INPUT_CAPACITY>
+            m_transitions;
+        FixedArray<TriggerDescription, SYNTHETIC_INPUT_CAPACITY>
+            m_pendingDescriptions;
+        FixedArray<SyntheticTransition, SYNTHETIC_INPUT_CAPACITY>
+            m_pendingTransitions;
+        std::atomic<double> m_currentJerkMagnitude{0.0};
+        mutable std::mutex m_diagnosticsMutex;
+        std::vector<ExecutedJerkSample> m_jerkSamples;
+        MockTrajectorySnapshot m_trajectory;
+        double m_lastProgramSeconds = 0.0;
+        double m_physicalTime = 0.0;
+        double m_referenceTime = 0.0;
+        std::array<double, MAX_JOINTS> m_jointSearchDirection{};
+        std::array<InputCondition, MAX_JOINTS> m_jointActiveCondition{};
+    };
+
+    SimulationExecutor::SimulationExecutor(
+        const double servoPeriod,
+        const FeedHoldConfiguration &feedHold,
+        const TrajectoryLimits &trajectory,
+        const std::vector<AxisConfiguration> &axes,
+        const std::vector<JointConfiguration> &joints) {
+        MachineConfiguration configuration;
+        configuration.feedHold = feedHold;
+        configuration.trajectory = trajectory;
+        configuration.simulation.servoPeriod = servoPeriod;
+        configuration.axes = axes;
+        configuration.joints = joints;
+        m_impl = std::make_unique<Impl>(
+            servoPeriod,
+            simulationExecutorConfiguration(configuration), joints);
+    }
+
+    SimulationExecutor::SimulationExecutor(
+        const double servoPeriod,
+        const MachineConfiguration &configuration)
+        : m_impl(std::make_unique<Impl>(
+              servoPeriod,
+              simulationExecutorConfiguration(configuration),
+              configuration.joints)) { }
+
+    SimulationExecutor::~SimulationExecutor() = default;
+
+    PublishResult SimulationExecutor::tryPublish(
+        const ExecutionItem &item) noexcept {
+        return m_impl->tryPublish(item);
+    }
+
+    DemandPublishResult SimulationExecutor::publishDemand(
+        const ExecutorDemand &demand) noexcept {
+        return m_impl->publishDemand(demand);
+    }
+
+    SubmitResult SimulationExecutor::trySubmit(
+        const ControlRequest &request) noexcept {
+        return m_impl->trySubmit(request);
+    }
+
+    bool SimulationExecutor::tryTakeEvent(
+        ExecutionEvent &event) noexcept {
+        return m_impl->tryTakeEvent(event);
+    }
+
+    bool SimulationExecutor::tryTakeSnapshot(
+        ExecutionSnapshot &snapshot) noexcept {
+        return m_impl->tryTakeSnapshot(snapshot);
+    }
+
+    void SimulationExecutor::restoreStationaryState(
+        const StationaryBackendState &state) noexcept {
+        m_impl->restoreStationaryState(state);
+    }
+
+    void SimulationExecutor::serviceImmediate() noexcept {
+        m_impl->serviceImmediate();
+    }
+
+    bool SimulationExecutor::advanceTick(
+        const bool publishSnapshot) noexcept {
+        return m_impl->advanceTick(publishSnapshot);
+    }
+
+    bool SimulationExecutor::advance(
+        const double seconds, const bool publishSnapshot) {
+        return m_impl->advance(seconds, publishSnapshot);
+    }
+
+    void SimulationExecutor::runUntilIdle(const double tickSeconds) {
+        m_impl->runUntilIdle(tickSeconds);
+    }
+
+    bool SimulationExecutor::configureSyntheticInput(
+        const TriggeredMoveId move,
+        const position_t &position) noexcept {
+        return m_impl->configureSyntheticInput(move, position);
+    }
+
+    bool SimulationExecutor::configureSyntheticJointInput(
+        const TriggeredMoveId move, const JointId joint,
+        const double position) noexcept {
+        return m_impl->configureSyntheticJointInput(move, joint, position);
+    }
+
+    void SimulationExecutor::latchEmergencyStop() noexcept {
+        m_impl->latchEmergencyStop();
+    }
+
+    void SimulationExecutor::resetEmergencyStop() noexcept {
+        m_impl->resetEmergencyStop();
+    }
+
+    double SimulationExecutor::lastProgramSeconds() const noexcept {
+        return m_impl->lastProgramSeconds();
+    }
+
+    double SimulationExecutor::currentJerkMagnitude() const noexcept {
+        return m_impl->currentJerkMagnitude();
+    }
+
+    void SimulationExecutor::clearTrajectoryDiagnostics() {
+        m_impl->clearTrajectoryDiagnostics();
+    }
+
+    MockTrajectorySnapshot SimulationExecutor::trajectorySnapshot() const {
+        return m_impl->trajectorySnapshot();
+    }
+
+    std::vector<ExecutedJerkSample>
+    SimulationExecutor::takeExecutedJerkSamples() {
+        return m_impl->takeExecutedJerkSamples();
+    }
+
     InProcessSimulationRuntime::InProcessSimulationRuntime(const TrajectoryLimits &limits,
                                                            const SimulationTiming &timing)
-        : m_backend({}, limits), m_servoPeriod(timing.servoPeriod),
+        : m_executor(std::make_unique<SimulationExecutor>(
+              timing.servoPeriod, FeedHoldConfiguration{}, limits)),
+          m_servoPeriod(timing.servoPeriod),
           m_schedulerPeriod(timing.schedulerPeriod),
           m_servoTicksPerSchedulerPeriod(static_cast<std::uint32_t>(
               std::max(1.0, std::round(timing.schedulerPeriod / timing.servoPeriod)))) { }
 
     InProcessSimulationRuntime::InProcessSimulationRuntime(const MachineConfiguration &configuration)
-        : m_backend(configuration.feedHold, configuration.trajectory,
-                    configuration.axes, configuration.joints),
+        : m_executor(std::make_unique<SimulationExecutor>(
+              configuration.simulation.servoPeriod, configuration)),
           m_joints(configuration.joints),
           m_servoPeriod(configuration.simulation.servoPeriod),
           m_schedulerPeriod(configuration.simulation.schedulerPeriod),
@@ -30,7 +592,7 @@ namespace ngc {
     }
 
     MotionBackend &InProcessSimulationRuntime::endpoint() noexcept {
-        return m_backend;
+        return *m_executor;
     }
 
     BackendCapabilities InProcessSimulationRuntime::capabilities() const noexcept {
@@ -44,7 +606,7 @@ namespace ngc {
             return false;
         }
 
-        m_backend.restoreStationaryState(state);
+        m_executor->restoreStationaryState(state);
 
         return true;
     }
@@ -116,7 +678,7 @@ namespace ngc {
             }
 
             resetTimedDiagnostics();
-            m_backend.clearTrajectoryDiagnostics();
+            m_executor->clearTrajectoryDiagnostics();
             m_timedExecutionActive.store(true, std::memory_order_release);
         }
         m_schedulerCv.notify_all();
@@ -166,7 +728,7 @@ namespace ngc {
             .tickMultiplier = m_tickMultiplier.load(std::memory_order_relaxed),
             .servoTicks = m_servoTicks.load(std::memory_order_relaxed),
             .programElapsedSeconds = m_programElapsedSeconds.load(std::memory_order_relaxed),
-            .executedPathJerk = m_backend.currentProgramJerkMagnitude(),
+            .executedPathJerk = m_executor->currentJerkMagnitude(),
             .deadlineMisses = m_deadlineMisses.load(std::memory_order_relaxed),
             .lastWakeLatenessSeconds = m_lastWakeLateness.load(std::memory_order_relaxed),
             .maximumWakeLatenessSeconds =
@@ -195,7 +757,15 @@ namespace ngc {
 
     void InProcessSimulationRuntime::advanceImmediate(const double seconds) {
         serviceEmergencyStop();
-        m_backend.advance(seconds);
+        if (seconds <= 0.0) {
+            m_executor->serviceImmediate();
+            return;
+        }
+        const auto ticks = static_cast<std::uint64_t>(
+            std::ceil(seconds / m_servoPeriod));
+        for (std::uint64_t tick = 0; tick < ticks; ++tick) {
+            (void)m_executor->advanceTick(tick + 1 == ticks);
+        }
     }
 
     std::uint64_t InProcessSimulationRuntime::advanceServiceMotionPeriod() {
@@ -203,7 +773,7 @@ namespace ngc {
             * m_tickMultiplier.load(std::memory_order_relaxed);
         for (std::uint64_t tick = 0; tick < ticks; ++tick) {
             serviceEmergencyStop();
-            m_backend.advanceTick(m_servoPeriod, tick + 1 == ticks);
+            (void)m_executor->advanceTick(tick + 1 == ticks);
         }
 
         return ticks;
@@ -211,13 +781,14 @@ namespace ngc {
 
     bool InProcessSimulationRuntime::configureSyntheticInput(
         const TriggeredMoveId move, const position_t &transitionPosition) noexcept {
-        return m_backend.configureSyntheticInput(move, transitionPosition);
+        return m_executor->configureSyntheticInput(move, transitionPosition);
     }
 
     bool InProcessSimulationRuntime::configureSyntheticJointInput(
         const TriggeredMoveId move, const JointId joint,
         const double transitionPosition) noexcept {
-        return m_backend.configureSyntheticJointInput(move, joint, transitionPosition);
+        return m_executor->configureSyntheticJointInput(
+            move, joint, transitionPosition);
     }
 
     void InProcessSimulationRuntime::requestEmergencyStop(
@@ -246,9 +817,9 @@ namespace ngc {
         const auto wasLatched = m_emergencyStopState.latched();
         const auto isLatched = m_emergencyStopState.update();
         if (isLatched && !wasLatched) {
-            m_backend.latchEmergencyStop();
+            m_executor->latchEmergencyStop();
         } else if (!isLatched && wasLatched) {
-            m_backend.resetEmergencyStop();
+            m_executor->resetEmergencyStop();
         }
     }
 
@@ -262,11 +833,11 @@ namespace ngc {
     }
 
     void InProcessSimulationRuntime::clearTrajectoryDiagnostics() {
-        m_backend.clearTrajectoryDiagnostics();
+        m_executor->clearTrajectoryDiagnostics();
     }
 
     std::vector<ExecutedJerkSample> InProcessSimulationRuntime::takeExecutedJerkSamples() {
-        return m_backend.takeExecutedJerkSamples();
+        return m_executor->takeExecutedJerkSamples();
     }
 
     void InProcessSimulationRuntime::runScheduler() {
@@ -347,9 +918,9 @@ namespace ngc {
                     const auto started = clock::now();
                     serviceEmergencyStop();
                     const auto crossedChunk =
-                        m_backend.advanceTick(m_servoPeriod, tick + 1 == ticksThisPeriod);
+                        m_executor->advanceTick(tick + 1 == ticksThisPeriod);
                     m_programElapsedSeconds.fetch_add(
-                        m_backend.lastAdvanceProgramSeconds(), std::memory_order_relaxed);
+                        m_executor->lastProgramSeconds(), std::memory_order_relaxed);
                     const auto duration =
                         std::chrono::duration<double>(clock::now() - started).count();
                     updateMaximum(m_maximumTickExecution, duration);

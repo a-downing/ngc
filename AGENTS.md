@@ -56,23 +56,31 @@ GeometryStreamProducer
 
 `Worker` retains immutable prepared curves and presentation metadata as Preview's sole toolpath representation. `MachineSessionManager` owns the persistent Simulation session that consumes the same prepared stream through `PreparedTrajectoryExecutionDriver`. Ordinary motion becomes timed axis-polynomial `PlanChunk` values; probes and homing/service moves use executor-owned triggered moves. Before publication, the NRT trajectory compiler proves the per-axis position range of every normal and stop-tail execution span against configured soft limits and validates triggered-move endpoints. The RT executor independently checks each current commanded axis position and projected limited-joint position before committing it; a violation faults motion and preserves the last valid command.
 
-`InProcessSimulationRuntime` owns the persistent `MockMotionBackend`, its sleeping
-servo-scheduler thread, accelerated-playback coordination, synthetic input
-policy, and mock-only timing and jerk diagnostics. `MachineSessionManager`
-delegates Simulation runtime responsibilities to that runtime. The
-runtime and backend survive individual program epochs; timed scheduling is
-activated only for an active program epoch, while homing and jogging currently
-use runtime-owned synchronous service stepping. `MockMotionBackend` is a non-RT
-implementation of the production-shaped backend contract.
+`InProcessSimulationRuntime` owns the persistent `SimulationExecutor`, its
+sleeping servo-scheduler thread, accelerated-playback coordination, synthetic
+input policy, and Simulation-only timing and jerk diagnostics. The executor is
+a thin non-RT adapter around `ProductionExecutorCore`; Simulation and Machine
+therefore use the same execution and lifecycle state machine.
+`MachineSessionManager` delegates Simulation runtime responsibilities to that
+runtime. The runtime and executor survive individual program epochs; timed
+scheduling is activated only for an active program epoch, while homing and
+jogging currently use runtime-owned synchronous service stepping.
 `ProductionExecutorCore` is the initial platform-independent, fixed-period,
 allocation-free execution core for normal `PlanChunk` motion, axis-space
 triggered moves, joint-space triggered moves, stop branches, markers,
 retirement, snapshots, faults, scheduled spindle-output events,
 ordinary-plan controlled stop, and executor-owned jogging.
-Plan-slot descriptors and inline ordinary controls share one ordered SPSC
-ingress queue. Exactly one NRT thread at a time owns both publication and
-control submission; ownership can transfer only after the prior owner has
-quiesced. Emergency stop remains out of band.
+Execution-item descriptors use an ordered SPSC ingress queue. Lifecycle intent
+uses a separate generation-tagged, three-slot SPSC latest-value demand mailbox;
+the executor acknowledges the consumed generation in its snapshots and gates
+plan activation on the current epoch's persistent demand. A single
+`ExecutorDemandController` owns generation assignment for each NRT session, so
+session, program, homing, and jogging code cannot construct or replay raw
+lifecycle demand. Stationary coordinate transactions and token-matched jog
+updates and stops remain acknowledged ordered controls. Exactly one NRT thread
+at a time owns publication, demand publication, and transactional control
+submission; ownership can transfer only after the prior owner has quiesced.
+Emergency stop remains out of band.
 Scheduled output events activate exactly once before their indexed normal
 execution span. Feed hold retains the event cursor, Resume does not replay
 applied events, and

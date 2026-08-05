@@ -20,6 +20,7 @@ namespace ngc {
     using SpanId = std::uint64_t;
     using ExecutionMarkerId = std::uint64_t;
     using RequestId = std::uint64_t;
+    using DemandGeneration = std::uint64_t;
     using JogId = std::uint64_t;
     using BranchSequence = std::uint64_t;
 
@@ -405,6 +406,28 @@ namespace ngc {
                                         SetContinuousJogVelocityRequest, StopJogRequest>;
     static_assert(std::is_trivially_copyable_v<ControlRequest>);
 
+    enum class ExecutorDemandMode : std::uint8_t {
+        Disabled,
+        Idle,
+        Run,
+        FeedHold,
+        Stop,
+        Jog,
+    };
+
+    struct ExecutorDemand {
+        DemandGeneration generation = 0;
+        EpochId epoch = 0;
+        ExecutorDemandMode mode = ExecutorDemandMode::Disabled;
+    };
+    static_assert(std::is_trivially_copyable_v<ExecutorDemand>);
+
+    enum class DemandPublishResult : std::uint8_t {
+        Published,
+        Invalid,
+        Unavailable,
+    };
+
     struct ChunkAccepted { EpochId epoch; ChunkId chunk; };
     struct ChunkRejected { EpochId epoch; ChunkId chunk; };
     struct ChunkRetired { EpochId epoch; ChunkId chunk; };
@@ -479,17 +502,23 @@ namespace ngc {
         JointMotionState commandedJoints{};
         JointMotionState feedbackJoints{};
         std::uint32_t faultCode = 0;
+        DemandGeneration acknowledgedDemandGeneration = 0;
+        ExecutorDemandMode demandedMode = ExecutorDemandMode::Disabled;
+        bool demandAccepted = true;
     };
 
     // NRT-facing endpoint. Calls only access bounded communication storage; they
     // never invoke the servo loop, allocate, wait, or acquire an RT-owned mutex.
-    // Exactly one NRT thread at a time owns both tryPublish() and trySubmit() so
-    // implementations can preserve one order across plans and ordinary controls.
-    // Ownership may transfer only after the previous owner has quiesced.
+    // Exactly one NRT thread at a time owns publication through all three input
+    // methods. Execution items and transactions retain their ordered ingress;
+    // lifecycle demand is an independently ordered latest value. Ownership may
+    // transfer only after the previous owner has quiesced.
     class MotionBackend {
     public:
         virtual ~MotionBackend() = default;
         virtual PublishResult tryPublish(const ExecutionItem &item) noexcept = 0;
+        virtual DemandPublishResult publishDemand(
+            const ExecutorDemand &demand) noexcept = 0;
         virtual SubmitResult trySubmit(const ControlRequest &request) noexcept = 0;
         virtual bool tryTakeEvent(ExecutionEvent &event) noexcept = 0;
         virtual bool tryTakeSnapshot(ExecutionSnapshot &snapshot) noexcept = 0;

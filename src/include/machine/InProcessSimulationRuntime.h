@@ -5,13 +5,15 @@
 #include <cstdint>
 #include <mutex>
 #include <thread>
+#include <memory>
 #include <vector>
 
 #include "machine/BackendRuntime.h"
 #include "machine/MachineConfiguration.h"
-#include "machine/MockMotionBackend.h"
+#include "machine/MockTrajectoryDiagnostics.h"
 
 namespace ngc {
+    class SimulationExecutor;
     struct SimulationRuntimeSnapshot {
         double servoPeriodSeconds = 0.001;
         double schedulerPeriodSeconds = 0.01;
@@ -81,7 +83,7 @@ namespace ngc {
         void resetTimedDiagnostics() noexcept;
         static void updateMaximum(std::atomic<double> &target, double value) noexcept;
 
-        MockMotionBackend m_backend;
+        std::unique_ptr<SimulationExecutor> m_executor;
         EmergencyStopControlBlock m_emergencyStopControl;
         EmergencyStopInterface m_emergencyStopInterface{m_emergencyStopControl};
         EmergencyStopState m_emergencyStopState{m_emergencyStopControl};

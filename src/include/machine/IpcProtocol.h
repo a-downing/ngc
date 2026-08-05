@@ -10,10 +10,11 @@
 #include "machine/EmergencyStop.h"
 #include "machine/MotionBackend.h"
 #include "machine/RealtimeTiming.h"
+#include "machine/SharedLatestValueMailbox.h"
 
 namespace ngc {
     inline constexpr std::uint64_t IPC_MAGIC = 0x4e47435f49504331ULL;
-    inline constexpr std::uint32_t IPC_ABI_VERSION = 7;
+    inline constexpr std::uint32_t IPC_ABI_VERSION = 8;
     inline constexpr std::size_t IPC_EXECUTION_CAPACITY = 8;
     inline constexpr std::size_t IPC_CONTROL_CAPACITY = 16;
     inline constexpr std::size_t IPC_EVENT_CAPACITY = 64;
@@ -65,6 +66,7 @@ namespace ngc {
         std::uint32_t regionSize = 0;
         std::uint32_t executionItemSize = 0;
         std::uint32_t controlRequestSize = 0;
+        std::uint32_t executorDemandSize = 0;
         std::uint32_t executionEventSize = 0;
         std::uint32_t executionSnapshotSize = 0;
         std::uint32_t realtimeTimingSummarySize = 0;
@@ -74,6 +76,7 @@ namespace ngc {
         std::uint32_t frontendProcessId = 0;
         std::uint32_t peerProcessId = 0;
         EmergencyStopControlBlock emergencyStop;
+        SharedLatestValueMailboxStorage<ExecutorDemand> demand;
         IpcRingStorage<ExecutionItem, IPC_EXECUTION_CAPACITY> executionItems;
         IpcRingStorage<ControlRequest, IPC_CONTROL_CAPACITY> controls;
         IpcRingStorage<ExecutionEvent, IPC_EVENT_CAPACITY> events;
@@ -142,16 +145,19 @@ namespace ngc {
     inline void initializeIpcSharedRegion(IpcSharedRegion &region, const IpcIdentity identity,
                                           const std::uint32_t frontendProcessId) noexcept {
         std::memset(&region, 0, sizeof(region));
+        initializeSharedLatestValueMailbox(region.demand);
         region.magic = IPC_MAGIC;
         region.abiVersion = IPC_ABI_VERSION;
         region.regionSize = sizeof(IpcSharedRegion);
         region.executionItemSize = sizeof(ExecutionItem);
         region.controlRequestSize = sizeof(ControlRequest);
+        region.executorDemandSize = sizeof(ExecutorDemand);
         region.executionEventSize = sizeof(ExecutionEvent);
         region.executionSnapshotSize = sizeof(ExecutionSnapshot);
         region.realtimeTimingSummarySize =
             sizeof(RealtimeTimingSummary);
         region.identity = identity;
+        region.demand.middle = 1;
         region.frontendProcessId = frontendProcessId;
         setIpcConnectionState(region, IpcConnectionState::FrontendReady);
     }
@@ -167,6 +173,7 @@ namespace ngc {
         if (region.regionSize != sizeof(IpcSharedRegion)
             || region.executionItemSize != sizeof(ExecutionItem)
             || region.controlRequestSize != sizeof(ControlRequest)
+            || region.executorDemandSize != sizeof(ExecutorDemand)
             || region.executionEventSize != sizeof(ExecutionEvent)
             || region.executionSnapshotSize != sizeof(ExecutionSnapshot)
             || region.realtimeTimingSummarySize

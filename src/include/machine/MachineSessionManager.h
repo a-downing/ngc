@@ -133,19 +133,9 @@ public:
 
     void start() override {
         m_runtime->start();
-        if (!m_simulation && !submitControlAndWait(ngc::EnableRequest{
-                std::numeric_limits<ngc::RequestId>::max()})) {
-            m_runtime->stop();
-            throw std::runtime_error(
-                "external executor rejected backend enable");
-        }
     }
 
     void stop() override {
-        if (!m_simulation) {
-            static_cast<void>(submitControlAndWait(ngc::DisableRequest{
-                std::numeric_limits<ngc::RequestId>::max() - 1}));
-        }
         m_runtime->stop();
     }
 
@@ -273,34 +263,6 @@ public:
     }
 
 private:
-    bool submitControlAndWait(const ngc::ControlRequest &request) {
-        const auto requestId = std::visit([](const auto &value) {
-            return value.id;
-        }, request);
-        if (m_runtime->endpoint().trySubmit(request)
-            != ngc::SubmitResult::Submitted) {
-            return false;
-        }
-
-        const auto deadline = std::chrono::steady_clock::now()
-            + std::chrono::seconds(2);
-        while (std::chrono::steady_clock::now() < deadline) {
-            ngc::ExecutionEvent event;
-            while (m_runtime->endpoint().tryTakeEvent(event)) {
-                if (const auto *completed =
-                        std::get_if<ngc::RequestCompleted>(&event);
-                    completed != nullptr
-                    && completed->request == requestId) {
-                    return completed->succeeded;
-                }
-            }
-            m_runtime->serviceImmediate();
-            std::this_thread::sleep_for(std::chrono::milliseconds(1));
-        }
-
-        return false;
-    }
-
     std::unique_ptr<ngc::BackendRuntime> m_runtime;
     ngc::InProcessSimulationRuntime *m_simulation = nullptr;
     double m_servoPeriod = 0.001;

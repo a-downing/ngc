@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <iostream>
 #include <limits>
@@ -7,12 +8,14 @@
 #include <optional>
 #include <stdexcept>
 #include <string_view>
+#include <thread>
 #include <type_traits>
 #include <utility>
 #include <variant>
 #include <vector>
 
 #include "machine/ProductionExecutorCore.h"
+#include "machine/LatestValueMailbox.h"
 
 namespace {
     void require(const bool condition, const std::string_view message) {
@@ -61,6 +64,70 @@ namespace {
             mappings, nextJoints, axes);
         requireNear(axes.position.x, 5.2,
                     "joint coordinate assignment did not rebase the axis");
+    }
+
+    struct MailboxValue {
+        std::uint64_t generation = 0;
+        std::uint64_t epoch = 0;
+        std::uint32_t mode = 0;
+    };
+
+    void testLatestValueMailboxPublishesCoherentValues() {
+        ngc::LatestValueMailbox<MailboxValue> mailbox;
+        MailboxValue value;
+        require(!mailbox.consumeLatest(value),
+                "new mailbox unexpectedly contained a publication");
+
+        mailbox.publish({1, 10, 1});
+        require(mailbox.consumeLatest(value),
+                "mailbox did not expose its first publication");
+        require(value.generation == 1 && value.epoch == 10
+                    && value.mode == 1,
+                "mailbox returned an incoherent first publication");
+        require(!mailbox.consumeLatest(value),
+                "mailbox replayed a consumed publication");
+
+        mailbox.publish({2, 20, 2});
+        mailbox.publish({3, 30, 3});
+        require(mailbox.consumeLatest(value),
+                "mailbox did not expose its latest publication");
+        require(value.generation == 3 && value.epoch == 30
+                    && value.mode == 3,
+                "mailbox did not coalesce to one coherent latest value");
+    }
+
+    void testLatestValueMailboxIsCoherentUnderConcurrency() {
+        constexpr auto publications = std::uint64_t{250'000};
+        ngc::LatestValueMailbox<MailboxValue> mailbox;
+        std::atomic<bool> producerDone{false};
+        std::thread producer([&] {
+            for (auto generation = std::uint64_t{1};
+                 generation <= publications; ++generation) {
+                mailbox.publish({
+                    generation,
+                    generation * 17,
+                    static_cast<std::uint32_t>(generation % 7),
+                });
+            }
+            producerDone.store(true, std::memory_order_release);
+        });
+
+        auto lastGeneration = std::uint64_t{0};
+        while (!producerDone.load(std::memory_order_acquire)
+               || lastGeneration != publications) {
+            MailboxValue value;
+            if (!mailbox.consumeLatest(value)) {
+                std::this_thread::yield();
+                continue;
+            }
+            require(value.generation > lastGeneration,
+                    "concurrent mailbox consumption moved backward");
+            require(value.epoch == value.generation * 17
+                        && value.mode == value.generation % 7,
+                    "concurrent mailbox consumption observed a torn value");
+            lastGeneration = value.generation;
+        }
+        producer.join();
     }
 
     ngc::AxisPolynomialSpan linearSpan(const ngc::SpanId id,
@@ -317,6 +384,74 @@ namespace {
         configuration.feedHold.axisAcceleration.x = acceleration;
 
         return configuration;
+    }
+
+    void testDemandStopPreventsQueuedPlanActivation() {
+        ngc::ProductionExecutorCore core(
+            0.001, controlledStopConfiguration());
+        require(core.publishDemand({
+                    .generation = 1,
+                    .epoch = 71,
+                    .mode = ngc::ExecutorDemandMode::Idle,
+                }) == ngc::DemandPublishResult::Published,
+                "idle demand was not published");
+        core.serviceImmediate();
+        takeEvents(core);
+        auto snapshot = latestSnapshot(core);
+        require(snapshot.state == ngc::BackendState::Held
+                    && snapshot.epoch == 71
+                    && snapshot.acknowledgedDemandGeneration == 1
+                    && snapshot.demandAccepted,
+                "idle demand did not establish its epoch at rest");
+
+        const auto chunk = linearChunk(
+            71, 711, 0, 1, 1, 0.0, 1.0, 1.0);
+        require(core.tryPublish(chunk) == ngc::PublishResult::Published,
+                "demand-stop fixture did not publish its plan");
+        require(core.publishDemand({
+                    .generation = 2,
+                    .epoch = 71,
+                    .mode = ngc::ExecutorDemandMode::Stop,
+                }) == ngc::DemandPublishResult::Published,
+                "stop demand was not published");
+
+        core.servoTick();
+        snapshot = latestSnapshot(core);
+        require(snapshot.state == ngc::BackendState::Held,
+                "stop demand did not retain held state");
+        require(snapshot.commanded.position.x == 0.0,
+                "acknowledged stop demand allowed a queued plan to move");
+        require(snapshot.queuedExecutionItems == 0,
+                "stop demand retained a queued plan");
+        require(snapshot.acknowledgedDemandGeneration == 2
+                    && snapshot.demandedMode
+                        == ngc::ExecutorDemandMode::Stop
+                    && snapshot.demandAccepted,
+                "stop demand acknowledgement was incorrect");
+    }
+
+    void testDemandModeRejectsLegacyLifecycleControls() {
+        ngc::ProductionExecutorCore core(0.001);
+        require(core.publishDemand({
+                    .generation = 1,
+                    .epoch = 72,
+                    .mode = ngc::ExecutorDemandMode::Idle,
+                }) == ngc::DemandPublishResult::Published,
+                "demand ownership fixture did not publish");
+        core.serviceImmediate();
+        takeEvents(core);
+
+        require(core.trySubmit(ngc::StartRequest{9, 72})
+                    == ngc::SubmitResult::Submitted,
+                "legacy lifecycle misuse was not accepted for acknowledgement");
+        core.serviceImmediate();
+        const auto events = takeEvents(core);
+        require(std::ranges::any_of(events, [](const auto &event) {
+            const auto *completed =
+                std::get_if<ngc::RequestCompleted>(&event);
+            return completed != nullptr && completed->request == 9
+                && !completed->succeeded;
+        }), "demand-owned executor accepted a legacy lifecycle control");
     }
 
     void testPublishesFixedExecutorIoState() {
@@ -2996,6 +3131,10 @@ int main() {
         std::declval<ngc::ProductionExecutorCore &>().servoTick()));
 
     try {
+        testLatestValueMailboxPublishesCoherentValues();
+        testLatestValueMailboxIsCoherentUnderConcurrency();
+        testDemandStopPreventsQueuedPlanActivation();
+        testDemandModeRejectsLegacyLifecycleControls();
         testAxisJointStateProjection();
         testPublishesFixedExecutorIoState();
         testAxisMotionSoftLimitGuardFaultsBeforeCommit();

@@ -70,6 +70,27 @@ namespace ngc {
                 return PublishResult::Published;
             }
 
+            DemandPublishResult publishDemand(
+                const ExecutorDemand &demand) noexcept override {
+                m_owner.refreshPeerState();
+                if (!m_owner.running()
+                    || !m_owner.m_demandProducer.has_value()) {
+                    return DemandPublishResult::Unavailable;
+                }
+                if (demand.generation == 0
+                    || (demand.mode != ExecutorDemandMode::Disabled
+                        && demand.epoch == 0)
+                    || demand.generation
+                        <= m_owner.m_lastDemandGeneration) {
+                    return DemandPublishResult::Invalid;
+                }
+
+                m_owner.m_demandProducer->publish(demand);
+                m_owner.m_lastDemandGeneration = demand.generation;
+
+                return DemandPublishResult::Published;
+            }
+
             SubmitResult trySubmit(const ControlRequest &request) noexcept override {
                 m_owner.refreshPeerState();
                 if (!m_owner.running()) {
@@ -161,6 +182,8 @@ namespace ngc {
             initializeIpcSharedRegion(
                 *m_region, m_configuration.identity,
                 ipc_detail::currentProcessId());
+            m_demandProducer.emplace(m_region->demand);
+            m_lastDemandGeneration = 0;
 
             std::vector<std::string> arguments{
                 "--mapping", m_sharedMemory.name(),
@@ -331,6 +354,7 @@ namespace ngc {
         }
 
         void closeConnection() noexcept {
+            m_demandProducer.reset();
             m_region = nullptr;
             m_process.close();
             m_sharedMemory.close();
@@ -345,6 +369,9 @@ namespace ngc {
         ipc_detail::ChildProcess m_process;
         IpcSharedRegion *m_region = nullptr;
         Endpoint m_endpoint;
+        std::optional<SharedLatestValueProducer<ExecutorDemand>>
+            m_demandProducer;
+        DemandGeneration m_lastDemandGeneration = 0;
         IpcRejection m_lastRejection = IpcRejection::None;
         EpochId m_activeEpoch = 0;
         EpochId m_lastPublishedEpoch = 0;

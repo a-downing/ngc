@@ -12,6 +12,7 @@
 #include "machine/TrajectoryPlanner.h"
 #include "machine/GeometryStreamProducer.h"
 #include "machine/MotionBackend.h"
+#include "machine/ExecutorDemandController.h"
 
 namespace ngc {
     enum class PreparedDriverState { Running, ProgramPaused, Completed, Error };
@@ -20,6 +21,7 @@ namespace ngc {
     // reference: barrier results travel back through GeometryFeedbackChannel.
     class PreparedTrajectoryExecutionDriver {
         MotionBackend &m_backend;
+        ExecutorDemandController &m_demand;
         PreparedGeometryForwardChannel &m_forward;
         GeometryFeedbackChannel &m_feedback;
         std::atomic<bool> &m_cancelled;
@@ -37,11 +39,8 @@ namespace ngc {
         std::optional<SynchronizationFenceId> m_synchronizationFence;
         bool m_waitingForHeld = false;
         bool m_exactStopHeld = false;
-        std::optional<RequestId> m_exactStopResumeRequest;
         GeometryEpoch m_epoch = 0;
         GeometrySequence m_nextSequence = 1;
-        RequestId m_nextRequest = 1;
-        RequestId m_startRequest = 0;
         bool m_backendReady = false;
 
         void fail(std::string message) {
@@ -218,11 +217,12 @@ namespace ngc {
 
     public:
         PreparedTrajectoryExecutionDriver(MotionBackend &backend,
+                                          ExecutorDemandController &demand,
                                           PreparedGeometryForwardChannel &forward,
                                           GeometryFeedbackChannel &feedback,
                                           std::atomic<bool> &cancelled,
                                           TrajectoryLimits limits = {})
-            : m_backend(backend), m_forward(forward), m_feedback(feedback),
+            : m_backend(backend), m_demand(demand), m_forward(forward), m_feedback(feedback),
               m_cancelled(cancelled), m_planner(limits) { }
 
         bool begin(const GeometryEpoch epoch = 1, const position_t &position = {}) {
@@ -240,16 +240,15 @@ namespace ngc {
             m_synchronizationFence.reset();
             m_waitingForHeld = false;
             m_exactStopHeld = false;
-            m_exactStopResumeRequest.reset();
             m_backendReady = false;
             m_epoch = epoch;
             m_nextSequence = 1;
             m_planner.clearDiagnostics();
             m_planner.reset(epoch, position);
-            if(m_backend.trySubmit(ResetRequest{m_nextRequest++, epoch}) != SubmitResult::Submitted)
-                return false;
-            m_startRequest = m_nextRequest++;
-            return m_backend.trySubmit(StartRequest{m_startRequest, epoch}) == SubmitResult::Submitted;
+            m_backendReady = m_demand.request(
+                epoch, ExecutorDemandMode::Run);
+
+            return m_backendReady;
         }
 
         void setLimits(const TrajectoryLimits &limits) { m_planner.setLimits(limits); }
@@ -317,14 +316,12 @@ namespace ngc {
                 ++m_outstandingChunks;
                 ++m_pendingItem;
                 if (m_exactStopHeld) {
-                    const auto request = m_nextRequest++;
-                    if (m_backend.trySubmit(ResumeRequest{request, m_epoch})
-                            != SubmitResult::Submitted) {
-                        fail("motion backend control channel is full while resuming after an exact stop");
+                    if (!m_demand.request(
+                            m_epoch, ExecutorDemandMode::Run)) {
+                        fail("motion backend demand mailbox rejected resume after an exact stop");
                         return false;
                     }
                     m_exactStopHeld = false;
-                    m_exactStopResumeRequest = request;
                 }
                 if(m_pendingItem == m_pending->items.size()) {
                     m_pending.reset();
@@ -406,17 +403,6 @@ namespace ngc {
                             fail("motion stopped on a rolling-horizon packet branch with retained prepared geometry");
                         } else {
                             m_exactStopHeld = true;
-                        }
-                    }
-                } else if(const auto *completed = std::get_if<RequestCompleted>(&event)) {
-                    if(completed->request == m_startRequest) {
-                        m_backendReady = completed->succeeded;
-                        if(!completed->succeeded) fail("motion backend rejected start request");
-                    } else if (m_exactStopResumeRequest
-                               && completed->request == *m_exactStopResumeRequest) {
-                        m_exactStopResumeRequest.reset();
-                        if (!completed->succeeded) {
-                            fail("motion backend rejected resume after an exact stop");
                         }
                     }
                 }

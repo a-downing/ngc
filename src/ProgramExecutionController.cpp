@@ -1,6 +1,7 @@
 #include "machine/ProgramExecutionController.h"
 
 #include <cmath>
+#include <format>
 #include <utility>
 
 #include "machine/MachineSession.h"
@@ -8,9 +9,9 @@
 
 namespace ngc {
     ProgramExecutionController::ProgramExecutionController(
-        MotionBackend &backend, PreparedTrajectoryExecutionDriver &driver,
+        ExecutorDemandController &demand, PreparedTrajectoryExecutionDriver &driver,
         SessionCommandQueue &commands)
-        : m_backend(backend), m_driver(driver), m_commands(commands) { }
+        : m_demand(demand), m_driver(driver), m_commands(commands) { }
 
     void ProgramExecutionController::begin(const EpochId epoch) {
         std::scoped_lock lock(m_mutex);
@@ -26,10 +27,6 @@ namespace ngc {
         m_feedResumeRequested = false;
         m_feedResumeInProgress = false;
         m_failureStopComplete = false;
-        m_pendingFeedHoldRequest.reset();
-        m_pendingFeedResumeRequest.reset();
-        m_pendingControlledStopRequest.reset();
-        m_pendingAbortRequest.reset();
         m_stoppedPosition.reset();
         m_error.reset();
     }
@@ -38,6 +35,21 @@ namespace ngc {
         const ExecutionSnapshot &snapshot, const bool shutdownRequested) {
         std::scoped_lock lock(m_mutex);
         if (!activeUnlocked()) {
+            return;
+        }
+
+        if (snapshot.acknowledgedDemandGeneration
+                == m_demand.lastGeneration()
+            && !snapshot.demandAccepted) {
+            fail(std::format(
+                "motion backend rejected executor demand generation {} mode {} epoch {} while backend state {} epoch {} active chunk {} joints {} velocity {} acceleration {}",
+                m_demand.lastGeneration(),
+                static_cast<int>(m_demand.mode()), m_demand.epoch(),
+                static_cast<int>(snapshot.state), snapshot.epoch,
+                snapshot.activeChunk, snapshot.activeJoints,
+                snapshot.commanded.velocity.length(),
+                snapshot.commanded.acceleration.length()));
+
             return;
         }
 
@@ -95,7 +107,7 @@ namespace ngc {
     void ProgramExecutionController::requestControlledStop(
         const ExecutionSnapshot &snapshot) {
         if (m_controlledStopInProgress || m_state == ProgramExecutionState::StopComplete
-            || m_feedHoldInProgress || m_pendingAbortRequest) {
+            || m_feedHoldInProgress) {
             return;
         }
 
@@ -113,7 +125,7 @@ namespace ngc {
             if (m_failureStopComplete || alreadyStationary) {
                 m_failureStopComplete = true;
                 m_stoppedPosition = snapshot.commanded.position;
-                requestFailureAbort();
+                m_state = ProgramExecutionState::Error;
 
                 return;
             }
@@ -124,30 +136,14 @@ namespace ngc {
             return;
         }
 
-        const auto request = m_nextRequest++;
-        if (m_backend.trySubmit(ControlledStopRequest { request })
-            != SubmitResult::Submitted) {
+        if (!m_demand.request(m_epoch, ExecutorDemandMode::Stop)) {
             if (!m_error) {
-                fail("motion backend control channel is full while requesting stop");
+                fail("motion backend demand mailbox rejected stop");
             }
 
             return;
         }
-        m_pendingControlledStopRequest = request;
         m_controlledStopInProgress = true;
-    }
-
-    void ProgramExecutionController::requestFailureAbort() {
-        if (m_pendingAbortRequest) {
-            return;
-        }
-
-        const auto request = m_nextRequest++;
-        if (m_backend.trySubmit(AbortRequest { request })
-            != SubmitResult::Submitted) {
-            return;
-        }
-        m_pendingAbortRequest = request;
     }
 
     void ProgramExecutionController::requestProgramResume() {
@@ -168,13 +164,11 @@ namespace ngc {
             return;
         }
         m_feedHoldRequested = false;
-        const auto request = m_nextRequest++;
-        if (m_backend.trySubmit(FeedHoldRequest { request }) != SubmitResult::Submitted) {
-            fail("motion backend control channel is full while requesting feed hold");
+        if (!m_demand.request(m_epoch, ExecutorDemandMode::FeedHold)) {
+            fail("motion backend demand mailbox rejected feed hold");
 
             return;
         }
-        m_pendingFeedHoldRequest = request;
     }
 
     void ProgramExecutionController::requestFeedResume() {
@@ -182,13 +176,12 @@ namespace ngc {
             return;
         }
         m_feedResumeRequested = false;
-        const auto request = m_nextRequest++;
-        if (m_backend.trySubmit(ResumeRequest { request, m_epoch }) != SubmitResult::Submitted) {
-            fail("motion backend control channel is full while resuming feed");
+        if (!m_demand.request(m_epoch, ExecutorDemandMode::Run)) {
+            fail("motion backend demand mailbox rejected feed resume");
 
             return;
         }
-        m_pendingFeedResumeRequest = request;
+        m_feedHoldHeld = false;
     }
 
     void ProgramExecutionController::observeBackendEvent(const ExecutionEvent &event) {
@@ -199,7 +192,6 @@ namespace ngc {
 
         if (std::holds_alternative<TriggeredMoveCompleted>(event)) {
             if (m_feedHoldInProgress) {
-                m_pendingFeedHoldRequest.reset();
                 m_feedHoldInProgress = false;
                 m_feedHoldHeld = false;
                 m_state = ProgramExecutionState::Running;
@@ -212,68 +204,27 @@ namespace ngc {
                 return;
             }
             if (m_error) {
-                m_pendingControlledStopRequest.reset();
                 m_controlledStopInProgress = false;
-                m_pendingFeedHoldRequest.reset();
                 m_feedHoldInProgress = false;
                 m_feedHoldHeld = false;
-                m_pendingFeedResumeRequest.reset();
                 m_feedResumeInProgress = false;
                 m_failureStopComplete = true;
                 m_stoppedPosition = held->state.position;
-                m_state = ProgramExecutionState::Holding;
-                requestFailureAbort();
+                m_state = ProgramExecutionState::Error;
 
                 return;
             }
             if (held->reason == BackendHoldReason::FeedHold) {
-                m_pendingFeedHoldRequest.reset();
                 m_feedHoldInProgress = false;
                 m_feedHoldHeld = true;
                 m_state = ProgramExecutionState::Paused;
             } else if (held->reason == BackendHoldReason::ControlledStop) {
-                m_pendingControlledStopRequest.reset();
                 m_controlledStopInProgress = false;
                 m_stoppedPosition = held->state.position;
                 m_state = ProgramExecutionState::StopComplete;
             }
 
             return;
-        }
-        const auto *completed = std::get_if<RequestCompleted>(&event);
-        if (!completed) {
-            return;
-        }
-        if (m_pendingAbortRequest
-            && completed->request == *m_pendingAbortRequest) {
-            m_pendingAbortRequest.reset();
-            if (completed->succeeded) {
-                m_state = ProgramExecutionState::Error;
-            }
-        } else if (m_pendingFeedHoldRequest && completed->request == *m_pendingFeedHoldRequest
-            && !completed->succeeded) {
-            m_pendingFeedHoldRequest.reset();
-            m_feedHoldInProgress = false;
-            m_state = ProgramExecutionState::Running;
-        } else if (m_pendingFeedResumeRequest
-                   && completed->request == *m_pendingFeedResumeRequest) {
-            m_pendingFeedResumeRequest.reset();
-            if (completed->succeeded) {
-                m_feedHoldHeld = false;
-                m_state = ProgramExecutionState::Running;
-            } else {
-                fail("motion backend rejected the feed-resume request");
-            }
-        } else if (m_pendingControlledStopRequest
-                   && completed->request == *m_pendingControlledStopRequest
-                   && !completed->succeeded) {
-            m_pendingControlledStopRequest.reset();
-            m_controlledStopInProgress = false;
-            if (m_error) {
-                requestFailureAbort();
-            } else {
-                fail("motion backend rejected the controlled-stop request");
-            }
         }
     }
 
@@ -309,10 +260,6 @@ namespace ngc {
         m_feedResumeRequested = false;
         m_feedResumeInProgress = false;
         m_failureStopComplete = false;
-        m_pendingFeedHoldRequest.reset();
-        m_pendingFeedResumeRequest.reset();
-        m_pendingControlledStopRequest.reset();
-        m_pendingAbortRequest.reset();
     }
 
     ProgramExecutionState ProgramExecutionController::state() const {
