@@ -1890,6 +1890,11 @@ final_move_together = true
                 "production runtime did not report its I/O fault");
         require(!observation->lastOutputs.executorEnabled,
                 "production runtime retained enabled outputs after an I/O fault");
+
+        const auto stopped = ngc::stopExecutorSafely(runtime);
+        require(stopped.state == ngc::BackendState::Faulted
+                    && stopped.faultCode == FaultingProductionExecutorIo::fault,
+                "faulted executor shutdown should preserve the terminal fault state");
     }
 
     void testProductionExecutorTimingBackpressureDoesNotBlockServo() {

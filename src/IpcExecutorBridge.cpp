@@ -214,6 +214,11 @@ namespace ngc {
                 static_cast<void>(drain());
             }
         }
+        // Faulted is terminal; its safe output image is already staged, and
+        // demand convergence intentionally rejects further lifecycle changes.
+        if (snapshot.state == BackendState::Faulted) {
+            return snapshot;
+        }
         if (snapshot.state != BackendState::Disabled) {
             static_cast<void>(demandAndWait(
                 0, ExecutorDemandMode::Disabled));
