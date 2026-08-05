@@ -1311,6 +1311,10 @@ namespace ngc {
     }
 
     bool ProductionExecutorCore::beginPlanStop() noexcept {
+        if (m_planStop.has_value()) {
+            return true;
+        }
+
         const auto &limits = m_configuration.controlledStopLimits;
         PlanStopRuntime runtime;
         runtime.origin = m_snapshot.commanded;

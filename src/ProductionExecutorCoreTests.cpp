@@ -430,6 +430,87 @@ namespace {
                 "stop demand acknowledgement was incorrect");
     }
 
+    void testDemandStopCompletesActivePlan() {
+        ngc::ProductionExecutorCore core(
+            0.01, controlledStopConfiguration());
+        require(core.publishDemand({
+                    .generation = 1,
+                    .epoch = 73,
+                    .mode = ngc::ExecutorDemandMode::Idle,
+                }) == ngc::DemandPublishResult::Published,
+                "active demand-stop fixture did not publish its idle demand");
+        core.serviceImmediate();
+        takeEvents(core);
+        require(latestSnapshot(core).state == ngc::BackendState::Held,
+                "active demand-stop fixture did not establish its epoch");
+
+        const auto chunk = linearChunk(
+            73, 731, 0, 741, 751, 0.0, 1.0, 1.0);
+        require(core.tryPublish(chunk) == ngc::PublishResult::Published,
+                "active demand-stop fixture did not publish its plan");
+        require(core.publishDemand({
+                    .generation = 2,
+                    .epoch = 73,
+                    .mode = ngc::ExecutorDemandMode::Run,
+                }) == ngc::DemandPublishResult::Published,
+                "active demand-stop fixture did not publish its run demand");
+
+        ngc::ExecutionSnapshot moving;
+        for (auto tick = 0; tick < 100; ++tick) {
+            core.servoTick();
+            takeEvents(core);
+            moving = latestSnapshot(core);
+            if (moving.state == ngc::BackendState::Running
+                && moving.commanded.velocity.x > 0.0) {
+                break;
+            }
+        }
+        require(moving.state == ngc::BackendState::Running
+                    && moving.commanded.velocity.x > 0.0,
+                "active demand-stop fixture did not establish motion");
+
+        require(core.publishDemand({
+                    .generation = 3,
+                    .epoch = 73,
+                    .mode = ngc::ExecutorDemandMode::Stop,
+                }) == ngc::DemandPublishResult::Published,
+                "active demand-stop fixture did not publish its stop demand");
+
+        std::vector<ngc::ExecutionEvent> events;
+        ngc::ExecutionSnapshot stopped;
+        for (auto tick = 0; tick < 1'000; ++tick) {
+            core.servoTick();
+            auto current = takeEvents(core);
+            events.insert(events.end(), current.begin(), current.end());
+            stopped = latestSnapshot(core);
+            if (stopped.state == ngc::BackendState::Held) {
+                break;
+            }
+        }
+
+        require(stopped.state == ngc::BackendState::Held,
+                "repeated stop-demand convergence restarted the stop trajectory");
+        require(stopped.commanded.position.x > moving.commanded.position.x,
+                "active demand stop did not advance through its braking trajectory");
+        requireNear(stopped.commanded.velocity.x, 0.0,
+                    "active demand stop retained velocity");
+        requireNear(stopped.commanded.acceleration.x, 0.0,
+                    "active demand stop retained acceleration");
+        require(stopped.queuedExecutionItems == 0,
+                "active demand stop retained queued execution items");
+        require(stopped.acknowledgedDemandGeneration == 3
+                    && stopped.demandedMode
+                        == ngc::ExecutorDemandMode::Stop
+                    && stopped.demandAccepted,
+                "active demand stop acknowledgement was incorrect");
+
+        const auto held = selectEvents<ngc::BackendHeld>(events);
+        require(held.size() == 1
+                    && held[0].reason
+                        == ngc::BackendHoldReason::ControlledStop,
+                "active demand stop did not report one terminal hold");
+    }
+
     void testDemandModeRejectsLegacyLifecycleControls() {
         ngc::ProductionExecutorCore core(0.001);
         require(core.publishDemand({
@@ -3134,6 +3215,7 @@ int main() {
         testLatestValueMailboxPublishesCoherentValues();
         testLatestValueMailboxIsCoherentUnderConcurrency();
         testDemandStopPreventsQueuedPlanActivation();
+        testDemandStopCompletesActivePlan();
         testDemandModeRejectsLegacyLifecycleControls();
         testAxisJointStateProjection();
         testPublishesFixedExecutorIoState();
