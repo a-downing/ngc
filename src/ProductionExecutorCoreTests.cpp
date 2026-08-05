@@ -329,6 +329,7 @@ namespace {
 
         auto outputs = core.outputState();
         require(!outputs.executorEnabled
+                    && outputs.safeOutputsRequired
                     && outputs.commandedJoints.position[0] == 1.25
                     && outputs.commandedJoints.velocity[0] == 0.5,
                 "disabled executor output omitted commanded joint state");
@@ -338,12 +339,22 @@ namespace {
                 "executor I/O state fixture did not accept enable");
         core.serviceImmediate();
         outputs = core.outputState();
-        require(outputs.executorEnabled,
-                "held executor output did not retain hardware enable");
+        require(outputs.executorEnabled && outputs.safeOutputsRequired,
+                "held executor output did not retain its safe hardware state");
+
+        require(core.trySubmit(ngc::ResetRequest{2, 1})
+                    == ngc::SubmitResult::Submitted
+                && core.trySubmit(ngc::StartRequest{3, 1})
+                    == ngc::SubmitResult::Submitted,
+                "executor I/O state fixture did not accept a start");
+        core.serviceImmediate();
+        require(!core.outputState().safeOutputsRequired,
+                "running executor output retained the safe-output latch");
 
         core.reportHostFault(0x1020'3040);
-        require(!core.outputState().executorEnabled,
-                "faulted executor output retained hardware enable");
+        require(!core.outputState().executorEnabled
+                    && core.outputState().safeOutputsRequired,
+                "faulted executor output retained unsafe hardware state");
     }
 
     void testAxisMotionSoftLimitGuardFaultsBeforeCommit() {

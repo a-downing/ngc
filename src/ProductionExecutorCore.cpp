@@ -618,6 +618,7 @@ namespace ngc {
                 if (success) {
                     resetFeedRetiming();
                     m_snapshot.state = BackendState::Running;
+                    m_outputState.safeOutputsRequired = false;
                 }
             } else if constexpr (std::same_as<T, ResumeRequest>) {
                 const auto feedHeld = m_feedRetiming.held;
@@ -655,6 +656,9 @@ namespace ngc {
                 if (success && !feedHeld) {
                     resetFeedRetiming();
                     m_snapshot.state = BackendState::Running;
+                }
+                if (success) {
+                    m_outputState.safeOutputsRequired = false;
                 }
             } else if constexpr (std::same_as<T, FeedHoldRequest>) {
                 success = !m_jog.has_value()

@@ -81,6 +81,7 @@ namespace ngc {
         LogicalDigitalOutputImage digitalOutputs;
         ProductionExecutorMotionContext motion;
         bool executorEnabled = false;
+        bool safeOutputsRequired = true;
     };
     static_assert(std::is_trivially_copyable_v<ProductionExecutorOutputState>);
 

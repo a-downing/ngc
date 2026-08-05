@@ -41,19 +41,42 @@ namespace ngc {
                 false, std::memory_order_acq_rel)) {
             return;
         }
+        establishSafeStop();
         m_stopping.store(true, std::memory_order_release);
         if (m_thread.joinable()) {
             m_thread.join();
         }
     }
 
+    void SpindleWorker::establishSafeStop() noexcept {
+        auto expected = SafeStopState::Armed;
+        static_cast<void>(m_safeStopState.compare_exchange_strong(
+            expected, SafeStopState::Requested,
+            std::memory_order_acq_rel));
+    }
+
+    bool SpindleWorker::tryRearm() noexcept {
+        if (faultCode() != 0) {
+            return false;
+        }
+
+        auto expected = SafeStopState::Established;
+
+        return m_safeStopState.compare_exchange_strong(
+            expected, SafeStopState::Armed,
+            std::memory_order_acq_rel);
+    }
+
     bool SpindleWorker::tryCommand(
         const SpindleEvent &desired) noexcept {
-        if (m_faultCode.load(std::memory_order_acquire) != 0) {
+        if (m_faultCode.load(std::memory_order_acquire) != 0
+            || m_safeStopState.load(std::memory_order_acquire)
+                != SafeStopState::Armed) {
             return false;
         }
         if (!m_commands.tryPush(desired)) {
             latchFault(SPINDLE_COMMAND_BACKPRESSURE_FAULT);
+            establishSafeStop();
 
             return false;
         }
@@ -83,11 +106,37 @@ namespace ngc {
     void SpindleWorker::run() noexcept {
         while (!m_stopping.load(std::memory_order_acquire)) {
             auto desired = SpindleEvent{};
+            if (m_safeStopState.load(std::memory_order_acquire)
+                == SafeStopState::Requested) {
+                while (m_commands.tryPop(desired)) { }
+                m_hardware->safeStop();
+                auto expected = SafeStopState::Requested;
+                static_cast<void>(m_safeStopState.compare_exchange_strong(
+                    expected, SafeStopState::Established,
+                    std::memory_order_acq_rel));
+            }
+            if (faultCode() != 0) {
+                break;
+            }
             while (m_commands.tryPop(desired)) {
-                if (!m_hardware->applyDesired(desired)) {
-                    latchFault(SPINDLE_COMMUNICATION_FAULT);
+                if (m_safeStopState.load(std::memory_order_acquire)
+                    != SafeStopState::Armed) {
                     break;
                 }
+                if (!m_hardware->applyDesired(desired)) {
+                    latchFault(SPINDLE_COMMUNICATION_FAULT);
+                    establishSafeStop();
+                    break;
+                }
+            }
+
+            const auto safeStopState =
+                m_safeStopState.load(std::memory_order_acquire);
+            if (safeStopState != SafeStopState::Armed) {
+                if (safeStopState == SafeStopState::Established) {
+                    std::this_thread::sleep_for(m_pollingPeriod);
+                }
+                continue;
             }
 
             auto status = SpindleHardwareStatus{};
@@ -112,8 +161,12 @@ namespace ngc {
             }
 
             if (faultCode() != 0) {
-                m_hardware->safeStop();
-                break;
+                establishSafeStop();
+                continue;
+            }
+            if (m_safeStopState.load(std::memory_order_acquire)
+                != SafeStopState::Armed) {
+                continue;
             }
             std::this_thread::sleep_for(m_pollingPeriod);
         }

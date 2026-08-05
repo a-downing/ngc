@@ -34,10 +34,25 @@ namespace ngc {
     void PhysicalExecutorIo::applyOutputs(
         const ProductionExecutorOutputState &outputs) noexcept {
         m_motion->applyOutputs(outputs);
-        if (!m_spindle
-            || (m_lastSpindle.has_value()
+        if (!m_spindle) {
+            return;
+        }
+        if (outputs.safeOutputsRequired) {
+            if (!m_safeOutputsRequired) {
+                m_spindle->establishSafeStop();
+                m_lastSpindle.reset();
+                m_safeOutputsRequired = true;
+            }
+
+            return;
+        }
+        if (m_safeOutputsRequired && !m_spindle->tryRearm()) {
+            return;
+        }
+        m_safeOutputsRequired = false;
+        if (m_lastSpindle.has_value()
                 && sameSpindle(
-                    *m_lastSpindle, outputs.spindle))) {
+                    *m_lastSpindle, outputs.spindle)) {
             return;
         }
         if (m_spindle->tryCommand(outputs.spindle)) {

@@ -46,12 +46,20 @@ namespace ngc {
 
         void start();
         void stop() noexcept;
+        void establishSafeStop() noexcept;
+        [[nodiscard]] bool tryRearm() noexcept;
         [[nodiscard]] bool tryCommand(
             const SpindleEvent &desired) noexcept;
         [[nodiscard]] std::uint32_t faultCode() const noexcept;
         [[nodiscard]] SpindleHardwareStatus status() const noexcept;
 
     private:
+        enum class SafeStopState : std::uint8_t {
+            Armed,
+            Requested,
+            Established,
+        };
+
         void run() noexcept;
         void latchFault(std::uint32_t fault) noexcept;
 
@@ -62,6 +70,7 @@ namespace ngc {
         SpscChannel<SpindleEvent, COMMAND_CAPACITY> m_commands;
         std::atomic<bool> m_stopping{false};
         std::atomic<bool> m_started{false};
+        std::atomic<SafeStopState> m_safeStopState{SafeStopState::Armed};
         std::atomic<std::uint32_t> m_faultCode{0};
         std::atomic<bool> m_communicationHealthy{false};
         std::atomic<bool> m_atSpeed{false};

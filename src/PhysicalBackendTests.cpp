@@ -317,6 +317,7 @@ namespace {
             auto outputs =
                 ngc::ProductionExecutorOutputState{};
             outputs.executorEnabled = true;
+            outputs.safeOutputsRequired = false;
             outputs.spindle = {
                 .enabled = true,
                 .direction = ngc::Direction::CW,
@@ -343,6 +344,17 @@ namespace {
                 observation->commands.load(
                     std::memory_order_acquire) == 1,
                 "unchanged spindle state was republished");
+
+            outputs.safeOutputsRequired = true;
+            io.applyOutputs(outputs);
+            waitFor(
+                [&] {
+                    return observation->stops.load(
+                            std::memory_order_acquire) != 0
+                        && !observation->enabled.load(
+                            std::memory_order_acquire);
+                },
+                "physical I/O did not establish the requested safe spindle state");
         }
         require(
             observation->stops.load(
@@ -398,6 +410,97 @@ namespace {
             "spindle worker changed command order");
     }
 
+    void testSpindleSafeStopSupersedesQueuedCommands() {
+        auto observation =
+            std::make_shared<SpindleObservation>();
+        ngc::SpindleWorker worker(
+            std::make_unique<ObservedSpindle>(observation), 100ms);
+        worker.start();
+        waitFor(
+            [&] {
+                return observation->polls.load(
+                    std::memory_order_acquire) != 0;
+            },
+            "spindle worker did not begin polling");
+
+        require(worker.tryCommand({
+                    .enabled = true,
+                    .direction = ngc::Direction::CW,
+                    .speed = 12000.0,
+                })
+                && worker.tryCommand({
+                    .enabled = true,
+                    .direction = ngc::Direction::CCW,
+                    .speed = 6000.0,
+                }),
+            "spindle worker rejected the safe-stop fixture commands");
+        worker.establishSafeStop();
+        waitFor(
+            [&] {
+                return observation->stops.load(
+                    std::memory_order_acquire) != 0;
+            },
+            "spindle worker did not establish its priority safe stop");
+        require(
+            observation->commands.load(
+                std::memory_order_acquire) == 0,
+            "spindle worker executed queued commands before its safe stop");
+        require(!worker.tryCommand({
+                    .enabled = true,
+                    .direction = ngc::Direction::CW,
+                    .speed = 12000.0,
+                }),
+            "safe-stopped spindle worker accepted a command before rearming");
+        require(worker.tryRearm(),
+                "safe-stopped spindle worker did not rearm");
+        require(worker.tryCommand({
+                    .enabled = true,
+                    .direction = ngc::Direction::CW,
+                    .speed = 12000.0,
+                }),
+            "rearmed spindle worker rejected a command");
+        waitFor(
+            [&] {
+                return observation->commands.load(
+                    std::memory_order_acquire) == 1;
+            },
+            "rearmed spindle worker did not execute its command");
+        worker.stop();
+    }
+
+    void testSpindleBackpressureDiscardsQueuedCommands() {
+        auto observation =
+            std::make_shared<SpindleObservation>();
+        ngc::SpindleWorker worker(
+            std::make_unique<ObservedSpindle>(observation));
+        const auto run = ngc::SpindleEvent{
+            .enabled = true,
+            .direction = ngc::Direction::CW,
+            .speed = 12000.0,
+        };
+        for (auto index = 0; index < 16; ++index) {
+            require(worker.tryCommand(run),
+                    "spindle backpressure fixture filled early");
+        }
+        require(!worker.tryCommand(run)
+                    && worker.faultCode()
+                        == ngc::SPINDLE_COMMAND_BACKPRESSURE_FAULT,
+                "full spindle queue did not latch backpressure");
+
+        worker.start();
+        waitFor(
+            [&] {
+                return observation->stops.load(
+                    std::memory_order_acquire) != 0;
+            },
+            "spindle backpressure did not establish a safe stop");
+        require(
+            observation->commands.load(
+                std::memory_order_acquire) == 0,
+            "spindle backpressure executed an abandoned command");
+        worker.stop();
+    }
+
     void testSpindleCommunicationFailureEstablishesSafeStop() {
         auto observation =
             std::make_shared<SpindleObservation>();
@@ -408,6 +511,7 @@ namespace {
         auto outputs =
             ngc::ProductionExecutorOutputState{};
         outputs.executorEnabled = true;
+        outputs.safeOutputsRequired = false;
         outputs.spindle = {
             .enabled = true,
             .direction = ngc::Direction::CCW,
@@ -708,6 +812,8 @@ int main() {
         testLoadsPhysicalBackendConfiguration();
         testPhysicalIoPublishesSpindleOffServoThread();
         testSpindleWorkerPreservesCommandOrder();
+        testSpindleSafeStopSupersedesQueuedCommands();
+        testSpindleBackpressureDiscardsQueuedCommands();
         testSpindleCommunicationFailureEstablishesSafeStop();
         testHuanyangCrcAndProtocolScaling();
         testHuanyangRejectsInvalidResponsesAndCommands();

@@ -199,7 +199,9 @@ current Huanyang spindle role is typed and
 validated but disabled. `PhysicalExecutorIo` composes motion I/O with
 an optional `SpindleHardware` behind a bounded RT-to-NRT `SpindleWorker`;
 serial communication never runs in the servo cycle, and worker shutdown or a
-latched spindle communication fault establishes the spindle safe stop. The
+latched spindle communication fault establishes the spindle safe stop. Safety
+stops bypass and discard the ordinary ordered spindle-command queue, and the
+worker rejects further commands until the executor explicitly rearms it. The
 Huanyang spindle hardware uses an NRT Linux serial transport with bounded
 transaction timeouts and the device's proprietary RTU packet shape and Modbus
 CRC. Startup establishes stop before reading and validating PD004, PD005,
