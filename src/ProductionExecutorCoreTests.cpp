@@ -1596,6 +1596,52 @@ namespace {
                     "relative joint target did not use retained joint state");
     }
 
+    void testRequiredJointTriggerFaultsAtTarget() {
+        auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
+        initialize(*core, 75);
+
+        auto move = triggeredJointMove(75, 751, 0, 851, 951);
+        move.joints = ngc::JointMask{1};
+        move.target[0] = 0.05;
+        move.triggerRequired = true;
+        require(move.triggers.push({
+                    0, 15, ngc::InputCondition::Active,
+                }),
+                "required joint trigger fixture did not fit");
+        ngc::assignJointPositionEnvelope(move, ngc::JointVector{});
+        require(core->tryPublish(ngc::ExecutionItem{move})
+                    == ngc::PublishResult::Published,
+                "required joint trigger move was not published");
+        require(core->trySubmit(ngc::StartRequest{3, move.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "required joint trigger move did not accept start");
+
+        std::vector<ngc::ExecutionEvent> events;
+        ngc::ExecutionSnapshot snapshot;
+        for (auto tick = 0; tick < 1'000; ++tick) {
+            core->servoTick();
+            auto current = takeEvents(*core);
+            events.insert(events.end(), current.begin(), current.end());
+            snapshot = latestSnapshot(*core);
+            if (snapshot.state == ngc::BackendState::Faulted) {
+                break;
+            }
+        }
+
+        const auto faults = selectEvents<ngc::BackendFault>(events);
+        require(snapshot.state == ngc::BackendState::Faulted
+                    && snapshot.faultCode
+                        == ngc::REQUIRED_JOINT_TRIGGER_NOT_REACHED_FAULT
+                    && faults.size() == 1
+                    && faults[0].code
+                        == ngc::REQUIRED_JOINT_TRIGGER_NOT_REACHED_FAULT,
+                "missing required joint trigger did not fault the executor");
+        require(selectEvents<ngc::TriggeredJointMoveCompleted>(events).empty(),
+                "missing required joint trigger reported normal completion");
+        require(!core->outputState().executorEnabled,
+                "missing required joint trigger did not establish safe outputs");
+    }
+
     void testHomingControlSequence() {
         auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
         initialize(*core, 80);
@@ -1727,7 +1773,7 @@ namespace {
                     "homing sequence changed an unselected joint");
     }
 
-    ngc::TriggeredMoveStatus runInitialJointInputCheck(
+    JointMoveRun runInitialJointInputCheck(
         const bool inputLevel) {
         auto core = std::make_unique<ngc::ProductionExecutorCore>(0.01);
         initialize(*core, 81);
@@ -1754,22 +1800,31 @@ namespace {
                 "initial joint-input check did not accept start");
 
         core->servoTick();
-        const auto completions =
-            selectEvents<ngc::TriggeredJointMoveCompleted>(
-                takeEvents(*core));
-        require(completions.size() == 1,
-                "initial joint-input check did not complete in place");
 
-        return completions[0].status;
+        return {
+            .events = takeEvents(*core),
+            .snapshot = latestSnapshot(*core),
+        };
     }
 
     void testInitialJointInputCheckRequiresExpectedLevel() {
-        require(runInitialJointInputCheck(false)
-                    == ngc::TriggeredMoveStatus::Triggered,
+        const auto released = runInitialJointInputCheck(false);
+        const auto releasedCompletions =
+            selectEvents<ngc::TriggeredJointMoveCompleted>(
+                released.events);
+        require(released.snapshot.state == ngc::BackendState::Held
+                    && releasedCompletions.size() == 1
+                    && releasedCompletions[0].status
+                        == ngc::TriggeredMoveStatus::Triggered,
                 "released joint input was not accepted at move start");
-        require(runInitialJointInputCheck(true)
-                    == ngc::TriggeredMoveStatus::ReachedTarget,
-                "active joint input incorrectly passed its release check");
+
+        const auto active = runInitialJointInputCheck(true);
+        const auto faults = selectEvents<ngc::BackendFault>(active.events);
+        require(active.snapshot.state == ngc::BackendState::Faulted
+                    && active.snapshot.faultCode
+                        == ngc::REQUIRED_JOINT_TRIGGER_NOT_REACHED_FAULT
+                    && faults.size() == 1,
+                "active joint input did not fault the required release check");
     }
 
     void testControlledStopAbortsTriggeredJointMove() {
@@ -3240,6 +3295,7 @@ int main() {
         testSampledTriggerGeneratesConstrainedStop();
         testPlanContinuesIntoTriggeredMove();
         testTriggeredJointsStopIndependentlyAndRetainState();
+        testRequiredJointTriggerFaultsAtTarget();
         testHomingControlSequence();
         testInitialJointInputCheckRequiresExpectedLevel();
         testControlledStopAbortsTriggeredJointMove();

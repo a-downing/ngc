@@ -960,6 +960,8 @@ public:
                 result.commandProgress = observation->commandProgress;
                 result.hasActiveMotion = observation->hasActiveMotion;
                 result.servoTicks = observation->servoTicks;
+                result.trajectoryBackendState = observation->backendState;
+                result.trajectoryBackendFaultCode = observation->backendFaultCode;
             }
         } else if (result.activity == ngc::SimulationActivity::Jogging) {
             if (const auto observation = m_machineSession.joggingObservation()) {
@@ -1527,6 +1529,17 @@ private:
         m_snapshot.hasActiveMotion = false;
         if (!result) {
             std::println(stderr, "MOTION ERROR: {}", result.error());
+            m_snapshot.powerState = m_machineSession.coordinator().powerState();
+            m_snapshot.machineActivity = m_machineSession.coordinator().activity();
+            if (const auto observation = m_machineSession.homingObservation()) {
+                m_snapshot.machinePosition = observation->machinePosition;
+                m_snapshot.joints = observation->joints;
+                m_snapshot.commandProgress = observation->commandProgress;
+                m_snapshot.servoTicks = observation->servoTicks;
+                m_snapshot.trajectoryBackendState = observation->backendState;
+                m_snapshot.trajectoryBackendFaultCode =
+                    observation->backendFaultCode;
+            }
             m_snapshot.status = ngc::SimulationStatus::Error;
             m_snapshot.error = result.error();
             return;

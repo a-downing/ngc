@@ -20,6 +20,8 @@ namespace ngc {
         double commandProgress = 0.0;
         bool hasActiveMotion = false;
         std::uint64_t servoTicks = 0;
+        BackendState backendState = BackendState::Disabled;
+        std::uint32_t backendFaultCode = 0;
     };
 
     struct HomingResult {

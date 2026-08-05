@@ -113,10 +113,6 @@ namespace ngc {
             if (fastResult->status == TriggeredMoveStatus::Aborted) {
                 return result(HomingOutcome::Stopped, 0);
             }
-            if (fastResult->status != TriggeredMoveStatus::Triggered) {
-                return std::unexpected(
-                    "fast homing search reached its travel limit before the switch");
-            }
 
             auto backoff = makeMove(group, epoch, false, false, true);
             backoff.targetMode = JointTargetMode::Absolute;
@@ -170,10 +166,6 @@ namespace ngc {
             if (releaseResult->status == TriggeredMoveStatus::Aborted) {
                 return result(HomingOutcome::Stopped, 0);
             }
-            if (releaseResult->status != TriggeredMoveStatus::Triggered) {
-                return std::unexpected(
-                    "homing switch remained active after backoff");
-            }
 
             auto slow = makeMove(group, epoch, true, true, false);
             assignJointPositionEnvelope(
@@ -184,10 +176,6 @@ namespace ngc {
             }
             if (slowResult->status == TriggeredMoveStatus::Aborted) {
                 return result(HomingOutcome::Stopped, 0);
-            }
-            if (slowResult->status != TriggeredMoveStatus::Triggered) {
-                return std::unexpected(
-                    "slow homing search reached its travel limit before the switch");
             }
 
             auto calibrated = slowResult->stoppedState.position;
@@ -428,6 +416,8 @@ namespace ngc {
         m_observation.commandProgress = snapshot.spanProgress;
         m_observation.hasActiveMotion =
             snapshot.state == BackendState::Running && snapshot.activeJoints != 0;
+        m_observation.backendState = snapshot.state;
+        m_observation.backendFaultCode = snapshot.faultCode;
         if (callbacks.observe) {
             callbacks.observe(m_observation);
         }

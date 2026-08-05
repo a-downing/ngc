@@ -34,6 +34,7 @@
 #include "machine/OwningSpscChannel.h"
 #include "machine/PreparedGeometry.h"
 #include "machine/PresentationTracker.h"
+#include "machine/SimulationExecutor.h"
 #ifdef __linux__
 #include "machine/HostedExecutorRuntime.h"
 #include "machine/IpcExecutorBridge.h"
@@ -101,6 +102,44 @@ namespace {
 
     private:
         bool m_failStart;
+    };
+
+    class NoTriggerSimulationRuntime final : public ngc::BackendRuntime {
+    public:
+        explicit NoTriggerSimulationRuntime(
+            const ngc::MachineConfiguration &configuration)
+            : m_executor(configuration.simulation.servoPeriod, configuration) { }
+
+        ngc::MotionBackend &endpoint() noexcept override {
+            return m_executor;
+        }
+
+        void start() override { }
+        void stop() override { }
+
+        [[nodiscard]] ngc::BackendCapabilities capabilities() const noexcept override {
+            return {};
+        }
+
+        [[nodiscard]] bool prepareTriggeredJointMove(
+            const ngc::TriggeredJointMove &) noexcept override {
+            return true;
+        }
+
+        void serviceImmediate() override {
+            m_executor.serviceImmediate();
+        }
+
+        [[nodiscard]] std::uint64_t advanceServiceMotionPeriod() override {
+            (void)m_executor.advanceTick();
+
+            return 1;
+        }
+
+        void waitForServiceMotion() override { }
+
+    private:
+        ngc::SimulationExecutor m_executor;
     };
 
 #ifdef __linux__
@@ -2195,8 +2234,7 @@ final_move_together = true
 
         const auto homing = controller.run(1, {}, callbacks);
         require(!homing
-                    && homing.error().find(
-                        "remained active after backoff")
+                    && homing.error().find("homing backend fault")
                         != std::string::npos,
                 "homing accepted a switch that did not release after backoff");
     }
@@ -2346,6 +2384,48 @@ final_move_together = true
         require(session.coordinator().activity() == ngc::MachineActivity::Idle,
                 "session-owned homing completion should release motion ownership");
         require(session.powerOff(), "idle jogging session should power off");
+    }
+
+    void testMissingHomingSwitchFaultsSessionAndRejectsRetry() {
+        const auto configuration = fixtureMachineConfiguration();
+        require(configuration.has_value(),
+                configuration ? "" : configuration.error());
+        NoTriggerSimulationRuntime runtime(*configuration);
+        ngc::MachineSession session(
+            configuration->unit, ngc::InterpretationMode::Simulation,
+            runtime, configuration->trajectory);
+        session.configureHoming(
+            configuration->axes, configuration->joints,
+            configuration->homing);
+        require(session.powerOn(),
+                "missing-switch homing session should power on");
+        require(session.queueHoming(),
+                "missing-switch homing should be admitted once");
+        const auto dispatched = session.dispatchNextOperation();
+        require(dispatched.has_value() && *dispatched
+                    && std::holds_alternative<ngc::StartHoming>(**dispatched),
+                dispatched
+                    ? "missing-switch homing operation was not dispatched"
+                    : dispatched.error());
+
+        const auto homing = session.runHoming({});
+        require(!homing
+                    && homing.error().find("homing backend fault")
+                        != std::string::npos,
+                "missing homing switch did not report a backend fault");
+        require(session.coordinator().powerState()
+                    == ngc::MachinePowerState::Faulted
+                    && session.coordinator().activity()
+                        == ngc::MachineActivity::Faulted,
+                "missing homing switch did not latch the session fault");
+        const auto observation = session.homingObservation();
+        require(observation
+                    && observation->backendState == ngc::BackendState::Faulted
+                    && observation->backendFaultCode
+                        == ngc::REQUIRED_JOINT_TRIGGER_NOT_REACHED_FAULT,
+                "missing homing switch did not retain its backend fault observation");
+        require(!session.queueHoming(),
+                "faulted homing session admitted a retry");
     }
 
     void testToolTableLoadsFinalLineWithoutNewline() {
@@ -8620,6 +8700,7 @@ int main() {
         testHostedExecutorRuntimeRunsHomingController();
 #endif
         testMachineSessionOwnsBackendNeutralServiceOperations();
+        testMissingHomingSwitchFaultsSessionAndRejectsRetry();
         testSimulationPersistsCoordinateSystemAtCompletion();
         testToolTableLoadsFinalLineWithoutNewline();
         testToolTableRejectsDuplicateToolNumbers();

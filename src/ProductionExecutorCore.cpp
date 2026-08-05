@@ -1985,7 +1985,6 @@ namespace ngc {
 
     void ProductionExecutorCore::completeTriggeredJoints() noexcept {
         const auto move = activeTriggeredJointMove();
-        m_tickObservation.completedMove = move.moveId;
         auto triggerState = m_snapshot.commandedJoints;
         JointMask expectedTriggers = 0;
         for (const auto &trigger : move.triggers) {
@@ -2002,6 +2001,16 @@ namespace ngc {
             triggerState.acceleration[trigger.joint] =
                 runtime.triggerAcceleration;
         }
+        if (m_triggeredJointCompletionStatus != TriggeredMoveStatus::Aborted
+            && move.triggerRequired
+            && (m_triggeredJointMask & expectedTriggers)
+                != expectedTriggers) {
+            discardExecution();
+            fault(REQUIRED_JOINT_TRIGGER_NOT_REACHED_FAULT);
+
+            return;
+        }
+        m_tickObservation.completedMove = move.moveId;
         const auto status =
             m_triggeredJointCompletionStatus
                 == TriggeredMoveStatus::Aborted

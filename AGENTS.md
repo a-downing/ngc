@@ -123,7 +123,9 @@ Homing joint moves carry executor-checked absolute position envelopes derived
 from each phase's actual starting position and resolved target. After the
 fixed backoff, homing samples the opposite switch level at zero motion before
 starting the slow search; it does not require an arbitrary minimum travel
-before accepting the slow-search trigger.
+before accepting the slow-search trigger. A required homing trigger that is
+not reached before its move target latches a backend and session fault,
+establishes safe outputs, and prevents another motion attempt until reset.
 `HostedExecutorRuntime` is the production-shaped `BackendRuntime` host for
 the core. It derives fixed-capacity executor mappings and limits from typed
 machine configuration, owns fixed-period ticking and stopped-state synchronous

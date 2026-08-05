@@ -765,11 +765,15 @@ namespace ngc {
             },
         };
         const auto homing = m_homingController->run(nextEpoch(), startingPosition, callbacks);
-        if (homing) {
-            m_interpreter.machine().synchronizePosition(homing->observation.machinePosition);
-            if (homing->outcome == HomingOutcome::Completed) {
-                m_homedJoints = homing->homedJoints;
-            }
+        if (!homing) {
+            m_coordinator.fault();
+
+            return homing;
+        }
+
+        m_interpreter.machine().synchronizePosition(homing->observation.machinePosition);
+        if (homing->outcome == HomingOutcome::Completed) {
+            m_homedJoints = homing->homedJoints;
         }
         m_coordinator.finishActivity();
 

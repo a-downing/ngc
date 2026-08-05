@@ -320,6 +320,8 @@ namespace ngc {
 
     enum class BackendState : std::uint8_t { Disabled, Held, Running, Holding, Faulted };
     inline constexpr std::uint32_t PLAN_START_DISCONTINUITY_FAULT = 6;
+    inline constexpr std::uint32_t REQUIRED_JOINT_TRIGGER_NOT_REACHED_FAULT =
+        0x48540001;
     inline constexpr std::uint32_t PLAN_UNDERRUN_FAULT = 0x504c0001;
     inline constexpr std::uint32_t PLAN_CONTINUATION_DISCONTINUITY_FAULT = 0x504c0002;
     enum class BranchChoice : std::uint8_t { Continue, Stop };
