@@ -4,7 +4,6 @@
 #include <array>
 #include <chrono>
 #include <cmath>
-#include <optional>
 #include <ranges>
 #include <utility>
 
@@ -630,7 +629,15 @@ namespace ngc {
     }
 
     void InProcessSimulationRuntime::serviceImmediate() {
-        advanceImmediate(0.0);
+        switch (requestService(0, ServiceRequestKind::Immediate)) {
+            case ServiceRequestResult::Direct:
+                serviceEmergencyStop();
+                m_executor->serviceImmediate();
+                break;
+            case ServiceRequestResult::Completed:
+            case ServiceRequestResult::Unavailable:
+                break;
+        }
     }
 
     void InProcessSimulationRuntime::waitForServiceMotion() {
@@ -644,6 +651,7 @@ namespace ngc {
         }
 
         m_stopping.store(false, std::memory_order_release);
+        m_pacingError.store(0, std::memory_order_release);
         m_schedulerThread = std::thread(&InProcessSimulationRuntime::runScheduler, this);
         m_started = true;
     }
@@ -665,6 +673,7 @@ namespace ngc {
 
         std::scoped_lock lock(m_schedulerMutex);
         m_started = false;
+        discardServiceRequests();
         m_executorBatchActive.store(false, std::memory_order_release);
     }
 
@@ -756,27 +765,35 @@ namespace ngc {
     }
 
     void InProcessSimulationRuntime::advanceImmediate(const double seconds) {
-        serviceEmergencyStop();
         if (seconds <= 0.0) {
-            m_executor->serviceImmediate();
+            serviceImmediate();
             return;
         }
         const auto ticks = static_cast<std::uint64_t>(
             std::ceil(seconds / m_servoPeriod));
-        for (std::uint64_t tick = 0; tick < ticks; ++tick) {
-            (void)m_executor->advanceTick(tick + 1 == ticks);
+
+        switch (requestService(ticks, ServiceRequestKind::Motion)) {
+            case ServiceRequestResult::Direct:
+                static_cast<void>(advanceServiceTicks(ticks, false));
+                break;
+            case ServiceRequestResult::Completed:
+            case ServiceRequestResult::Unavailable:
+                break;
         }
     }
 
     std::uint64_t InProcessSimulationRuntime::advanceServiceMotionPeriod() {
         const auto ticks = static_cast<std::uint64_t>(m_servoTicksPerSchedulerPeriod)
             * m_tickMultiplier.load(std::memory_order_relaxed);
-        for (std::uint64_t tick = 0; tick < ticks; ++tick) {
-            serviceEmergencyStop();
-            (void)m_executor->advanceTick(tick + 1 == ticks);
-        }
 
-        return ticks;
+        switch (requestService(ticks, ServiceRequestKind::Motion)) {
+            case ServiceRequestResult::Direct:
+                return advanceServiceTicks(ticks, false);
+            case ServiceRequestResult::Completed:
+                return ticks;
+            case ServiceRequestResult::Unavailable:
+                return 0;
+        }
     }
 
     bool InProcessSimulationRuntime::configureSyntheticInput(
@@ -823,6 +840,90 @@ namespace ngc {
         }
     }
 
+    InProcessSimulationRuntime::ServiceRequestResult
+    InProcessSimulationRuntime::requestService(
+        const std::uint64_t ticks, const ServiceRequestKind kind) {
+        std::unique_lock lock(m_schedulerMutex);
+        if (!m_started) {
+            return ServiceRequestResult::Direct;
+        }
+        if (m_stopping.load(std::memory_order_acquire)) {
+            return ServiceRequestResult::Unavailable;
+        }
+
+        const auto request = ServiceRequest {
+            ++m_nextServiceRequest, ticks, kind,
+        };
+        while (m_serviceRequest.has_value()
+               && !m_stopping.load(std::memory_order_acquire)) {
+            m_schedulerCv.wait(lock);
+        }
+        if (m_stopping.load(std::memory_order_acquire)) {
+            return ServiceRequestResult::Unavailable;
+        }
+
+        m_serviceRequest = request;
+        m_schedulerCv.notify_all();
+        m_schedulerCv.wait(lock, [&] {
+            return m_completedServiceRequest >= request.generation
+                || m_stopping.load(std::memory_order_acquire);
+        });
+
+        if (m_stopping.load(std::memory_order_acquire)) {
+            return ServiceRequestResult::Unavailable;
+        }
+        if (m_completedServiceRequest >= request.generation) {
+            return ServiceRequestResult::Completed;
+        }
+
+        return ServiceRequestResult::Unavailable;
+    }
+
+    void InProcessSimulationRuntime::serviceRequestedWork(
+        const ServiceRequest &request) noexcept {
+        if (request.kind == ServiceRequestKind::Immediate) {
+            if (!m_stopping.load(std::memory_order_acquire)) {
+                serviceEmergencyStop();
+                if (!m_stopping.load(std::memory_order_acquire)) {
+                    m_executor->serviceImmediate();
+                }
+            }
+        } else {
+            static_cast<void>(advanceServiceTicks(request.ticks, true));
+        }
+
+        {
+            std::scoped_lock lock(m_schedulerMutex);
+            m_completedServiceRequest = request.generation;
+        }
+        m_schedulerCv.notify_all();
+    }
+
+    std::uint64_t InProcessSimulationRuntime::advanceServiceTicks(
+        const std::uint64_t ticks, const bool stopWhenRequested) noexcept {
+        auto advanced = std::uint64_t {0};
+        for (; advanced < ticks; ++advanced) {
+            if (stopWhenRequested
+                && m_stopping.load(std::memory_order_acquire)) {
+                break;
+            }
+
+            serviceEmergencyStop();
+            if (stopWhenRequested
+                && m_stopping.load(std::memory_order_acquire)) {
+                break;
+            }
+
+            (void)m_executor->advanceTick(advanced + 1 == ticks);
+        }
+
+        return advanced;
+    }
+
+    void InProcessSimulationRuntime::discardServiceRequests() noexcept {
+        m_serviceRequest.reset();
+    }
+
     bool InProcessSimulationRuntime::emergencyStopWorkPending() const noexcept {
         const auto status = m_emergencyStopInterface.status();
         const auto requested = m_emergencyStopInterface.requestedSources();
@@ -845,26 +946,47 @@ namespace ngc {
 
         WindowsServoPacer pacer(m_schedulerPeriod);
         if (!pacer.valid()) {
-            m_pacingError.store(pacer.errorCode(), std::memory_order_release);
+            {
+                std::scoped_lock lock(m_schedulerMutex);
+                m_pacingError.store(pacer.errorCode(), std::memory_order_release);
+                m_stopping.store(true, std::memory_order_release);
+                discardServiceRequests();
+            }
+            m_schedulerCv.notify_all();
+
             return;
         }
 
         for (;;) {
+            std::optional<ServiceRequest> serviceRequest;
             {
                 std::unique_lock lock(m_schedulerMutex);
                 m_schedulerCv.wait(lock, [&] {
                     return m_stopping.load(std::memory_order_acquire)
                         || m_timedExecutionActive.load(std::memory_order_acquire)
-                        || emergencyStopWorkPending();
+                        || emergencyStopWorkPending()
+                        || m_serviceRequest.has_value();
                 });
                 if (m_stopping.load(std::memory_order_acquire)) {
+                    discardServiceRequests();
+                    m_schedulerCv.notify_all();
+
                     return;
                 }
                 if (!m_timedExecutionActive.load(std::memory_order_acquire)) {
-                    serviceEmergencyStop();
-                    continue;
+                    if (emergencyStopWorkPending()) {
+                        serviceEmergencyStop();
+                    } else if (m_serviceRequest.has_value()) {
+                        serviceRequest = *m_serviceRequest;
+                        m_serviceRequest.reset();
+                    }
+                } else {
+                    pacer.reset();
                 }
-                pacer.reset();
+            }
+            if (serviceRequest.has_value()) {
+                serviceRequestedWork(*serviceRequest);
+                continue;
             }
 
             while (m_timedExecutionActive.load(std::memory_order_acquire)

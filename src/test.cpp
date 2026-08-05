@@ -1799,6 +1799,37 @@ final_move_together = true
         runtime.stop();
     }
 
+    void testInProcessSimulationServiceRequestsSerializeEmergencyStop() {
+        ngc::InProcessSimulationRuntime runtime(
+            {}, { .servoPeriod = 0.001, .schedulerPeriod = 0.002 });
+        runtime.start();
+        runtime.serviceImmediate();
+        runtime.setTickMultiplier(1000);
+
+        std::uint64_t servicedTicks = 0;
+        std::thread service([&] {
+            servicedTicks = runtime.advanceServiceMotionPeriod();
+        });
+        runtime.requestEmergencyStop(ngc::EmergencyStopSource::Gui);
+        service.join();
+
+        const auto guiSource = ngc::emergencyStopSourceMask(
+            ngc::EmergencyStopSource::Gui);
+        auto status = runtime.emergencyStopStatus();
+        for (auto attempt = 0;
+             attempt < 1000 && (status.latchedSources & guiSource) == 0;
+             ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            status = runtime.emergencyStopStatus();
+        }
+        require((status.latchedSources & guiSource) != 0,
+                "started Simulation service motion should acknowledge an emergency stop");
+        require(servicedTicks
+                    == runtime.servoTicksPerSchedulerPeriod() * 1000,
+                "started Simulation service motion should acknowledge its complete request");
+        runtime.stop();
+    }
+
 #ifdef __linux__
     void testHostedExecutorRuntimeOwnsFixedPeriodLifecycle() {
         const auto configuration = fixtureMachineConfiguration();
@@ -8518,6 +8549,7 @@ int main() {
         testPreviewImportsSelectedPersistentWorkOffsets();
         testMachineSessionViewDerivesOperatorControls();
         testInProcessSimulationRuntimePersistsAcrossTimedEpochs();
+        testInProcessSimulationServiceRequestsSerializeEmergencyStop();
 #ifdef __linux__
         testHostedExecutorRuntimeOwnsFixedPeriodLifecycle();
         testFrontendLossDisablesRunningExecutorWithoutPlan();

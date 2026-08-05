@@ -3,9 +3,10 @@
 #include <atomic>
 #include <condition_variable>
 #include <cstdint>
-#include <mutex>
-#include <thread>
 #include <memory>
+#include <mutex>
+#include <optional>
+#include <thread>
 #include <vector>
 
 #include "machine/BackendRuntime.h"
@@ -77,8 +78,31 @@ namespace ngc {
         std::vector<ExecutedJerkSample> takeExecutedJerkSamples();
 
     private:
+        enum class ServiceRequestKind : std::uint8_t {
+            Immediate,
+            Motion,
+        };
+
+        enum class ServiceRequestResult : std::uint8_t {
+            Direct,
+            Completed,
+            Unavailable,
+        };
+
+        struct ServiceRequest {
+            std::uint64_t generation = 0;
+            std::uint64_t ticks = 0;
+            ServiceRequestKind kind = ServiceRequestKind::Immediate;
+        };
+
         void runScheduler();
         void serviceEmergencyStop() noexcept;
+        [[nodiscard]] ServiceRequestResult requestService(
+            std::uint64_t ticks, ServiceRequestKind kind);
+        void serviceRequestedWork(const ServiceRequest &request) noexcept;
+        [[nodiscard]] std::uint64_t advanceServiceTicks(
+            std::uint64_t ticks, bool stopWhenRequested) noexcept;
+        void discardServiceRequests() noexcept;
         [[nodiscard]] bool emergencyStopWorkPending() const noexcept;
         void resetTimedDiagnostics() noexcept;
         static void updateMaximum(std::atomic<double> &target, double value) noexcept;
@@ -96,6 +120,10 @@ namespace ngc {
         std::condition_variable m_schedulerCv;
         std::thread m_schedulerThread;
         bool m_started = false;
+        // The scheduler is the sole owner of executor state while started.
+        std::optional<ServiceRequest> m_serviceRequest;
+        std::uint64_t m_nextServiceRequest = 0;
+        std::uint64_t m_completedServiceRequest = 0;
         std::atomic<bool> m_stopping{false};
         std::atomic<bool> m_timedExecutionActive{false};
         std::atomic<bool> m_executorBatchActive{false};
