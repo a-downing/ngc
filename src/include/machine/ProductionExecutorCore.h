@@ -19,6 +19,8 @@
 #include "machine/SpscChannel.h"
 
 namespace ngc {
+    struct MachineConfiguration;
+
     using ProductionExecutorAxisMapping = AxisJointMapping;
 
     struct ProductionExecutorFeedHoldConfiguration {
@@ -55,6 +57,9 @@ namespace ngc {
     };
     static_assert(
         std::is_trivially_copyable_v<ProductionExecutorConfiguration>);
+
+    [[nodiscard]] ProductionExecutorConfiguration productionExecutorConfiguration(
+        const MachineConfiguration &configuration, double servoPeriod);
 
     inline constexpr std::uint32_t
         PRODUCTION_EXECUTOR_MOTION_IS_PROBE = 1U << 0;

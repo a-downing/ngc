@@ -9,6 +9,7 @@
 #include <variant>
 
 #include "ExecutionItemOperations.h"
+#include "machine/MachineConfiguration.h"
 
 namespace ngc {
     namespace {
@@ -19,6 +20,19 @@ namespace ngc {
         constexpr std::uint32_t FEED_RETIMING_STOP_BRANCH_FAULT = 5;
         constexpr double DYNAMIC_LIMIT_TOLERANCE = 1.01;
         constexpr double POSITION_LIMIT_TOLERANCE = 1e-9;
+
+        AxisId axisId(const Machine::Axis axis) noexcept {
+            switch (axis) {
+                case Machine::Axis::X: return AxisId::X;
+                case Machine::Axis::Y: return AxisId::Y;
+                case Machine::Axis::Z: return AxisId::Z;
+                case Machine::Axis::A: return AxisId::A;
+                case Machine::Axis::B: return AxisId::B;
+                case Machine::Axis::C: return AxisId::C;
+            }
+
+            return AxisId::X;
+        }
 
         double magnitude(const position_t &value) noexcept {
             return std::sqrt(value.x * value.x + value.y * value.y
@@ -156,6 +170,60 @@ namespace ngc {
             return lower <= upper + 1e-12;
         }
 
+    }
+
+    ProductionExecutorConfiguration productionExecutorConfiguration(
+        const MachineConfiguration &configuration, const double servoPeriod) {
+        ProductionExecutorConfiguration result;
+        result.feedHold.tangentialAcceleration =
+            configuration.feedHold.tangentialAcceleration;
+        result.feedHold.tangentialJerk = configuration.feedHold.tangentialJerk;
+        result.feedHold.pathAcceleration =
+            configuration.trajectory.pathAcceleration;
+
+        for (const auto &axis : configuration.axes) {
+            const auto id = axisId(axis.axis);
+            auto &mapping = result.axes[static_cast<std::size_t>(id)];
+            axisComponent(result.axisPosition.minimum, id) = axis.minimum;
+            axisComponent(result.axisPosition.maximum, id) = axis.maximum;
+            axisComponent(result.controlledStopLimits.velocity, id) =
+                axis.maxVelocity;
+            axisComponent(result.controlledStopLimits.acceleration, id) =
+                axis.maxAcceleration;
+            axisComponent(result.controlledStopLimits.jerk, id) = axis.maxJerk;
+            axisComponent(result.feedHold.axisAcceleration, id) =
+                axis.maxAcceleration;
+
+            for (const auto jointId : axis.joints) {
+                if (jointId >= MAX_JOINTS) {
+                    throw std::invalid_argument(
+                        "production executor axis mapping contains an invalid joint");
+                }
+                const auto joint = std::ranges::find(
+                    configuration.joints, jointId, &JointConfiguration::id);
+                if (joint == configuration.joints.end()) {
+                    throw std::invalid_argument(
+                        "production executor axis mapping contains an unknown joint");
+                }
+
+                mapping.joints |= JointMask{1} << jointId;
+                mapping.coordinateScale[jointId] = joint->coordinateScale;
+                const auto range = jointCoordinateRange(*joint);
+                result.jointMinimum[jointId] = range.minimum;
+                result.jointMaximum[jointId] = range.maximum;
+                result.positionLimitedJoints |= JointMask{1} << jointId;
+            }
+        }
+
+        if (configuration.pendant.velocity.leaseDuration > 0.0) {
+            const auto ticks =
+                std::ceil(configuration.pendant.velocity.leaseDuration / servoPeriod);
+            result.maximumJogLeaseTicks = static_cast<std::uint32_t>(std::clamp(
+                ticks, 1.0,
+                static_cast<double>(std::numeric_limits<std::uint32_t>::max())));
+        }
+
+        return result;
     }
 
     bool ProductionExecutorCore::PlanQueue::tryPush(

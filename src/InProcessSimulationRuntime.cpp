@@ -8,7 +8,6 @@
 #include <utility>
 
 #include "WindowsServoPacer.h"
-#include "machine/HostedExecutorRuntime.h"
 #include "machine/ProductionExecutorCore.h"
 #include "machine/SpscChannel.h"
 #include "machine/SimulationExecutor.h"
@@ -36,17 +35,15 @@ namespace ngc {
 
         ProductionExecutorConfiguration simulationExecutorConfiguration(
             const MachineConfiguration &configuration) {
-            auto simulation = configuration;
-            simulation.machineExecutor.reset();
-            auto result =
-                hostedExecutorRuntimeConfiguration(simulation).executor;
+            auto result = productionExecutorConfiguration(
+                configuration, configuration.simulation.servoPeriod);
             result.controlledStopLimits.velocity =
-                simulation.trajectory.axisVelocity;
+                configuration.trajectory.axisVelocity;
             result.controlledStopLimits.acceleration =
-                simulation.trajectory.axisAcceleration;
+                configuration.trajectory.axisAcceleration;
             result.controlledStopLimits.jerk =
-                simulation.trajectory.axisJerk;
-            result.axisPosition = simulation.trajectory.axisPosition;
+                configuration.trajectory.axisJerk;
+            result.axisPosition = configuration.trajectory.axisPosition;
             const auto sanitize = [](double &value) {
                 if (std::isnan(value) || value <= 0.0) {
                     value = std::numeric_limits<double>::infinity();

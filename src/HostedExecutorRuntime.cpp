@@ -5,8 +5,6 @@
 #include <chrono>
 #include <cmath>
 #include <cstddef>
-#include <limits>
-#include <ranges>
 #include <stdexcept>
 #include <utility>
 
@@ -27,32 +25,6 @@ namespace ngc {
 
             void establishSafeOutputs() noexcept override { }
         };
-
-        std::size_t axisIndex(const Machine::Axis axis) noexcept {
-            switch (axis) {
-                case Machine::Axis::X: return static_cast<std::size_t>(AxisId::X);
-                case Machine::Axis::Y: return static_cast<std::size_t>(AxisId::Y);
-                case Machine::Axis::Z: return static_cast<std::size_t>(AxisId::Z);
-                case Machine::Axis::A: return static_cast<std::size_t>(AxisId::A);
-                case Machine::Axis::B: return static_cast<std::size_t>(AxisId::B);
-                case Machine::Axis::C: return static_cast<std::size_t>(AxisId::C);
-            }
-
-            return 0;
-        }
-
-        double &component(position_t &value, const Machine::Axis axis) noexcept {
-            switch (axis) {
-                case Machine::Axis::X: return value.x;
-                case Machine::Axis::Y: return value.y;
-                case Machine::Axis::Z: return value.z;
-                case Machine::Axis::A: return value.a;
-                case Machine::Axis::B: return value.b;
-                case Machine::Axis::C: return value.c;
-            }
-
-            return value.x;
-        }
 
         std::size_t histogramBucket(const std::uint64_t nanoseconds) noexcept {
             if (nanoseconds == 0) {
@@ -84,62 +56,8 @@ namespace ngc {
                 1.0, std::round(configuration.simulation.schedulerPeriod
                                 / configuration.simulation.servoPeriod)));
         }
-        result.executor.feedHold.tangentialAcceleration =
-            configuration.feedHold.tangentialAcceleration;
-        result.executor.feedHold.tangentialJerk =
-            configuration.feedHold.tangentialJerk;
-        result.executor.feedHold.pathAcceleration =
-            configuration.trajectory.pathAcceleration;
-
-        for (const auto &axis : configuration.axes) {
-            auto &mapping = result.executor.axes[axisIndex(axis.axis)];
-            component(result.executor.axisPosition.minimum, axis.axis) =
-                axis.minimum;
-            component(result.executor.axisPosition.maximum, axis.axis) =
-                axis.maximum;
-            auto &stopVelocity =
-                component(result.executor.controlledStopLimits.velocity, axis.axis);
-            auto &stopAcceleration =
-                component(result.executor.controlledStopLimits.acceleration, axis.axis);
-            auto &stopJerk =
-                component(result.executor.controlledStopLimits.jerk, axis.axis);
-            auto &holdAcceleration =
-                component(result.executor.feedHold.axisAcceleration, axis.axis);
-
-            stopVelocity = axis.maxVelocity;
-            stopAcceleration = axis.maxAcceleration;
-            stopJerk = axis.maxJerk;
-            holdAcceleration = axis.maxAcceleration;
-            for (const auto id : axis.joints) {
-                if (id >= MAX_JOINTS) {
-                    throw std::invalid_argument(
-                        "production executor axis mapping contains an invalid joint");
-                }
-                const auto joint = std::ranges::find(
-                    configuration.joints, id, &JointConfiguration::id);
-                if (joint == configuration.joints.end()) {
-                    throw std::invalid_argument(
-                        "production executor axis mapping contains an unknown joint");
-                }
-
-                mapping.joints |= JointMask{1} << id;
-                mapping.coordinateScale[id] = joint->coordinateScale;
-                const auto range = jointCoordinateRange(*joint);
-                result.executor.jointMinimum[id] = range.minimum;
-                result.executor.jointMaximum[id] = range.maximum;
-                result.executor.positionLimitedJoints |= JointMask{1} << id;
-            }
-        }
-
-        if (configuration.pendant.velocity.leaseDuration > 0.0) {
-            const auto ticks = std::ceil(
-                configuration.pendant.velocity.leaseDuration
-                / result.servoPeriod);
-            result.executor.maximumJogLeaseTicks = static_cast<std::uint32_t>(
-                std::clamp(ticks, 1.0,
-                           static_cast<double>(
-                               std::numeric_limits<std::uint32_t>::max())));
-        }
+        result.executor =
+            productionExecutorConfiguration(configuration, result.servoPeriod);
 
         return result;
     }
