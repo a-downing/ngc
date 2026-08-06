@@ -14,6 +14,16 @@ about IPC liveness, frontend hangs, or communication-timeout behavior. Continue
 to treat actual frontend process loss, backend-process loss, hardware transport
 failure, and the existing external-enable/E-stop paths as safety-relevant.
 
+For general exploratory bug hunts, treat the machine and physical-backend
+configuration as trusted operator input that is required to be correct. Do not
+select behavior caused only by an incorrect or intentionally unsafe
+configuration as a program finding, including programmable digital-I/O
+mappings that synthesize or bypass a configured safety signal. Investigate
+configuration provenance, misuse resistance, or fail-safe schema constraints
+only when the task specifically asks for configuration validation or hardening.
+Continue to report code that fails to honor the valid loaded configuration or
+that behaves unsafely with the repository's configured mappings.
+
 For C++ changes, follow the repository's dedicated [C++ style guide](docs/cpp_style.md). Treat it as the formatting authority for new and modified C++ code.
 
 ## Continuous-path terminology

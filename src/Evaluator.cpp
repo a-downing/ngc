@@ -7,6 +7,7 @@
 #include <cmath>
 #include <cstddef>
 #include <format>
+#include <limits>
 #include <vector>
 #include <stdexcept>
 #include <unordered_map>
@@ -97,6 +98,16 @@ namespace ngc {
 
         static Context *context(VisitorContext *ctx) { return static_cast<Context *>(ctx); }
 
+        static uint32_t toAddress(const double value) {
+            if (!std::isfinite(value) || value < 0.0
+                || value > static_cast<double>(std::numeric_limits<uint32_t>::max())
+                || std::trunc(value) != value) {
+                throw std::logic_error("memory address must be an unsigned integer");
+            }
+
+            return static_cast<uint32_t>(value);
+        }
+
     public:
         explicit Impl(Evaluator &owner, Memory &mem,
                            const std::function<void(std::unique_ptr<const EvaluatorMessage>, Evaluator &)> &callback,
@@ -133,7 +144,7 @@ namespace ngc {
             for(const auto &stmt : program) {
                 interrupt();
                 if(const auto s = stmt->as<AliasStatement>(); s) {
-                    const auto addr = static_cast<uint32_t>(eval(s->address(), &ctx));
+                    const auto addr = toAddress(eval(s->address(), &ctx));
                     declareGlobal(s->variable(), addr);
                     continue;
                 }
@@ -189,7 +200,7 @@ namespace ngc {
                 return;
             }
 
-            auto addr = static_cast<uint32_t>(eval(stmt->address(), ctx));
+            auto addr = toAddress(eval(stmt->address(), ctx));
             m_scope.back().emplace(stmt->variable()->name(), addr);
         }
 
@@ -324,7 +335,7 @@ namespace ngc {
         }
 
         void visit(const NumericVariableExpression* expr, VisitorContext* ctx) override {
-            const auto addr = static_cast<uint32_t>(eval(expr->real(), ctx));
+            const auto addr = toAddress(eval(expr->real(), ctx));
             context(ctx)->result = addr;
         }
 
@@ -356,7 +367,7 @@ namespace ngc {
 
                 left = eval(expr->left(), ctx, false);
                 right = eval(expr->right(), ctx);
-                const auto addr = static_cast<uint32_t>(left);
+                const auto addr = toAddress(left);
                 write(addr, right);
             } else {
                 left = eval(expr->left(), ctx);
@@ -396,7 +407,7 @@ namespace ngc {
                     throw std::runtime_error(std::format("tried to take address of {}", expr->className()));
                 }
 
-                value = static_cast<uint32_t>(eval(expr->real(), ctx, false));
+                value = toAddress(eval(expr->real(), ctx, false));
             } else {
                 value = eval(expr->real(), ctx);
             }
@@ -500,7 +511,7 @@ namespace ngc {
             expr->accept(*this, ctx);
 
             if(dereference && expr->is<VariableExpression>()) {
-                const auto addr = static_cast<uint32_t>(context(ctx)->result);
+                const auto addr = toAddress(context(ctx)->result);
                 return read(addr);
             }
 

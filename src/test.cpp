@@ -548,6 +548,22 @@ final_move_together = true
         }
     }
 
+    void testNumericParameterAddressesMustBeIntegers() {
+        const auto commands = run("#[100.0] = 2\nG1 F60 X#100\n");
+        require(commands.size() == 1 && std::get<ngc::MoveLine>(commands.front()).to().x == 2.0,
+                "an exactly integral parameter address should be accepted");
+
+        for (const std::string_view source : { "#[100.5] = 1\n", "G1 F60 X#[100.5]\n", "#[0/0] = 1\n" }) {
+            bool rejected = false;
+            try {
+                static_cast<void>(run(source));
+            } catch (const std::exception &) {
+                rejected = true;
+            }
+            require(rejected, "an invalid parameter address should be rejected");
+        }
+    }
+
     void testPersistentParameterCodec() {
         ngc::Memory memory;
         memory.init(ngc::gVars);
@@ -8754,6 +8770,7 @@ G1 F60 X2
 int main() {
     try {
         testMemoryStackBounds();
+        testNumericParameterAddressesMustBeIntegers();
         testPersistentParameterCodec();
         testPersistentParameterFilesAreAtomicAndIsolated();
         testSessionCommandQueueIsBoundedAndOrdered();
