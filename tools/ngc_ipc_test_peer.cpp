@@ -24,12 +24,10 @@
 #include <unistd.h>
 
 #include "ExecutionItemOperations.h"
-#include "IpcPlatform.h"
 #include "config/BackendRuntimeConfiguration.h"
 #include "config/ConfigurationFingerprint.h"
 #include "config/TomlConfiguration.h"
-#include "machine/IpcExecutorBridge.h"
-#include "machine/IpcProtocol.h"
+#include "machine/IpcExecutorPeer.h"
 #include "machine/MachineConfiguration.h"
 #include "machine/HostedExecutorRuntime.h"
 
@@ -43,27 +41,12 @@ namespace {
     };
 
     struct Options {
-        std::string mapping;
-        ngc::IpcIdentity expected{};
+        ngc::IpcExecutorPeerOptions ipc;
         std::optional<std::filesystem::path> machineConfiguration;
         std::optional<std::filesystem::path> backendConfiguration;
-        bool consume = true;
         bool nonRealtime = false;
-        bool validateConfigurationOnly = false;
-        std::optional<std::uint64_t> exitAfterControls;
-        std::optional<std::chrono::milliseconds> exitAfterHandshake;
         std::optional<SimulatedUdpConfiguration> simulatedUdp;
     };
-
-    std::uint64_t parseUnsigned(const std::string_view value) {
-        std::size_t consumed = 0;
-        const auto result = std::stoull(std::string(value), &consumed);
-        if (consumed != value.size()) {
-            throw std::runtime_error("invalid unsigned integer");
-        }
-
-        return result;
-    }
 
     Options parseOptions(const int argc, char **argv) {
         Options options;
@@ -77,49 +60,43 @@ namespace {
                 return argv[index];
             };
 
-            if (option == "--mapping") {
-                options.mapping = value();
-            } else if (option == "--session") {
-                options.expected.sessionGeneration = parseUnsigned(value());
-            } else if (option == "--epoch") {
-                options.expected.epochGeneration = parseUnsigned(value());
-            } else if (option == "--authority") {
-                options.expected.authorityGeneration = parseUnsigned(value());
-            } else if (option == "--machine-configuration") {
+            if (ngc::parseIpcExecutorPeerOption(
+                    index, argc, argv, options.ipc)) {
+                continue;
+            }
+            if (option == "--machine-configuration") {
                 options.machineConfiguration = value();
             } else if (option == "--backend-configuration") {
                 options.backendConfiguration = value();
             } else if (option == "--no-consume") {
-                options.consume = false;
+                options.ipc.consume = false;
             } else if (option == "--non-realtime") {
                 options.nonRealtime = true;
-            } else if (option == "--validate-config-only") {
-                options.validateConfigurationOnly = true;
             } else if (option == "--exit-after-controls") {
-                options.exitAfterControls = parseUnsigned(value());
+                options.ipc.exitAfterControls =
+                    ngc::parseUnsignedCommandLineValue(value());
             } else if (option == "--exit-after-handshake-ms") {
-                options.exitAfterHandshake = std::chrono::milliseconds(
-                    parseUnsigned(value()));
+                options.ipc.exitAfterHandshake = std::chrono::milliseconds(
+                    ngc::parseUnsignedCommandLineValue(value()));
             } else if (option == "--simulated-udp-response-us") {
                 if (!options.simulatedUdp.has_value()) {
                     options.simulatedUdp.emplace();
                 }
                 options.simulatedUdp->responseDelay =
-                    std::chrono::microseconds(parseUnsigned(value()));
+                    std::chrono::microseconds(
+                        ngc::parseUnsignedCommandLineValue(value()));
             } else if (option == "--simulated-udp-responder-cpu") {
                 if (!options.simulatedUdp.has_value()) {
                     options.simulatedUdp.emplace();
                 }
                 options.simulatedUdp->responderCpu =
-                    static_cast<std::uint32_t>(parseUnsigned(value()));
+                    static_cast<std::uint32_t>(
+                        ngc::parseUnsignedCommandLineValue(value()));
             } else {
                 throw std::runtime_error("unknown option: " + std::string(option));
             }
         }
-        if (!options.validateConfigurationOnly
-            && options.mapping.empty()) {
-            throw std::runtime_error("--mapping is required");
-        }
+        ngc::validateIpcExecutorPeerOptions(options.ipc);
 
         return options;
     }
@@ -638,7 +615,7 @@ namespace {
 
     int run(const Options &options) {
         auto loaded = loadExecutorConfiguration(options);
-        if (options.validateConfigurationOnly) {
+        if (options.ipc.validateConfigurationOnly) {
             static_cast<void>(makeRuntime(
                 std::move(loaded.runtime),
                 std::make_unique<TemporaryTriggeredInputs>(
@@ -647,112 +624,20 @@ namespace {
             return 0;
         }
 
-        auto memory = ngc::ipc_detail::SharedMemory::open(
-            options.mapping, sizeof(ngc::IpcSharedRegion));
-        auto &region = *static_cast<ngc::IpcSharedRegion *>(memory.data());
-        auto expected = options.expected;
-        expected.configurationFingerprint =
-            loaded.fingerprint;
-        const auto rejection = ngc::validateIpcSharedRegion(
-            region, expected);
-        if (rejection != ngc::IpcRejection::None) {
-            ngc::setIpcRejection(region, rejection);
-            ngc::setIpcConnectionState(
-                region, ngc::IpcConnectionState::Rejected);
+        return ngc::runIpcExecutorPeer(
+            options.ipc, loaded.fingerprint, [&] {
+                auto triggeredInputs =
+                    std::make_unique<TemporaryTriggeredInputs>(
+                        options.simulatedUdp);
+                auto *policy = triggeredInputs.get();
 
-            return 2;
-        }
-        if (ngc::ipc_detail::parentProcessId()
-            != region.frontendProcessId) {
-            ngc::setIpcConnectionState(
-                region, ngc::IpcConnectionState::PeerLost);
-
-            return 3;
-        }
-
-        auto triggeredInputs = std::make_unique<TemporaryTriggeredInputs>(
-            options.simulatedUdp);
-        auto *triggeredInputsPointer = triggeredInputs.get();
-        auto runtime = makeRuntime(
-            std::move(loaded.runtime),
-            std::move(triggeredInputs));
-        runtime->attachEmergencyStopControl(region.emergencyStop);
-        if (ngc::ipc_detail::parentProcessId()
-            != region.frontendProcessId) {
-            ngc::setIpcConnectionState(
-                region, ngc::IpcConnectionState::PeerLost);
-
-            return 3;
-        }
-        runtime->start();
-        const auto stopAfterFrontendLoss = [&] {
-            ngc::setIpcConnectionState(
-                region, ngc::IpcConnectionState::PeerLost);
-            static_cast<void>(
-                ngc::stopExecutorSafely(*runtime));
-            runtime->stop();
-
-            return 3;
-        };
-        if (ngc::ipc_detail::parentProcessId()
-            != region.frontendProcessId) {
-            return stopAfterFrontendLoss();
-        }
-        region.peerProcessId = ngc::ipc_detail::currentProcessId();
-        ngc::setIpcConnectionState(region, ngc::IpcConnectionState::PeerReady);
-        while (ngc::ipcConnectionState(region)
-               == ngc::IpcConnectionState::PeerReady) {
-            if (ngc::ipc_detail::parentProcessId()
-                != region.frontendProcessId) {
-                return stopAfterFrontendLoss();
-            }
-            std::this_thread::yield();
-        }
-        if (ngc::ipcConnectionState(region)
-            != ngc::IpcConnectionState::Running) {
-            ngc::setIpcConnectionState(
-                region, ngc::IpcConnectionState::PeerStopped);
-
-            return 0;
-        }
-
-        ngc::IpcExecutorBridge bridge(
-            region, *runtime, runtime->endpoint(),
-            triggeredInputsPointer);
-        const auto started = std::chrono::steady_clock::now();
-
-        for (;;) {
-            const auto state = ngc::ipcConnectionState(region);
-            if (state == ngc::IpcConnectionState::StopRequested) {
-                static_cast<void>(
-                    ngc::stopExecutorSafely(*runtime));
-                runtime->stop();
-                ngc::setIpcConnectionState(
-                    region, ngc::IpcConnectionState::PeerStopped);
-
-                return 0;
-            }
-            if (ngc::ipc_detail::parentProcessId()
-                != region.frontendProcessId) {
-                return stopAfterFrontendLoss();
-            }
-            if (options.exitAfterHandshake.has_value()
-                && std::chrono::steady_clock::now() - started
-                    >= *options.exitAfterHandshake) {
-                return 3;
-            }
-
-            const auto progressed = bridge.service(options.consume);
-            if (options.exitAfterControls.has_value()
-                && bridge.completedControls() >= *options.exitAfterControls) {
-                return 4;
-            }
-
-            if (!progressed) {
-                std::this_thread::sleep_for(
-                    std::chrono::microseconds(100));
-            }
-        }
+                return ngc::IpcExecutorPeerRuntime{
+                    .runtime = makeRuntime(
+                        std::move(loaded.runtime),
+                        std::move(triggeredInputs)),
+                    .policy = policy,
+                };
+            });
     }
 }
 

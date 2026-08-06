@@ -11,14 +11,11 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
-#include <thread>
 #include <utility>
 #include <vector>
 
-#include "IpcPlatform.h"
 #include "config/ConfigurationFingerprint.h"
-#include "machine/IpcExecutorBridge.h"
-#include "machine/IpcProtocol.h"
+#include "machine/IpcExecutorPeer.h"
 #include "machine/MachineConfiguration.h"
 #include "machine/PhysicalExecutorIo.h"
 #include "machine/HostedExecutorRuntime.h"
@@ -33,24 +30,12 @@
 
 namespace {
     struct Options {
-        std::string mapping;
-        ngc::IpcIdentity expected{};
+        ngc::IpcExecutorPeerOptions ipc;
         std::filesystem::path machineConfiguration = "machine.toml";
         std::filesystem::path backendConfiguration =
             "physical_backend.toml";
         std::chrono::milliseconds timeout{10};
-        bool validateConfigurationOnly = false;
     };
-
-    std::uint64_t parseUnsigned(const std::string_view value) {
-        std::size_t consumed = 0;
-        const auto result = std::stoull(std::string(value), &consumed);
-        if (consumed != value.size()) {
-            throw std::runtime_error("invalid unsigned integer");
-        }
-
-        return result;
-    }
 
     Options parseOptions(const int argc, char **argv) {
         Options result;
@@ -66,35 +51,23 @@ namespace {
                 return argv[index];
             };
 
-            if (option == "--mapping") {
-                result.mapping = value();
-            } else if (option == "--session") {
-                result.expected.sessionGeneration =
-                    parseUnsigned(value());
-            } else if (option == "--epoch") {
-                result.expected.epochGeneration =
-                    parseUnsigned(value());
-            } else if (option == "--authority") {
-                result.expected.authorityGeneration =
-                    parseUnsigned(value());
-            } else if (option == "--machine-configuration") {
+            if (ngc::parseIpcExecutorPeerOption(
+                    index, argc, argv, result.ipc)) {
+                continue;
+            }
+            if (option == "--machine-configuration") {
                 result.machineConfiguration = value();
             } else if (option == "--backend-configuration") {
                 result.backendConfiguration = value();
             } else if (option == "--timeout-ms") {
                 result.timeout = std::chrono::milliseconds(
-                    parseUnsigned(value()));
-            } else if (option == "--validate-config-only") {
-                result.validateConfigurationOnly = true;
+                    ngc::parseUnsignedCommandLineValue(value()));
             } else {
                 throw std::runtime_error(
                     "unknown option: " + std::string(option));
             }
         }
-        if (!result.validateConfigurationOnly
-            && result.mapping.empty()) {
-            throw std::runtime_error("--mapping is required");
-        }
+        ngc::validateIpcExecutorPeerOptions(result.ipc);
 
         return result;
     }
@@ -342,113 +315,34 @@ namespace {
         const auto &mesa = physical->motion;
         auto resolved = resolveExecutorConfiguration(
             *machine, *physical);
-        if (options.validateConfigurationOnly) {
+        if (options.ipc.validateConfigurationOnly) {
             return 0;
         }
 
-        auto memory = ngc::ipc_detail::SharedMemory::open(
-            options.mapping, sizeof(ngc::IpcSharedRegion));
-        auto &region =
-            *static_cast<ngc::IpcSharedRegion *>(memory.data());
-        auto expected = options.expected;
-        expected.configurationFingerprint =
+        auto transport = std::unique_ptr<ngc::mesa::Lbp16UdpTransport>{};
+        const auto fingerprint =
             ngc::toml_configuration::combinedFingerprint(
                 machine->sourceFingerprint,
                 physical->sourceFingerprint,
                 machine->machineExecutor->servoPeriod);
-        const auto rejection = ngc::validateIpcSharedRegion(
-            region, expected);
-        if (rejection != ngc::IpcRejection::None) {
-            ngc::setIpcRejection(region, rejection);
-            ngc::setIpcConnectionState(
-                region, ngc::IpcConnectionState::Rejected);
 
-            return 2;
-        }
-        if (ngc::ipc_detail::parentProcessId()
-            != region.frontendProcessId) {
-            ngc::setIpcConnectionState(
-                region, ngc::IpcConnectionState::PeerLost);
+        return ngc::runIpcExecutorPeer(
+            options.ipc, fingerprint, [&] {
+                auto openedTransport = ngc::mesa::Lbp16UdpTransport::open({
+                    .address = mesa.address,
+                    .timeout = options.timeout,
+                });
+                if (!openedTransport) {
+                    throw std::runtime_error(openedTransport.error());
+                }
+                transport = std::move(*openedTransport);
 
-            return 3;
-        }
-
-        auto transport = ngc::mesa::Lbp16UdpTransport::open({
-            .address = mesa.address,
-            .timeout = options.timeout,
-        });
-        if (!transport) {
-            throw std::runtime_error(transport.error());
-        }
-        auto runtime = makeRuntime(
-            *machine, *physical, **transport,
-            std::move(resolved));
-        runtime->attachEmergencyStopControl(region.emergencyStop);
-        if (ngc::ipc_detail::parentProcessId()
-            != region.frontendProcessId) {
-            ngc::setIpcConnectionState(
-                region, ngc::IpcConnectionState::PeerLost);
-
-            return 3;
-        }
-        runtime->start();
-        const auto stopAfterFrontendLoss = [&] {
-            ngc::setIpcConnectionState(
-                region, ngc::IpcConnectionState::PeerLost);
-            static_cast<void>(
-                ngc::stopExecutorSafely(*runtime));
-            runtime->stop();
-
-            return 3;
-        };
-        if (ngc::ipc_detail::parentProcessId()
-            != region.frontendProcessId) {
-            return stopAfterFrontendLoss();
-        }
-        region.peerProcessId =
-            ngc::ipc_detail::currentProcessId();
-        ngc::setIpcConnectionState(
-            region, ngc::IpcConnectionState::PeerReady);
-        while (ngc::ipcConnectionState(region)
-               == ngc::IpcConnectionState::PeerReady) {
-            if (ngc::ipc_detail::parentProcessId()
-                != region.frontendProcessId) {
-                return stopAfterFrontendLoss();
-            }
-            std::this_thread::yield();
-        }
-        if (ngc::ipcConnectionState(region)
-            != ngc::IpcConnectionState::Running) {
-            runtime->stop();
-            ngc::setIpcConnectionState(
-                region, ngc::IpcConnectionState::PeerStopped);
-
-            return 0;
-        }
-
-        ngc::IpcExecutorBridge bridge(
-            region, *runtime, runtime->endpoint());
-        for (;;) {
-            if (ngc::ipcConnectionState(region)
-                == ngc::IpcConnectionState::StopRequested) {
-                static_cast<void>(
-                    ngc::stopExecutorSafely(*runtime));
-                runtime->stop();
-                ngc::setIpcConnectionState(
-                    region, ngc::IpcConnectionState::PeerStopped);
-
-                return 0;
-            }
-            if (ngc::ipc_detail::parentProcessId()
-                != region.frontendProcessId) {
-                return stopAfterFrontendLoss();
-            }
-
-            if (!bridge.service(true)) {
-                std::this_thread::sleep_for(
-                    std::chrono::microseconds(100));
-            }
-        }
+                return ngc::IpcExecutorPeerRuntime{
+                    .runtime = makeRuntime(
+                        *machine, *physical, *transport,
+                        std::move(resolved)),
+                };
+            });
     }
 }
 

@@ -67,6 +67,7 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_sources(ngc_core PRIVATE
         src/ExternalExecutorRuntime.cpp
         src/IpcExecutorBridge.cpp
+        src/IpcExecutorPeer.cpp
         src/IpcPlatform.cpp
         src/PhysicalExecutorIo.cpp
         src/HostedExecutorRuntime.cpp
