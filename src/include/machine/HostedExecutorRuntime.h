@@ -49,6 +49,11 @@ namespace ngc {
         // Called after cyclic execution has quiesced. This must complete the
         // hardware-specific safe-output operation before returning.
         virtual void establishSafeOutputs() noexcept = 0;
+        // A false value retains fixed-period lifecycle and input servicing but
+        // prevents execution from activating or advancing.
+        [[nodiscard]] virtual bool executionReady() const noexcept {
+            return true;
+        }
         [[nodiscard]] virtual std::uint32_t faultCode() const noexcept {
             return 0;
         }

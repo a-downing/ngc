@@ -147,7 +147,7 @@ namespace ngc {
         void setDigitalInputSample(DigitalInputId input, bool active) noexcept;
         void setDigitalInputSamples(
             const LogicalDigitalInputImage &inputs) noexcept;
-        void servoTick(bool publishSnapshot = true) noexcept;
+        void servoTick(bool publishSnapshot = true, bool advanceExecution = true) noexcept;
         void reportHostFault(std::uint32_t code) noexcept;
         void latchEmergencyStop(std::uint32_t code = EMERGENCY_STOP_FAULT) noexcept;
         void resetEmergencyStop() noexcept;

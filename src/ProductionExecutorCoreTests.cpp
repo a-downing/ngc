@@ -430,6 +430,53 @@ namespace {
                 "stop demand acknowledgement was incorrect");
     }
 
+    void testExecutionReadinessBlocksOnlyMotionAdvancement() {
+        ngc::ProductionExecutorCore core(0.25);
+        require(core.publishDemand({
+                    .generation = 1,
+                    .epoch = 72,
+                    .mode = ngc::ExecutorDemandMode::Idle,
+                }) == ngc::DemandPublishResult::Published,
+                "readiness fixture idle demand was not published");
+        core.serviceImmediate();
+        takeEvents(core);
+        latestSnapshot(core);
+
+        const auto chunk = linearChunk(
+            72, 721, 0, 1, 1, 0.0, 1.0, 1.0);
+        require(core.tryPublish(chunk) == ngc::PublishResult::Published,
+                "readiness fixture plan was not published");
+        require(core.publishDemand({
+                    .generation = 2,
+                    .epoch = 72,
+                    .mode = ngc::ExecutorDemandMode::Run,
+                }) == ngc::DemandPublishResult::Published,
+                "readiness fixture run demand was not published");
+
+        core.servoTick(true, false);
+        const auto blockedEvents = takeEvents(core);
+        const auto blocked = latestSnapshot(core);
+        require(blocked.state == ngc::BackendState::Running
+                    && blocked.acknowledgedDemandGeneration == 2
+                    && blocked.demandAccepted,
+                "blocked execution did not service its lifecycle demand");
+        require(blocked.commanded.position.x == 0.0
+                    && blocked.activeChunk == 0
+                    && blocked.queuedExecutionItems == 1,
+                "blocked execution activated or advanced queued motion");
+        require(selectEvents<ngc::ChunkAccepted>(blockedEvents).empty(),
+                "blocked execution accepted a queued plan");
+
+        core.servoTick();
+        const auto releasedEvents = takeEvents(core);
+        const auto released = latestSnapshot(core);
+        require(released.activeChunk == chunk.id
+                    && released.commanded.position.x > 0.0,
+                "ready execution did not activate and advance queued motion");
+        require(selectEvents<ngc::ChunkAccepted>(releasedEvents).size() == 1,
+                "ready execution did not accept its queued plan exactly once");
+    }
+
     void testDemandStopCompletesActivePlan() {
         ngc::ProductionExecutorCore core(
             0.01, controlledStopConfiguration());
@@ -3270,6 +3317,7 @@ int main() {
         testLatestValueMailboxPublishesCoherentValues();
         testLatestValueMailboxIsCoherentUnderConcurrency();
         testDemandStopPreventsQueuedPlanActivation();
+        testExecutionReadinessBlocksOnlyMotionAdvancement();
         testDemandStopCompletesActivePlan();
         testDemandModeRejectsLegacyLifecycleControls();
         testAxisJointStateProjection();

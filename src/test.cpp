@@ -213,6 +213,10 @@ namespace {
             safeOutputsEstablished = true;
         }
 
+        [[nodiscard]] bool executionReady() const noexcept override {
+            return readyForExecution;
+        }
+
         [[nodiscard]] std::uint32_t faultCode() const noexcept override {
             return m_fault;
         }
@@ -220,6 +224,7 @@ namespace {
         static constexpr std::uint32_t TEST_FAULT = 0x1234'5678;
         ngc::ProductionExecutorOutputState lastOutputs;
         bool safeOutputsEstablished = false;
+        bool readyForExecution = true;
 
     private:
         std::uint32_t m_fault;
@@ -1987,6 +1992,83 @@ final_move_together = true
         runtime.stop();
         require(observation->safeOutputsEstablished,
                 "faulted runtime stop did not establish safe physical outputs");
+    }
+
+    void testHostedExecutorRuntimeWaitsForIoExecutionReadiness() {
+        ngc::HostedExecutorRuntimeConfiguration configuration;
+        configuration.servoPeriod = 0.25;
+        auto io = std::make_unique<ObservingProductionExecutorIo>();
+        auto *const observation = io.get();
+        observation->readyForExecution = false;
+        ngc::HostedExecutorRuntime runtime(
+            configuration, std::move(io));
+        auto &backend = runtime.endpoint();
+        const auto submit = [&](const ngc::ControlRequest &request) {
+            require(backend.trySubmit(request)
+                        == ngc::SubmitResult::Submitted,
+                    "execution-readiness setup control should fit");
+            runtime.serviceImmediate();
+        };
+
+        submit(ngc::ResetRequest{1, 81});
+        submit(ngc::EnableRequest{2});
+
+        ngc::PlanChunk chunk;
+        chunk.stopTailPolicy = ngc::StopTailPolicy::StopAllowed;
+        chunk.epoch = 81;
+        chunk.id = 811;
+        chunk.branch = 1;
+        ngc::AxisPolynomialSpan motion;
+        motion.id = 1;
+        motion.duration = 1.0;
+        motion.inverseDuration = 1.0;
+        motion.inverseDurationSquared = 1.0;
+        motion.inverseDurationCubed = 1.0;
+        motion.coefficients[0].x = 1.0;
+        require(chunk.normalMotion.push(motion),
+                "execution-readiness motion should fit");
+        auto stop = motion;
+        stop.id = 2;
+        stop.duration = 0.25;
+        stop.inverseDuration = 4.0;
+        stop.inverseDurationSquared = 16.0;
+        stop.inverseDurationCubed = 64.0;
+        stop.origin.x = 1.0;
+        stop.coefficients[0].x = 0.0;
+        require(chunk.stopTail.push(stop),
+                "execution-readiness stop tail should fit");
+        chunk.branchState.position.x = 1.0;
+        chunk.stopState.position.x = 1.0;
+        require(backend.tryPublish(chunk)
+                    == ngc::PublishResult::Published,
+                "execution-readiness plan should publish");
+        require(backend.trySubmit(ngc::StartRequest{3, chunk.epoch})
+                    == ngc::SubmitResult::Submitted,
+                "execution-readiness start should fit");
+
+        require(runtime.advanceServiceMotionPeriod() == 1,
+                "blocked execution-readiness tick did not run");
+        ngc::ExecutionSnapshot snapshot;
+        auto foundSnapshot = false;
+        while (backend.tryTakeSnapshot(snapshot)) {
+            foundSnapshot = true;
+        }
+        require(foundSnapshot
+                    && snapshot.state == ngc::BackendState::Running
+                    && snapshot.activeChunk == 0
+                    && snapshot.commanded.position.x == 0.0,
+                "unready physical I/O allowed logical motion to advance");
+
+        observation->readyForExecution = true;
+        require(runtime.advanceServiceMotionPeriod() == 1,
+                "released execution-readiness tick did not run");
+        foundSnapshot = false;
+        while (backend.tryTakeSnapshot(snapshot)) {
+            foundSnapshot = true;
+        }
+        require(foundSnapshot && snapshot.activeChunk == chunk.id
+                    && snapshot.commanded.position.x > 0.0,
+                "ready physical I/O did not release logical motion");
     }
 
     void testHostedExecutorRuntimeMakesDirectStopTerminalAndSafe() {
@@ -8691,6 +8773,7 @@ int main() {
         testFrontendLossDisablesRunningExecutorWithoutPlan();
         testHostedExecutorRuntimePublishesBoundedTiming();
         testHostedExecutorRuntimeReportsIoFault();
+        testHostedExecutorRuntimeWaitsForIoExecutionReadiness();
         testHostedExecutorRuntimeMakesDirectStopTerminalAndSafe();
         testProductionExecutorTimingBackpressureDoesNotBlockServo();
 #endif

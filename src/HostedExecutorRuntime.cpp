@@ -482,7 +482,7 @@ namespace ngc {
             m_core->reportHostFault(fault);
         } else {
             m_core->setDigitalInputSamples(m_inputs);
-            m_core->servoTick(publishSnapshot);
+            m_core->servoTick(publishSnapshot, m_io->executionReady());
         }
         m_io->applyOutputs(m_core->outputState());
 

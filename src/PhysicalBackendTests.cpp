@@ -137,7 +137,12 @@ namespace {
             lastEnabled.store(false, std::memory_order_release);
         }
 
+        [[nodiscard]] bool executionReady() const noexcept override {
+            return readyForExecution.load(std::memory_order_acquire);
+        }
+
         std::atomic<bool> lastEnabled{false};
+        std::atomic<bool> readyForExecution{true};
     };
 
     struct HuanyangObservation {
@@ -393,6 +398,19 @@ namespace {
                 && !observation->enabled.load(
                     std::memory_order_acquire),
             "spindle worker shutdown did not establish safe stop");
+    }
+
+    void testPhysicalIoForwardsMotionExecutionReadiness() {
+        auto motion = std::make_unique<NullMotionIo>();
+        auto *const observation = motion.get();
+        ngc::PhysicalExecutorIo io(std::move(motion));
+        require(io.executionReady(),
+                "physical I/O did not forward ready motion state");
+
+        observation->readyForExecution.store(
+            false, std::memory_order_release);
+        require(!io.executionReady(),
+                "physical I/O did not forward blocked motion state");
     }
 
     void testSpindleWorkerPreservesCommandOrder() {
@@ -880,6 +898,7 @@ int main() {
     try {
         testLoadsPhysicalBackendConfiguration();
         testPhysicalIoPublishesSpindleOffServoThread();
+        testPhysicalIoForwardsMotionExecutionReadiness();
         testSpindleWorkerPreservesCommandOrder();
         testSpindleSafeStopSupersedesQueuedCommands();
         testSpindleBackpressureDiscardsQueuedCommands();

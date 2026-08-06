@@ -431,6 +431,12 @@ namespace ngc::mesa {
         static_cast<void>(exchangePendingOutputs());
     }
 
+    bool MesaProductionExecutorIo::executionReady() const noexcept {
+        return m_stepGeneratorCount == 0
+            || (m_accumulatorFeedbackAvailable
+                && m_accumulatorFeedbackAligned);
+    }
+
     bool MesaProductionExecutorIo::exchangePendingOutputs() noexcept {
         const auto result = m_io->cycle(m_pendingOutputs);
         if (result.fault == HostMot2CyclicIoFault::None

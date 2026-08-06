@@ -1811,6 +1811,8 @@ namespace {
             });
         require(adapter.has_value(),
                 "valid Mesa executor I/O adapter was rejected");
+        require(!(*adapter)->executionReady(),
+                "Mesa executor reported ready before DPLL alignment");
 
         auto outputs = ngc::ProductionExecutorOutputState{};
         (*adapter)->applyOutputs(outputs);
@@ -1833,8 +1835,9 @@ namespace {
 
         (*adapter)->sampleDigitalInputs({}, inputs);
 
-        require(inputs[0] && (*adapter)->faultCode() == 0,
-                "Mesa field input program did not publish logical input zero");
+        require(inputs[0] && (*adapter)->faultCode() == 0
+                    && (*adapter)->executionReady(),
+                "Mesa field input program did not publish logical input zero or align execution");
         outputs.commandedJoints.position[0] = 0.000'012'5;
         outputs.commandedJoints.velocity[0] = 0.25;
         (*adapter)->applyOutputs(outputs);

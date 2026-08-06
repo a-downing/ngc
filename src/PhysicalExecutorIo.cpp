@@ -62,6 +62,10 @@ namespace ngc {
         }
     }
 
+    bool PhysicalExecutorIo::executionReady() const noexcept {
+        return m_motion->executionReady();
+    }
+
     std::uint32_t
     PhysicalExecutorIo::faultCode() const noexcept {
         const auto motionFault = m_motion->faultCode();

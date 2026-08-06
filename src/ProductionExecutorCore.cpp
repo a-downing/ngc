@@ -392,7 +392,7 @@ namespace ngc {
         m_digitalInputs = inputs;
     }
 
-    void ProductionExecutorCore::servoTick(const bool shouldPublishSnapshot) noexcept {
+    void ProductionExecutorCore::servoTick(const bool shouldPublishSnapshot, const bool advanceExecution) noexcept {
         const auto startingChunk = m_snapshot.activeChunk;
         m_tickObservation = {};
         serviceDemand();
@@ -400,8 +400,9 @@ namespace ngc {
         serviceIngress();
         convergeDemand();
 
-        if (m_snapshot.state == BackendState::Running
-            || m_snapshot.state == BackendState::Holding) {
+        if (advanceExecution
+            && (m_snapshot.state == BackendState::Running
+                || m_snapshot.state == BackendState::Holding)) {
             if (m_jog.has_value()) {
                 advanceJog(m_servoPeriod);
             } else if (!m_active.has_value()

@@ -22,6 +22,7 @@ namespace ngc {
         void applyOutputs(
             const ProductionExecutorOutputState &outputs) noexcept override;
         void establishSafeOutputs() noexcept override;
+        [[nodiscard]] bool executionReady() const noexcept override;
         [[nodiscard]] std::uint32_t faultCode() const noexcept override;
         [[nodiscard]] ProductionExecutorIoFaultDiagnostic
         faultDiagnostic() const noexcept override;
