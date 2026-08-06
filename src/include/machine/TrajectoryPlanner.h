@@ -758,9 +758,16 @@ namespace ngc {
             m_lastRollingFailure.clear();
         }
 
-        void rebase(const EpochId epoch, const position_t &position) {
-            m_compiler.reset(epoch,position);
-            m_continuousBoundary={position,{},{}};
+        [[nodiscard]] bool reconcileHeldPosition(const position_t &position) {
+            if (!m_window.empty() || m_preparedWindow || m_preparedChain
+                || m_preparedChainEnded) {
+                return false;
+            }
+
+            m_compiler.reconcileHeldPosition(position);
+            m_continuousBoundary = {position, {}, {}};
+
+            return true;
         }
 
         void clearDiagnostics() { m_diagnostics = {}; }

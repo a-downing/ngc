@@ -6280,6 +6280,50 @@ G1 F60 X2
         worker.join();
     }
 
+    void testMachineSessionManagerReconcilesEarlyProbeBeforeG64Motion() {
+        const auto configuration = ngc::loadMachineConfiguration("machine.toml");
+        require(configuration.has_value(), configuration ? "" : configuration.error());
+        ngc::MachineSessionManager worker(*configuration);
+        const auto authority = worker.state().authority;
+        require(worker.powerOn(authority), "Simulation should power on explicitly");
+        ngc::ToolTable tools;
+        // With no physical tool selected, this active offset places the
+        // Simulation contact 0.5 units before the probe target.
+        tools.set(1, {
+            .number = 1,
+            .x = 0.5,
+            .y = 0.0,
+            .z = 0.0,
+            .a = 0.0,
+            .b = 0.0,
+            .c = 0.0,
+            .diameter = 0.25,
+            .comment = "early probe fixture",
+        });
+        require(worker.start(authority, {{
+                    "G43 H1\n"
+                    "G64 P0.01\n"
+                    "G38.3 F60 X2\n"
+                    "G1 X3\n",
+                    "early-probe-g64-worker.ngc",
+                }}, tools, true),
+                "early-probe G64 regression should start");
+
+        auto snapshot = worker.snapshot();
+        for (int attempt = 0; attempt < 10000
+             && snapshot.status != ngc::SimulationStatus::Completed
+             && snapshot.status != ngc::SimulationStatus::Error; ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            snapshot = worker.snapshot();
+        }
+        require(snapshot.status == ngc::SimulationStatus::Completed,
+                std::format("G64 motion after an early probe should complete: {}",
+                            snapshot.error));
+        requireNear(snapshot.machinePosition.x, 3.5,
+                    "G64 motion after an early probe stopped at the wrong machine position");
+        worker.join();
+    }
+
     void testMachineSessionManagerProbeContactSupersedesFeedHold() {
         const auto configuration = ngc::loadMachineConfiguration("machine.toml");
         require(configuration.has_value(), configuration ? "" : configuration.error());
@@ -8843,6 +8887,7 @@ int main() {
         testMachineSessionManagerFeedHoldReachesPausedAtRest();
         testMachineSessionManagerStopBrakesAndAbandonsProgram();
         testMachineSessionManagerFeedHoldResumesProbeApproach();
+        testMachineSessionManagerReconcilesEarlyProbeBeforeG64Motion();
         testMachineSessionManagerProbeContactSupersedesFeedHold();
         test1001PreviewCompletesBoundedly();
         testSingleShortEntityClusterRetainsMidpointControl();

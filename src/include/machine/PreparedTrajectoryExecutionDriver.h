@@ -365,6 +365,11 @@ namespace ngc {
                 observe(event);
                 if(const auto *move = std::get_if<TriggeredMoveCompleted>(&event)) {
                     if(move->epoch == m_epoch && m_probePending) {
+                        if (!m_planner.reconcileHeldPosition(
+                                move->stoppedState.position)) {
+                            fail("probe completed while the trajectory planner retained geometry");
+                            return;
+                        }
                         const auto status = [&] {
                             switch(move->status) {
                                 case TriggeredMoveStatus::Triggered: return ProbeStatus::Triggered;

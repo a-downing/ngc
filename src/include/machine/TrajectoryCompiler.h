@@ -631,6 +631,7 @@ namespace ngc {
             if(m_progressCallback) m_progressCallback();
         }
         const position_t &plannedPosition() const { return m_position; }
+        void reconcileHeldPosition(const position_t &position) { m_position = position; }
 
         std::expected<PlanChunk, std::string> compile(
             const MachineCommand &command,
