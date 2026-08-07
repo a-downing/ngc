@@ -14,7 +14,7 @@ requires another.
 
 1. [Completed] Consolidate authority-aware `MachineSessionManager` delegation.
 2. [Completed] Share `Machine::Axis` position-component access.
-3. [Pending] Consolidate per-target persistence-store initialization.
+3. [Completed] Consolidate per-target persistence-store initialization.
 4. [Pending] Share pure `MachineCommand` classification and endpoint helpers.
 5. [Pending] Consider RAII cleanup of `imgui_main.cpp` only if it produces a meaningful
    net reduction.
@@ -198,6 +198,27 @@ follow-up separate if its callback or observation-type differences require a
 more elaborate abstraction.
 
 ## 3. Consolidate per-target persistence-store initialization
+
+### Completion record
+
+Completed in the current worktree. `ApplicationImpl` now keeps parameter and
+tool-table paths and readiness in one `PersistenceStores` value per target.
+Shared helpers initialize parameter and tool-table stores, while caller-provided
+tool-table application keeps the Simulation-only Preview update explicit.
+Orderly shutdown consumes the same per-target state, and active-store access
+uses one target-selection helper.
+
+The refactor removes 135 lines and adds 94 lines in `src/Application.cpp`, for a
+net reduction of 41 lines. Parameter initialization remains independent of
+legacy tool-table migration failure, preserving the existing protection against
+overwriting an invalid parameter store.
+
+Verification completed:
+
+- `cmake --build build --target imgui_main ngc_tests`
+- `.\build\ngc_tests.exe` passed from the repository root, including parameter
+  persistence and tool-table migration coverage.
+- `git diff --check` passed.
 
 ### Motivation
 

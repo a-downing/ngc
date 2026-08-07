@@ -229,12 +229,16 @@ class ApplicationImpl final {
     ngc::JoggingConfiguration m_joggingConfiguration;
     ngc::PendantConfiguration m_pendantConfiguration;
     ngc::Machine::Unit m_machineUnit;
-    ngc::ParameterStorePaths m_parameterStores;
-    ngc::ToolTableStorePaths m_toolTableStores;
-    bool m_simulationParameterStoreReady = false;
-    bool m_simulationToolTableStoreReady = false;
-    bool m_machineParameterStoreReady = false;
-    bool m_machineToolTableStoreReady = false;
+    struct PersistenceStores {
+        ngc::MachineControlTarget target;
+        std::filesystem::path parameterPath;
+        std::filesystem::path toolTablePath;
+        bool parametersReady = false;
+        bool toolTableReady = false;
+    };
+    std::filesystem::path m_legacyToolTablePath;
+    PersistenceStores m_simulationStores;
+    PersistenceStores m_machineStores;
     std::uint64_t m_simulationToolTableRevision = 0;
     ngc::MachineControlTarget m_toolTableRevisionTarget =
         ngc::MachineControlTarget::Simulation;
@@ -502,8 +506,12 @@ public:
         : m_window(window), m_simulationTiming(configuration.simulation),
           m_joggingConfiguration(configuration.jogging),
           m_pendantConfiguration(configuration.pendant), m_machineUnit(configuration.unit),
-          m_parameterStores(configuration.parameterStores),
-          m_toolTableStores(configuration.toolTableStores),
+          m_legacyToolTablePath(configuration.toolTableStores.legacy),
+          m_simulationStores { ngc::MachineControlTarget::Simulation,
+              configuration.parameterStores.simulation,
+              configuration.toolTableStores.simulation },
+          m_machineStores { ngc::MachineControlTarget::Machine, configuration.parameterStores.machine,
+              configuration.toolTableStores.machine },
           m_axes(configuration.axes), m_joints(configuration.joints),
           m_worker(configuration.unit,geometryPolicy(configuration.trajectory,splineFitSolver)),
           m_simulation(configuration),
@@ -523,6 +531,51 @@ public:
         }
     }
 
+    template <typename ApplyToolTable>
+    void initializeToolTableStore(const ngc::MachineControlAuthority authority, PersistenceStores &stores,
+                                  ngc::ToolTable &tools, ApplyToolTable &&applyToolTable) {
+        if (auto loaded = tools.load(stores.toolTablePath); !loaded) {
+            m_errorMessage = loaded.error();
+            return;
+        }
+        if (!std::forward<ApplyToolTable>(applyToolTable)(tools)) {
+            m_errorMessage = std::format(
+                "{} tool table was loaded, but could not be applied",
+                ngc::gui::controlTargetName(stores.target));
+            return;
+        }
+
+        if (auto configured = m_simulation.setToolTableStorePath(authority, stores.toolTablePath);
+            !configured) {
+            m_errorMessage = configured.error();
+            return;
+        }
+
+        stores.toolTableReady = true;
+    }
+
+    void initializeParameterStore(const ngc::MachineControlAuthority authority,
+                                  PersistenceStores &stores) {
+        std::error_code parameterStoreError;
+        const auto parameterStoreExists = std::filesystem::exists(stores.parameterPath, parameterStoreError);
+        if (parameterStoreError) {
+            m_errorMessage = std::format(
+                "failed to inspect {} parameter store '{}': {}",
+                ngc::gui::controlTargetName(stores.target),
+                stores.parameterPath.string(), parameterStoreError.message());
+            return;
+        }
+
+        const auto initialized = parameterStoreExists
+            ? m_simulation.loadPersistentParameters(authority, stores.parameterPath)
+            : m_simulation.setPersistentParameterStorePath(authority, stores.parameterPath);
+        if (!initialized) {
+            m_errorMessage = initialized.error();
+        } else {
+            stores.parametersReady = true;
+        }
+    }
+
     void init() {
         m_glGenBuffers = reinterpret_cast<GlGenBuffersProc>(glfwGetProcAddress("glGenBuffers"));
         m_glDeleteBuffers = reinterpret_cast<GlDeleteBuffersProc>(glfwGetProcAddress("glDeleteBuffers"));
@@ -532,47 +585,20 @@ public:
             m_glGenBuffers(1, &m_previewGeometryBuffer);
         }
         m_previewVisibilityThread = std::thread(&ApplicationImpl::previewVisibilityWork, this);
-        const auto migratedTools = ngc::migrateLegacyToolTables(m_toolTableStores);
+        const auto migratedTools = ngc::migrateLegacyToolTables({
+            m_legacyToolTablePath,
+            m_machineStores.toolTablePath,
+            m_simulationStores.toolTablePath });
         if (!migratedTools) {
             m_errorMessage = migratedTools.error();
-        } else if (auto loadedTools = m_tools.load(m_toolTableStores.simulation);
-                  !loadedTools) {
-            m_errorMessage = loadedTools.error();
-        } else if (!m_worker.setToolTable(m_tools)
-                  || !m_simulation.setToolTable(m_controlAuthority, m_tools)) {
-            m_errorMessage = "Simulation tool table was loaded, but could not be applied";
-        } else if (auto configured = m_simulation.setToolTableStorePath(
-                      m_controlAuthority, m_toolTableStores.simulation);
-                  !configured) {
-            m_errorMessage = configured.error();
         } else {
-            m_simulationToolTableStoreReady = true;
+            initializeToolTableStore(m_controlAuthority, m_simulationStores, m_tools,
+                [&](const ngc::ToolTable &tools) {
+                    return m_worker.setToolTable(tools)
+                        && m_simulation.setToolTable(m_controlAuthority, tools);
+                });
         }
-
-        std::error_code parameterStoreError;
-        const auto parameterStoreExists = std::filesystem::exists(
-            m_parameterStores.simulation, parameterStoreError);
-        if (parameterStoreError) {
-            m_errorMessage = std::format(
-                "failed to inspect Simulation parameter store '{}': {}",
-                m_parameterStores.simulation.string(), parameterStoreError.message());
-        } else if (parameterStoreExists) {
-            const auto loaded = m_simulation.loadPersistentParameters(
-                m_controlAuthority, m_parameterStores.simulation);
-            if (!loaded) {
-                m_errorMessage = loaded.error();
-            } else {
-                m_simulationParameterStoreReady = true;
-            }
-        } else {
-            const auto configured = m_simulation.setPersistentParameterStorePath(
-                m_controlAuthority, m_parameterStores.simulation);
-            if (!configured) {
-                m_errorMessage = configured.error();
-            } else {
-                m_simulationParameterStoreReady = true;
-            }
-        }
+        initializeParameterStore(m_controlAuthority, m_simulationStores);
 
         if (m_simulation.state().machineAvailable) {
             const auto machineAuthority =
@@ -583,52 +609,11 @@ public:
             } else {
                 m_controlAuthority = *machineAuthority;
                 ngc::ToolTable machineTools;
-                if (auto loaded = machineTools.load(m_toolTableStores.machine);
-                    !loaded) {
-                    m_errorMessage = loaded.error();
-                } else if (!m_simulation.setToolTable(
-                               m_controlAuthority, machineTools)) {
-                    m_errorMessage =
-                        "Machine tool table was loaded, but could not be applied";
-                } else if (auto configured =
-                               m_simulation.setToolTableStorePath(
-                                   m_controlAuthority,
-                                   m_toolTableStores.machine);
-                           !configured) {
-                    m_errorMessage = configured.error();
-                } else {
-                    m_machineToolTableStoreReady = true;
-                }
-
-                std::error_code machineParameterError;
-                const auto machineParametersExist = std::filesystem::exists(
-                    m_parameterStores.machine, machineParameterError);
-                if (machineParameterError) {
-                    m_errorMessage = std::format(
-                        "failed to inspect Machine parameter store '{}': {}",
-                        m_parameterStores.machine.string(),
-                        machineParameterError.message());
-                } else if (machineParametersExist) {
-                    const auto loaded =
-                        m_simulation.loadPersistentParameters(
-                            m_controlAuthority,
-                            m_parameterStores.machine);
-                    if (!loaded) {
-                        m_errorMessage = loaded.error();
-                    } else {
-                        m_machineParameterStoreReady = true;
-                    }
-                } else {
-                    const auto configured =
-                        m_simulation.setPersistentParameterStorePath(
-                            m_controlAuthority,
-                            m_parameterStores.machine);
-                    if (!configured) {
-                        m_errorMessage = configured.error();
-                    } else {
-                        m_machineParameterStoreReady = true;
-                    }
-                }
+                initializeToolTableStore(m_controlAuthority, m_machineStores, machineTools,
+                    [&](const ngc::ToolTable &tools) {
+                        return m_simulation.setToolTable(m_controlAuthority, tools);
+                    });
+                initializeParameterStore(m_controlAuthority, m_machineStores);
 
                 const auto simulationAuthority =
                     m_simulation.selectControlTarget(
@@ -678,29 +663,17 @@ public:
         m_scrollDelta += delta;
     }
 
-    [[nodiscard]] std::filesystem::path activeParameterStore() const {
+    [[nodiscard]] const PersistenceStores &activeStores() const noexcept {
         return m_controlAuthority.target == ngc::MachineControlTarget::Machine
-            ? m_parameterStores.machine : m_parameterStores.simulation;
+            ? m_machineStores : m_simulationStores;
     }
 
-    [[nodiscard]] std::filesystem::path activeToolTableStore() const {
-        return m_controlAuthority.target == ngc::MachineControlTarget::Machine
-            ? m_toolTableStores.machine : m_toolTableStores.simulation;
-    }
-
-    [[nodiscard]] bool activeParameterStoreReady() const noexcept {
-        return m_controlAuthority.target == ngc::MachineControlTarget::Machine
-            ? m_machineParameterStoreReady : m_simulationParameterStoreReady;
-    }
-
-    [[nodiscard]] bool activeToolTableStoreReady() const noexcept {
-        return m_controlAuthority.target == ngc::MachineControlTarget::Machine
-            ? m_machineToolTableStoreReady : m_simulationToolTableStoreReady;
-    }
-
+    [[nodiscard]] std::filesystem::path activeParameterStore() const { return activeStores().parameterPath; }
+    [[nodiscard]] std::filesystem::path activeToolTableStore() const { return activeStores().toolTablePath; }
+    [[nodiscard]] bool activeParameterStoreReady() const noexcept { return activeStores().parametersReady; }
+    [[nodiscard]] bool activeToolTableStoreReady() const noexcept { return activeStores().toolTableReady; }
     [[nodiscard]] std::string_view activeTargetName() const noexcept {
-        return m_controlAuthority.target == ngc::MachineControlTarget::Machine
-            ? std::string_view("Machine") : std::string_view("Simulation");
+        return ngc::gui::controlTargetName(activeStores().target);
     }
 
     void terminate() {
@@ -713,54 +686,40 @@ public:
         m_previewVisibilityCv.notify_one();
         if(m_previewVisibilityThread.joinable()) m_previewVisibilityThread.join();
         m_simulation.join();
-        const auto saveStores = [&](const ngc::MachineControlTarget target,
-                                    const bool parametersReady,
-                                    const bool toolsReady,
-                                    const std::filesystem::path &parameterPath,
-                                    const std::filesystem::path &toolPath) {
-            const auto authority = m_simulation.selectControlTarget(target);
+        const auto saveStores = [&](const PersistenceStores &stores) {
+            const auto authority = m_simulation.selectControlTarget(stores.target);
             if (!authority) {
                 m_errorMessage = authority.error();
                 std::println(
                     stderr, "Failed to select {} while saving stores: {}",
-                    ngc::gui::controlTargetName(target), authority.error());
+                    ngc::gui::controlTargetName(stores.target), authority.error());
                 return;
             }
             m_controlAuthority = *authority;
-            if (parametersReady) {
+            if (stores.parametersReady) {
                 const auto saved = m_simulation.savePersistentParameters(
-                    m_controlAuthority, parameterPath);
+                    m_controlAuthority, stores.parameterPath);
                 if (!saved) {
                     m_errorMessage = saved.error();
                     std::println(
                         stderr, "Failed to save {} parameters: {}",
-                        ngc::gui::controlTargetName(target), saved.error());
+                        ngc::gui::controlTargetName(stores.target), saved.error());
                 }
             }
-            if (toolsReady) {
+            if (stores.toolTableReady) {
                 const auto saved = m_simulation.saveToolTable(
-                    m_controlAuthority, toolPath);
+                    m_controlAuthority, stores.toolTablePath);
                 if (!saved) {
                     m_errorMessage = saved.error();
                     std::println(
                         stderr, "Failed to save {} tool table: {}",
-                        ngc::gui::controlTargetName(target), saved.error());
+                        ngc::gui::controlTargetName(stores.target), saved.error());
                 }
             }
         };
-        saveStores(
-            ngc::MachineControlTarget::Simulation,
-            m_simulationParameterStoreReady,
-            m_simulationToolTableStoreReady,
-            m_parameterStores.simulation,
-            m_toolTableStores.simulation);
+        saveStores(m_simulationStores);
         if (m_simulation.state().machineAvailable) {
-            saveStores(
-                ngc::MachineControlTarget::Machine,
-                m_machineParameterStoreReady,
-                m_machineToolTableStoreReady,
-                m_parameterStores.machine,
-                m_toolTableStores.machine);
+            saveStores(m_machineStores);
         }
         m_worker.join();
         if(m_glDeleteBuffers) {
