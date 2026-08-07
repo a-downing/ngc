@@ -29,6 +29,7 @@
 #include "machine/InProcessSimulationRuntime.h"
 #include "machine/MachineControl.h"
 #include "machine/MachineConfiguration.h"
+#include "machine/MachineAxis.h"
 #include "machine/MachineSessionCommand.h"
 #include "machine/MachineSession.h"
 #include "machine/PreparedTrajectoryExecutionDriver.h"
@@ -747,8 +748,8 @@ public:
         }
         if(!std::isfinite(workPosition))
             return std::unexpected("requested work coordinate is not finite");
-        const auto machinePosition = axisComponent(m_snapshot.machinePosition, axis);
-        const auto toolOffset = axisComponent(
+        const auto machinePosition = machineAxisPositionComponent(m_snapshot.machinePosition, axis);
+        const auto toolOffset = machineAxisPositionComponent(
             m_machineSession.presentationTracker().snapshot().activePresentation.activeToolOffset, axis);
         const auto offset = machinePosition - toolOffset - workPosition;
         m_machineSession.interpreter().machine().setActiveWorkOffset(axis, offset);
@@ -1465,31 +1466,6 @@ private:
         if (const auto backend = latestTimedBackendSnapshot()) {
             applyBackendSnapshot(*backend);
         }
-    }
-
-    static double &axisComponent(ngc::position_t &position, const ngc::Machine::Axis axis) {
-        switch(axis) {
-            case ngc::Machine::Axis::X: return position.x;
-            case ngc::Machine::Axis::Y: return position.y;
-            case ngc::Machine::Axis::Z: return position.z;
-            case ngc::Machine::Axis::A: return position.a;
-            case ngc::Machine::Axis::B: return position.b;
-            case ngc::Machine::Axis::C: return position.c;
-        }
-        return position.x;
-    }
-
-    static double axisComponent(const ngc::position_t &position, const ngc::Machine::Axis axis) {
-        switch (axis) {
-            case ngc::Machine::Axis::X: return position.x;
-            case ngc::Machine::Axis::Y: return position.y;
-            case ngc::Machine::Axis::Z: return position.z;
-            case ngc::Machine::Axis::A: return position.a;
-            case ngc::Machine::Axis::B: return position.b;
-            case ngc::Machine::Axis::C: return position.c;
-        }
-
-        return position.x;
     }
 
     ngc::TrajectoryCommandPresentation sessionPresentation() const {

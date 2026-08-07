@@ -1,37 +1,13 @@
 #include "machine/HomingController.h"
 
+#include "machine/MachineAxis.h"
+
 #include <algorithm>
 #include <cmath>
 #include <ranges>
 
 namespace ngc {
     namespace {
-        double &axisComponent(position_t &position, const Machine::Axis axis) {
-            switch (axis) {
-                case Machine::Axis::X: return position.x;
-                case Machine::Axis::Y: return position.y;
-                case Machine::Axis::Z: return position.z;
-                case Machine::Axis::A: return position.a;
-                case Machine::Axis::B: return position.b;
-                case Machine::Axis::C: return position.c;
-            }
-
-            return position.x;
-        }
-
-        double axisComponent(const position_t &position, const Machine::Axis axis) {
-            switch (axis) {
-                case Machine::Axis::X: return position.x;
-                case Machine::Axis::Y: return position.y;
-                case Machine::Axis::Z: return position.z;
-                case Machine::Axis::A: return position.a;
-                case Machine::Axis::B: return position.b;
-                case Machine::Axis::C: return position.c;
-            }
-
-            return position.x;
-        }
-
         InputCondition releasedCondition(
             const InputCondition condition) noexcept {
             switch (condition) {
@@ -94,7 +70,7 @@ namespace ngc {
         for (const auto &joint : m_joints) {
             allJoints |= JointMask {1} << joint.id;
             initial[joint.id] =
-                axisComponent(startingPosition, joint.axis) * joint.coordinateScale;
+                machineAxisPositionComponent(startingPosition, joint.axis) * joint.coordinateScale;
         }
 
         const auto begun = operation.begin(epoch, ExecutorDemandMode::Idle);
@@ -416,7 +392,7 @@ namespace ngc {
                 ++count;
             }
             if (count != 0) {
-                axisComponent(m_observation.machinePosition, axis.axis) = sum / count;
+                machineAxisPositionComponent(m_observation.machinePosition, axis.axis) = sum / count;
             }
         }
         m_observation.commandProgress = snapshot.spanProgress;

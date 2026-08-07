@@ -64,6 +64,7 @@
 
 #include "machine/ToolTable.h"
 #include "machine/MachineCommand.h"
+#include "machine/MachineAxis.h"
 #include "operator/OperatorJogController.h"
 #include "operator/PendantTouchOffController.h"
 #include "pendant/VistaCncP2sDisplay.h"
@@ -2538,18 +2539,6 @@ public:
         return static_cast<ngc::AxisId>(static_cast<std::uint8_t>(axis));
     }
 
-    static double axisValue(const ngc::position_t &position, const ngc::Machine::Axis axis) {
-        switch(axis) {
-            case ngc::Machine::Axis::X: return position.x;
-            case ngc::Machine::Axis::Y: return position.y;
-            case ngc::Machine::Axis::Z: return position.z;
-            case ngc::Machine::Axis::A: return position.a;
-            case ngc::Machine::Axis::B: return position.b;
-            case ngc::Machine::Axis::C: return position.c;
-        }
-        return 0.0;
-    }
-
     void renderJogPane(const ImGuiViewport &viewport, const ngc::SimulationSnapshot &simulation,
                        const float contentBottom) {
         const auto left = viewport.Pos.x + viewport.Size.x - m_jogPaneWidth;
@@ -2573,11 +2562,11 @@ public:
                 ImGui::TableNextColumn();
                 ImGui::TextUnformatted(axisLabel(axis.axis));
                 ImGui::TableNextColumn();
-                ImGui::Text("% .4f", axisValue(dro.machinePosition, axis.axis));
+                ImGui::Text("% .4f", ngc::machineAxisPositionComponent(dro.machinePosition, axis.axis));
                 ImGui::TableNextColumn();
-                ImGui::Text("% .4f", axisValue(dro.workPosition, axis.axis));
+                ImGui::Text("% .4f", ngc::machineAxisPositionComponent(dro.workPosition, axis.axis));
                 ImGui::TableNextColumn();
-                ImGui::Text("% .4f", axisValue(dro.toolTipPosition, axis.axis));
+                ImGui::Text("% .4f", ngc::machineAxisPositionComponent(dro.toolTipPosition, axis.axis));
             }
             ImGui::EndTable();
         }
@@ -2735,7 +2724,7 @@ public:
                 }
                 const auto homed = (simulation.homedJoints & joints) == joints;
                 const auto enabled = m_jogTargetMode == 1 || homed;
-                ImGui::Text("%s  % .4f%s", axisLabel(axis.axis), axisValue(simulation.machinePosition, axis.axis),
+                ImGui::Text("%s  % .4f%s", axisLabel(axis.axis), ngc::machineAxisPositionComponent(simulation.machinePosition, axis.axis),
                             homed ? "" : "  unhomed");
                 ImGui::SameLine(std::max(100.0f, ImGui::GetWindowWidth() - 130.0f));
                 const ngc::JogTarget target = m_jogTargetMode == 0
@@ -3346,7 +3335,7 @@ public:
                 ? std::string_view(
                     simulation.activePresentation.workCoordinateSystem->name)
                 : std::string_view("G54");
-            const auto position = axisValue(workPosition, selectedMachineAxis);
+            const auto position = ngc::machineAxisPositionComponent(workPosition, selectedMachineAxis);
             const auto &touchOff = m_pendantTouchOffController.snapshot();
             const auto display = m_pendantProfile.snapshot().mode == ngc::pendant::Mode::Zero
                     && touchOff.axis == selectedAxis

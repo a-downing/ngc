@@ -24,6 +24,7 @@
 #include "evaluator/InterpreterSession.h"
 #include "evaluator/Preamble.h"
 #include "machine/Machine.h"
+#include "machine/MachineAxis.h"
 #include "machine/MachineConfiguration.h"
 #include "machine/ArcInterpolation.h"
 #include "machine/HomingController.h"
@@ -55,6 +56,32 @@
 namespace {
     constexpr double EPSILON = 1e-9;
     constexpr ngc::Machine::Unit UNIT = ngc::Machine::Unit::Inch;
+
+    void require(const bool condition, const std::string_view message);
+
+    void testMachineAxisPositionComponentAccess() {
+        ngc::position_t position{1.0, 2.0, 3.0, 4.0, 5.0, 6.0};
+        constexpr std::array axes{
+            ngc::Machine::Axis::X,
+            ngc::Machine::Axis::Y,
+            ngc::Machine::Axis::Z,
+            ngc::Machine::Axis::A,
+            ngc::Machine::Axis::B,
+            ngc::Machine::Axis::C,
+        };
+
+        const auto &constPosition = position;
+        for (std::size_t index = 0; index < axes.size(); ++index) {
+            require(ngc::machineAxisPositionComponent(constPosition, axes[index])
+                        == static_cast<double>(index + 1),
+                    "const machine-axis component access should select the requested axis");
+            ngc::machineAxisPositionComponent(position, axes[index]) += 10.0;
+        }
+
+        require(position.x == 11.0 && position.y == 12.0 && position.z == 13.0
+                    && position.a == 14.0 && position.b == 15.0 && position.c == 16.0,
+                "mutable machine-axis component access should select the requested axis");
+    }
 
     class CountingBackendRuntime final : public ngc::BackendRuntime {
     public:
@@ -9056,6 +9083,7 @@ G1 F60 X2
 
 int main() {
     try {
+        testMachineAxisPositionComponentAccess();
         testMemoryStackBounds();
         testNumericParameterAddressesMustBeIntegers();
         testPersistentParameterCodec();

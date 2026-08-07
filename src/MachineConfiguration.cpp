@@ -12,6 +12,7 @@
 #include <toml++/toml.hpp>
 
 #include "config/TomlConfiguration.h"
+#include "machine/MachineAxis.h"
 
 namespace ngc {
     JointCoordinateRange jointCoordinateRange(
@@ -63,18 +64,6 @@ namespace ngc {
                 case Machine::Axis::C: return "c";
             }
             return "?";
-        }
-
-        double &axisComponent(position_t &value, const Machine::Axis axis) {
-            switch(axis) {
-                case Machine::Axis::X: return value.x;
-                case Machine::Axis::Y: return value.y;
-                case Machine::Axis::Z: return value.z;
-                case Machine::Axis::A: return value.a;
-                case Machine::Axis::B: return value.b;
-                case Machine::Axis::C: return value.c;
-            }
-            PANIC("{} missing case statement", __func__);
         }
 
         std::expected<InputCondition, std::string> parseCondition(
@@ -444,8 +433,8 @@ namespace ngc {
                             path, prefix + ".joints", "a joint may belong to only one logical axis", axisTable));
                 result.axes.push_back({ axis, std::move(*jointIds), *minimum, *maximum,
                                         *maxVelocity, *maxAcceleration, *maxJerk });
-                axisComponent(result.trajectory.axisPosition.minimum, axis) = *minimum;
-                axisComponent(result.trajectory.axisPosition.maximum, axis) = *maximum;
+                machineAxisPositionComponent(result.trajectory.axisPosition.minimum, axis) = *minimum;
+                machineAxisPositionComponent(result.trajectory.axisPosition.maximum, axis) = *maximum;
             }
 
             std::unordered_set<DigitalInputId> inputIds;
@@ -586,11 +575,11 @@ namespace ngc {
                     axis.maxJerk = std::min(
                         axis.maxJerk, joint->maxJerk / scale);
                 }
-                axisComponent(result.trajectory.axisVelocity, axis.axis) =
+                machineAxisPositionComponent(result.trajectory.axisVelocity, axis.axis) =
                     axis.maxVelocity;
-                axisComponent(result.trajectory.axisAcceleration, axis.axis) =
+                machineAxisPositionComponent(result.trajectory.axisAcceleration, axis.axis) =
                     axis.maxAcceleration;
-                axisComponent(result.trajectory.axisJerk, axis.axis) =
+                machineAxisPositionComponent(result.trajectory.axisJerk, axis.axis) =
                     axis.maxJerk;
             }
 
