@@ -10,6 +10,7 @@
 #include "machine/MachineConfiguration.h"
 #include "machine/ExecutorDemandController.h"
 #include "machine/MotionBackend.h"
+#include "machine/ServicedMotionOperation.h"
 
 namespace ngc {
     enum class HomingOutcome { Completed, Stopped };
@@ -40,6 +41,8 @@ namespace ngc {
         std::function<void()> serviceImmediate;
         std::function<std::uint64_t()> advanceServiceMotionPeriod;
         std::function<void()> waitForServiceMotion;
+        std::function<void()> stopRuntime;
+        std::function<void()> faultSession;
         std::function<void(const HomingObservation &)> observe;
     };
 
@@ -63,16 +66,15 @@ namespace ngc {
         [[nodiscard]] TriggeredJointMove makeReleaseCheck(
             const HomingGroupConfiguration &group, EpochId epoch,
             const JointMotionState &state);
-        [[nodiscard]] bool submitControl(
-            const ControlRequest &request, const HomingRuntimeCallbacks &callbacks);
         [[nodiscard]] std::expected<bool, std::string> setJointPositions(
             JointMask joints, const JointVector &positions,
-            const HomingRuntimeCallbacks &callbacks);
+            ServicedMotionOperation &operation);
         [[nodiscard]] std::expected<TriggeredJointMoveCompleted, std::string> executeMove(
-            const TriggeredJointMove &move, const HomingRuntimeCallbacks &callbacks);
-        void takeSnapshots(const HomingRuntimeCallbacks &callbacks);
+            const TriggeredJointMove &move, ServicedMotionOperation &operation,
+            const HomingRuntimeCallbacks &callbacks);
         void observeSnapshot(
-            const ExecutionSnapshot &snapshot, const HomingRuntimeCallbacks &callbacks);
+            const ExecutionSnapshot &snapshot, std::uint64_t servoTicks,
+            const HomingRuntimeCallbacks &callbacks);
         [[nodiscard]] HomingResult result(HomingOutcome outcome, JointMask homedJoints) const;
 
         std::vector<AxisConfiguration> m_axes;

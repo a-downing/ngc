@@ -350,7 +350,12 @@ complete live tool table, then powers Simulation and advances generation-tagged
 control authority. Simulation changes are never copied back to Machine.
 `MachineSession`
 owns homing and jogging runtime-service callback
-construction plus thread-safe live service observations. `BackendRuntime`
+construction plus thread-safe live service observations. The NRT-only
+`ServicedMotionOperation` shared by both controllers owns lifecycle-demand
+publication, bounded servicing, event and snapshot draining, post-start
+stop-and-quiesce cleanup, final stationary observation, and runtime-stop/session-fault
+fallback. A serviced-motion activity remains owned until that scope observes
+stationary completion, a backend fault, or safe disable. `BackendRuntime`
 provides the NRT service mechanics used by those controllers;
 `InProcessSimulationRuntime` supplies synchronous service-clock advancement,
 waiting, and synthetic homing-switch preparation without exposing that policy

@@ -759,13 +759,25 @@ namespace ngc {
             .waitForServiceMotion = [&] {
                 m_runtime.waitForServiceMotion();
             },
+            .stopRuntime = [&] {
+                m_runtime.stop();
+            },
+            .faultSession = [&] {
+                m_coordinator.fault();
+            },
             .observe = [&](const HomingObservation &observation) {
                 std::scoped_lock lock(m_serviceObservationMutex);
                 m_homingObservation = observation;
             },
         };
+        m_servicedMotionOwned.store(true);
         const auto homing = m_homingController->run(nextEpoch(), startingPosition, callbacks);
+        m_servicedMotionOwned.store(false);
         if (!homing) {
+            if (const auto observation = homingObservation()) {
+                m_interpreter.machine().synchronizePosition(
+                    observation->machinePosition);
+            }
             m_coordinator.fault();
 
             return homing;
@@ -843,15 +855,26 @@ namespace ngc {
             .waitForServiceMotion = [&] {
                 m_runtime.waitForServiceMotion();
             },
+            .stopRuntime = [&] {
+                m_runtime.stop();
+            },
+            .faultSession = [&] {
+                m_coordinator.fault();
+            },
             .observe = [&](const JoggingObservation &observation) {
                 std::scoped_lock lock(m_serviceObservationMutex);
                 m_joggingObservation = observation;
             },
         };
+        m_servicedMotionOwned.store(true);
         const auto result = m_joggingController->run(
             nextEpoch(), startingPosition, firstRequest, nextControl, callbacks);
+        m_servicedMotionOwned.store(false);
         if (result) {
             m_interpreter.machine().synchronizePosition(result->observation.machinePosition);
+        } else if (const auto observation = joggingObservation()) {
+            m_interpreter.machine().synchronizePosition(
+                observation->machinePosition);
         }
         m_coordinator.finishActivity();
 
@@ -862,6 +885,10 @@ namespace ngc {
         std::scoped_lock lock(m_serviceObservationMutex);
 
         return m_joggingObservation;
+    }
+
+    bool MachineSession::servicedMotionOwned() const noexcept {
+        return m_servicedMotionOwned.load();
     }
 
     void MachineSession::requestGeometryStop() {

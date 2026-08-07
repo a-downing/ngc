@@ -1,6 +1,15 @@
 # Serviced motion must retain ownership until the backend is quiescent
 
-Status: open; diagnosis complete; fix not implemented.
+Status: implemented.
+
+The implementation is `ServicedMotionOperation`, shared by jogging and homing.
+It owns their common bounded service loop, demand publication, snapshot and
+event draining, explicit post-start cleanup, final observation, and
+runtime-stop/session-fault fallback. `MachineSession` retains a separate
+serviced-motion ownership barrier until the scope returns a backend-observed
+terminal result. Regression coverage injects backpressure into both jog update
+and token-matched jog-stop submission, rejects cleanup Stop demand, and covers
+a post-start homing failure.
 
 ## Problem statement
 
@@ -46,9 +55,10 @@ A local error is not a terminal motion state. Frontend activity flags must descr
 
 The jog dead-man lease remains an authoritative fallback, but it must not be the normal cleanup mechanism for a failed NRT submission.
 
-## Proposed abstraction
+## Implemented abstraction
 
-Introduce one NRT-only operation scope for motion that is driven by service callbacks, tentatively named `ServicedMotionOperation`. It should own:
+The NRT-only operation scope for motion driven by service callbacks is named
+`ServicedMotionOperation`. It owns:
 
 - the execution epoch and persistent lifecycle demand;
 - immediate service, one-period advancement, and waiting callbacks;
@@ -132,16 +142,16 @@ Those transitions should occur from the operation scope's backend-observed termi
 
 The abstraction must remain NRT. It must preserve the existing single-NRT-owner rule for plan publication, demand publication, and transactional control submission, and it must not add allocation or unbounded data to the executor's real-time path.
 
-## Implementation sequence
+## Implementation coverage
 
-1. Add the shared operation-scope type and focused unit tests for terminal convergence and cleanup-error composition.
-2. Route jogging start, normal completion, submission failure, operator stop, and shutdown through the scope.
-3. Change the session and host cleanup so they release ownership only from a terminal operation result carrying the final backend observation.
-4. Add the backend-owned operation state to `motionOwnedOrQueued()` as a second admission barrier.
-5. Route homing's post-start error exits through the same stop-and-quiesce mechanism. In particular, audit lifecycle Stop publication failure and service-loop exhaustion.
-6. Consider reuse by program execution separately after the safety fix is proven.
+1. The shared operation scope owns terminal convergence and cleanup-error composition.
+2. Jogging start, normal completion, submission failure, operator stop, and shutdown pass through the scope.
+3. Session and host cleanup release ownership only after a terminal operation result carrying the final backend observation.
+4. `motionOwnedOrQueued()` includes the session's independent serviced-motion ownership barrier.
+5. Homing's post-start exits use the same stop-and-quiesce mechanism.
+6. Program execution remains separate because it already has its own controlled-stop state machine.
 
-Likely file placement, subject to the repository's naming conventions when implementation begins:
+The shared implementation is located at:
 
 ```text
 src/include/machine/ServicedMotionOperation.h

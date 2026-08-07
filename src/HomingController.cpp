@@ -70,13 +70,24 @@ namespace ngc {
             return std::unexpected("homing runtime callbacks are incomplete");
         }
 
-        m_backend.discardPendingOutput();
         m_observation = {.machinePosition = startingPosition};
         m_nextRequest = 1;
         m_nextChunk = 1;
         m_branch = 0;
         m_nextMove = 1;
         m_stopRequested = false;
+        ServicedMotionOperation operation(
+            m_backend, m_demand, {
+                .serviceImmediate = callbacks.serviceImmediate,
+                .advanceServiceMotionPeriod = callbacks.advanceServiceMotionPeriod,
+                .waitForServiceMotion = callbacks.waitForServiceMotion,
+                .observeSnapshot = [&](const ExecutionSnapshot &snapshot,
+                                       const std::uint64_t servoTicks) {
+                    observeSnapshot(snapshot, servoTicks, callbacks);
+                },
+                .stopRuntime = callbacks.stopRuntime,
+                .faultSession = callbacks.faultSession,
+            });
 
         JointMask allJoints = 0;
         JointVector initial;
@@ -86,32 +97,34 @@ namespace ngc {
                 axisComponent(startingPosition, joint.axis) * joint.coordinateScale;
         }
 
-        if (!m_demand.request(epoch, ExecutorDemandMode::Idle)) {
+        const auto begun = operation.begin(epoch, ExecutorDemandMode::Idle);
+        if (!begun) {
             return std::unexpected("failed to initialize the motion backend for homing");
         }
-        callbacks.serviceImmediate();
-        const auto initialized = setJointPositions(allJoints, initial, callbacks);
+        const auto initialized = setJointPositions(allJoints, initial, operation);
         if (!initialized || !*initialized) {
             return std::unexpected(initialized
                 ? "failed to initialize the motion backend for homing"
                 : initialized.error());
         }
-        if (!m_demand.request(epoch, ExecutorDemandMode::Run)) {
+        if (!operation.requestDemand(ExecutorDemandMode::Run)) {
             return std::unexpected(
                 "failed to start the motion backend for homing");
         }
-        callbacks.serviceImmediate();
+        operation.motionMayBeActive();
 
         for (const auto &group : m_homing.groups) {
             auto fast = makeMove(group, epoch, true, false, false);
             assignJointPositionEnvelope(
                 fast, m_observation.joints.position);
-            const auto fastResult = executeMove(fast, callbacks);
+            const auto fastResult = executeMove(fast, operation, callbacks);
             if (!fastResult) {
-                return std::unexpected(fastResult.error());
+                return operation.finish<HomingResult>(
+                    std::unexpected(fastResult.error()));
             }
             if (fastResult->status == TriggeredMoveStatus::Aborted) {
-                return result(HomingOutcome::Stopped, 0);
+                return operation.finish<HomingResult>(
+                    result(HomingOutcome::Stopped, 0));
             }
 
             auto backoff = makeMove(group, epoch, false, false, true);
@@ -129,15 +142,18 @@ namespace ngc {
             }
             assignJointPositionEnvelope(
                 backoff, fastResult->stoppedState.position);
-            const auto backoffResult = executeMove(backoff, callbacks);
+            const auto backoffResult = executeMove(backoff, operation, callbacks);
             if (!backoffResult) {
-                return std::unexpected(backoffResult.error());
+                return operation.finish<HomingResult>(
+                    std::unexpected(backoffResult.error()));
             }
             if (backoffResult->status == TriggeredMoveStatus::Aborted) {
-                return result(HomingOutcome::Stopped, 0);
+                return operation.finish<HomingResult>(
+                    result(HomingOutcome::Stopped, 0));
             }
             if (backoffResult->status != TriggeredMoveStatus::ReachedTarget) {
-                return std::unexpected("fixed homing backoff did not complete");
+                return operation.finish<HomingResult>(std::unexpected(
+                    "fixed homing backoff did not complete"));
             }
             for (const auto id : group.joints) {
                 const auto *joint = configuredJoint(id);
@@ -149,8 +165,8 @@ namespace ngc {
                 if (searchDirection
                     * (backoffResult->stoppedState.position[id]
                        - fastResult->triggerState.position[id]) >= 0.0) {
-                    return std::unexpected(
-                        "homing backoff did not move behind the fast trigger");
+                    return operation.finish<HomingResult>(std::unexpected(
+                        "homing backoff did not move behind the fast trigger"));
                 }
             }
 
@@ -159,23 +175,27 @@ namespace ngc {
             assignJointPositionEnvelope(
                 releaseCheck, backoffResult->stoppedState.position);
             const auto releaseResult = executeMove(
-                releaseCheck, callbacks);
+                releaseCheck, operation, callbacks);
             if (!releaseResult) {
-                return std::unexpected(releaseResult.error());
+                return operation.finish<HomingResult>(
+                    std::unexpected(releaseResult.error()));
             }
             if (releaseResult->status == TriggeredMoveStatus::Aborted) {
-                return result(HomingOutcome::Stopped, 0);
+                return operation.finish<HomingResult>(
+                    result(HomingOutcome::Stopped, 0));
             }
 
             auto slow = makeMove(group, epoch, true, true, false);
             assignJointPositionEnvelope(
                 slow, releaseResult->stoppedState.position);
-            const auto slowResult = executeMove(slow, callbacks);
+            const auto slowResult = executeMove(slow, operation, callbacks);
             if (!slowResult) {
-                return std::unexpected(slowResult.error());
+                return operation.finish<HomingResult>(
+                    std::unexpected(slowResult.error()));
             }
             if (slowResult->status == TriggeredMoveStatus::Aborted) {
-                return result(HomingOutcome::Stopped, 0);
+                return operation.finish<HomingResult>(
+                    result(HomingOutcome::Stopped, 0));
             }
 
             auto calibrated = slowResult->stoppedState.position;
@@ -189,30 +209,33 @@ namespace ngc {
                 calibrated[id] += desiredSwitch - slowResult->triggerState.position[id];
             }
             const auto established = setJointPositions(
-                slow.triggerRequired ? slow.joints : 0, calibrated, callbacks);
+                slow.triggerRequired ? slow.joints : 0, calibrated, operation);
             if (!established || !*established) {
-                return std::unexpected(established
+                return operation.finish<HomingResult>(std::unexpected(established
                     ? "failed to establish joint coordinates after slow homing search"
-                    : established.error());
+                    : established.error()));
             }
 
             auto finalMove = makeMove(group, epoch, false, false, false);
             assignJointPositionEnvelope(
                 finalMove, m_observation.joints.position);
-            const auto finalResult = executeMove(finalMove, callbacks);
+            const auto finalResult = executeMove(finalMove, operation, callbacks);
             if (!finalResult) {
-                return std::unexpected(finalResult.error());
+                return operation.finish<HomingResult>(
+                    std::unexpected(finalResult.error()));
             }
             if (finalResult->status == TriggeredMoveStatus::Aborted) {
-                return result(HomingOutcome::Stopped, 0);
+                return operation.finish<HomingResult>(
+                    result(HomingOutcome::Stopped, 0));
             }
             if (finalResult->status != TriggeredMoveStatus::ReachedTarget) {
-                return std::unexpected(
-                    "final move to the configured home position did not complete");
+                return operation.finish<HomingResult>(std::unexpected(
+                    "final move to the configured home position did not complete"));
             }
         }
 
-        return result(HomingOutcome::Completed, allJoints);
+        return operation.finish<HomingResult>(
+            result(HomingOutcome::Completed, allJoints));
     }
 
     const JointConfiguration *HomingController::configuredJoint(const JointId id) const {
@@ -300,103 +323,86 @@ namespace ngc {
         return move;
     }
 
-    bool HomingController::submitControl(
-        const ControlRequest &request, const HomingRuntimeCallbacks &callbacks) {
-        if (m_backend.trySubmit(request) != SubmitResult::Submitted) {
-            return false;
-        }
-        callbacks.serviceImmediate();
-
-        return true;
-    }
-
     std::expected<bool, std::string> HomingController::setJointPositions(
         const JointMask joints, const JointVector &positions,
-        const HomingRuntimeCallbacks &callbacks) {
+        ServicedMotionOperation &operation) {
         const auto request = m_nextRequest++;
-        if (!submitControl(SetJointPositionRequest {request, joints, positions}, callbacks)) {
+        if (!operation.submit(SetJointPositionRequest {request, joints, positions})) {
             return false;
         }
 
-        for (std::size_t guard = 0; guard < 10000000; ++guard) {
-            ExecutionEvent event;
-            while (m_backend.tryTakeEvent(event)) {
-                if (const auto *result = std::get_if<RequestCompleted>(&event);
-                    result && result->request == request) {
-                    takeSnapshots(callbacks);
+        const auto event = operation.serviceUntil(
+            [&](const ExecutionEvent &candidate) {
+                const auto *completed = std::get_if<RequestCompleted>(&candidate);
 
-                    return result->succeeded;
-                }
-                if (const auto *fault = std::get_if<BackendFault>(&event)) {
-                    return std::unexpected(
-                        "homing backend fault " + std::to_string(fault->code));
-                }
+                return completed && completed->request == request;
+            },
+            "joint-coordinate establishment exceeded its bounded service iteration limit");
+        if (!event) {
+            auto error = event.error();
+            if (error.starts_with("motion backend fault ")) {
+                error.replace(0, std::string("motion backend").size(), "homing backend");
             }
-            m_observation.servoTicks += callbacks.advanceServiceMotionPeriod();
-            takeSnapshots(callbacks);
-            callbacks.waitForServiceMotion();
+
+            return std::unexpected(std::move(error));
         }
 
-        return std::unexpected(
-            "joint-coordinate establishment exceeded its bounded service iteration limit");
+        return std::get<RequestCompleted>(*event).succeeded;
     }
 
     std::expected<TriggeredJointMoveCompleted, std::string> HomingController::executeMove(
-        const TriggeredJointMove &move, const HomingRuntimeCallbacks &callbacks) {
-        m_backend.discardPendingEvents();
+        const TriggeredJointMove &move, ServicedMotionOperation &operation,
+        const HomingRuntimeCallbacks &callbacks) {
+        operation.discardPendingEvents();
         if (!callbacks.prepareTriggeredMove(move)) {
             return std::unexpected("homing runtime failed to prepare a triggered move");
         }
-        if (m_backend.tryPublish(ExecutionItem {move}) != PublishResult::Published) {
+        if (!operation.publish(ExecutionItem {move})) {
             return std::unexpected("motion backend rejected a homing move");
         }
-        for (std::size_t guard = 0; guard < 10000000; ++guard) {
-            if (callbacks.stopRequested() && !m_stopRequested) {
-                if (!m_demand.request(
-                        move.epoch, ExecutorDemandMode::Stop)) {
-                    return std::unexpected(
-                        "motion backend demand mailbox rejected the homing stop");
+        operation.motionMayBeActive();
+        const auto event = operation.serviceUntil(
+            [&](const ExecutionEvent &candidate) {
+                const auto *completed =
+                    std::get_if<TriggeredJointMoveCompleted>(&candidate);
+
+                return completed && completed->move == move.moveId;
+            },
+            [&]() -> std::optional<std::string> {
+                if (callbacks.stopRequested() && !m_stopRequested) {
+                    if (!operation.requestDemand(ExecutorDemandMode::Stop)) {
+                        return "motion backend demand mailbox rejected the homing stop";
+                    }
+                    m_stopRequested = true;
                 }
-                callbacks.serviceImmediate();
-                m_stopRequested = true;
+
+                return std::nullopt;
+            },
+            "homing move exceeded its bounded service iteration limit");
+        if (!event) {
+            auto error = event.error();
+            if (error.starts_with("motion backend fault ")) {
+                error.replace(0, std::string("motion backend").size(), "homing backend");
             }
 
-            m_observation.servoTicks += callbacks.advanceServiceMotionPeriod();
-            takeSnapshots(callbacks);
-
-            ExecutionEvent event;
-            while (m_backend.tryTakeEvent(event)) {
-                if (const auto *completed =
-                        std::get_if<TriggeredJointMoveCompleted>(&event);
-                    completed && completed->move == move.moveId) {
-                    ExecutionSnapshot stopped;
-                    stopped.state = BackendState::Held;
-                    stopped.commandedJoints = completed->stoppedState;
-                    stopped.spanProgress = 1.0;
-                    observeSnapshot(stopped, callbacks);
-
-                    return *completed;
-                }
-                if (const auto *fault = std::get_if<BackendFault>(&event)) {
-                    return std::unexpected(
-                        "homing backend fault " + std::to_string(fault->code));
-                }
-            }
-            callbacks.waitForServiceMotion();
+            return std::unexpected(std::move(error));
         }
 
-        return std::unexpected("homing move exceeded its bounded service iteration limit");
-    }
-
-    void HomingController::takeSnapshots(const HomingRuntimeCallbacks &callbacks) {
-        ExecutionSnapshot snapshot;
-        while (m_backend.tryTakeSnapshot(snapshot)) {
-            observeSnapshot(snapshot, callbacks);
+        const auto completed = std::get<TriggeredJointMoveCompleted>(*event);
+        operation.observeTerminalJoints(
+            completed.stoppedState,
+            completed.status == TriggeredMoveStatus::Fault
+                ? BackendState::Faulted : BackendState::Held);
+        if (completed.status == TriggeredMoveStatus::Fault) {
+            return std::unexpected("homing backend fault while completing a move");
         }
+
+        return completed;
     }
 
     void HomingController::observeSnapshot(
-        const ExecutionSnapshot &snapshot, const HomingRuntimeCallbacks &callbacks) {
+        const ExecutionSnapshot &snapshot, const std::uint64_t servoTicks,
+        const HomingRuntimeCallbacks &callbacks) {
         m_observation.joints = snapshot.commandedJoints;
         for (const auto &axis : m_axes) {
             double sum = 0.0;
@@ -414,6 +420,7 @@ namespace ngc {
             }
         }
         m_observation.commandProgress = snapshot.spanProgress;
+        m_observation.servoTicks = servoTicks;
         m_observation.hasActiveMotion =
             snapshot.state == BackendState::Running && snapshot.activeJoints != 0;
         m_observation.backendState = snapshot.state;

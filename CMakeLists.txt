@@ -55,6 +55,7 @@ add_library(ngc_core STATIC
         src/ProgramExecutionController.cpp
         src/ProductionExecutorCore.cpp
         src/PreparedGeometry.cpp
+        src/ServicedMotionOperation.cpp
         src/SplineReconstruction.cpp
         src/TrajectoryCompiler.cpp
         src/Evaluator.cpp

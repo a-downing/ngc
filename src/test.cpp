@@ -142,6 +142,60 @@ namespace {
         ngc::SimulationExecutor m_executor;
     };
 
+    class FailingControlBackend final : public ngc::MotionBackend {
+    public:
+        enum class Failure { JogUpdate, JogStop, JogUpdateAndStopDemand };
+
+        FailingControlBackend(ngc::MotionBackend &backend, const Failure failure)
+            : m_backend(backend), m_failure(failure) { }
+
+        ngc::PublishResult tryPublish(const ngc::ExecutionItem &item) noexcept override {
+            return m_backend.tryPublish(item);
+        }
+
+        ngc::DemandPublishResult publishDemand(
+            const ngc::ExecutorDemand &demand) noexcept override {
+            if (demandCount < demands.size()) {
+                demands[demandCount++] = demand;
+            }
+            if (m_failure == Failure::JogUpdateAndStopDemand
+                && demand.mode == ngc::ExecutorDemandMode::Stop) {
+                return ngc::DemandPublishResult::Unavailable;
+            }
+
+            return m_backend.publishDemand(demand);
+        }
+
+        ngc::SubmitResult trySubmit(const ngc::ControlRequest &request) noexcept override {
+            const auto shouldFail = !failed && (m_failure != Failure::JogStop
+                ? std::holds_alternative<ngc::SetContinuousJogVelocityRequest>(request)
+                : std::holds_alternative<ngc::StopJogRequest>(request));
+            if (shouldFail) {
+                failed = true;
+
+                return ngc::SubmitResult::Full;
+            }
+
+            return m_backend.trySubmit(request);
+        }
+
+        bool tryTakeEvent(ngc::ExecutionEvent &event) noexcept override {
+            return m_backend.tryTakeEvent(event);
+        }
+
+        bool tryTakeSnapshot(ngc::ExecutionSnapshot &snapshot) noexcept override {
+            return m_backend.tryTakeSnapshot(snapshot);
+        }
+
+        std::array<ngc::ExecutorDemand, 16> demands{};
+        std::size_t demandCount = 0;
+        bool failed = false;
+
+    private:
+        ngc::MotionBackend &m_backend;
+        Failure m_failure;
+    };
+
 #ifdef __linux__
     class ScheduledTriggerProductionExecutorIo final
         : public ngc::ProductionExecutorIo {
@@ -2235,6 +2289,10 @@ final_move_together = true
                 return runtime.advanceServiceMotionPeriod();
             },
             .waitForServiceMotion = [] { },
+            .stopRuntime = [&] {
+                runtime.stop();
+            },
+            .faultSession = [] { },
             .observe = {},
         };
         const ngc::position_t startingPosition {
@@ -2327,6 +2385,10 @@ final_move_together = true
                 return runtime.advanceServiceMotionPeriod();
             },
             .waitForServiceMotion = [] { },
+            .stopRuntime = [&] {
+                runtime.stop();
+            },
+            .faultSession = [] { },
             .observe = {},
         };
 
@@ -2335,6 +2397,183 @@ final_move_together = true
                     && homing.error().find("homing backend fault")
                         != std::string::npos,
                 "homing accepted a switch that did not release after backoff");
+    }
+
+    void testJoggingControllerQuiescesAfterControlBackpressure(
+            const FailingControlBackend::Failure failure) {
+        const auto configuration = fixtureMachineConfiguration();
+        require(configuration.has_value(),
+                configuration ? "" : configuration.error());
+        ngc::InProcessSimulationRuntime runtime(*configuration);
+        FailingControlBackend backend(runtime.endpoint(), failure);
+        ngc::ExecutorDemandController demand(backend);
+        ngc::JoggingController controller(
+            configuration->axes, configuration->joints, backend, demand);
+
+        const auto axis = std::ranges::find(
+            configuration->axes, ngc::Machine::Axis::Y,
+            &ngc::AxisConfiguration::axis);
+        require(axis != configuration->axes.end(),
+                "backpressure fixture should find configured Y");
+        ngc::JointMask joints = 0;
+        double stopJerk = std::numeric_limits<double>::infinity();
+        for (const auto id : axis->joints) {
+            joints |= ngc::JointMask {1} << id;
+            const auto joint = std::ranges::find(
+                configuration->joints, id, &ngc::JointConfiguration::id);
+            require(joint != configuration->joints.end(),
+                    "backpressure fixture should find each Y joint");
+            stopJerk = std::min(stopJerk, joint->maxJerk);
+        }
+
+        constexpr std::uint32_t leaseTicks = 10000;
+        constexpr ngc::JogId jog = 711;
+        const ngc::StartContinuousJogRequest start {
+            .id = 710,
+            .jog = jog,
+            .target = {ngc::JogTargetType::JointGroup, ngc::AxisId::Y, joints},
+            .signedVelocity = 0.5,
+            .limits = {
+                axis->maxVelocity,
+                configuration->jogging.acceleration,
+                configuration->jogging.jerk,
+            },
+            .stopLimits = {
+                axis->maxVelocity,
+                axis->maxAcceleration,
+                stopJerk,
+            },
+            .leaseTicks = leaseTicks,
+        };
+        ngc::JoggingObservation observation;
+        bool controlIssued = false;
+        std::uint64_t failureTick = 0;
+        const auto nextControl = [&]() -> std::optional<ngc::ControlRequest> {
+            if (!observation.hasActiveMotion || controlIssued) {
+                return std::nullopt;
+            }
+            controlIssued = true;
+            failureTick = observation.servoTicks;
+            if (failure != FailingControlBackend::Failure::JogStop) {
+                return ngc::SetContinuousJogVelocityRequest {712, jog, 0.25};
+            }
+
+            return ngc::StopJogRequest {712, jog};
+        };
+        bool runtimeStopped = false;
+        bool sessionFaulted = false;
+        const ngc::JoggingRuntimeCallbacks callbacks {
+            .shutdownRequested = [] {
+                return false;
+            },
+            .serviceImmediate = [&] {
+                runtime.advanceImmediate(0.0);
+            },
+            .advanceServiceMotionPeriod = [&] {
+                return runtime.advanceServiceMotionPeriod();
+            },
+            .waitForServiceMotion = [] { },
+            .stopRuntime = [&] {
+                runtimeStopped = true;
+                runtime.stop();
+            },
+            .faultSession = [&] {
+                sessionFaulted = true;
+            },
+            .observe = [&](const ngc::JoggingObservation &value) {
+                observation = value;
+            },
+        };
+
+        const auto result = controller.run(
+            1, {}, ngc::ControlRequest {start}, nextControl, callbacks);
+        require(!result, "injected jog control backpressure should fail the operation");
+        require(result.error().find("motion backend jog control channel is full")
+                    != std::string::npos,
+                "jog cleanup should preserve the original submission error");
+        require(controlIssued && backend.failed,
+                "backpressure should be injected only after the jog became active");
+        require(std::ranges::any_of(
+                    backend.demands.begin(),
+                    backend.demands.begin() + backend.demandCount,
+                    [](const ngc::ExecutorDemand &value) {
+                        return value.mode == ngc::ExecutorDemandMode::Stop;
+                    }),
+                "failed jog control should publish lifecycle Stop through the demand mailbox");
+        if (failure == FailingControlBackend::Failure::JogUpdateAndStopDemand) {
+            require(runtimeStopped && sessionFaulted
+                        && result.error().find("cleanup failed") != std::string::npos,
+                    "failed cleanup Stop should stop the runtime, fault the session, and augment diagnostics");
+        } else {
+            require(!runtimeStopped && !sessionFaulted,
+                    "successful explicit cleanup should not use the runtime-stop fallback");
+            require(!observation.hasActiveMotion
+                        && observation.servoTicks - failureTick < leaseTicks,
+                    "explicit cleanup should reach rest before dead-man lease expiry");
+            for (const auto id : axis->joints) {
+                require(std::abs(observation.joints.velocity[id]) <= 1e-10
+                            && std::abs(observation.joints.acceleration[id]) <= 1e-10,
+                        "failed jog cleanup should return every participating joint at rest");
+            }
+        }
+    }
+
+    void testHomingControllerQuiescesAfterPostStartFailure() {
+        const auto configuration = fixtureMachineConfiguration();
+        require(configuration.has_value(),
+                configuration ? "" : configuration.error());
+        ngc::InProcessSimulationRuntime runtime(*configuration);
+        FailingControlBackend backend(
+            runtime.endpoint(), FailingControlBackend::Failure::JogStop);
+        ngc::ExecutorDemandController demand(backend);
+        ngc::HomingController controller(
+            configuration->axes, configuration->joints,
+            configuration->homing, backend, demand);
+        ngc::HomingObservation observation;
+        bool runtimeStopped = false;
+        bool sessionFaulted = false;
+        const ngc::HomingRuntimeCallbacks callbacks {
+            .stopRequested = [] {
+                return false;
+            },
+            .prepareTriggeredMove = [](const ngc::TriggeredJointMove &) {
+                return false;
+            },
+            .serviceImmediate = [&] {
+                runtime.advanceImmediate(0.0);
+            },
+            .advanceServiceMotionPeriod = [&] {
+                return runtime.advanceServiceMotionPeriod();
+            },
+            .waitForServiceMotion = [] { },
+            .stopRuntime = [&] {
+                runtimeStopped = true;
+                runtime.stop();
+            },
+            .faultSession = [&] {
+                sessionFaulted = true;
+            },
+            .observe = [&](const ngc::HomingObservation &value) {
+                observation = value;
+            },
+        };
+
+        const auto result = controller.run(1, {}, callbacks);
+        require(!result
+                    && result.error().find(
+                        "homing runtime failed to prepare a triggered move")
+                        != std::string::npos,
+                "homing cleanup should preserve a post-start operation error");
+        require(std::ranges::any_of(
+                    backend.demands.begin(),
+                    backend.demands.begin() + backend.demandCount,
+                    [](const ngc::ExecutorDemand &value) {
+                        return value.mode == ngc::ExecutorDemandMode::Stop;
+                    }),
+                "post-start homing failure should publish lifecycle Stop");
+        require(!runtimeStopped && !sessionFaulted
+                    && !observation.hasActiveMotion,
+                "post-start homing failure should quiesce without the runtime fallback");
     }
 
 #ifdef __linux__
@@ -2364,6 +2603,10 @@ final_move_together = true
             .waitForServiceMotion = [&] {
                 runtime.waitForServiceMotion();
             },
+            .stopRuntime = [&] {
+                runtime.stop();
+            },
+            .faultSession = [] { },
             .observe = {},
         };
         const ngc::position_t startingPosition {
@@ -8840,6 +9083,13 @@ int main() {
 #endif
         testHomingControllerOwnsBackendNeutralSequence();
         testHomingControllerRejectsSwitchThatRemainsActiveAfterBackoff();
+        testJoggingControllerQuiescesAfterControlBackpressure(
+            FailingControlBackend::Failure::JogUpdate);
+        testJoggingControllerQuiescesAfterControlBackpressure(
+            FailingControlBackend::Failure::JogStop);
+        testJoggingControllerQuiescesAfterControlBackpressure(
+            FailingControlBackend::Failure::JogUpdateAndStopDemand);
+        testHomingControllerQuiescesAfterPostStartFailure();
 #ifdef __linux__
         testHostedExecutorRuntimeRunsHomingController();
 #endif

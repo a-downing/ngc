@@ -10,6 +10,7 @@
 #include "machine/MachineConfiguration.h"
 #include "machine/ExecutorDemandController.h"
 #include "machine/MotionBackend.h"
+#include "machine/ServicedMotionOperation.h"
 
 namespace ngc {
     enum class JoggingOutcome { Completed, Stopped };
@@ -20,6 +21,8 @@ namespace ngc {
         double commandProgress = 0.0;
         bool hasActiveMotion = false;
         std::uint64_t servoTicks = 0;
+        BackendState backendState = BackendState::Disabled;
+        std::uint32_t backendFaultCode = 0;
     };
 
     struct JoggingResult {
@@ -33,6 +36,8 @@ namespace ngc {
         std::function<void()> serviceImmediate;
         std::function<std::uint64_t()> advanceServiceMotionPeriod;
         std::function<void()> waitForServiceMotion;
+        std::function<void()> stopRuntime;
+        std::function<void()> faultSession;
         std::function<void(const JoggingObservation &)> observe;
     };
 
@@ -51,14 +56,12 @@ namespace ngc {
 
     private:
         [[nodiscard]] const JointConfiguration *configuredJoint(JointId id) const;
-        [[nodiscard]] bool submitControl(
-            const ControlRequest &request, const JoggingRuntimeCallbacks &callbacks);
         [[nodiscard]] std::expected<bool, std::string> setJointPositions(
             JointMask joints, const JointVector &positions,
-            const JoggingRuntimeCallbacks &callbacks);
-        void takeSnapshots(const JoggingRuntimeCallbacks &callbacks);
+            ServicedMotionOperation &operation);
         void observeSnapshot(
-            const ExecutionSnapshot &snapshot, const JoggingRuntimeCallbacks &callbacks);
+            const ExecutionSnapshot &snapshot, std::uint64_t servoTicks,
+            const JoggingRuntimeCallbacks &callbacks);
 
         std::vector<AxisConfiguration> m_axes;
         std::vector<JointConfiguration> m_joints;

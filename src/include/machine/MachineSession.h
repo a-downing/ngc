@@ -252,6 +252,7 @@ namespace ngc {
         [[nodiscard]] std::expected<JoggingResult, std::string> runJogging(
             const position_t &startingPosition, const ControlRequest &firstRequest);
         [[nodiscard]] std::optional<JoggingObservation> joggingObservation() const;
+        [[nodiscard]] bool servicedMotionOwned() const noexcept;
         void requestGeometryStop();
         [[nodiscard]] bool executionEpochActive() const noexcept;
         [[nodiscard]] GeometryEpoch nextEpoch() noexcept;
@@ -404,6 +405,7 @@ namespace ngc {
         mutable std::mutex m_serviceObservationMutex;
         std::optional<HomingObservation> m_homingObservation;
         std::optional<JoggingObservation> m_joggingObservation;
+        std::atomic<bool> m_servicedMotionOwned {false};
         JointMask m_homedJoints = 0;
         JointMask m_configuredJoints = 0;
         bool m_requireHomingBeforeMotion = false;

@@ -316,7 +316,7 @@ class MachineSessionHost {
     [[nodiscard]] bool motionOwnedOrQueued() const noexcept {
         return m_running || !m_machineSession.coordinator().commands().empty()
             || m_machineSession.coordinator().activity() != ngc::MachineActivity::Idle
-            || m_activeJog.has_value();
+            || m_activeJog.has_value() || m_machineSession.servicedMotionOwned();
     }
 
     [[nodiscard]] bool hasControlAuthorityLocked(
@@ -970,6 +970,8 @@ public:
                 result.commandProgress = observation->commandProgress;
                 result.hasActiveMotion = observation->hasActiveMotion;
                 result.servoTicks = observation->servoTicks;
+                result.trajectoryBackendState = observation->backendState;
+                result.trajectoryBackendFaultCode = observation->backendFaultCode;
             }
         }
         if (result.status == ngc::SimulationStatus::Paused
@@ -1589,6 +1591,15 @@ private:
         m_snapshot.hasActiveMotion = false;
         m_snapshot.activeJogTarget.reset();
         if (!result) {
+            if (const auto observation = m_machineSession.joggingObservation()) {
+                m_snapshot.machinePosition = observation->machinePosition;
+                m_snapshot.joints = observation->joints;
+                m_snapshot.commandProgress = observation->commandProgress;
+                m_snapshot.servoTicks = observation->servoTicks;
+                m_snapshot.trajectoryBackendState = observation->backendState;
+                m_snapshot.trajectoryBackendFaultCode =
+                    observation->backendFaultCode;
+            }
             m_snapshot.status = ngc::SimulationStatus::Error;
             m_snapshot.error = result.error();
             m_machineSession.coordinator().commands().clear();

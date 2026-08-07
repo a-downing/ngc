@@ -73,9 +73,20 @@ namespace ngc {
             return std::unexpected("jogging runtime callbacks are incomplete");
         }
 
-        m_backend.discardPendingOutput();
         m_observation = {.machinePosition = startingPosition};
         m_nextRequest = std::numeric_limits<RequestId>::max() - 16;
+        ServicedMotionOperation operation(
+            m_backend, m_demand, {
+                .serviceImmediate = callbacks.serviceImmediate,
+                .advanceServiceMotionPeriod = callbacks.advanceServiceMotionPeriod,
+                .waitForServiceMotion = callbacks.waitForServiceMotion,
+                .observeSnapshot = [&](const ExecutionSnapshot &snapshot,
+                                       const std::uint64_t servoTicks) {
+                    observeSnapshot(snapshot, servoTicks, callbacks);
+                },
+                .stopRuntime = callbacks.stopRuntime,
+                .faultSession = callbacks.faultSession,
+            });
 
         JointMask allJoints = 0;
         JointVector initial;
@@ -85,70 +96,85 @@ namespace ngc {
                 axisComponent(startingPosition, joint.axis) * joint.coordinateScale;
         }
 
-        if (!m_demand.request(epoch, ExecutorDemandMode::Jog)) {
+        const auto begun = operation.begin(epoch, ExecutorDemandMode::Jog);
+        if (!begun) {
             return std::unexpected("failed to initialize the motion backend for jogging");
         }
-        callbacks.serviceImmediate();
-        const auto initialized = setJointPositions(allJoints, initial, callbacks);
+        const auto initialized = setJointPositions(allJoints, initial, operation);
         if (!initialized || !*initialized) {
             return std::unexpected(initialized
                 ? "failed to initialize the motion backend for jogging"
                 : initialized.error());
         }
-        if (!submitControl(firstRequest, callbacks)) {
+        if (!operation.submit(firstRequest)) {
             return std::unexpected("motion backend control channel is full while starting jogging");
         }
+        operation.motionMayBeActive();
 
         const auto firstRequestId = requestId(firstRequest);
         bool stopSubmitted = false;
         bool sessionStopped = false;
-        for (std::size_t guard = 0; guard < 10000000; ++guard) {
-            while (const auto control = nextControl()) {
-                if (m_backend.trySubmit(*control) != SubmitResult::Submitted) {
-                    return std::unexpected("motion backend jog control channel is full");
-                }
-            }
-            if (callbacks.shutdownRequested() && !stopSubmitted) {
-                if (m_backend.trySubmit(StopJogRequest {m_nextRequest--, *jog})
-                    != SubmitResult::Submitted) {
-                    return std::unexpected(
-                        "motion backend control channel is full while stopping jogging");
-                }
-                stopSubmitted = true;
-                sessionStopped = true;
-            }
-
-            m_observation.servoTicks += callbacks.advanceServiceMotionPeriod();
-            takeSnapshots(callbacks);
-
-            ExecutionEvent event;
-            while (m_backend.tryTakeEvent(event)) {
-                if (const auto *completed = std::get_if<RequestCompleted>(&event);
-                    completed && !completed->succeeded
+        const auto event = operation.serviceUntil(
+            [&](const ExecutionEvent &candidate) {
+                const auto *completed = std::get_if<RequestCompleted>(&candidate);
+                if (completed && !completed->succeeded
                     && completed->request == firstRequestId) {
-                    return std::unexpected("motion backend rejected the start-jog request");
+                    return true;
                 }
-                if (const auto *stopped = std::get_if<JogStopped>(&event);
-                    stopped && stopped->jog == *jog) {
-                    m_observation.joints = stopped->jointState;
-                    m_observation.hasActiveMotion = false;
+                const auto *stopped = std::get_if<JogStopped>(&candidate);
 
-                    return JoggingResult {
-                        .outcome = sessionStopped
-                            ? JoggingOutcome::Stopped : JoggingOutcome::Completed,
-                        .observation = m_observation,
-                        .stopReason = stopped->reason,
-                    };
+                return stopped && stopped->jog == *jog;
+            },
+            [&]() -> std::optional<std::string> {
+                while (const auto control = nextControl()) {
+                    if (!operation.submit(*control)) {
+                        return "motion backend jog control channel is full";
+                    }
                 }
-                if (const auto *fault = std::get_if<BackendFault>(&event)) {
-                    return std::unexpected(
-                        "jogging backend fault " + std::to_string(fault->code));
+                if (callbacks.shutdownRequested() && !stopSubmitted) {
+                    if (!operation.submit(StopJogRequest {m_nextRequest--, *jog})) {
+                        return "motion backend control channel is full while stopping jogging";
+                    }
+                    stopSubmitted = true;
+                    sessionStopped = true;
                 }
+
+                return std::nullopt;
+            },
+            "jogging exceeded its bounded service iteration limit");
+        if (!event) {
+            auto error = event.error();
+            if (error.starts_with("motion backend fault ")) {
+                error.replace(0, std::string("motion backend").size(), "jogging backend");
             }
-            callbacks.waitForServiceMotion();
+
+            return operation.finish<JoggingResult>(std::unexpected(std::move(error)));
+        }
+        if (const auto *completed = std::get_if<RequestCompleted>(&*event)) {
+            return operation.finish<JoggingResult>(std::unexpected(
+                completed->succeeded
+                    ? "jogging ended without a terminal jog event"
+                    : "motion backend rejected the start-jog request"));
         }
 
-        return std::unexpected("jogging exceeded its bounded service iteration limit");
+        const auto &stopped = std::get<JogStopped>(*event);
+        const auto terminalState = stopped.reason == JogStopReason::Fault
+            ? BackendState::Faulted
+            : stopped.reason == JogStopReason::Disabled
+                ? BackendState::Disabled : BackendState::Held;
+        operation.observeTerminalJoints(stopped.jointState, terminalState);
+        m_observation.hasActiveMotion = false;
+        if (stopped.reason == JogStopReason::Fault) {
+            return operation.finish<JoggingResult>(std::unexpected(
+                "jogging backend fault while stopping the active jog"));
+        }
+
+        return operation.finish<JoggingResult>(JoggingResult {
+            .outcome = sessionStopped
+                ? JoggingOutcome::Stopped : JoggingOutcome::Completed,
+            .observation = m_observation,
+            .stopReason = stopped.reason,
+        });
     }
 
     const JointConfiguration *JoggingController::configuredJoint(const JointId id) const {
@@ -157,56 +183,36 @@ namespace ngc {
         return found == m_joints.end() ? nullptr : &*found;
     }
 
-    bool JoggingController::submitControl(
-        const ControlRequest &request, const JoggingRuntimeCallbacks &callbacks) {
-        if (m_backend.trySubmit(request) != SubmitResult::Submitted) {
-            return false;
-        }
-        callbacks.serviceImmediate();
-
-        return true;
-    }
-
     std::expected<bool, std::string> JoggingController::setJointPositions(
         const JointMask joints, const JointVector &positions,
-        const JoggingRuntimeCallbacks &callbacks) {
+        ServicedMotionOperation &operation) {
         const auto request = m_nextRequest--;
-        if (!submitControl(SetJointPositionRequest {request, joints, positions}, callbacks)) {
+        if (!operation.submit(SetJointPositionRequest {request, joints, positions})) {
             return false;
         }
 
-        for (std::size_t guard = 0; guard < 10000000; ++guard) {
-            ExecutionEvent event;
-            while (m_backend.tryTakeEvent(event)) {
-                if (const auto *completed = std::get_if<RequestCompleted>(&event);
-                    completed && completed->request == request) {
-                    takeSnapshots(callbacks);
+        const auto event = operation.serviceUntil(
+            [&](const ExecutionEvent &candidate) {
+                const auto *completed = std::get_if<RequestCompleted>(&candidate);
 
-                    return completed->succeeded;
-                }
-                if (const auto *fault = std::get_if<BackendFault>(&event)) {
-                    return std::unexpected(
-                        "jogging backend fault " + std::to_string(fault->code));
-                }
-            }
-            m_observation.servoTicks += callbacks.advanceServiceMotionPeriod();
-            takeSnapshots(callbacks);
-            callbacks.waitForServiceMotion();
-        }
-
-        return std::unexpected(
+                return completed && completed->request == request;
+            },
             "joint-coordinate initialization exceeded its bounded service iteration limit");
-    }
+        if (!event) {
+            auto error = event.error();
+            if (error.starts_with("motion backend fault ")) {
+                error.replace(0, std::string("motion backend").size(), "jogging backend");
+            }
 
-    void JoggingController::takeSnapshots(const JoggingRuntimeCallbacks &callbacks) {
-        ExecutionSnapshot snapshot;
-        while (m_backend.tryTakeSnapshot(snapshot)) {
-            observeSnapshot(snapshot, callbacks);
+            return std::unexpected(std::move(error));
         }
+
+        return std::get<RequestCompleted>(*event).succeeded;
     }
 
     void JoggingController::observeSnapshot(
-        const ExecutionSnapshot &snapshot, const JoggingRuntimeCallbacks &callbacks) {
+        const ExecutionSnapshot &snapshot, const std::uint64_t servoTicks,
+        const JoggingRuntimeCallbacks &callbacks) {
         m_observation.joints = snapshot.commandedJoints;
         for (const auto &axis : m_axes) {
             double sum = 0.0;
@@ -224,8 +230,11 @@ namespace ngc {
             }
         }
         m_observation.commandProgress = snapshot.spanProgress;
+        m_observation.servoTicks = servoTicks;
         m_observation.hasActiveMotion =
             snapshot.state == BackendState::Running && snapshot.activeJoints != 0;
+        m_observation.backendState = snapshot.state;
+        m_observation.backendFaultCode = snapshot.faultCode;
         if (callbacks.observe) {
             callbacks.observe(m_observation);
         }
