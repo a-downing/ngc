@@ -27,8 +27,6 @@ namespace ngc {
     using ProgramPauseId = std::uint64_t;
     using SynchronizationFenceId = std::uint64_t;
 
-    enum class ExecutablePathMode { ExactStop, Continuous };
-
     struct TrajectoryPlanningMetadata {
         ExecutablePathMode pathMode = ExecutablePathMode::ExactStop;
         std::optional<double> pathTolerance;

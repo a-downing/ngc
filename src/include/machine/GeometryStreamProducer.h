@@ -90,38 +90,11 @@ namespace ngc {
             return (left - right).length() <= 1e-12;
         }
 
-        static bool continuousMotion(const PreparedCommandRecord &record) {
-            if(record.metadata.pathMode != ExecutablePathMode::Continuous) return false;
-            return std::visit([](const auto &command) {
-                using T = std::decay_t<decltype(command)>;
-                if constexpr(std::same_as<T, MoveLine>)
-                    return command.speed() > 0.0 && !command.machineCoordinates();
-                else if constexpr(std::same_as<T, MoveArc>) return command.speed() > 0.0;
-                else return false;
-            }, record.command);
-        }
-
         static bool preparedMotion(const PreparedCommandRecord &record) {
             return std::visit([](const auto &command) {
                 using T = std::decay_t<decltype(command)>;
                 return std::same_as<T, MoveLine> || std::same_as<T, MoveArc>;
             }, record.command);
-        }
-
-        static std::optional<position_t> commandStart(const MachineCommand &command) {
-            return std::visit([](const auto &value) -> std::optional<position_t> {
-                using T = std::decay_t<decltype(value)>;
-                if constexpr(std::same_as<T, MoveLine> || std::same_as<T, MoveArc>) return value.from();
-                else return std::nullopt;
-            }, command);
-        }
-
-        static std::optional<position_t> commandEnd(const MachineCommand &command) {
-            return std::visit([](const auto &value) -> std::optional<position_t> {
-                using T = std::decay_t<decltype(value)>;
-                if constexpr(std::same_as<T, MoveLine> || std::same_as<T, MoveArc>) return value.to();
-                else return std::nullopt;
-            }, command);
         }
 
         bool publish(PreparedStreamMessage message) {
@@ -224,7 +197,7 @@ namespace ngc {
                 const bool deferFinalRetainedSection = false) {
             const auto started = std::chrono::steady_clock::now();
             position_t start{};
-            if(const auto value = commandStart(m_continuous.front().command)) start = *value;
+            if(const auto value = motionStart(m_continuous.front().command)) start = *value;
             const GeometryPreparationEffort effort{
                 .certifySourceTube = false,
                 .generateSamples = true,
@@ -359,7 +332,7 @@ namespace ngc {
             }
             auto record = makeRecord(std::move(command));
             if(preparedMotion(record)) {
-                const auto pathMode = continuousMotion(record)
+                const auto pathMode = isContinuousMotion(record.command, record.metadata.pathMode)
                     ? ExecutablePathMode::Continuous : ExecutablePathMode::ExactStop;
                 // The modal G64 state is not sufficient to classify executable
                 // motion. Rapids, explicit G53 moves, and other protected
@@ -403,10 +376,10 @@ namespace ngc {
                     &&m_continuousScale && std::abs(*m_continuousScale - scale) <= 0.0
                     &&m_continuousPresentation && sameProtectedTrajectoryPresentation(
                         *m_continuousPresentation, record.presentation)
-                    &&commandEnd(m_continuous.back().command)
-                    &&commandStart(record.command)
-                    &&samePosition(*commandEnd(m_continuous.back().command),
-                                   *commandStart(record.command));
+                    &&motionEnd(m_continuous.back().command)
+                    &&motionStart(record.command)
+                    &&samePosition(*motionEnd(m_continuous.back().command),
+                                   *motionStart(record.command));
                 if(!compatible && !m_continuous.empty()
                    &&!flushContinuous()) return false;
                 if(m_continuous.empty() && m_chain == 0) {

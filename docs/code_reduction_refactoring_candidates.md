@@ -15,7 +15,7 @@ requires another.
 1. [Completed] Consolidate authority-aware `MachineSessionManager` delegation.
 2. [Completed] Share `Machine::Axis` position-component access.
 3. [Completed] Consolidate per-target persistence-store initialization.
-4. [Pending] Share pure `MachineCommand` classification and endpoint helpers.
+4. [Completed] Share pure `MachineCommand` classification and endpoint helpers.
 5. [Pending] Consider RAII cleanup of `imgui_main.cpp` only if it produces a meaningful
    net reduction.
 
@@ -277,6 +277,27 @@ between Simulation and Machine persistence handling.
 - Confirm Preview receives the Simulation tool table and never the Machine table.
 
 ## 4. Share pure `MachineCommand` helpers
+
+### Completion record
+
+Completed in the current worktree. `MachineCommand.h` now owns continuous-motion
+classification and ordinary line/arc endpoint extraction. The geometry producer,
+prepared-geometry construction, and trajectory planner use those helpers, so
+Preview preparation and trajectory timing share one definition of these command
+semantics.
+
+Production code removes 71 lines and adds 54 lines for a net reduction of 17
+lines. The original estimate was optimistic because the canonical implementation
+uses the repository's expanded control-flow style. Focused tests cover exact-stop
+mode, feed and rapid lines, zero-speed and machine-coordinate lines, feed and
+zero-speed arcs, probes, nonmotion commands, and line/arc endpoints.
+
+Verification completed:
+
+- `cmake --build build --target ngc_tests`
+- `.\build\ngc_tests.exe` passed from the repository root.
+- `cmake --build build --target imgui_main`
+- `git diff --check` passed.
 
 ### Motivation
 

@@ -5,6 +5,7 @@
 #include <utility>
 #include <string>
 #include <format>
+#include <optional>
 #include <variant>
 
 #include "utils.h"
@@ -181,4 +182,43 @@ namespace ngc {
     };
 
     using MachineCommand = std::variant<SpindleStart, SpindleStop, MoveLine, MoveArc, ProbeMove>;
+
+    enum class ExecutablePathMode { ExactStop, Continuous };
+
+    inline bool isContinuousMotion(const MachineCommand &command, const ExecutablePathMode pathMode) {
+        if (pathMode != ExecutablePathMode::Continuous) {
+            return false;
+        }
+
+        if (const auto *line = std::get_if<MoveLine>(&command)) {
+            return line->speed() > 0.0 && !line->machineCoordinates();
+        }
+        if (const auto *arc = std::get_if<MoveArc>(&command)) {
+            return arc->speed() > 0.0;
+        }
+
+        return false;
+    }
+
+    inline std::optional<position_t> motionStart(const MachineCommand &command) {
+        if (const auto *line = std::get_if<MoveLine>(&command)) {
+            return line->from();
+        }
+        if (const auto *arc = std::get_if<MoveArc>(&command)) {
+            return arc->from();
+        }
+
+        return std::nullopt;
+    }
+
+    inline std::optional<position_t> motionEnd(const MachineCommand &command) {
+        if (const auto *line = std::get_if<MoveLine>(&command)) {
+            return line->to();
+        }
+        if (const auto *arc = std::get_if<MoveArc>(&command)) {
+            return arc->to();
+        }
+
+        return std::nullopt;
+    }
 }

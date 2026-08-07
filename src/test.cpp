@@ -584,6 +584,42 @@ final_move_together = true
         requireNear(feed->to().x, 20.0, "G1 endpoint is incorrect");
     }
 
+    void testMachineCommandMotionHelpers() {
+        const ngc::position_t from{1.0, 2.0, 3.0, 4.0, 5.0, 6.0};
+        const ngc::position_t to{7.0, 8.0, 9.0, 10.0, 11.0, 12.0};
+        struct ClassificationCase {
+            ngc::MachineCommand command;
+            bool continuous;
+        };
+        const std::array cases{
+            ClassificationCase{ngc::MoveLine{from, to, 60.0}, true},
+            ClassificationCase{ngc::MoveLine{from, to, -1.0}, false},
+            ClassificationCase{ngc::MoveLine{from, to, 0.0}, false},
+            ClassificationCase{ngc::MoveLine{from, to, 60.0, true}, false},
+            ClassificationCase{ngc::MoveArc{from, to, {}, {0.0, 0.0, 1.0}, 60.0}, true},
+            ClassificationCase{ngc::MoveArc{from, to, {}, {0.0, 0.0, 1.0}, 0.0}, false},
+            ClassificationCase{ngc::ProbeMove{1, from, to, 60.0, true, true}, false},
+            ClassificationCase{ngc::SpindleStop{}, false},
+        };
+        for (const auto &[command, continuous] : cases) {
+            require(!ngc::isContinuousMotion(command, ngc::ExecutablePathMode::ExactStop),
+                    "exact-stop mode classified a command as continuous motion");
+            require(ngc::isContinuousMotion(command, ngc::ExecutablePathMode::Continuous) == continuous,
+                    "continuous-path command classification mismatch");
+        }
+
+        for (const auto &command : {cases[0].command, cases[4].command}) {
+            require(ngc::motionStart(command).has_value() && ngc::motionStart(command)->x == from.x,
+                    "ordinary motion start extraction failed");
+            require(ngc::motionEnd(command).has_value() && ngc::motionEnd(command)->c == to.c,
+                    "ordinary motion end extraction failed");
+        }
+        for (const auto &command : {cases[6].command, cases[7].command}) {
+            require(!ngc::motionStart(command) && !ngc::motionEnd(command),
+                    "nonordinary command exposed ordinary motion endpoints");
+        }
+    }
+
     void testG64IsAnInertPathModeFlag() {
         ngc::Machine machine(UNIT);
         const auto commands = execute(machine, "G21 G64 P1\nG1 F120 X1\n");
@@ -9132,6 +9168,7 @@ int main() {
         testLexerRejectsIncompleteOperators();
         testFileHelpersHandleEmptyAndFailedIo();
         testRapidAndFeedMove();
+        testMachineCommandMotionHelpers();
         testG64IsAnInertPathModeFlag();
         testG64BlendScaleGeometryProgramIsValid();
         testFeedMotionRequiresFeedrate();

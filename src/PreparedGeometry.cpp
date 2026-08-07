@@ -946,11 +946,7 @@ namespace ngc {
                 }
             }, record.command);
             if(!entity) return std::unexpected(entity.error());
-            expected = std::visit([](const auto &command) -> position_t {
-                using T = std::decay_t<decltype(command)>;
-                if constexpr(std::same_as<T, MoveLine> || std::same_as<T, MoveArc>) return command.to();
-                else return {};
-            }, record.command);
+            expected = *motionEnd(record.command);
             entities.push_back(*entity);
         }
 

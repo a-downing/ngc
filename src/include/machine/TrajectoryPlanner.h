@@ -195,35 +195,8 @@ namespace ngc {
                 end?formatPosition(*end):std::string("<none>"));
         }
 
-        static bool continuousMotion(const TrajectoryPlannerInput &input) {
-            if(input.metadata.pathMode != ExecutablePathMode::Continuous) return false;
-            return std::visit([](const auto &command) {
-                using T = std::decay_t<decltype(command)>;
-                if constexpr(std::same_as<T,MoveLine>)
-                    return command.speed()>0.0&&!command.machineCoordinates();
-                else if constexpr(std::same_as<T,MoveArc>) return command.speed()>0.0;
-                else return false;
-            }, input.command);
-        }
-
         static bool samePosition(const position_t &left,const position_t &right) {
             return (left-right).length()<=1e-12;
-        }
-
-        static std::optional<position_t> motionStart(const MachineCommand &command) {
-            return std::visit([](const auto &value) -> std::optional<position_t> {
-                using T=std::decay_t<decltype(value)>;
-                if constexpr(std::same_as<T,MoveLine>||std::same_as<T,MoveArc>) return value.from();
-                else return std::nullopt;
-            },command);
-        }
-
-        static std::optional<position_t> motionEnd(const MachineCommand &command) {
-            return std::visit([](const auto &value) -> std::optional<position_t> {
-                using T=std::decay_t<decltype(value)>;
-                if constexpr(std::same_as<T,MoveLine>||std::same_as<T,MoveArc>) return value.to();
-                else return std::nullopt;
-            },command);
         }
 
         static double positionDot(const position_t &left,const position_t &right) {
@@ -827,7 +800,7 @@ namespace ngc {
                 >=2.0*m_compiler.limits().lookaheadDuration;
         }
         bool enqueue(TrajectoryPlannerInput input) {
-            if(continuousMotion(input)) {
+            if(isContinuousMotion(input.command,input.metadata.pathMode)) {
                 if(!m_preparedWindow) return false;
                 ++m_diagnostics.continuousModeInputs;
             }
@@ -962,7 +935,7 @@ namespace ngc {
             const auto started = std::chrono::steady_clock::now();
             auto input = std::move(m_window.front());
             m_window.pop_front();
-            if(continuousMotion(input)) ++m_diagnostics.continuousExactStops;
+            if(isContinuousMotion(input.command,input.metadata.pathMode)) ++m_diagnostics.continuousExactStops;
             auto item = std::visit([&](const auto &command) -> std::expected<ExecutionItem, std::string> {
                 using T = std::decay_t<decltype(command)>;
                 if constexpr(std::same_as<T, ProbeMove>) {
@@ -1017,7 +990,9 @@ namespace ngc {
                 return std::unexpected(std::format(
                     "prepared G64 horizon lost its command/piece ownership: commands={} pieces={}",
                     m_preparedWindow->commands.size(),m_preparedWindow->pieces.size()));
-            const auto allContinuous=std::ranges::all_of(m_window,continuousMotion);
+            const auto allContinuous=std::ranges::all_of(m_window,[](const auto &input) {
+                return isContinuousMotion(input.command,input.metadata.pathMode);
+            });
             const auto movingBoundary=m_continuousBoundary.velocity.length()>1e-10
                 ||m_continuousBoundary.acceleration.length()>1e-10;
             if(!allContinuous||(!m_preparedWindow&&m_window.size()<2&&!movingBoundary))
@@ -1296,7 +1271,8 @@ namespace ngc {
        }
 
         bool shouldPlanImmediately() const {
-            return !m_window.empty() && !continuousMotion(m_window.front());
+            return !m_window.empty()
+                && !isContinuousMotion(m_window.front().command,m_window.front().metadata.pathMode);
         }
     };
 }
