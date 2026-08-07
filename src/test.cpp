@@ -4944,7 +4944,7 @@ G1 F60 X2
         machine.memory().write(ngc::Var::G54_Y, 20.0);
         machine.memory().write(ngc::Var::G54_Z, 30.0);
 
-        const auto commands = execute(machine, "G43 H1\nG53 G1 F1 X1 Y1 Z1\n");
+        const auto commands = execute(machine, "G43 H1\nG1 F1\nG53 X1 Y1 Z1\n");
 
         require(commands.size() == 1, "expected one compensated G53 move");
         const auto *move = std::get_if<ngc::MoveLine>(&commands.front());
@@ -4953,6 +4953,11 @@ G1 F60 X2
         requireNear(move->to().y, 4.0, "G53 must bypass G54 Y while retaining the tool offset");
         requireNear(move->to().z, 5.0, "G53 must bypass G54 Z while retaining the tool offset");
         require(move->machineCoordinates(), "G53 motion should retain its machine-coordinate display metadata");
+    }
+
+    void testG53RequiresLinearMotion() {
+        requireInterpreterError("G53 G2 F1 X1 Y1 I1\n", "G53 requires G0 or G1 to be active");
+        requireInterpreterError("G3 F1\nG53 X1 Y1 I1\n", "G53 requires G0 or G1 to be active");
     }
 
     void testArcAllowsOmittedZeroCenterOffsets() {
@@ -9229,6 +9234,7 @@ int main() {
         testToolLengthCompensationUsesActiveTool();
         testToolLengthCompensationWithWorkOffset();
         testG53BypassesWorkOffsetButRetainsToolOffset();
+        testG53RequiresLinearMotion();
         testArcAllowsOmittedZeroCenterOffsets();
         testArcGeometryValidation();
         testArcRadiusMismatchIsRecoverableInterpreterError();

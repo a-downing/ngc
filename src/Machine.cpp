@@ -455,6 +455,14 @@ namespace ngc {
                 m_state.modeMotion = std::exchange(state.modeMotion, std::nullopt);
             }
 
+            if (m_state.nonModal == GCNonModal::G53
+                && m_state.modeMotion != GCMotion::G0
+                && m_state.modeMotion != GCMotion::G1) {
+                throw std::runtime_error(std::format("{}: G53 requires G0 or G1 to be active: {}",
+                                                     block.statement()->startToken().location(),
+                                                     block.statement()->text()));
+            }
+
             if(state.modeDistance) {
                 m_state.modeDistance = std::exchange(state.modeDistance, std::nullopt);
             }
