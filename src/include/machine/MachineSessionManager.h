@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <deque>
 #include <expected>
+#include <functional>
 #include <limits>
 #include <memory>
 #include <mutex>
@@ -17,6 +18,7 @@
 #include <thread>
 #include <tuple>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "config/ConfigurationFingerprint.h"
@@ -2106,6 +2108,38 @@ private:
             "control has transferred or the request targets another session");
     }
 
+    static SessionCommandResult staleSessionCommand() {
+        return { SessionCommandRejection::StaleControlAuthority };
+    }
+
+    template <typename Result, typename Operation, typename... Arguments>
+    Result delegateControlled(const MachineControlAuthority authority,
+                              Result staleResult, Operation operation,
+                              Arguments &&...arguments) {
+        std::scoped_lock lock(m_mutex);
+        auto *session = controlledSessionLocked(authority);
+        if (!session) {
+            return staleResult;
+        }
+
+        return std::invoke(operation, *session, localAuthority(*session),
+            std::forward<Arguments>(arguments)...);
+    }
+
+    template <typename Result, typename Operation, typename... Arguments>
+    Result delegateControlled(const MachineControlAuthority authority,
+                              Result staleResult, Operation operation,
+                              Arguments &&...arguments) const {
+        std::scoped_lock lock(m_mutex);
+        const auto *session = controlledSessionLocked(authority);
+        if (!session) {
+            return staleResult;
+        }
+
+        return std::invoke(operation, *session, localAuthority(*session),
+            std::forward<Arguments>(arguments)...);
+    }
+
 public:
     explicit MachineSessionManager(const ngc::Machine::Unit unit = ngc::Machine::Unit::Inch,
                                    const ngc::TrajectoryLimits limits = {},
@@ -2242,12 +2276,8 @@ public:
     }
 
     SessionCommandResult powerOff(const MachineControlAuthority authority) {
-        std::scoped_lock lock(m_mutex);
-        auto *session = controlledSessionLocked(authority);
-
-        return session ? session->powerOff(localAuthority(*session))
-                       : SessionCommandResult {
-                           SessionCommandRejection::StaleControlAuthority };
+        return delegateControlled(authority, staleSessionCommand(),
+            &detail::MachineSessionHost::powerOff);
     }
 
     bool emergencyStop() {
@@ -2283,21 +2313,13 @@ public:
     SessionCommandResult start(const MachineControlAuthority authority,
                                const std::vector<std::tuple<std::string, std::string>> &programs,
                                const ngc::ToolTable &tools, const bool preserveState = false) {
-        std::scoped_lock lock(m_mutex);
-        auto *session = controlledSessionLocked(authority);
-
-        return session
-            ? session->start(localAuthority(*session), programs, tools, preserveState)
-            : SessionCommandResult { SessionCommandRejection::StaleControlAuthority };
+        return delegateControlled(authority, staleSessionCommand(),
+            &detail::MachineSessionHost::start, programs, tools, preserveState);
     }
 
     SessionCommandResult home(const MachineControlAuthority authority) {
-        std::scoped_lock lock(m_mutex);
-        auto *session = controlledSessionLocked(authority);
-
-        return session ? session->home(localAuthority(*session))
-                       : SessionCommandResult {
-                           SessionCommandRejection::StaleControlAuthority };
+        return delegateControlled(authority, staleSessionCommand(),
+            &detail::MachineSessionHost::home);
     }
 
     bool homingAvailable() const {
@@ -2308,76 +2330,49 @@ public:
 
     SessionCommandResult startJog(const MachineControlAuthority authority,
                                   const ngc::ControlRequest &request) {
-        std::scoped_lock lock(m_mutex);
-        auto *session = controlledSessionLocked(authority);
-
-        return session ? session->startJog(localAuthority(*session), request)
-                       : SessionCommandResult {
-                           SessionCommandRejection::StaleControlAuthority };
+        return delegateControlled(authority, staleSessionCommand(),
+            &detail::MachineSessionHost::startJog, request);
     }
 
     bool renewJog(const MachineControlAuthority authority, const ngc::RequestId request,
                   const ngc::JogId jog) {
-        std::scoped_lock lock(m_mutex);
-        auto *session = controlledSessionLocked(authority);
-
-        return session && session->renewJog(localAuthority(*session), request, jog);
+        return delegateControlled(authority, false,
+            &detail::MachineSessionHost::renewJog, request, jog);
     }
 
     bool setJogVelocity(const MachineControlAuthority authority,
                         const ngc::SetContinuousJogVelocityRequest &request) {
-        std::scoped_lock lock(m_mutex);
-        auto *session = controlledSessionLocked(authority);
-
-        return session && session->setJogVelocity(localAuthority(*session), request);
+        return delegateControlled(authority, false,
+            &detail::MachineSessionHost::setJogVelocity, request);
     }
 
     std::expected<void, std::string> setActiveWorkCoordinate(
             const MachineControlAuthority authority, const ngc::Machine::Axis axis,
             const double workPosition) {
-        std::scoped_lock lock(m_mutex);
-        auto *session = controlledSessionLocked(authority);
-        if (!session) {
-            return staleControlAuthority();
-        }
-
-        return session->setActiveWorkCoordinate(
-            localAuthority(*session), axis, workPosition);
+        return delegateControlled(authority, staleControlAuthority(),
+            &detail::MachineSessionHost::setActiveWorkCoordinate, axis,
+            workPosition);
     }
 
     bool stopJog(const MachineControlAuthority authority, const ngc::RequestId request,
                  const ngc::JogId jog) {
-        std::scoped_lock lock(m_mutex);
-        auto *session = controlledSessionLocked(authority);
-
-        return session && session->stopJog(localAuthority(*session), request, jog);
+        return delegateControlled(authority, false,
+            &detail::MachineSessionHost::stopJog, request, jog);
     }
 
     SessionCommandResult feedHold(const MachineControlAuthority authority) {
-        std::scoped_lock lock(m_mutex);
-        auto *session = controlledSessionLocked(authority);
-
-        return session ? session->feedHold(localAuthority(*session))
-                       : SessionCommandResult {
-                           SessionCommandRejection::StaleControlAuthority };
+        return delegateControlled(authority, staleSessionCommand(),
+            &detail::MachineSessionHost::feedHold);
     }
 
     SessionCommandResult resume(const MachineControlAuthority authority) {
-        std::scoped_lock lock(m_mutex);
-        auto *session = controlledSessionLocked(authority);
-
-        return session ? session->resume(localAuthority(*session))
-                       : SessionCommandResult {
-                           SessionCommandRejection::StaleControlAuthority };
+        return delegateControlled(authority, staleSessionCommand(),
+            &detail::MachineSessionHost::resume);
     }
 
     SessionCommandResult stop(const MachineControlAuthority authority) {
-        std::scoped_lock lock(m_mutex);
-        auto *session = controlledSessionLocked(authority);
-
-        return session ? session->stop(localAuthority(*session))
-                       : SessionCommandResult {
-                           SessionCommandRejection::StaleControlAuthority };
+        return delegateControlled(authority, staleSessionCommand(),
+            &detail::MachineSessionHost::stop);
     }
 
     void setTickMultiplier(const int multiplier) {
@@ -2443,10 +2438,8 @@ public:
 
     bool setToolTable(const MachineControlAuthority authority,
                       const ngc::ToolTable &tools) {
-        std::scoped_lock lock(m_mutex);
-        auto *session = controlledSessionLocked(authority);
-
-        return session && session->setToolTable(localAuthority(*session), tools);
+        return delegateControlled(authority, false,
+            &detail::MachineSessionHost::setToolTable, tools);
     }
 
     ngc::ToolTable toolTable() const {
@@ -2475,60 +2468,34 @@ public:
 
     std::expected<void, std::string> setToolTableStorePath(
             const MachineControlAuthority authority, const std::filesystem::path &path) {
-        std::scoped_lock lock(m_mutex);
-        auto *session = controlledSessionLocked(authority);
-        if (!session) {
-            return staleControlAuthority();
-        }
-
-        return session->setToolTableStorePath(localAuthority(*session), path);
+        return delegateControlled(authority, staleControlAuthority(),
+            &detail::MachineSessionHost::setToolTableStorePath, path);
     }
 
     std::expected<void, std::string> saveToolTable(
             const MachineControlAuthority authority,
             const std::filesystem::path &path) const {
-        std::scoped_lock lock(m_mutex);
-        const auto *session = controlledSessionLocked(authority);
-        if (!session) {
-            return staleControlAuthority();
-        }
-
-        return session->saveToolTable(localAuthority(*session), path);
+        return delegateControlled(authority, staleControlAuthority(),
+            &detail::MachineSessionHost::saveToolTable, path);
     }
 
     std::expected<void, std::string> setPersistentParameterStorePath(
             const MachineControlAuthority authority, const std::filesystem::path &path) {
-        std::scoped_lock lock(m_mutex);
-        auto *session = controlledSessionLocked(authority);
-        if (!session) {
-            return staleControlAuthority();
-        }
-
-        return session->setPersistentParameterStorePath(
-            localAuthority(*session), path);
+        return delegateControlled(authority, staleControlAuthority(),
+            &detail::MachineSessionHost::setPersistentParameterStorePath, path);
     }
 
     std::expected<void, std::string> loadPersistentParameters(
             const MachineControlAuthority authority, const std::filesystem::path &path) {
-        std::scoped_lock lock(m_mutex);
-        auto *session = controlledSessionLocked(authority);
-        if (!session) {
-            return staleControlAuthority();
-        }
-
-        return session->loadPersistentParameters(localAuthority(*session), path);
+        return delegateControlled(authority, staleControlAuthority(),
+            &detail::MachineSessionHost::loadPersistentParameters, path);
     }
 
     std::expected<void, std::string> savePersistentParameters(
             const MachineControlAuthority authority,
             const std::filesystem::path &path) const {
-        std::scoped_lock lock(m_mutex);
-        const auto *session = controlledSessionLocked(authority);
-        if (!session) {
-            return staleControlAuthority();
-        }
-
-        return session->savePersistentParameters(localAuthority(*session), path);
+        return delegateControlled(authority, staleControlAuthority(),
+            &detail::MachineSessionHost::savePersistentParameters, path);
     }
 
     std::vector<ngc::ExecutedJerkSample> takeExecutedJerkSamples() {
